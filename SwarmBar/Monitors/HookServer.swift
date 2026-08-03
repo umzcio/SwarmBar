@@ -172,12 +172,15 @@ final class HookServer: ApprovalResponding {
                 status: .waitingApproval(command: command),
                 sticky: true, cwd: cwd, accountLabel: request.accountLabel
             )
-            // Kimi's PermissionRequest is observation-only (its return is
-            // ignored), so it marks the row but cannot hold a decision.
-            if tool == .kimiCode {
-                finishEmpty()
-            } else {
+            // Only Claude honors a held decision response. Kimi's
+            // PermissionRequest is observation-only, and Grok 0.2.118
+            // treats a timed-out hook as consent, so holding its
+            // connection AUTO-APPROVED prompts about 3s in; both get an
+            // instant empty response and answer through the terminal.
+            if tool == .claudeCode {
                 holdForDecision(sessionID: sessionID, kind: .claudeHook, connection: connection)
+            } else {
+                finishEmpty()
             }
 
         case "PermissionResult":
