@@ -18,7 +18,7 @@ final class SessionStore {
         iconTicker = Task { [weak self] in
             while !Task.isCancelled {
                 let active = self?.anyActive ?? false
-                try? await Task.sleep(for: .milliseconds(active ? 130 : 500))
+                try? await Task.sleep(for: .milliseconds(active ? 220 : 500))
                 guard let self else { return }
                 if self.anyActive { self.iconPhase &+= 1 }
             }
