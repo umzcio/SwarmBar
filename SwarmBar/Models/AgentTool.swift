@@ -26,7 +26,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .claudeCode: "anthropic"
         case .codex:      "openai"
-        case .kimiCode:   nil
+        case .kimiCode:   "kimi"
         }
     }
 
