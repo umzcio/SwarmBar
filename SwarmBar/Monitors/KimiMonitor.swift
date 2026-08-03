@@ -20,7 +20,7 @@ struct KimiMonitor: SessionMonitor {
                 let sessions = await Task.detached {
                     Self.discover(
                         root: root,
-                        liveDirectories: ProcessLiveness.directories(processName: "kimi"),
+                        liveCounts: ProcessLiveness.directoryCounts(processName: "kimi"),
                         now: now
                     )
                 }.value
@@ -36,7 +36,7 @@ struct KimiMonitor: SessionMonitor {
 
     nonisolated static func discover(
         root: URL,
-        liveDirectories: Set<String>? = nil,
+        liveCounts: [String: Int]? = nil,
         now: Date
     ) -> [AgentSession] {
         let fm = FileManager.default
@@ -86,8 +86,8 @@ struct KimiMonitor: SessionMonitor {
 
             let workDir = stateWorkDir ?? entry.workDir
             let projectPath = workDir.map { URL(fileURLWithPath: $0) }
-            let live = liveDirectories.map { dirs in
-                workDir.map { dirs.contains($0) } ?? false
+            let live = liveCounts.map { counts in
+                workDir.map { (counts[$0] ?? 0) > 0 } ?? false
             } ?? true
             let fallback: SessionStatus = live && age < activeAfter
                 ? .working(activity: "Working…")
@@ -107,6 +107,32 @@ struct KimiMonitor: SessionMonitor {
                 lastActivityAt: lastActivity
             ))
         }
+        if let liveCounts { sessions = capLive(sessions, counts: liveCounts) }
         return sessions.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// Sessions share workDirs across restarts, and a killed session's
+    /// wire still parses as working for a while. Only as many sessions per
+    /// directory can be non-idle as there are kimi processes running
+    /// there; the newest win.
+    private nonisolated static func capLive(
+        _ sessions: [AgentSession],
+        counts: [String: Int]
+    ) -> [AgentSession] {
+        var remaining = counts
+        return sessions
+            .sorted { $0.lastActivityAt > $1.lastActivityAt }
+            .map { session in
+                guard session.status != .idle,
+                      let directory = session.projectPath?.path
+                else { return session }
+                if remaining[directory, default: 0] > 0 {
+                    remaining[directory]! -= 1
+                    return session
+                }
+                var demoted = session
+                demoted.status = .idle
+                return demoted
+            }
     }
 }

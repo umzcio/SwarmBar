@@ -6,13 +6,20 @@ import Foundation
 /// actually running in the session's directory.
 enum ProcessLiveness {
     nonisolated static func directories(processName: String) -> Set<String> {
-        guard let pidText = run("/usr/bin/pgrep", ["-x", processName]) else { return [] }
-        var directories: Set<String> = []
+        Set(directoryCounts(processName: processName).keys)
+    }
+
+    /// How many live processes with the given name run in each directory.
+    /// Restart trails leave several sessions sharing one workDir; only as
+    /// many of them can be live as there are processes there.
+    nonisolated static func directoryCounts(processName: String) -> [String: Int] {
+        guard let pidText = run("/usr/bin/pgrep", ["-x", processName]) else { return [:] }
+        var counts: [String: Int] = [:]
         for line in pidText.split(separator: "\n") {
             guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
-            for path in cwds(pid: pid) { directories.insert(path) }
+            for path in cwds(pid: pid) { counts[path, default: 0] += 1 }
         }
-        return directories
+        return counts
     }
 
     /// The pid of the newest live process with the given name whose cwd is
