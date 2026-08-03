@@ -13,7 +13,11 @@ targets:
     type: application
     platform: macOS
     sources:
-      - SwarmBar
+      - path: SwarmBar
+        excludes:
+          - Resources
+      - path: SwarmBar/Resources
+        buildPhase: resources
     info:
       path: SwarmBar/Info.plist
       properties:

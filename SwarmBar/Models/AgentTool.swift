@@ -20,6 +20,16 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// Bundled monochrome logomark (SVG resource name); nil falls back to
+    /// the text glyph.
+    var logoResource: String? {
+        switch self {
+        case .claudeCode: "anthropic"
+        case .codex:      "openai"
+        case .kimiCode:   nil
+        }
+    }
+
     var tint: Color {
         switch self {
         case .claudeCode: Color(red: 0.85, green: 0.47, blue: 0.34)
