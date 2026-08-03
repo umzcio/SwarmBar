@@ -32,3 +32,28 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "-"
         GENERATE_INFOPLIST_FILE: NO
+  SwarmBarTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+    dependencies:
+      - target: SwarmBar
+    settings:
+      base:
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/SwarmBar.app/Contents/MacOS/SwarmBar
+        BUNDLE_LOADER: $(TEST_HOST)
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.zach.SwarmBarTests
+schemes:
+  SwarmBar:
+    build:
+      targets:
+        SwarmBar: all
+        SwarmBarTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SwarmBarTests
