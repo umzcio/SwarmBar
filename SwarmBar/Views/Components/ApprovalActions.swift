@@ -7,11 +7,11 @@ struct ApprovalActions: View {
     var body: some View {
         HStack(spacing: 6) {
             Button("Approve") { store.approve(session) }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
+                .buttonStyle(ActionPill.approve)
+                .accessibilityLabel("Approve")
             Button("Deny") { store.deny(session) }
-                .buttonStyle(.bordered)
+                .buttonStyle(ActionPill.deny)
+                .accessibilityLabel("Deny")
         }
-        .controlSize(.small)
     }
 }

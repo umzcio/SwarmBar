@@ -14,7 +14,7 @@ struct SessionRow: View {
                         .font(.headline)
                         .lineLimit(1)
                     Spacer()
-                    ElapsedTimeText(since: session.startedAt)
+                    ElapsedTimeText(since: session.elapsedAnchor)
                 }
                 HStack(spacing: 5) {
                     // Fresh identity per status kind restarts the pulse/blink
@@ -25,6 +25,11 @@ struct SessionRow: View {
                     Text("\(session.status.label) · \(session.tool.label)")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(session.status.tint)
+                    if let account = session.accountLabel {
+                        Text(account)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 switch session.status {
@@ -32,13 +37,14 @@ struct SessionRow: View {
                     CommandPreview(command: command)
                     ApprovalActions(session: session)
                 case .waitingInput(let prompt):
-                    Text("\u{201C}\(prompt)\u{201D}")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    if !prompt.isEmpty {
+                        Text("\u{201C}\(prompt)\u{201D}")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                     Button("Reply…") { store.openForReply(session) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.blue)
-                        .controlSize(.small)
+                        .buttonStyle(ActionPill.reply)
+                        .accessibilityLabel("Reply")
                 case .working(let activity), .runningTool(let activity):
                     Text(activity)
                         .font(.callout)

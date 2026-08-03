@@ -49,7 +49,8 @@ struct CodexMonitor: SessionMonitor {
                 projectName: projectPath?.lastPathComponent ?? "codex session",
                 projectPath: projectPath,
                 status: status,
-                startedAt: values.creationDate ?? mtime
+                startedAt: values.creationDate ?? mtime,
+                lastActivityAt: mtime
             ))
         }
         return sessions.sorted { $0.startedAt > $1.startedAt }

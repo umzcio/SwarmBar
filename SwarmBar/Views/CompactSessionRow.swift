@@ -22,7 +22,7 @@ struct CompactSessionRow: View {
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.orange)
                 case .waitingInput(let prompt):
-                    Text("\u{201C}\(prompt)\u{201D}")
+                    Text(prompt.isEmpty ? "Waiting on you" : "\u{201C}\(prompt)\u{201D}")
                         .foregroundStyle(.blue)
                 case .working(let activity), .runningTool(let activity):
                     Text(activity)
@@ -46,7 +46,7 @@ struct CompactSessionRow: View {
                 MicroButton(.reply, help: "Reply") { store.openForReply(session) }
             }
 
-            ElapsedTimeText(since: session.startedAt)
+            ElapsedTimeText(since: session.elapsedAnchor)
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 8)

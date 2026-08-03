@@ -65,7 +65,8 @@ struct ClaudeCodeMonitor: SessionMonitor {
                         projectName: projectPath?.lastPathComponent ?? projectDir.lastPathComponent,
                         projectPath: projectPath,
                         status: parsed.status,
-                        startedAt: values.creationDate ?? mtime
+                        startedAt: values.creationDate ?? mtime,
+                        lastActivityAt: mtime
                     ))
                 }
             }
