@@ -68,7 +68,7 @@ struct SummaryLine: View {
 
     var body: some View {
         summary
-            .font(.system(size: 12))
+            .font(.callout)
             .foregroundStyle(.secondary)
     }
 
@@ -90,7 +90,7 @@ struct PopoverFooter: View {
             Spacer()
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.borderless)
-                .font(.system(size: 12))
+                .font(.callout)
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12)

@@ -11,7 +11,7 @@ struct SessionRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(session.projectName)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.headline)
                         .lineLimit(1)
                     Spacer()
                     ElapsedTimeText(since: session.startedAt)
@@ -23,7 +23,7 @@ struct SessionRow: View {
                     StatusDot(status: session.status)
                         .id(session.status.label)
                     Text("\(session.status.label) · \(session.tool.label)")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(session.status.tint)
                 }
 
@@ -33,7 +33,7 @@ struct SessionRow: View {
                     ApprovalActions(session: session)
                 case .waitingInput(let prompt):
                     Text("\u{201C}\(prompt)\u{201D}")
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                     Button("Reply…") { store.openForReply(session) }
                         .buttonStyle(.borderedProminent)
@@ -41,12 +41,12 @@ struct SessionRow: View {
                         .controlSize(.small)
                 case .working(let activity), .runningTool(let activity):
                     Text(activity)
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 case .done(let summary):
                     Text(summary)
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 case .idle:
                     EmptyView()

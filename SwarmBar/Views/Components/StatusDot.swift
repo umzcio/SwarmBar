@@ -1,25 +1,40 @@
 import SwiftUI
 
+/// Active statuses pulse an expanding halo ring (the dot itself stays solid);
+/// attention statuses blink the dot hard. Both gate on reduce motion. The
+/// parent gives this view a fresh identity per status kind so the
+/// repeatForever loops restart on category changes.
 struct StatusDot: View {
     let status: SessionStatus
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var dimmed = false
-
-    private var animates: Bool { !reduceMotion && (status.pulses || status.blinks) }
+    @State private var phase = false
 
     var body: some View {
         Circle()
             .fill(status.tint)
             .frame(width: 7, height: 7)
-            .opacity(dimmed ? (status.blinks ? 0.25 : 0.55) : 1)
-            .animation(
-                animates
-                    ? .easeInOut(duration: status.blinks ? 0.55 : 0.7).repeatForever(autoreverses: true)
-                    : nil,
-                value: dimmed
-            )
-            .onAppear { dimmed = animates }
-            .onChange(of: animates) { _, nowAnimates in dimmed = nowAnimates }
+            .opacity(status.blinks && phase ? 0.25 : 1)
+            .background {
+                if status.pulses && !reduceMotion {
+                    Circle()
+                        .stroke(status.tint.opacity(phase ? 0 : 0.5), lineWidth: 3)
+                        .scaleEffect(phase ? 2.4 : 1)
+                }
+            }
+            .onAppear { start() }
+    }
+
+    private func start() {
+        guard !reduceMotion else { return }
+        if status.blinks {
+            withAnimation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true)) {
+                phase = true
+            }
+        } else if status.pulses {
+            withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) {
+                phase = true
+            }
+        }
     }
 }
