@@ -89,12 +89,14 @@ enum TerminalFocuser {
         return nil
     }
 
-    /// Kimi has no session-to-pid registry, but its process keeps the
-    /// session's workDir as cwd, so match on that (newest process wins
-    /// when two sessions share a directory).
+    /// Kimi (and its BearCode fork) have no session-to-pid registry, but
+    /// their processes keep the session's workDir as cwd, so match on
+    /// that (newest process wins when two sessions share a directory).
     private nonisolated static func kimiPid(projectPath: URL?) -> Int? {
         guard let path = projectPath?.path else { return nil }
         return ProcessLiveness.pid(processName: "kimi", cwd: path)
+            ?? ProcessLiveness.pid(
+                commandPattern: KimiMonitor.BearCode.commandPattern, cwd: path)
     }
 
     private nonisolated static func grokPid(forSession id: UUID) -> Int? {

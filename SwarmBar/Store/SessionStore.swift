@@ -38,7 +38,7 @@ final class SessionStore {
     /// of identical finished rows; Recent keeps only the newest per
     /// project for those. Claude and Codex sessions are distinct
     /// conversations and all stay visible.
-    private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode, .kimiCode]
+    private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode, .kimiCode, .bearCode]
 
     /// How long a finished session stays in Recent. Discovery keeps a
     /// longer window so quiet-but-open sessions are still found, but a
@@ -213,10 +213,10 @@ final class SessionStore {
             answerTuiPrompt(session, keys: ["y"])
             return
         }
-        if session.tool == .kimiCode {
-            // Kimi's selector wraps, so navigation counts are unsafe;
-            // the option is read off the screen and answered by its own
-            // number. PermissionResult (hook) clears the row.
+        if session.tool == .kimiCode || session.tool == .bearCode {
+            // The Kimi-family selector wraps, so navigation counts are
+            // unsafe; the option is read off the screen and answered by
+            // its own number. PermissionResult (hook) clears the row.
             answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnce(in:))
             return
         }
@@ -242,7 +242,7 @@ final class SessionStore {
             answerTuiPrompt(session, keys: ["ESC"])
             return
         }
-        if session.tool == .kimiCode {
+        if session.tool == .kimiCode || session.tool == .bearCode {
             answerNumberedPrompt(session, choose: TuiPromptLayout.reject(in:))
             return
         }

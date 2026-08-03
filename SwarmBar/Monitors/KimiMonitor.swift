@@ -34,10 +34,40 @@ struct KimiMonitor: SessionMonitor {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
     }
 
+    /// BearCode is Zach's own fork of the kimi-code engine: identical state
+    /// layout under ~/.bearcode, identical wire protocol and hooks, but it
+    /// runs as `node .../bearcode-cli/.../main.mjs`, so liveness matches on
+    /// the command line instead of a process name.
+    struct BearCode: SessionMonitor {
+        nonisolated static let commandPattern = "bearcode-cli/apps/kimi-code/dist/main.mjs"
+
+        func start(into store: SessionStore) async {
+            while !Task.isCancelled {
+                if !store.isPaused {
+                    let now = Date.now
+                    let root = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent(".bearcode")
+                    let sessions = await Task.detached {
+                        KimiMonitor.discover(
+                            root: root,
+                            liveCounts: ProcessLiveness.directoryCounts(
+                                commandPattern: Self.commandPattern),
+                            now: now,
+                            tool: .bearCode
+                        )
+                    }.value
+                    store.sync(tool: .bearCode, sessions: sessions)
+                }
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
     nonisolated static func discover(
         root: URL,
         liveCounts: [String: Int]? = nil,
-        now: Date
+        now: Date,
+        tool: AgentTool = .kimiCode
     ) -> [AgentSession] {
         let fm = FileManager.default
         let indexFile = root.appendingPathComponent("session_index.jsonl")
@@ -99,7 +129,7 @@ struct KimiMonitor: SessionMonitor {
 
             sessions.append(AgentSession(
                 id: StableID.uuid(for: sessionId),
-                tool: .kimiCode,
+                tool: tool,
                 projectName: projectPath?.lastPathComponent ?? sessionDir.lastPathComponent,
                 projectPath: projectPath,
                 status: status,

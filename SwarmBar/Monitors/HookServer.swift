@@ -234,11 +234,17 @@ final class HookServer: ApprovalResponding {
     /// schema, so check both before assuming Claude Code.
     nonisolated static func originTool(rawSessionID: String) -> AgentTool {
         if rawSessionID.hasPrefix("session_") {
-            let index = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".kimi-code/session_index.jsonl")
-            if let text = try? String(contentsOf: index, encoding: .utf8),
-               text.contains(rawSessionID) {
-                return .kimiCode
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let indexes: [(String, AgentTool)] = [
+                (".kimi-code/session_index.jsonl", .kimiCode),
+                (".bearcode/session_index.jsonl", .bearCode),
+            ]
+            for (path, tool) in indexes {
+                if let text = try? String(
+                    contentsOf: home.appendingPathComponent(path), encoding: .utf8),
+                   text.contains(rawSessionID) {
+                    return tool
+                }
             }
         }
         let grokRoot = FileManager.default.homeDirectoryForCurrentUser

@@ -13,7 +13,17 @@ enum ProcessLiveness {
     /// Restart trails leave several sessions sharing one workDir; only as
     /// many of them can be live as there are processes there.
     nonisolated static func directoryCounts(processName: String) -> [String: Int] {
-        guard let pidText = run("/usr/bin/pgrep", ["-x", processName]) else { return [:] }
+        counts(pgrepArgs: ["-x", processName])
+    }
+
+    /// For tools launched through interpreters (BearCode runs as
+    /// `node .../main.mjs`), match the command line instead of the name.
+    nonisolated static func directoryCounts(commandPattern: String) -> [String: Int] {
+        counts(pgrepArgs: ["-f", commandPattern])
+    }
+
+    private nonisolated static func counts(pgrepArgs: [String]) -> [String: Int] {
+        guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return [:] }
         var counts: [String: Int] = [:]
         for line in pidText.split(separator: "\n") {
             guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
@@ -26,7 +36,15 @@ enum ProcessLiveness {
     /// the given directory. The session-to-process mapping for tools with
     /// no pid registry.
     nonisolated static func pid(processName: String, cwd: String) -> Int? {
-        guard let pidText = run("/usr/bin/pgrep", ["-x", processName]) else { return nil }
+        pid(pgrepArgs: ["-x", processName], cwd: cwd)
+    }
+
+    nonisolated static func pid(commandPattern: String, cwd: String) -> Int? {
+        pid(pgrepArgs: ["-f", commandPattern], cwd: cwd)
+    }
+
+    private nonisolated static func pid(pgrepArgs: [String], cwd: String) -> Int? {
+        guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return nil }
         for line in pidText.split(separator: "\n").reversed() {
             guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
             if cwds(pid: pid).contains(cwd) { return pid }

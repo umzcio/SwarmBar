@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum AgentTool: String, CaseIterable, Identifiable, Sendable {
-    case claudeCode, codex, kimiCode, openCode, grokBuild
+    case claudeCode, codex, kimiCode, bearCode, openCode, grokBuild
     var id: String { rawValue }
 
     var label: String {
@@ -9,6 +9,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .claudeCode: "Claude Code"
         case .codex:      "Codex"
         case .kimiCode:   "Kimi Code"
+        case .bearCode:   "BearCode"
         case .openCode:   "OpenCode"
         case .grokBuild:  "Grok Build"
         }
@@ -19,6 +20,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .claudeCode: "✳︎"
         case .codex:      "◎"
         case .kimiCode:   "K"
+        case .bearCode:   "B"
         case .openCode:   "O"
         case .grokBuild:  "X"
         }
@@ -31,6 +33,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .claudeCode: "anthropic"
         case .codex:      "openai"
         case .kimiCode:   "kimi"
+        case .bearCode:   "bearcode"
         case .openCode:   "opencode"
         case .grokBuild:  "xai"
         }
@@ -41,6 +44,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .claudeCode: Color(red: 0.85, green: 0.47, blue: 0.34)
         case .codex:      Color(red: 0.10, green: 0.76, blue: 0.72)
         case .kimiCode:   Color(red: 0.30, green: 0.55, blue: 1.00)
+        case .bearCode:   Color(red: 0.87, green: 0.54, blue: 0.20)
         case .openCode:   Color(red: 0.42, green: 0.40, blue: 0.39)
         case .grokBuild:  Color(red: 0.29, green: 0.31, blue: 0.36)
         }
