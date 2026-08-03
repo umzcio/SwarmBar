@@ -3,16 +3,14 @@ import Foundation
 /// Kimi Code: ~/.kimi-code/session_index.jsonl maps sessionId -> sessionDir
 /// -> workDir (last line wins on duplicate sessionId, since the index can
 /// accumulate repeat entries). Each sessionDir has state.json (workDir,
-/// updatedAt as an ISO string) and agents/main/wire.jsonl (protocol events
-/// with epoch-millisecond timestamps). Sessions sampled on this machine were
-/// empty shells whose wire.jsonl only carried metadata / config.update /
-/// tools.set_active_tools, so there's no reliable "waiting on you" signal to
-/// parse out of the wire protocol yet. Status here is honestly just
-/// recency-based: recently touched sessions are treated as working, older
-/// ones (up to the discovery window) as idle.
+/// updatedAt as an ISO string) and agents/main/wire.jsonl, whose trailing
+/// events map to status via KimiWireParser. The wire flushes per settled
+/// step (pending approval prompts never reach it in realtime), so the
+/// recency heuristic remains the fallback when the parser finds nothing.
 struct KimiMonitor: SessionMonitor {
     nonisolated static let discoveryWindow: TimeInterval = 8 * 60 * 60
     nonisolated static let activeAfter: TimeInterval = 2 * 60
+    nonisolated static let staleAfter: TimeInterval = 30 * 60
 
     func start(into store: SessionStore) async {
         while !Task.isCancelled {
@@ -78,9 +76,13 @@ struct KimiMonitor: SessionMonitor {
 
             let workDir = stateWorkDir ?? entry.workDir
             let projectPath = workDir.map { URL(fileURLWithPath: $0) }
-            let status: SessionStatus = age < activeAfter
+            let fallback: SessionStatus = age < activeAfter
                 ? .working(activity: "Working…")
                 : .idle
+            let parsed = age < staleAfter
+                ? ClaudeCodeMonitor.tail(of: wirePath).flatMap(KimiWireParser.parse(tail:))
+                : nil
+            let status = parsed ?? fallback
 
             sessions.append(AgentSession(
                 id: StableID.uuid(for: sessionId),

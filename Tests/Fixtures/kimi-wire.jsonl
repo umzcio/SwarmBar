@@ -1,0 +1,13 @@
+{"type":"metadata","recordVersion":1,"sessionId":"session_c2868fd1-17eb-4772-9697-ca164f3fdd88"}
+{"type":"config.update","profileName":"agent"}
+{"type":"turn.prompt","input":[{"type":"text","text":"What is my network settings"}],"origin":{"kind":"user"},"time":1785789889093}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"eed7c461","turnId":"0","step":1}}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"kimi-for-coding"}
+{"type":"context.append_loop_event","event":{"type":"content.part","turnId":"0","step":1,"part":{"type":"think","think":"The user is asking about their network settings."}}}
+{"type":"permission.record_approval_result","turnId":0,"toolCallId":"tool_2a7n","toolName":"Bash","action":"Running: ifconfig","result":{"decision":"rejected"},"time":1785790074}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool_2a7n","turnId":"0","step":1,"toolCallId":"tool_2a7n","name":"Bash","args":{"command":"ifconfig","timeout":30},"description":"Running: ifconfig","display":{"kind":"command","command":"ifconfig","cwd":"/Users/zach/Desktop","language":"bash"}}}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool_2a7n","toolCallId":"tool_2a7n","result":{"output":"Tool \"Bash\" was not run because the user rejected the approval request.","isError":true}}}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"eed7c461","turnId":"0","step":1,"finishReason":"tool_use"}}
+{"type":"context.append_loop_event","event":{"type":"content.part","turnId":"0","step":2,"part":{"type":"text","text":"I can't run system commands to inspect your network settings right now.\nLet me know how you'd like to proceed."}}}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"f1a2","turnId":"0","step":2,"finishReason":"stop"}}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":747,"output":292},"usageScope":"turn","time":1785790080040}

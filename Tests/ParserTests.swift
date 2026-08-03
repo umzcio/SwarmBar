@@ -103,3 +103,44 @@ struct CodexSessionParserTests {
                 == .runningTool(activity: "Running exec"))
     }
 }
+
+@MainActor
+struct KimiWireParserTests {
+    @Test func finishedTurnIsWaitingWithLastText() throws {
+        let status = try #require(KimiWireParser.parse(tail: fixture("kimi-wire")))
+        #expect(status == .waitingInput(
+            prompt: "I can't run system commands to inspect your network settings right now."))
+    }
+
+    @Test func trailingCancelIsIdle() throws {
+        let tail = try fixture("kimi-wire") + """
+        {"type":"turn.prompt","input":[{"type":"text","text":"again"}],"origin":{"kind":"user"},"time":1785790084294}
+        {"type":"turn.cancel","time":1785790085169}
+        """
+        #expect(KimiWireParser.parse(tail: tail) == .idle)
+    }
+
+    @Test func trailingToolCallIsRunningTool() {
+        let tail = """
+        {"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"t1","name":"Bash","display":{"kind":"command","command":"swift build 2>&1"}}}
+        """
+        #expect(KimiWireParser.parse(tail: tail)
+                == .runningTool(activity: "Running swift build 2>&1"))
+    }
+
+    @Test func trailingRequestIsWorking() {
+        let tail = """
+        {"type":"turn.prompt","input":[{"type":"text","text":"hi"}],"origin":{"kind":"user"}}
+        {"type":"llm.request","kind":"loop","provider":"kimi"}
+        """
+        #expect(KimiWireParser.parse(tail: tail) == .working(activity: "Thinking…"))
+    }
+
+    @Test func configOnlyWireYieldsNothing() {
+        let tail = """
+        {"type":"metadata","recordVersion":1}
+        {"type":"config.update","profileName":"agent"}
+        """
+        #expect(KimiWireParser.parse(tail: tail) == nil)
+    }
+}
