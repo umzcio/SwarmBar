@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SwarmBar — UX Prototype</title>
+<style>
+  :root{
+    --green:#30d158; --amber:#ff9f0a; --blue:#0a84ff; --red:#ff453a;
+    --gray:#98989d; --purple:#bf5af2;
+    --panel:rgba(28,28,32,.72);
+    --row:rgba(255,255,255,.045);
+    --row-hover:rgba(255,255,255,.09);
+    --hairline:rgba(255,255,255,.08);
+    --text:rgba(255,255,255,.92);
+    --text-2:rgba(255,255,255,.55);
+    --text-3:rgba(255,255,255,.35);
+    --claude:#d97757; --codex:#19c2b8; --kimi:#4c8dff;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+    background:#0a0a10;
+    color:var(--text);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ---------- desktop ---------- */
+  .desktop{
+    position:fixed;inset:0;
+    background:
+      radial-gradient(1200px 800px at 15% 110%, #2b1d4e 0%, transparent 60%),
+      radial-gradient(1000px 700px at 90% -10%, #123a52 0%, transparent 55%),
+      radial-gradient(900px 900px at 60% 60%, #1b2a4d 0%, transparent 65%),
+      linear-gradient(160deg,#0b0d1a 0%,#141229 100%);
+  }
+  .desktop::after{ /* faint grain */
+    content:"";position:absolute;inset:0;opacity:.05;pointer-events:none;
+    background-image:radial-gradient(rgba(255,255,255,.6) .5px, transparent .6px);
+    background-size:3px 3px;
+  }
+  .hint{
+    position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);
+    text-align:center;color:var(--text-3);font-size:13px;line-height:1.7;
+    user-select:none;
+  }
+  .hint b{color:var(--text-2);font-weight:600}
+  .hint kbd{
+    font-family:inherit;background:rgba(255,255,255,.08);border:1px solid var(--hairline);
+    border-radius:5px;padding:1px 7px;font-size:12px;color:var(--text-2);
+  }
+
+  /* ---------- menu bar ---------- */
+  .menubar{
+    position:fixed;top:0;left:0;right:0;height:32px;z-index:50;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:0 12px;
+    background:rgba(20,20,26,.55);
+    backdrop-filter:blur(30px) saturate(1.6);
+    -webkit-backdrop-filter:blur(30px) saturate(1.6);
+    border-bottom:1px solid rgba(255,255,255,.05);
+    font-size:13px;font-weight:500;
+  }
+  .mb-left,.mb-right{display:flex;align-items:center;gap:4px}
+  .mb-item{padding:3px 9px;border-radius:5px;color:var(--text);white-space:nowrap}
+  .mb-item.dim{color:var(--text-2);font-weight:400}
+  .mb-apple{font-size:15px;padding:2px 10px}
+  .mb-status{color:var(--text-2);padding:3px 7px;border-radius:5px;font-size:12px}
+
+  /* SwarmBar menu bar item */
+  .swarm-item{
+    display:flex;align-items:center;gap:6px;
+    padding:3px 8px;border-radius:5px;cursor:pointer;position:relative;
+    transition:background .12s ease;
+  }
+  .swarm-item:hover{background:rgba(255,255,255,.10)}
+  .swarm-item.open{background:rgba(255,255,255,.16)}
+  .swarm-glyph{position:relative;width:18px;height:14px}
+  .swarm-dot{
+    position:absolute;width:5px;height:5px;border-radius:50%;
+    background:var(--text);opacity:.9;
+  }
+  .swarm-dot:nth-child(1){left:0;top:5px}
+  .swarm-dot:nth-child(2){left:7px;top:0}
+  .swarm-dot:nth-child(3){left:7px;top:9px}
+  .swarm-dot:nth-child(4){left:13px;top:5px}
+  .swarming .swarm-dot{animation:buzz 1.6s ease-in-out infinite}
+  .swarming .swarm-dot:nth-child(2){animation-delay:.2s}
+  .swarming .swarm-dot:nth-child(3){animation-delay:.45s}
+  .swarming .swarm-dot:nth-child(4){animation-delay:.7s}
+  @keyframes buzz{
+    0%,100%{transform:translate(0,0);opacity:.9}
+    35%{transform:translate(.8px,-1.2px);opacity:.55}
+    70%{transform:translate(-.7px,.9px);opacity:.9}
+  }
+  .swarm-badge{
+    min-width:16px;height:16px;padding:0 4px;border-radius:8px;
+    background:var(--amber);color:#1a1206;font-size:11px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .swarm-badge.hidden{display:none}
+
+  /* ---------- popover ---------- */
+  .popover{
+    position:fixed;top:38px;right:150px;width:380px;z-index:60;
+    background:var(--panel);
+    backdrop-filter:blur(40px) saturate(1.8);
+    -webkit-backdrop-filter:blur(40px) saturate(1.8);
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:14px;
+    box-shadow:0 20px 60px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.35);
+    transform-origin:top right;
+    transition:opacity .16s ease, transform .16s cubic-bezier(.2,.9,.3,1.2);
+  }
+  .popover.closed{opacity:0;transform:scale(.96) translateY(-6px);pointer-events:none}
+  .popover::before{ /* arrow */
+    content:"";position:absolute;top:-6px;right:26px;width:12px;height:12px;
+    background:inherit;border-left:1px solid rgba(255,255,255,.10);
+    border-top:1px solid rgba(255,255,255,.10);
+    transform:rotate(45deg);
+    backdrop-filter:blur(40px);
+  }
+
+  .pop-header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:13px 16px 11px;
+  }
+  .pop-title{font-size:14px;font-weight:700;letter-spacing:.1px}
+  .pop-sub{font-size:12px;color:var(--text-2);margin-top:2px}
+  .pop-sub .attn{color:var(--amber);font-weight:600}
+  .header-actions{display:flex;gap:4px}
+  .icon-btn{
+    width:26px;height:26px;border:none;border-radius:7px;background:transparent;
+    color:var(--text-2);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+    transition:background .12s;
+  }
+  .icon-btn:hover{background:var(--row-hover);color:var(--text)}
+  .icon-btn.paused{color:var(--amber)}
+
+  .section-label{
+    padding:8px 16px 5px;font-size:11px;font-weight:700;letter-spacing:.6px;
+    text-transform:uppercase;color:var(--text-3);
+    display:flex;align-items:center;gap:6px;
+  }
+  .section-label.attn{color:var(--amber)}
+  .divider{height:1px;background:var(--hairline);margin:6px 0 0}
+
+  .rows{padding:0 8px}
+  .row{
+    display:flex;align-items:flex-start;gap:10px;
+    padding:9px 8px;border-radius:9px;cursor:default;
+    transition:background .12s;
+  }
+  .row:hover{background:var(--row-hover)}
+  .row.leaving{opacity:0;transform:translateX(8px);transition:all .25s ease}
+  .row.entering{animation:slidein .3s ease}
+  @keyframes slidein{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+
+  .tool-chip{
+    width:26px;height:26px;border-radius:7px;flex:none;margin-top:1px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:13px;font-weight:800;color:#fff;
+  }
+  .tool-claude{background:linear-gradient(145deg,#e08a63,#c05f3c)}
+  .tool-codex{background:linear-gradient(145deg,#25d4c9,#0e9a92)}
+  .tool-kimi{background:linear-gradient(145deg,#5f9bff,#2f6be0)}
+
+  .row-main{flex:1;min-width:0}
+  .row-top{display:flex;align-items:baseline;gap:7px}
+  .sess-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess-time{font-size:11px;color:var(--text-3);flex:none;margin-left:auto;font-variant-numeric:tabular-nums}
+  .activity{
+    font-size:12px;color:var(--text-2);margin-top:2px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .activity code{
+    font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:11px;
+    color:var(--text-2);
+  }
+  .approval-cmd{
+    margin-top:6px;padding:6px 9px;border-radius:7px;
+    background:rgba(0,0,0,.35);border:1px solid rgba(255,159,10,.25);
+    font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:11px;
+    color:#ffd699;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .approval-actions{display:flex;gap:6px;margin-top:7px}
+  .btn{
+    border:none;border-radius:6px;padding:4px 11px;font-size:12px;font-weight:600;
+    cursor:pointer;font-family:inherit;transition:filter .12s, transform .05s;
+  }
+  .btn:active{transform:scale(.97)}
+  .btn-approve{background:var(--amber);color:#241703}
+  .btn-approve:hover{filter:brightness(1.1)}
+  .btn-deny{background:rgba(255,255,255,.10);color:var(--text)}
+  .btn-deny:hover{background:rgba(255,255,255,.16)}
+  .btn-reply{background:var(--blue);color:#fff}
+  .btn-reply:hover{filter:brightness(1.1)}
+
+  /* status indicator */
+  .status{display:flex;align-items:center;gap:5px;flex:none;margin-top:5px}
+  .s-dot{width:7px;height:7px;border-radius:50%;flex:none;position:relative}
+  .s-working .s-dot{background:var(--green);animation:pulse 1.4s ease-in-out infinite}
+  .s-tooling .s-dot{background:var(--purple);animation:pulse 1s ease-in-out infinite}
+  .s-waiting_approval .s-dot{background:var(--amber);animation:blink 1.1s steps(2,start) infinite}
+  .s-waiting_input .s-dot{background:var(--blue);animation:blink 1.4s steps(2,start) infinite}
+  .s-idle .s-dot{background:var(--gray)}
+  .s-done .s-dot{background:var(--green)}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(48,209,88,.5)}50%{box-shadow:0 0 0 4px rgba(48,209,88,0)}}
+  @keyframes blink{50%{opacity:.25}}
+  .s-label{font-size:11px;font-weight:600}
+  .s-working .s-label{color:var(--green)}
+  .s-tooling .s-label{color:var(--purple)}
+  .s-waiting_approval .s-label{color:var(--amber)}
+  .s-waiting_input .s-label{color:var(--blue)}
+  .s-idle .s-label,.s-done .s-label{color:var(--text-3)}
+
+  .empty-attn{
+    padding:10px 16px 4px;font-size:12px;color:var(--text-3);
+  }
+
+  .pop-footer{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:9px 12px;border-top:1px solid var(--hairline);margin-top:6px;
+  }
+  .foot-btn{
+    border:none;background:transparent;color:var(--text-2);font-size:12px;font-weight:500;
+    padding:5px 9px;border-radius:6px;cursor:pointer;font-family:inherit;
+    transition:background .12s;
+  }
+  .foot-btn:hover{background:var(--row-hover);color:var(--text)}
+
+  /* ---------- compact density mode ---------- */
+  .crow{align-items:center;padding:5px 8px;gap:8px}
+  .c-status{margin-top:0}
+  .c-chip{width:18px;height:18px;border-radius:5px;font-size:10px;margin-top:0}
+  .c-name{font-size:12.5px;font-weight:600;flex:none;max-width:118px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c-activity{flex:1;min-width:0;font-size:11.5px;color:var(--text-3);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c-activity code{font-size:10.5px}
+  .c-cmd{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:10.5px;color:#ffd699}
+  .c-prompt{color:var(--blue)}
+  .cbtn{width:20px;height:20px;flex:none;border:none;border-radius:6px;
+    font-size:11px;font-weight:700;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    transition:filter .12s, transform .05s}
+  .cbtn:active{transform:scale(.94)}
+  .cbtn-ok{background:var(--amber);color:#241703}
+  .cbtn-no{background:rgba(255,255,255,.12);color:var(--text)}
+  .cbtn-reply{background:var(--blue);color:#fff}
+  .cbtn:hover{filter:brightness(1.15)}
+  .popover.compact .section-label{padding:6px 16px 3px}
+  .icon-btn.active{background:rgba(255,255,255,.14);color:var(--text)}
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+</style>
+</head>
+<body>
+
+<div class="desktop"></div>
+
+<div class="hint">
+  <b>SwarmBar</b> — menu bar prototype<br>
+  Click the <kbd>⸫ swarm icon</kbd> in the menu bar (top right) to toggle the popover.<br>
+  Sessions simulate live agent activity: approvals appear, timers tick, work completes.
+</div>
+
+<!-- ================= menu bar ================= -->
+<div class="menubar">
+  <div class="mb-left">
+    <div class="mb-item mb-apple"></div>
+    <div class="mb-item"><b>Finder</b></div>
+    <div class="mb-item dim">File</div>
+    <div class="mb-item dim">Edit</div>
+    <div class="mb-item dim">View</div>
+    <div class="mb-item dim">Go</div>
+    <div class="mb-item dim">Window</div>
+    <div class="mb-item dim">Help</div>
+  </div>
+  <div class="mb-right">
+    <div class="swarm-item" id="swarmItem" title="SwarmBar">
+      <div class="swarm-glyph" id="swarmGlyph">
+        <div class="swarm-dot"></div><div class="swarm-dot"></div>
+        <div class="swarm-dot"></div><div class="swarm-dot"></div>
+      </div>
+      <div class="swarm-badge hidden" id="swarmBadge">0</div>
+    </div>
+    <div class="mb-status">􀙇</div>
+    <div class="mb-status">🔋 87%</div>
+    <div class="mb-item dim" id="clock">Sat 10:42 AM</div>
+  </div>
+</div>
+
+<!-- ================= popover ================= -->
+<div class="popover closed" id="popover">
+  <div class="pop-header">
+    <div>
+      <div class="pop-title">SwarmBar</div>
+      <div class="pop-sub" id="popSub">— sessions</div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" id="densityBtn" title="Compact view">☰</button>
+      <button class="icon-btn" id="pauseBtn" title="Pause all agents">⏸</button>
+      <button class="icon-btn" title="Preferences">⚙︎</button>
+    </div>
+  </div>
+
+  <div class="section-label attn" id="attnLabel">Needs you</div>
+  <div class="rows" id="attnRows"></div>
+  <div class="empty-attn" id="attnEmpty" style="display:none">All agents running on their own 🐝</div>
+
+  <div class="divider"></div>
+  <div class="section-label">Active</div>
+  <div class="rows" id="activeRows"></div>
+
+  <div class="divider"></div>
+  <div class="section-label">Recent</div>
+  <div class="rows" id="doneRows"></div>
+
+  <div class="pop-footer">
+    <button class="foot-btn">＋ Watch a session…</button>
+    <div>
+      <button class="foot-btn">Preferences</button>
+      <button class="foot-btn">Quit</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/* data + simulation                                                    */
+/* ------------------------------------------------------------------ */
+const TOOLS = {
+  claude: { label:"Claude Code", cls:"tool-claude", glyph:"✳︎" },
+  codex:  { label:"Codex",       cls:"tool-codex",  glyph:"◎" },
+  kimi:   { label:"Kimi Code",   cls:"tool-kimi",   glyph:"K" },
+};
+
+const STATUS_META = {
+  working:          { label:"Working" },
+  tooling:          { label:"Running tool" },
+  waiting_approval: { label:"Approval" },
+  waiting_input:    { label:"Waiting on you" },
+  idle:             { label:"Idle" },
+  done:             { label:"Done" },
+};
+
+const WORK_ACTIVITIES = [
+  "Thinking through the refactor…",
+  "Editing <code>SessionMonitor.swift</code>",
+  "Reading <code>StatusBarController.swift</code>",
+  "Planning next steps…",
+  "Writing unit tests…",
+  "Reviewing diff before commit…",
+];
+const TOOL_ACTIVITIES = [
+  "Running <code>swift build</code>",
+  "Running <code>swift test</code>",
+  "Grepping for <code>NSStatusItem</code>",
+  "Running <code>git diff --stat</code>",
+  "Fetching docs page…",
+];
+const APPROVAL_CMDS = [
+  "rm -rf DerivedData/",
+  "git push origin main",
+  "brew install swiftlint",
+  "npm install -g @anthropic-ai/claude-code",
+  "curl -sL https://example.com/install.sh | sh",
+];
+const INPUT_PROMPTS = [
+  "Should the popover pin on click or hover?",
+  "Two approaches to the state machine — which do you prefer?",
+  "Ready to commit 4 files. Message okay?",
+];
+
+let nextId = 1;
+const now = () => Date.now();
+
+function makeSession(tool, project, status, activity, ageMs){
+  return { id: nextId++, tool, project, status, activity,
+           startedAt: now() - ageMs, cmd:null, prompt:null };
+}
+
+let sessions = [
+  makeSession("claude","swarmbar — main","working", WORK_ACTIVITIES[1], 8*60e3),
+  makeSession("claude","muren-site","tooling", TOOL_ACTIVITIES[0], 22*60e3),
+  makeSession("codex","docuridge","working", WORK_ACTIVITIES[4], 3*60e3),
+  makeSession("kimi","curbdot","waiting_input", null, 14*60e3),
+  makeSession("codex","ficino","done","Merged PR #42 · 12 files", 41*60e3),
+];
+sessions[3].prompt = INPUT_PROMPTS[0];
+
+// seed one approval so the badge is alive on load
+sessions.push((() => {
+  const s = makeSession("claude","aif-scanner","waiting_approval",null, 5*60e3);
+  s.cmd = APPROVAL_CMDS[0];
+  return s;
+})());
+
+let paused = false;
+let open = true; // start open so the prototype shows itself
+
+/* ------------------------------------------------------------------ */
+/* rendering                                                           */
+/* ------------------------------------------------------------------ */
+const $ = id => document.getElementById(id);
+
+function fmtElapsed(ms){
+  const m = Math.floor(ms/60000), s = Math.floor(ms/1000)%60;
+  if (m >= 60) return Math.floor(m/60)+"h "+(m%60)+"m";
+  if (m > 0) return m+"m "+s+"s";
+  return s+"s";
+}
+
+let dense = false;
+
+function compactRowHTML(s){
+  const t = TOOLS[s.tool];
+  const meta = STATUS_META[s.status];
+  let mid = "", acts = "";
+  if (s.status === "waiting_approval"){
+    mid = `<span class="c-cmd">$ ${s.cmd}</span>`;
+    acts = `<button class="cbtn cbtn-ok" data-act="approve" data-id="${s.id}" title="Approve">✓</button>
+            <button class="cbtn cbtn-no" data-act="deny" data-id="${s.id}" title="Deny">✕</button>`;
+  } else if (s.status === "waiting_input"){
+    mid = `<span class="c-prompt">“${s.prompt}”</span>`;
+    acts = `<button class="cbtn cbtn-reply" data-act="reply" data-id="${s.id}" title="Reply">↩</button>`;
+  } else if (s.activity){
+    mid = `<span>${s.activity}</span>`;
+  }
+  return `
+  <div class="row crow entering" id="row-${s.id}">
+    <div class="status s-${s.status} c-status" title="${meta.label}"><div class="s-dot"></div></div>
+    <div class="tool-chip ${t.cls} c-chip" title="${t.label}">${t.glyph}</div>
+    <div class="c-name" title="${s.project}">${s.project}</div>
+    <div class="c-activity">${mid}</div>
+    ${acts}
+    <div class="sess-time" data-elapsed="${s.id}">${fmtElapsed(now()-s.startedAt)}</div>
+  </div>`;
+}
+
+function rowHTML(s){
+  if (dense) return compactRowHTML(s);
+  const t = TOOLS[s.tool];
+  const meta = STATUS_META[s.status];
+  let body = "";
+
+  if (s.status === "waiting_approval"){
+    body = `
+      <div class="approval-cmd">$ ${s.cmd}</div>
+      <div class="approval-actions">
+        <button class="btn btn-approve" data-act="approve" data-id="${s.id}">Approve</button>
+        <button class="btn btn-deny" data-act="deny" data-id="${s.id}">Deny</button>
+      </div>`;
+  } else if (s.status === "waiting_input"){
+    body = `
+      <div class="activity">“${s.prompt}”</div>
+      <div class="approval-actions">
+        <button class="btn btn-reply" data-act="reply" data-id="${s.id}">Reply…</button>
+      </div>`;
+  } else if (s.activity){
+    body = `<div class="activity">${s.activity}</div>`;
+  }
+
+  return `
+  <div class="row entering" id="row-${s.id}">
+    <div class="tool-chip ${t.cls}" title="${t.label}">${t.glyph}</div>
+    <div class="row-main">
+      <div class="row-top">
+        <div class="sess-name">${s.project}</div>
+        <div class="sess-time" data-elapsed="${s.id}">${fmtElapsed(now()-s.startedAt)}</div>
+      </div>
+      <div class="status s-${s.status}">
+        <div class="s-dot"></div>
+        <div class="s-label">${meta.label} · ${t.label}</div>
+      </div>
+      ${body}
+    </div>
+  </div>`;
+}
+
+function render(){
+  const attn   = sessions.filter(s => s.status==="waiting_approval" || s.status==="waiting_input");
+  const active = sessions.filter(s => s.status==="working" || s.status==="tooling");
+  const rest   = sessions.filter(s => s.status==="idle" || s.status==="done");
+
+  $("attnRows").innerHTML   = attn.map(rowHTML).join("");
+  $("activeRows").innerHTML = active.map(rowHTML).join("");
+  $("doneRows").innerHTML   = rest.map(rowHTML).join("");
+  $("attnEmpty").style.display = attn.length ? "none" : "block";
+  $("attnLabel").style.display = "block";
+
+  // header summary
+  const parts = [`${sessions.length} sessions`];
+  if (attn.length) parts.push(`<span class="attn">${attn.length} need${attn.length===1?"s":""} you</span>`);
+  else parts.push(`${active.length} active`);
+  $("popSub").innerHTML = parts.join(" · ");
+
+  // menu bar
+  const badge = $("swarmBadge");
+  if (attn.length){ badge.textContent = attn.length; badge.classList.remove("hidden"); }
+  else badge.classList.add("hidden");
+  $("swarmGlyph").classList.toggle("swarming", !paused && active.length > 0);
+}
+
+/* elapsed timers tick without re-rendering rows */
+setInterval(() => {
+  document.querySelectorAll("[data-elapsed]").forEach(el => {
+    const s = sessions.find(x => x.id === +el.dataset.elapsed);
+    if (s) el.textContent = fmtElapsed(now() - s.startedAt);
+  });
+}, 1000);
+
+/* clock */
+function tickClock(){
+  const d = new Date();
+  const day = d.toLocaleDateString("en-US",{weekday:"short"});
+  const t = d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});
+  $("clock").textContent = `${day} ${t}`;
+}
+tickClock(); setInterval(tickClock, 15000);
+
+/* ------------------------------------------------------------------ */
+/* live simulation                                                     */
+/* ------------------------------------------------------------------ */
+const pick = a => a[Math.floor(Math.random()*a.length)];
+
+setInterval(() => {
+  if (paused) return;
+  const s = pick(sessions);
+  const roll = Math.random();
+
+  if (s.status === "working"){
+    if (roll < .35){ s.status = "tooling"; s.activity = pick(TOOL_ACTIVITIES); }
+    else if (roll < .45){ s.status = "waiting_approval"; s.activity = null; s.cmd = pick(APPROVAL_CMDS); }
+    else if (roll < .52){ s.status = "waiting_input"; s.activity = null; s.prompt = pick(INPUT_PROMPTS); }
+    else if (roll < .58){ s.status = "done"; s.activity = "Task complete · "+(2+Math.floor(Math.random()*14))+" files changed"; }
+    else { s.activity = pick(WORK_ACTIVITIES); }
+  }
+  else if (s.status === "tooling"){
+    if (roll < .6){ s.status = "working"; s.activity = pick(WORK_ACTIVITIES); }
+    else { s.activity = pick(TOOL_ACTIVITIES); }
+  }
+  else if (s.status === "done" && roll < .12 && sessions.length < 8){
+    // a new session spins up now and then
+    const tools = Object.keys(TOOLS);
+    const projects = ["bearcode","unifyit","range-notes","homelab-scripts","spendit"];
+    sessions.unshift(makeSession(pick(tools), pick(projects), "working", pick(WORK_ACTIVITIES), 0));
+  }
+  render();
+}, 3500);
+
+/* ------------------------------------------------------------------ */
+/* interactions                                                        */
+/* ------------------------------------------------------------------ */
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-act]");
+  if (b){
+    const s = sessions.find(x => x.id === +b.dataset.id);
+    if (!s) return;
+    if (b.dataset.act === "approve"){ s.status="tooling"; s.activity=`Running <code>${s.cmd.split(" ")[0]}</code>`; s.cmd=null; }
+    if (b.dataset.act === "deny"){ s.status="working"; s.activity="Rethinking approach without that command…"; s.cmd=null; }
+    if (b.dataset.act === "reply"){ s.status="working"; s.activity="Continuing with your answer…"; s.prompt=null; }
+    render();
+    return;
+  }
+  // toggle popover
+  if (e.target.closest("#swarmItem")){
+    open = !open;
+    $("popover").classList.toggle("closed", !open);
+    $("swarmItem").classList.toggle("open", open);
+    return;
+  }
+  // click-away closes
+  if (open && !e.target.closest("#popover")){
+    open = false;
+    $("popover").classList.add("closed");
+    $("swarmItem").classList.remove("open");
+  }
+});
+
+$("densityBtn").addEventListener("click", () => {
+  dense = !dense;
+  $("popover").classList.toggle("compact", dense);
+  $("densityBtn").classList.toggle("active", dense);
+  $("densityBtn").title = dense ? "Comfortable view" : "Compact view";
+  render();
+});
+
+$("pauseBtn").addEventListener("click", () => {
+  paused = !paused;
+  $("pauseBtn").classList.toggle("paused", paused);
+  $("pauseBtn").title = paused ? "Resume all agents" : "Pause all agents";
+  $("pauseBtn").textContent = paused ? "▶" : "⏸";
+  render();
+});
+
+/* initial state */
+$("popover").classList.remove("closed");
+$("swarmItem").classList.add("open");
+render();
+</script>
+</body>
+</html>
