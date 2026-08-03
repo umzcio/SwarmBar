@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 struct PopoverRootView: View {
@@ -131,8 +132,26 @@ struct SummaryLine: View {
 }
 
 struct PopoverFooter: View {
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+
     var body: some View {
         HStack {
+            Toggle("Launch at login", isOn: $launchAtLogin)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .onChange(of: launchAtLogin) { _, enable in
+                    do {
+                        if enable {
+                            try SMAppService.mainApp.register()
+                        } else {
+                            try SMAppService.mainApp.unregister()
+                        }
+                    } catch {
+                        launchAtLogin = SMAppService.mainApp.status == .enabled
+                    }
+                }
             Spacer()
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.borderless)

@@ -56,5 +56,17 @@ struct SessionRow: View {
         .padding(8)
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
+        .sessionContextMenu(session, store: store)
+    }
+}
+
+extension View {
+    func sessionContextMenu(_ session: AgentSession, store: SessionStore) -> some View {
+        contextMenu {
+            Button("Open in Terminal") { store.openInTerminal(session) }
+                .disabled(session.projectPath == nil)
+            Button("Copy project path") { store.copyProjectPath(session) }
+                .disabled(session.projectPath == nil)
+        }
     }
 }

@@ -53,6 +53,7 @@ struct CompactSessionRow: View {
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
         .help(session.projectName)
+        .sessionContextMenu(session, store: store)
     }
 }
 

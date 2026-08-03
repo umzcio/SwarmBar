@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -58,23 +59,41 @@ final class SessionStore {
         mutate(&sessions[index])
     }
 
-    // Called by row buttons. In phase 1 these transition mock state directly;
-    // real monitors (phase 3+) route through each tool's control channel and
-    // confirm the new state from the tool side.
+    // Called by row buttons. Mock sessions (no projectPath) transition state
+    // directly. Real sessions are read-only per CLAUDE.md: the buttons bring
+    // you to the session's terminal instead of writing to the tool's files;
+    // proper control channels are a later design.
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
+        if session.projectPath != nil { openInTerminal(session); return }
         let executable = command.split(separator: " ").first.map(String.init) ?? command
         update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
     }
 
     func deny(_ session: AgentSession) {
         guard case .waitingApproval = session.status else { return }
+        if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
     }
 
     func openForReply(_ session: AgentSession) {
         guard case .waitingInput = session.status else { return }
+        if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Continuing with your answer…") }
+    }
+
+    func openInTerminal(_ session: AgentSession) {
+        guard let path = session.projectPath else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Terminal", path.path]
+        try? process.run()
+    }
+
+    func copyProjectPath(_ session: AgentSession) {
+        guard let path = session.projectPath else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path.path, forType: .string)
     }
 
     func pauseAll() {
