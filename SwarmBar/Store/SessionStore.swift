@@ -141,6 +141,15 @@ final class SessionStore {
             update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
             return
         }
+        if session.tool == .grokBuild {
+            // Grok's hook runner ignores deny responses (verified), so the
+            // prompt is answered through its TUI selector. Layouts vary
+            // (3-option shell prompts, 4-option edit prompts), but reject
+            // is always last and plain approve-once second-from-last, so
+            // navigate: clamp to the bottom, step up once, submit.
+            answerGrokPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         let executable = command.split(separator: " ").first.map(String.init) ?? command
         update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
@@ -152,8 +161,25 @@ final class SessionStore {
             update(id: session.id) { $0.status = .working(activity: "Rethinking after deny…") }
             return
         }
+        if session.tool == .grokBuild {
+            // Reject is the last option in every observed layout: clamp to
+            // the bottom and submit; the second newline submits the reject
+            // feedback field empty.
+            answerGrokPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
+    }
+
+    private func answerGrokPrompt(_ session: AgentSession, keys: [String]) {
+        let id = session.id
+        let path = session.projectPath
+        Task.detached {
+            if !TerminalFocuser.sendKeys(sessionID: id, keys: keys) {
+                TerminalFocuser.focus(sessionID: id, projectPath: path)
+            }
+        }
     }
 
     func openForReply(_ session: AgentSession) {

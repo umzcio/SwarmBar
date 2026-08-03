@@ -60,8 +60,12 @@ enum GrokUpdatesParser {
             let update = (params["update"] as? [String: Any]) ?? params
             guard (update["sessionUpdate"] as? String) == "tool_call" else { continue }
             let rawInput = update["rawInput"] as? [String: Any]
-            let command = (rawInput?["command"] as? String) ?? (update["title"] as? String)
-            return command.map(firstLine)
+            if let command = rawInput?["command"] as? String { return firstLine(command) }
+            let title = update["title"] as? String ?? "tool"
+            if let path = (rawInput?["file_path"] ?? rawInput?["absolute_path"] ?? rawInput?["path"]) as? String {
+                return "\(title) \(URL(fileURLWithPath: path).lastPathComponent)"
+            }
+            return title
         }
         return nil
     }

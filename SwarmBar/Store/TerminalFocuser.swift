@@ -16,6 +16,40 @@ enum TerminalFocuser {
         }
     }
 
+    /// Sends keystrokes to the session's tty via iTerm2 (the only terminal
+    /// here with a per-session write-text verb). "\n" sends a bare newline,
+    /// "UP"/"DOWN" send arrow escape sequences, anything else is written
+    /// without a newline. Used to answer Grok's TUI permission selector
+    /// remotely. Returns false when the session has no live tty or iTerm2
+    /// isn't running.
+    nonisolated static func sendKeys(sessionID: UUID, keys: [String]) -> Bool {
+        guard let tty = tty(forSession: sessionID), isRunning("iTerm2") else { return false }
+        let writes = keys.map { key in
+            switch key {
+            case "\n":   "tell s to write text \"\""
+            case "UP":   "tell s to write text ((character id 27) & \"[A\") newline NO"
+            case "DOWN": "tell s to write text ((character id 27) & \"[B\") newline NO"
+            default:     "tell s to write text \"\(key)\" newline NO"
+            }
+        }.joined(separator: "\n          delay 0.08\n          ")
+        let script = """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "/dev/\(tty)" then
+                  \(writes)
+                  return "SENT"
+                end if
+              end repeat
+            end repeat
+          end repeat
+          return "MISS"
+        end tell
+        """
+        return runScript(script) == "SENT"
+    }
+
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID) -> String? {
