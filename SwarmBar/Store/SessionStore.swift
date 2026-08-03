@@ -38,7 +38,7 @@ final class SessionStore {
     /// of identical finished rows; Recent keeps only the newest per
     /// project for those. Claude and Codex sessions are distinct
     /// conversations and all stay visible.
-    private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode]
+    private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode, .kimiCode]
 
     /// How long a finished session stays in Recent. Discovery keeps a
     /// longer window so quiet-but-open sessions are still found, but a
@@ -213,6 +213,13 @@ final class SessionStore {
             answerTuiPrompt(session, keys: ["y"])
             return
         }
+        if session.tool == .kimiCode {
+            // Kimi's selector: Approve once is always the top option, so
+            // clamp up and confirm. PermissionResult (hook) records the
+            // outcome and clears the row.
+            answerTuiPrompt(session, keys: Array(repeating: "UP", count: 8) + ["\n"])
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         let executable = command.split(separator: " ").first.map(String.init) ?? command
         update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
@@ -235,6 +242,14 @@ final class SessionStore {
             answerTuiPrompt(session, keys: ["ESC"])
             return
         }
+        if session.tool == .kimiCode {
+            // Reject with feedback is the bottom option in every observed
+            // layout: clamp down, confirm, and submit the reason as the
+            // feedback text so the model knows where the deny came from.
+            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8)
+                + ["\n", "Denied from SwarmBar", "\n"])
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
     }
@@ -243,7 +258,7 @@ final class SessionStore {
         let id = session.id
         let path = session.projectPath
         Task.detached {
-            if !TerminalFocuser.sendKeys(sessionID: id, keys: keys) {
+            if !TerminalFocuser.sendKeys(sessionID: id, projectPath: path, keys: keys) {
                 TerminalFocuser.focus(sessionID: id, projectPath: path)
             }
         }

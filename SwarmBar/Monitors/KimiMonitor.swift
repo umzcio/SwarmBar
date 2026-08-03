@@ -17,7 +17,13 @@ struct KimiMonitor: SessionMonitor {
             if !store.isPaused {
                 let now = Date.now
                 let root = Self.defaultRoot()
-                let sessions = await Task.detached { Self.discover(root: root, now: now) }.value
+                let sessions = await Task.detached {
+                    Self.discover(
+                        root: root,
+                        liveDirectories: ProcessLiveness.directories(processName: "kimi"),
+                        now: now
+                    )
+                }.value
                 store.sync(tool: .kimiCode, sessions: sessions)
             }
             try? await Task.sleep(for: .seconds(5))
@@ -28,7 +34,11 @@ struct KimiMonitor: SessionMonitor {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
     }
 
-    nonisolated static func discover(root: URL, now: Date) -> [AgentSession] {
+    nonisolated static func discover(
+        root: URL,
+        liveDirectories: Set<String>? = nil,
+        now: Date
+    ) -> [AgentSession] {
         let fm = FileManager.default
         let indexFile = root.appendingPathComponent("session_index.jsonl")
         guard let text = try? String(contentsOf: indexFile, encoding: .utf8) else { return [] }
@@ -76,10 +86,13 @@ struct KimiMonitor: SessionMonitor {
 
             let workDir = stateWorkDir ?? entry.workDir
             let projectPath = workDir.map { URL(fileURLWithPath: $0) }
-            let fallback: SessionStatus = age < activeAfter
+            let live = liveDirectories.map { dirs in
+                workDir.map { dirs.contains($0) } ?? false
+            } ?? true
+            let fallback: SessionStatus = live && age < activeAfter
                 ? .working(activity: "Working…")
                 : .idle
-            let parsed = age < staleAfter
+            let parsed = live && age < staleAfter
                 ? ClaudeCodeMonitor.tail(of: wirePath).flatMap(KimiWireParser.parse(tail:))
                 : nil
             let status = parsed ?? fallback

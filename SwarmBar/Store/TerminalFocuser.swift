@@ -7,7 +7,7 @@ import Foundation
 /// the project directory in a new Terminal window.
 enum TerminalFocuser {
     nonisolated static func focus(sessionID: UUID, projectPath: URL?) {
-        if let tty = tty(forSession: sessionID),
+        if let tty = tty(forSession: sessionID, projectPath: projectPath),
            focusRunningTerminal(device: "/dev/\(tty)") {
             return
         }
@@ -22,8 +22,9 @@ enum TerminalFocuser {
     /// without a newline. Used to answer Grok's TUI permission selector
     /// remotely. Returns false when the session has no live tty or iTerm2
     /// isn't running.
-    nonisolated static func sendKeys(sessionID: UUID, keys: [String]) -> Bool {
-        guard let tty = tty(forSession: sessionID), isRunning("iTerm2") else { return false }
+    nonisolated static func sendKeys(sessionID: UUID, projectPath: URL? = nil, keys: [String]) -> Bool {
+        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+              isRunning("iTerm2") else { return false }
         let writes = keys.map { key in
             switch key {
             case "\n":   "tell s to write text \"\""
@@ -53,13 +54,25 @@ enum TerminalFocuser {
 
     // MARK: - Session -> tty
 
-    private nonisolated static func tty(forSession id: UUID) -> String? {
-        if let pid = claudePid(forSession: id) ?? grokPid(forSession: id) ?? codexPid(forSession: id) {
+    private nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
+        let pid = claudePid(forSession: id)
+            ?? grokPid(forSession: id)
+            ?? codexPid(forSession: id)
+            ?? kimiPid(projectPath: projectPath)
+        if let pid {
             let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let name, !name.isEmpty, name != "??" { return name }
         }
         return nil
+    }
+
+    /// Kimi has no session-to-pid registry, but its process keeps the
+    /// session's workDir as cwd, so match on that (newest process wins
+    /// when two sessions share a directory).
+    private nonisolated static func kimiPid(projectPath: URL?) -> Int? {
+        guard let path = projectPath?.path else { return nil }
+        return ProcessLiveness.pid(processName: "kimi", cwd: path)
     }
 
     private nonisolated static func grokPid(forSession id: UUID) -> Int? {
