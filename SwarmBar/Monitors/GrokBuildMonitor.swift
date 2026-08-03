@@ -10,7 +10,6 @@ import Foundation
 /// directories.
 struct GrokBuildMonitor: SessionMonitor {
     nonisolated static let discoveryWindow: TimeInterval = 8 * 60 * 60
-    nonisolated static let waitingAfter: TimeInterval = 30 * 60
 
     func start(into store: SessionStore) async {
         while !Task.isCancelled {
@@ -58,28 +57,39 @@ struct GrokBuildMonitor: SessionMonitor {
     }
 
     /// active_sessions.json's entries may be bare id strings or objects with
-    /// an id under one of a few likely keys; either way, gather everything
-    /// that could plausibly be a session id.
-    private nonisolated static func activeSessionIDs(root: URL) -> Set<String> {
+    /// an id under one of a few likely keys. Two liveness corrections
+    /// observed in the wild: entries can outlive a crashed process (dead
+    /// pid), and the TUI can switch sessions within one process, leaving
+    /// the abandoned session still registered under the same pid. Only the
+    /// newest opened_at per pid is genuinely attached.
+    nonisolated static func activeSessionIDs(root: URL) -> Set<String> {
         let path = root.appendingPathComponent("active_sessions.json")
         guard let data = try? Data(contentsOf: path),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
         else { return [] }
         let idKeys = ["id", "session_id", "sessionId", "sessionID"]
+
         var ids = Set<String>()
+        var newestPerPid: [Int: (id: String, openedAt: Date)] = [:]
         for element in array {
             if let string = element as? String {
                 ids.insert(string)
                 continue
             }
-            guard let entry = element as? [String: Any] else { continue }
-            // Stale entries can outlive a crashed process; a dead pid means
-            // the session is not actually live.
-            if let pid = entry["pid"] as? Int, kill(pid_t(pid), 0) != 0 { continue }
-            for key in idKeys {
-                if let value = entry[key] as? String { ids.insert(value) }
+            guard let entry = element as? [String: Any],
+                  let id = idKeys.compactMap({ entry[$0] as? String }).first
+            else { continue }
+            guard let pid = entry["pid"] as? Int else {
+                ids.insert(id)
+                continue
             }
+            guard kill(pid_t(pid), 0) == 0 else { continue }
+            let openedAt = (entry["opened_at"] as? String)
+                .flatMap { ClaudeSessionParser.date($0) } ?? .distantPast
+            if let current = newestPerPid[pid], current.openedAt >= openedAt { continue }
+            newestPerPid[pid] = (id, openedAt)
         }
+        ids.formUnion(newestPerPid.values.map(\.id))
         return ids
     }
 
@@ -105,14 +115,13 @@ struct GrokBuildMonitor: SessionMonitor {
         let isActive = infoId.map { activeIds.contains($0) } ?? false
         let status: SessionStatus
         if isActive {
-            // A live process gets its real state from the update stream;
-            // recency only decides for exited sessions.
+            // A live process gets its real state from the update stream.
             let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
             status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
                 ?? .working(activity: "Working…")
-        } else if age < waitingAfter {
-            status = .waitingInput(prompt: lastAssistantPreview(dir: dir) ?? "")
         } else {
+            // No process means nothing to wait for; exited sessions are
+            // idle no matter how fresh their last activity is.
             status = .idle
         }
 
@@ -130,41 +139,4 @@ struct GrokBuildMonitor: SessionMonitor {
         )
     }
 
-    /// chat_history.jsonl lines are {"type": system/user/assistant, ...}
-    /// with message content whose exact shape wasn't pinned down, so this
-    /// checks a few plausible spots for a string to preview.
-    private nonisolated static func lastAssistantPreview(dir: URL) -> String? {
-        let path = dir.appendingPathComponent("chat_history.jsonl")
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
-        for raw in text.split(separator: "\n").reversed() {
-            guard let data = raw.data(using: .utf8),
-                  let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  (line["type"] as? String) == "assistant"
-            else { continue }
-            if let preview = textPreview(from: line) { return preview }
-        }
-        return nil
-    }
-
-    private nonisolated static func textPreview(from line: [String: Any]) -> String? {
-        if let content = line["content"] as? String { return firstLine(content) }
-        if let items = line["content"] as? [[String: Any]] {
-            let text = items.compactMap { $0["text"] as? String }.joined(separator: " ")
-            if !text.isEmpty { return firstLine(text) }
-        }
-        if let message = line["message"] as? [String: Any] {
-            if let content = message["content"] as? String { return firstLine(content) }
-            if let items = message["content"] as? [[String: Any]] {
-                let text = items.compactMap { $0["text"] as? String }.joined(separator: " ")
-                if !text.isEmpty { return firstLine(text) }
-            }
-        }
-        return nil
-    }
-
-    private nonisolated static func firstLine(_ text: String) -> String {
-        let line = text.split(separator: "\n").first.map(String.init) ?? text
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return trimmed.count <= 90 ? trimmed : String(trimmed.prefix(90)) + "…"
-    }
 }

@@ -218,7 +218,7 @@ struct GrokBuildMonitorTests {
         #expect(sessions.first?.id == UUID(uuidString: id))
     }
 
-    @Test func inactiveFreshSessionIsWaitingInput() throws {
+    @Test func inactiveFreshSessionIsIdleNotWaiting() throws {
         let root = try makeRoot()
         let id = UUID().uuidString
         let now = Date.now
@@ -229,7 +229,29 @@ struct GrokBuildMonitorTests {
 
         let sessions = GrokBuildMonitor.discover(root: root, now: now)
         #expect(sessions.count == 1)
-        #expect(sessions.first?.status == .waitingInput(prompt: "Ready for review, shall I proceed?"))
+        #expect(sessions.first?.status == .idle)
+    }
+
+    @Test func sessionSwitchInOneProcessKeepsOnlyNewestActive() throws {
+        // The TUI can switch sessions within one process; the abandoned
+        // session stays registered under the same pid and must not count
+        // as live.
+        let root = try makeRoot()
+        let abandoned = UUID().uuidString
+        let current = UUID().uuidString
+        let pid = Int(ProcessInfo.processInfo.processIdentifier)
+        let iso = ISO8601DateFormatter()
+        let entries: [[String: Any]] = [
+            ["session_id": abandoned, "pid": pid,
+             "opened_at": iso.string(from: Date(timeIntervalSinceNow: -120))],
+            ["session_id": current, "pid": pid,
+             "opened_at": iso.string(from: Date(timeIntervalSinceNow: -30))],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: entries)
+        try data.write(to: root.appendingPathComponent("active_sessions.json"))
+
+        let active = GrokBuildMonitor.activeSessionIDs(root: root)
+        #expect(active == [current])
     }
 
     @Test func staleInactiveSessionIsIdle() throws {
