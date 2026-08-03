@@ -17,7 +17,11 @@ struct SessionRow: View {
                     ElapsedTimeText(since: session.startedAt)
                 }
                 HStack(spacing: 5) {
+                    // Fresh identity per status kind restarts the pulse/blink
+                    // loop; without it the repeatForever animation freezes
+                    // when the status category changes.
                     StatusDot(status: session.status)
+                        .id(session.status.label)
                     Text("\(session.status.label) · \(session.tool.label)")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(session.status.tint)

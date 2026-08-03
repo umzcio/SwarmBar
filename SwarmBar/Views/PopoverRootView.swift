@@ -3,6 +3,10 @@ import SwiftUI
 struct PopoverRootView: View {
     @Environment(SessionStore.self) private var store
 
+    // MenuBarExtra windows size to their content's ideal height, which
+    // collapses a ScrollView to zero; measure the content instead.
+    @State private var contentHeight: CGFloat = 100
+
     var body: some View {
         VStack(spacing: 0) {
             PopoverHeader()
@@ -29,8 +33,13 @@ struct PopoverRootView: View {
                     )
                 }
                 .padding(.bottom, 6)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    contentHeight = height
+                }
             }
-            .frame(maxHeight: 480)
+            .frame(height: min(contentHeight, 480))
 
             PopoverFooter()
         }
