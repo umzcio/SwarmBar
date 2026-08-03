@@ -134,7 +134,8 @@ struct KimiMonitor: SessionMonitor {
                 projectPath: projectPath,
                 status: status,
                 startedAt: startedAt,
-                lastActivityAt: lastActivity
+                lastActivityAt: lastActivity,
+                processAlive: live
             ))
         }
         if let liveCounts { sessions = capLive(sessions, counts: liveCounts) }
@@ -162,6 +163,7 @@ struct KimiMonitor: SessionMonitor {
                 }
                 var demoted = session
                 demoted.status = .idle
+                demoted.processAlive = false
                 return demoted
             }
     }

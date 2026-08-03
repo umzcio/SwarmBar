@@ -48,6 +48,14 @@ enum SessionStatus: Equatable, Sendable {
     var pulses: Bool { isActive }
     var blinks: Bool { needsAttention }
 
+    /// Finished states show "how long ago"; live ones show a duration.
+    var timerReadsAgo: Bool {
+        switch self {
+        case .idle, .done: true
+        default: false
+        }
+    }
+
     /// Classifies a finished turn: a message that asks something is
     /// waiting on the user, a plain report is done. The full text decides
     /// (questions often sit in the last paragraph), the preview is shown.

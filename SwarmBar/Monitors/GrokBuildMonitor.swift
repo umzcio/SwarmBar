@@ -165,7 +165,8 @@ struct GrokBuildMonitor: SessionMonitor {
             projectPath: projectPath,
             status: status,
             startedAt: createdAt,
-            lastActivityAt: updatedAt
+            lastActivityAt: updatedAt,
+            processAlive: isActive
         )
     }
 

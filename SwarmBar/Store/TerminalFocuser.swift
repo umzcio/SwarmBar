@@ -119,7 +119,7 @@ enum TerminalFocuser {
     /// Codex has no session-to-pid registry, but the codex process keeps
     /// its rollout file (whose name ends in the session id) open for
     /// appending, so lsof on that file names the owning process.
-    private nonisolated static func codexPid(forSession id: UUID) -> Int? {
+    nonisolated static func codexPid(forSession id: UUID) -> Int? {
         let fm = FileManager.default
         let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
         let suffix = "\(id.uuidString.lowercased()).jsonl"
@@ -134,7 +134,7 @@ enum TerminalFocuser {
         return nil
     }
 
-    private nonisolated static func claudePid(forSession id: UUID) -> Int? {
+    nonisolated static func claudePid(forSession id: UUID) -> Int? {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []

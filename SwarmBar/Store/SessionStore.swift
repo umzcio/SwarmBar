@@ -30,9 +30,17 @@ final class SessionStore {
         }
     }
 
-    // Derived slices the popover renders.
+    // Derived slices the popover renders. Active includes live sessions
+    // that just finished a turn: their process is still up and their
+    // terminal is a click away, so they are not history yet.
     var attention: [AgentSession] { sessions.filter { $0.status.needsAttention } }
-    var active:    [AgentSession] { sessions.filter { $0.status.isActive } }
+    var active: [AgentSession] {
+        sessions.filter { session in
+            if session.status.isActive { return true }
+            if case .done = session.status { return session.processAlive }
+            return false
+        }
+    }
 
     /// Tools that mint a session per launch (Grok, OpenCode) leave trails
     /// of identical finished rows; Recent keeps only the newest per
@@ -46,8 +54,9 @@ final class SessionStore {
     static let recentRetention: TimeInterval = 60 * 60
 
     var recent: [AgentSession] {
+        let activeIds = Set(active.map(\.id))
         let finished = sessions.filter {
-            !$0.status.needsAttention && !$0.status.isActive
+            !$0.status.needsAttention && !activeIds.contains($0.id)
                 && Date.now.timeIntervalSince($0.lastActivityAt) < Self.recentRetention
         }
         var newestByProject: [String: Date] = [:]
@@ -60,6 +69,7 @@ final class SessionStore {
             let key = "\(session.tool.rawValue)|\(session.projectPath?.path ?? session.projectName)"
             return session.lastActivityAt >= newestByProject[key] ?? .distantPast
         }
+        .sorted { $0.lastActivityAt > $1.lastActivityAt }
     }
 
     /// What the popover actually lists; the header counts this, not the

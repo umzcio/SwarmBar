@@ -14,7 +14,7 @@ struct SessionRow: View {
                         .font(.headline)
                         .lineLimit(1)
                     Spacer()
-                    ElapsedTimeText(since: session.elapsedAnchor)
+                    ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
                 }
                 HStack(spacing: 5) {
                     // Fresh identity per status kind restarts the pulse/blink

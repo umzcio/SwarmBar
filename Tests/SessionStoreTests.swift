@@ -21,6 +21,17 @@ struct SessionStoreTests {
         #expect(Set(store.attention.map(\.id)) == Set([approval.id, input.id]))
         #expect(Set(store.active.map(\.id)) == Set([working.id, tooling.id]))
         #expect(Set(store.recent.map(\.id)) == Set([idle.id, done.id]))
+
+        // A finished turn whose process still runs is Active, not history.
+        var liveDone = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .done(summary: "Shipped."), processAlive: true)
+        store.upsert(liveDone)
+        #expect(store.active.contains { $0.id == liveDone.id })
+        #expect(!store.recent.contains { $0.id == liveDone.id })
+        liveDone.processAlive = false
+        store.upsert(liveDone)
+        #expect(store.recent.contains { $0.id == liveDone.id })
         #expect(store.anyActive)
         #expect(store.attentionCount == 2)
     }

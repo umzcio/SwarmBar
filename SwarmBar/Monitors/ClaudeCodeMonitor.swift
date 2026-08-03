@@ -66,7 +66,8 @@ struct ClaudeCodeMonitor: SessionMonitor {
                         projectPath: projectPath,
                         status: parsed.status,
                         startedAt: values.creationDate ?? mtime,
-                        lastActivityAt: mtime
+                        lastActivityAt: mtime,
+                        processAlive: TerminalFocuser.claudePid(forSession: id) != nil
                     ))
                 }
             }

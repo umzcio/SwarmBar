@@ -47,7 +47,7 @@ struct CompactSessionRow: View {
                 MicroButton(.dismiss, help: "Dismiss") { store.acknowledge(session) }
             }
 
-            ElapsedTimeText(since: session.elapsedAnchor)
+            ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 8)

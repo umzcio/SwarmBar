@@ -50,7 +50,8 @@ struct CodexMonitor: SessionMonitor {
                 projectPath: projectPath,
                 status: status,
                 startedAt: values.creationDate ?? mtime,
-                lastActivityAt: mtime
+                lastActivityAt: mtime,
+                processAlive: TerminalFocuser.codexPid(forSession: id) != nil
             ))
         }
         return sessions.sorted { $0.startedAt > $1.startedAt }

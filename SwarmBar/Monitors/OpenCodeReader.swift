@@ -78,13 +78,13 @@ enum OpenCodeReader {
         var deduped = demoteSuperseded(results)
         if let liveDirectories {
             deduped = deduped.map { session in
-                guard let directory = session.projectPath?.path,
-                      !liveDirectories.contains(directory),
-                      session.status != .idle
-                else { return session }
-                var demoted = session
-                demoted.status = .idle
-                return demoted
+                var session = session
+                let live = session.projectPath.map { liveDirectories.contains($0.path) } ?? false
+                session.processAlive = live && session.status != .idle
+                if !live, session.status != .idle {
+                    session.status = .idle
+                }
+                return session
             }
         }
         return deduped.sorted { $0.startedAt > $1.startedAt }

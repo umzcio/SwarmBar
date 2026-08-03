@@ -11,6 +11,9 @@ struct AgentSession: Identifiable, Equatable, Sendable {
                                   // show this for waiting/idle states
     var pid: pid_t?               // liveness checks
     var accountLabel: String?     // e.g. GMAIL / TEAM / CIO, from hook env
+    /// Whether the tool's process still runs. A live session that just
+    /// finished a turn belongs in Active, not buried in Recent history.
+    var processAlive: Bool
 
     init(
         id: UUID = UUID(),
@@ -21,7 +24,8 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         startedAt: Date = .now,
         lastActivityAt: Date? = nil,
         pid: pid_t? = nil,
-        accountLabel: String? = nil
+        accountLabel: String? = nil,
+        processAlive: Bool = false
     ) {
         self.id = id
         self.tool = tool
@@ -32,6 +36,7 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         self.lastActivityAt = lastActivityAt ?? startedAt
         self.pid = pid
         self.accountLabel = accountLabel
+        self.processAlive = processAlive
     }
 
     /// What the row's elapsed timer should measure: run length while
