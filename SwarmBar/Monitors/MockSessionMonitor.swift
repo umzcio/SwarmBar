@@ -68,6 +68,9 @@ struct MockSessionMonitor: SessionMonitor {
             AgentSession(tool: .openCode, projectName: "range-notes",
                          status: .working(activity: Self.workActivities[5]),
                          startedAt: .now.addingTimeInterval(-11 * 60)),
+            AgentSession(tool: .grokBuild, projectName: "spendit",
+                         status: .runningTool(activity: Self.toolActivities[3]),
+                         startedAt: .now.addingTimeInterval(-2 * 60)),
         ]
         for session in seeded.reversed() { store.upsert(session) }
     }
