@@ -309,3 +309,35 @@ struct GrokUpdatesParserTests {
         #expect(GrokUpdatesParser.parse(tail: tail) == nil)
     }
 }
+
+@MainActor
+struct GrokPermissionDetectionTests {
+    @Test func pendingPromptDetectedFromEvents() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let events = """
+        {"ts":"t","type":"tool_started","tool_name":"run_terminal_command"}
+        {"ts":"t","type":"phase_changed","phase":"permission_prompt"}
+        {"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}
+        """
+        try events.write(to: dir.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
+        #expect(GrokBuildMonitor.pendingPermissionTool(dir: dir) == "run_terminal_command")
+    }
+
+    @Test func answeredPromptIsNotPending() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let events = """
+        {"ts":"t","type":"phase_changed","phase":"permission_prompt"}
+        {"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}
+        {"ts":"t","type":"phase_changed","phase":"working"}
+        """
+        try events.write(to: dir.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
+        #expect(GrokBuildMonitor.pendingPermissionTool(dir: dir) == nil)
+    }
+
+    @Test func pendingToolCommandFromUpdates() {
+        let tail = "{\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"title\":\"run_terminal_command\",\"rawInput\":{\"command\":\"rm -rf build/\"}}}}"
+        #expect(GrokUpdatesParser.pendingToolCommand(tail: tail) == "rm -rf build/")
+    }
+}

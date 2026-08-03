@@ -50,6 +50,29 @@ struct GrokBuildMonitor: SessionMonitor {
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 
+    /// Returns the tool name awaiting permission if the session's trailing
+    /// phase is permission_prompt, nil once the prompt has been answered
+    /// (a later phase_changed supersedes it).
+    nonisolated static func pendingPermissionTool(dir: URL) -> String? {
+        guard let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("events.jsonl"))
+        else { return nil }
+        var requestedTool: String?
+        for raw in tail.split(separator: "\n").reversed() {
+            guard let data = raw.data(using: .utf8),
+                  let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let type = line["type"] as? String
+            else { continue }
+            if type == "permission_requested", requestedTool == nil {
+                requestedTool = line["tool_name"] as? String
+            }
+            if type == "phase_changed" {
+                guard (line["phase"] as? String) == "permission_prompt" else { return nil }
+                return requestedTool ?? "tool"
+            }
+        }
+        return nil
+    }
+
     private nonisolated static func isDirectory(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
@@ -115,10 +138,17 @@ struct GrokBuildMonitor: SessionMonitor {
         let isActive = infoId.map { activeIds.contains($0) } ?? false
         let status: SessionStatus
         if isActive {
-            // A live process gets its real state from the update stream.
+            // events.jsonl records permission prompts explicitly
+            // (phase_changed to permission_prompt + permission_requested);
+            // otherwise the update stream carries the working state.
             let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
-            status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
-                ?? .working(activity: "Working…")
+            if let tool = pendingPermissionTool(dir: dir) {
+                let command = tail.flatMap { GrokUpdatesParser.pendingToolCommand(tail: $0) }
+                status = .waitingApproval(command: command ?? tool)
+            } else {
+                status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
+                    ?? .working(activity: "Working…")
+            }
         } else {
             // No process means nothing to wait for; exited sessions are
             // idle no matter how fresh their last activity is.

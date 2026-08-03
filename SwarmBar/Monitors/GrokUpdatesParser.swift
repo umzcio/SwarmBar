@@ -49,6 +49,23 @@ enum GrokUpdatesParser {
         return sawStop ? .waitingInput(prompt: "") : nil
     }
 
+    /// The command (or title) of the most recent tool_call, used as the
+    /// approval row's command preview while a permission prompt is pending.
+    nonisolated static func pendingToolCommand(tail: String) -> String? {
+        for raw in tail.split(separator: "\n").reversed() {
+            guard let data = raw.data(using: .utf8),
+                  let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let params = line["params"] as? [String: Any]
+            else { continue }
+            let update = (params["update"] as? [String: Any]) ?? params
+            guard (update["sessionUpdate"] as? String) == "tool_call" else { continue }
+            let rawInput = update["rawInput"] as? [String: Any]
+            let command = (rawInput?["command"] as? String) ?? (update["title"] as? String)
+            return command.map(firstLine)
+        }
+        return nil
+    }
+
     private nonisolated static func question(from update: [String: Any]) -> String? {
         guard let rawInput = update["rawInput"] as? [String: Any],
               let questions = rawInput["questions"] as? [[String: Any]],
