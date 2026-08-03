@@ -15,10 +15,8 @@ struct SwarmBarApp: App {
             PopoverRootView()
                 .environment(store)
         } label: {
-            MenuBarLabel(
-                anyActive: store.anyActive,
-                attentionCount: store.attentionCount
-            )
+            MenuBarLabel()
+                .environment(store)
         }
         .menuBarExtraStyle(.window)
     }
