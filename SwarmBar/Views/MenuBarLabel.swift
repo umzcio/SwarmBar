@@ -25,7 +25,7 @@ struct MenuBarLabel: View {
         if store.attentionCount > 0 {
             return SwarmGlyphRenderer.attentionFrame(centerLit: store.iconPhase % 2 == 0)
         }
-        if store.anyActive {
+        if store.anyActive, !store.isPaused {
             return SwarmGlyphRenderer.fillFrame(store.iconPhase % 9)
         }
         return SwarmGlyphRenderer.solid()

@@ -48,6 +48,9 @@ struct PopoverRootView: View {
 }
 
 struct PopoverHeader: View {
+    @Environment(SessionStore.self) private var store
+    @AppStorage("compactRows") private var compact = false
+
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -56,10 +59,53 @@ struct PopoverHeader: View {
                 SummaryLine()
             }
             Spacer()
+            HStack(spacing: 4) {
+                HeaderIconButton(
+                    symbol: "list.dash",
+                    active: compact,
+                    help: compact ? "Comfortable view" : "Compact view"
+                ) { compact.toggle() }
+                HeaderIconButton(
+                    symbol: store.isPaused ? "play.fill" : "pause.fill",
+                    tint: store.isPaused ? .orange : nil,
+                    help: store.isPaused ? "Resume all agents" : "Pause all agents"
+                ) { store.pauseAll() }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 13)
         .padding(.bottom, 11)
+    }
+}
+
+struct HeaderIconButton: View {
+    let symbol: String
+    var active: Bool = false
+    var tint: Color? = nil
+    let help: String
+    let action: () -> Void
+
+    init(symbol: String, active: Bool = false, tint: Color? = nil,
+         help: String, action: @escaping () -> Void) {
+        self.symbol = symbol
+        self.active = active
+        self.tint = tint
+        self.help = help
+        self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(tint.map(AnyShapeStyle.init)
+                                 ?? (active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary)))
+                .frame(width: 26, height: 26)
+                .background(.primary.opacity(active ? 0.14 : 0),
+                            in: .rect(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 

@@ -23,7 +23,9 @@ final class SessionStore {
                 let active = self?.anyActive ?? false
                 try? await Task.sleep(for: .milliseconds(attention ? 500 : 450))
                 guard let self else { return }
-                if self.attentionCount > 0 || self.anyActive { self.iconPhase &+= 1 }
+                if self.attentionCount > 0 || (self.anyActive && !self.isPaused) {
+                    self.iconPhase &+= 1
+                }
             }
         }
     }
@@ -75,5 +77,7 @@ final class SessionStore {
         update(id: session.id) { $0.status = .working(activity: "Continuing with your answer…") }
     }
 
-    func pauseAll() { }
+    func pauseAll() {
+        isPaused.toggle()
+    }
 }
