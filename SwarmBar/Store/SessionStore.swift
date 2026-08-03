@@ -109,6 +109,14 @@ final class SessionStore {
         for id in incomingIds where endedSessions.contains(id) {
             update(id: id) { $0.status = .idle }
         }
+        for (id, ackTime) in acknowledgedAt {
+            guard let session = sessions.first(where: { $0.id == id }) else { continue }
+            if session.lastActivityAt > ackTime {
+                acknowledgedAt.removeValue(forKey: id)
+            } else if case .waitingInput(let prompt) = session.status {
+                update(id: id) { $0.status = .done(summary: prompt) }
+            }
+        }
         reapplyHookOverrides()
     }
 
@@ -135,6 +143,18 @@ final class SessionStore {
         endedSessions.insert(sessionID)
         clearHookOverride(sessionID: sessionID)
         update(id: sessionID) { $0.status = .idle }
+    }
+
+    /// A waiting row the user dismissed reads as done until the session
+    /// produces new activity; the poller would otherwise re-derive the
+    /// waiting verdict from the unchanged transcript on the next sync.
+    @ObservationIgnored private var acknowledgedAt: [UUID: Date] = [:]
+
+    func acknowledge(_ session: AgentSession) {
+        guard case .waitingInput(let prompt) = session.status else { return }
+        acknowledgedAt[session.id] = session.lastActivityAt
+        clearHookOverride(sessionID: session.id)
+        update(id: session.id) { $0.status = .done(summary: prompt) }
     }
 
     func applyHookEvent(

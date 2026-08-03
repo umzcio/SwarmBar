@@ -106,10 +106,10 @@ struct CodexSessionParserTests {
 
 @MainActor
 struct KimiWireParserTests {
-    @Test func finishedTurnIsWaitingWithLastText() throws {
+    @Test func finishedPlainReportIsDone() throws {
         let status = try #require(KimiWireParser.parse(tail: fixture("kimi-wire")))
-        #expect(status == .waitingInput(
-            prompt: "I can't run system commands to inspect your network settings right now."))
+        #expect(status == .done(
+            summary: "I can't run system commands to inspect your network settings right now."))
     }
 
     @Test func trailingCancelIsIdle() throws {

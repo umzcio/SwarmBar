@@ -186,7 +186,7 @@ struct OpenCodeReaderTests {
             .min(by: { $0.lastActivityAt < $1.lastActivityAt })
         #expect(ghost?.status == .idle)
         let other = sessions.first(where: { $0.projectName == "proj-5" })
-        #expect(other?.status == .waitingInput(prompt: "different directory"))
+        #expect(other?.status == .done(summary: "different directory"))
     }
 
     @Test func sessionsOutsideLiveDirectoriesGoIdle() throws {
@@ -337,13 +337,22 @@ struct GrokUpdatesParserTests {
                 == .runningTool(activity: "Running run_command"))
     }
 
-    @Test func stopAfterAgentMessageIsWaitingWithPreview() {
+    @Test func stopAfterPlainReportIsDone() {
         let tail = [
             envelope("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"All done, ready for review.\"}}"),
             envelope("{\"sessionUpdate\":\"hook_execution\",\"event_name\":\"stop\",\"runs\":[]}"),
         ].joined(separator: "\n")
         #expect(GrokUpdatesParser.parse(tail: tail)
-                == .waitingInput(prompt: "All done, ready for review."))
+                == .done(summary: "All done, ready for review."))
+    }
+
+    @Test func stopAfterQuestionIsWaiting() {
+        let tail = [
+            envelope("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Ship it, or keep polishing?\"}}"),
+            envelope("{\"sessionUpdate\":\"hook_execution\",\"event_name\":\"stop\",\"runs\":[]}"),
+        ].joined(separator: "\n")
+        #expect(GrokUpdatesParser.parse(tail: tail)
+                == .waitingInput(prompt: "Ship it, or keep polishing?"))
     }
 
     @Test func trailingThoughtIsWorking() {

@@ -156,7 +156,10 @@ enum OpenCodeReader {
         }
         if age < waitingAfter {
             let text = parts.first(where: { $0.type == "text" })?.text
-            return .waitingInput(prompt: text.map(firstLine) ?? "")
+            return .finishedTurn(
+                fullText: text ?? "",
+                preview: text.map(firstLine) ?? ""
+            )
         }
         return .idle
     }

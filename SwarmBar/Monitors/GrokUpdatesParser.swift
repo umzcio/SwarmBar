@@ -35,7 +35,11 @@ enum GrokUpdatesParser {
 
             case "agent_message_chunk":
                 if sawStop {
-                    return .waitingInput(prompt: chunkText(update).map(firstLine) ?? "")
+                    let text = chunkText(update)
+                    return .finishedTurn(
+                        fullText: text ?? "",
+                        preview: text.map(firstLine) ?? ""
+                    )
                 }
                 return .working(activity: "Responding…")
 

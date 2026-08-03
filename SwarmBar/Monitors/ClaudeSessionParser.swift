@@ -35,7 +35,10 @@ enum ClaudeSessionParser {
                 let text = assistantText(of: line)
                 guard !text.isEmpty else { continue }
                 if let age, age > staleAfter { return ParsedStatus(status: .idle, cwd: cwd) }
-                return ParsedStatus(status: .waitingInput(prompt: prompt(from: text)), cwd: cwd)
+                return ParsedStatus(
+                    status: .finishedTurn(fullText: text, preview: prompt(from: text)),
+                    cwd: cwd
+                )
             case "user":
                 if let age, age > staleAfter { return ParsedStatus(status: .idle, cwd: cwd) }
                 let hasToolResult = contentItems(of: line)?

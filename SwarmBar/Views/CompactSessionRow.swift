@@ -44,6 +44,7 @@ struct CompactSessionRow: View {
             }
             if case .waitingInput = session.status {
                 MicroButton(.reply, help: "Reply") { store.openForReply(session) }
+                MicroButton(.dismiss, help: "Dismiss") { store.acknowledge(session) }
             }
 
             ElapsedTimeText(since: session.elapsedAnchor)
@@ -59,13 +60,14 @@ struct CompactSessionRow: View {
 
 struct MicroButton: View {
     enum Kind {
-        case approve, deny, reply
+        case approve, deny, reply, dismiss
 
         var symbol: String {
             switch self {
             case .approve: "checkmark"
             case .deny:    "xmark"
             case .reply:   "arrowshape.turn.up.left"
+            case .dismiss: "checkmark"
             }
         }
     }
@@ -97,6 +99,7 @@ struct MicroButton: View {
         case .approve: AnyShapeStyle(.black.opacity(0.85))
         case .deny:    AnyShapeStyle(.primary)
         case .reply:   AnyShapeStyle(.white)
+        case .dismiss: AnyShapeStyle(.primary)
         }
     }
 
@@ -105,6 +108,7 @@ struct MicroButton: View {
         case .approve: AnyShapeStyle(.orange)
         case .deny:    AnyShapeStyle(.primary.opacity(0.12))
         case .reply:   AnyShapeStyle(.blue)
+        case .dismiss: AnyShapeStyle(.primary.opacity(0.12))
         }
     }
 }

@@ -42,9 +42,14 @@ struct SessionRow: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
-                    Button("Reply…") { store.openForReply(session) }
-                        .buttonStyle(ActionPill.reply)
-                        .accessibilityLabel("Reply")
+                    HStack(spacing: 6) {
+                        Button("Reply…") { store.openForReply(session) }
+                            .buttonStyle(ActionPill.reply)
+                            .accessibilityLabel("Reply")
+                        Button("Dismiss") { store.acknowledge(session) }
+                            .buttonStyle(ActionPill.deny)
+                            .accessibilityLabel("Dismiss")
+                    }
                 case .working(let activity), .runningTool(let activity):
                     Text(activity)
                         .font(.callout)

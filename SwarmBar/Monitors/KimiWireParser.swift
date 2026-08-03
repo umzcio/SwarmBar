@@ -14,6 +14,10 @@ enum KimiWireParser {
     nonisolated static func parse(tail: String) -> SessionStatus? {
         let lines = tail.split(separator: "\n").compactMap(decode)
         let lastText = lines.reversed().lazy.compactMap(text(from:)).first
+        let finished = SessionStatus.finishedTurn(
+            fullText: lastText ?? "",
+            preview: (lastText).map(firstLine) ?? ""
+        )
 
         for line in lines.reversed() {
             switch line["type"] as? String {
@@ -22,7 +26,7 @@ enum KimiWireParser {
             case "turn.prompt", "llm.request":
                 return .working(activity: "Thinking…")
             case "usage.record":
-                return .waitingInput(prompt: lastText ?? "")
+                return finished
             case "context.append_loop_event":
                 guard let event = line["event"] as? [String: Any],
                       let kind = event["type"] as? String
@@ -31,11 +35,11 @@ enum KimiWireParser {
                 case "step.begin":
                     return .working(activity: "Working…")
                 case "step.end":
-                    return .waitingInput(prompt: lastText ?? "")
+                    return finished
                 case "content.part":
                     let part = event["part"] as? [String: Any]
                     if let text = part?["text"] as? String {
-                        return .waitingInput(prompt: firstLine(text))
+                        return .finishedTurn(fullText: text, preview: firstLine(text))
                     }
                     return .working(activity: "Thinking…")
                 case "tool.call":
@@ -69,7 +73,7 @@ enum KimiWireParser {
               event["type"] as? String == "content.part",
               let part = event["part"] as? [String: Any]
         else { return nil }
-        return (part["text"] as? String).map(firstLine)
+        return part["text"] as? String
     }
 
     private nonisolated static func firstLine(_ text: String) -> String {

@@ -47,4 +47,16 @@ enum SessionStatus: Equatable, Sendable {
 
     var pulses: Bool { isActive }
     var blinks: Bool { needsAttention }
+
+    /// Classifies a finished turn: a message that asks something is
+    /// waiting on the user, a plain report is done. The full text decides
+    /// (questions often sit in the last paragraph), the preview is shown.
+    /// Empty text stays waiting, since there is nothing to classify.
+    static func finishedTurn(fullText: String, preview: String) -> SessionStatus {
+        let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .waitingInput(prompt: preview) }
+        return trimmed.contains("?")
+            ? .waitingInput(prompt: preview)
+            : .done(summary: preview)
+    }
 }
