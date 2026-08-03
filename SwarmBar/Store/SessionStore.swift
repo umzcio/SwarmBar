@@ -163,11 +163,11 @@ final class SessionStore {
     }
 
     func openInTerminal(_ session: AgentSession) {
-        guard let path = session.projectPath else { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", path.path]
-        try? process.run()
+        let id = session.id
+        let path = session.projectPath
+        Task.detached {
+            TerminalFocuser.focus(sessionID: id, projectPath: path)
+        }
     }
 
     func copyProjectPath(_ session: AgentSession) {
