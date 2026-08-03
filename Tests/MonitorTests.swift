@@ -160,6 +160,34 @@ struct OpenCodeReaderTests {
         let sessions = OpenCodeReader.sessions(dbPath: "/nonexistent/opencode.db", now: .now)
         #expect(sessions.isEmpty)
     }
+
+    @Test func supersededSessionsInSameDirectoryGoIdle() throws {
+        let path = try makeDB()
+        let now = Date.now
+        let older = Int64(((now.timeIntervalSince1970 - 10 * 60) * 1000).rounded())
+        let newer = Int64((now.timeIntervalSince1970 * 1000).rounded())
+        insert(dbPath: path, sql: """
+        INSERT INTO session VALUES ('ghost', '/tmp/proj-4', 'title', \(older - 1000), \(older));
+        INSERT INTO message VALUES ('m4', 'ghost', \(older));
+        INSERT INTO part VALUES ('p1', 'm4', '{"type":"text","text":"abandoned"}');
+        INSERT INTO session VALUES ('live', '/tmp/proj-4', 'title', \(newer - 1000), \(newer));
+        INSERT INTO message VALUES ('m5', 'live', \(newer));
+        INSERT INTO part VALUES ('p2', 'm5', '{"type":"step-start"}');
+        INSERT INTO session VALUES ('other', '/tmp/proj-5', 'title', \(older - 1000), \(older));
+        INSERT INTO message VALUES ('m6', 'other', \(older));
+        INSERT INTO part VALUES ('p3', 'm6', '{"type":"text","text":"different directory"}');
+        """)
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.count == 3)
+        let live = sessions.filter { $0.projectName == "proj-4" }
+            .max(by: { $0.lastActivityAt < $1.lastActivityAt })
+        #expect(live?.status == .working(activity: "Working…"))
+        let ghost = sessions.filter { $0.projectName == "proj-4" }
+            .min(by: { $0.lastActivityAt < $1.lastActivityAt })
+        #expect(ghost?.status == .idle)
+        let other = sessions.first(where: { $0.projectName == "proj-5" })
+        #expect(other?.status == .waitingInput(prompt: "different directory"))
+    }
 }
 
 @MainActor

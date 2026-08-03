@@ -243,7 +243,9 @@ final class HookServer: ApprovalResponding {
         }
         let sessionID = StableID.uuid(for: rawSessionID)
         let permission = body["permission"] as? String ?? "tool"
-        let pattern = (body["patterns"] as? [Any])?.first as? String
+        let metadata = body["metadata"] as? [String: Any]
+        let pattern = (metadata?["command"] as? String)
+            ?? (body["patterns"] as? [Any])?.first as? String
         let command: String = {
             guard let pattern else { return permission }
             if permission == "bash" {

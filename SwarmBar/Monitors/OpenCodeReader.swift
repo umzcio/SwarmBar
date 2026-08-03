@@ -68,7 +68,30 @@ enum OpenCodeReader {
                 lastActivityAt: updatedAt
             ))
         }
-        return results.sorted { $0.startedAt > $1.startedAt }
+        return demoteSuperseded(results).sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// Every opencode launch auto-creates a session in its directory, and
+    /// the database has no record of which sessions still have a live TUI,
+    /// so restarts leave a trail of ghosts that would all read as waiting.
+    /// Only the most recently active session per directory keeps its
+    /// status; older siblings go idle (same policy as Grok's same-pid
+    /// session-switch dedupe).
+    private nonisolated static func demoteSuperseded(_ sessions: [AgentSession]) -> [AgentSession] {
+        var newestByDirectory: [String: Date] = [:]
+        for session in sessions {
+            let key = session.projectPath?.path ?? session.projectName
+            newestByDirectory[key] = max(newestByDirectory[key] ?? .distantPast, session.lastActivityAt)
+        }
+        return sessions.map { session in
+            let key = session.projectPath?.path ?? session.projectName
+            guard session.lastActivityAt < newestByDirectory[key] ?? .distantPast else {
+                return session
+            }
+            var demoted = session
+            demoted.status = .idle
+            return demoted
+        }
     }
 
     private struct PartRow {
