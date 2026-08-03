@@ -19,6 +19,9 @@ struct SwarmBarApp: App {
         } else {
             Task { await ClaudeCodeMonitor().start(into: store) }
             Task { await CodexMonitor().start(into: store) }
+            Task { await KimiMonitor().start(into: store) }
+            Task { await OpenCodeMonitor().start(into: store) }
+            Task { await GrokBuildMonitor().start(into: store) }
         }
     }
 
