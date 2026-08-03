@@ -22,7 +22,7 @@ struct MenuBarLabel: View {
 
     private var glyph: NSImage {
         if reduceMotion { return SwarmGlyphRenderer.solid() }
-        if store.attentionCount > 0 {
+        if store.approvalCount > 0 {
             return SwarmGlyphRenderer.attentionFrame(centerLit: store.iconPhase % 2 == 0)
         }
         if store.anyActive, !store.isPaused {

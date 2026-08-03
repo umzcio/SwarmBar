@@ -20,11 +20,10 @@ final class SessionStore {
     init() {
         iconTicker = Task { [weak self] in
             while !Task.isCancelled {
-                let attention = (self?.attentionCount ?? 0) > 0
-                let active = self?.anyActive ?? false
-                try? await Task.sleep(for: .milliseconds(attention ? 500 : 450))
+                let flashing = (self?.approvalCount ?? 0) > 0
+                try? await Task.sleep(for: .milliseconds(flashing ? 500 : 450))
                 guard let self else { return }
-                if self.attentionCount > 0 || (self.anyActive && !self.isPaused) {
+                if self.approvalCount > 0 || (self.anyActive && !self.isPaused) {
                     self.iconPhase &+= 1
                 }
             }
@@ -38,6 +37,16 @@ final class SessionStore {
 
     var anyActive: Bool { !active.isEmpty }
     var attentionCount: Int { attention.count }
+
+    /// Pending approvals only. The icon's flash is reserved for these;
+    /// waiting-on-you sessions surface through the count text so the fill
+    /// cycle stays visible while agents work.
+    var approvalCount: Int {
+        sessions.filter {
+            if case .waitingApproval = $0.status { return true }
+            return false
+        }.count
+    }
 
     // Called by monitors.
     func upsert(_ session: AgentSession) {
