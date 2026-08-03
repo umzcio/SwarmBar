@@ -14,24 +14,39 @@ struct PopoverRootView: View {
 
             ScrollView {
                 VStack(spacing: 0) {
-                    SessionSection(
-                        title: "Needs you",
-                        emphasis: .attention,
-                        sessions: store.attention,
-                        emptyText: "All agents running on their own 🐝"
-                    )
-                    Divider().padding(.top, 6)
-                    SessionSection(
-                        title: "Active",
-                        emphasis: .normal,
-                        sessions: store.active
-                    )
-                    Divider().padding(.top, 6)
-                    SessionSection(
-                        title: "Recent",
-                        emphasis: .normal,
-                        sessions: store.recent
-                    )
+                    if store.visibleCount == 0 {
+                        Text("No agent sessions")
+                            .font(.callout)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 24)
+                    } else {
+                        if !store.attention.isEmpty {
+                            SessionSection(
+                                title: "Needs you",
+                                emphasis: .attention,
+                                sessions: store.attention
+                            )
+                        }
+                        if !store.active.isEmpty {
+                            if !store.attention.isEmpty { Divider().padding(.top, 6) }
+                            SessionSection(
+                                title: "Active",
+                                emphasis: .normal,
+                                sessions: store.active
+                            )
+                        }
+                        if !store.recent.isEmpty {
+                            if !store.attention.isEmpty || !store.active.isEmpty {
+                                Divider().padding(.top, 6)
+                            }
+                            SessionSection(
+                                title: "Recent",
+                                emphasis: .normal,
+                                sessions: store.recent
+                            )
+                        }
+                    }
                 }
                 .padding(.bottom, 6)
                 .onGeometryChange(for: CGFloat.self) { proxy in
@@ -120,7 +135,8 @@ struct SummaryLine: View {
     }
 
     private var summary: Text {
-        let base = Text("\(store.visibleCount) sessions · ")
+        let count = store.visibleCount
+        let base = Text("\(count) session\(count == 1 ? "" : "s") · ")
         if store.attentionCount > 0 {
             let word = store.attentionCount == 1 ? "needs" : "need"
             return base + Text("\(store.attentionCount) \(word) you")

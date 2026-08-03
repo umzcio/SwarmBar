@@ -1,12 +1,14 @@
 import SwiftUI
 
+/// A section renders nothing at all when it has no rows; an orange label
+/// with nothing to show (or worse, a mascot line) is noise. The header's
+/// count line already answers the at-a-glance question.
 struct SessionSection: View {
     enum Emphasis { case normal, attention }
 
     let title: String
     let emphasis: Emphasis
     let sessions: [AgentSession]
-    var emptyText: String? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("compactRows") private var compact = false
@@ -20,14 +22,6 @@ struct SessionSection: View {
                 .padding(.horizontal, 16)
                 .padding(.top, compact ? 6 : 8)
                 .padding(.bottom, compact ? 3 : 5)
-
-            if sessions.isEmpty, let emptyText {
-                Text(emptyText)
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 4)
-            }
 
             ForEach(sessions) { session in
                 Group {

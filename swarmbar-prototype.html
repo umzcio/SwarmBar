@@ -308,7 +308,7 @@
 
   <div class="section-label attn" id="attnLabel">Needs you</div>
   <div class="rows" id="attnRows"></div>
-  <div class="empty-attn" id="attnEmpty" style="display:none">All agents running on their own 🐝</div>
+  
 
   <div class="divider"></div>
   <div class="section-label">Active</div>
@@ -488,8 +488,7 @@ function render(){
   $("attnRows").innerHTML   = attn.map(rowHTML).join("");
   $("activeRows").innerHTML = active.map(rowHTML).join("");
   $("doneRows").innerHTML   = rest.map(rowHTML).join("");
-  $("attnEmpty").style.display = attn.length ? "none" : "block";
-  $("attnLabel").style.display = "block";
+  $("attnLabel").style.display = attn.length ? "block" : "none";
 
   // header summary
   const parts = [`${sessions.length} sessions`];
