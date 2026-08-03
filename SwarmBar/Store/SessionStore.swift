@@ -8,23 +8,6 @@ final class SessionStore {
     private(set) var sessions: [AgentSession] = []
     var isPaused = false
 
-    // Drives the menu bar glyph's traveling-wave frame. The MenuBarExtra
-    // label only reliably re-renders on observable data changes, so the
-    // ticker lives here rather than in the label view.
-    private(set) var iconPhase = 0
-    @ObservationIgnored private var iconTicker: Task<Void, Never>?
-
-    init() {
-        iconTicker = Task { [weak self] in
-            while !Task.isCancelled {
-                let active = self?.anyActive ?? false
-                try? await Task.sleep(for: .milliseconds(active ? 130 : 500))
-                guard let self else { return }
-                if self.anyActive { self.iconPhase &+= 1 }
-            }
-        }
-    }
-
     // Derived slices the popover renders.
     var attention: [AgentSession] { sessions.filter { $0.status.needsAttention } }
     var active:    [AgentSession] { sessions.filter { $0.status.isActive } }
