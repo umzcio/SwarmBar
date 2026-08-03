@@ -11,7 +11,9 @@ final class HookServer: ApprovalResponding {
     static let port: UInt16 = 48620
     /// Held-decision window. Kept under the hook command's own timeout so
     /// the fail-open path is a clean empty response, not a killed process.
-    static let decisionHold: Duration = .seconds(55)
+    /// Long on purpose: the popover is a glance-later surface, and once
+    /// this expires the prompt can only be answered at the terminal.
+    static let decisionHold: Duration = .seconds(345)
 
     private let store: SessionStore
     private var listener: NWListener?
@@ -196,7 +198,10 @@ final class HookServer: ApprovalResponding {
             try? await Task.sleep(for: Self.decisionHold)
             guard !Task.isCancelled else { return }
             // Fail open: no decision, terminal prompt proceeds as normal.
+            // Drop the sticky override too, or the row keeps showing
+            // Approve/Deny buttons that can no longer answer anything.
             self?.finishPending(sessionID: sessionID, json: Data("{}".utf8))
+            self?.store.clearHookOverride(sessionID: sessionID)
         }
         pendingApprovals[sessionID] = PendingApproval(
             respond: { json in Self.respond(connection, json: json) },
