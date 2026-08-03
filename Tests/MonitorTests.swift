@@ -188,6 +188,25 @@ struct OpenCodeReaderTests {
         let other = sessions.first(where: { $0.projectName == "proj-5" })
         #expect(other?.status == .waitingInput(prompt: "different directory"))
     }
+
+    @Test func sessionsOutsideLiveDirectoriesGoIdle() throws {
+        let path = try makeDB()
+        let now = Date.now
+        let updated = Int64((now.timeIntervalSince1970 * 1000).rounded())
+        insert(dbPath: path, sql: """
+        INSERT INTO session VALUES ('live', '/tmp/proj-live', 'title', \(updated - 1000), \(updated));
+        INSERT INTO message VALUES ('m1', 'live', \(updated));
+        INSERT INTO part VALUES ('p1', 'm1', '{"type":"step-start"}');
+        INSERT INTO session VALUES ('dead', '/tmp/proj-dead', 'title', \(updated - 1000), \(updated));
+        INSERT INTO message VALUES ('m2', 'dead', \(updated));
+        INSERT INTO part VALUES ('p2', 'm2', '{"type":"step-start"}');
+        """)
+        let sessions = OpenCodeReader.sessions(
+            dbPath: path, liveDirectories: ["/tmp/proj-live"], now: now)
+        #expect(sessions.first(where: { $0.projectName == "proj-live" })?.status
+                == .working(activity: "Working…"))
+        #expect(sessions.first(where: { $0.projectName == "proj-dead" })?.status == .idle)
+    }
 }
 
 @MainActor

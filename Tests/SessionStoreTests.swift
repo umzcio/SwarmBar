@@ -25,6 +25,26 @@ struct SessionStoreTests {
         #expect(store.attentionCount == 2)
     }
 
+    @Test func recentCollapsesLaunchScopedToolTrails() {
+        let store = SessionStore()
+        let old = AgentSession(
+            tool: .grokBuild, projectName: "zach", status: .idle,
+            lastActivityAt: .now.addingTimeInterval(-3600))
+        let newer = AgentSession(
+            tool: .grokBuild, projectName: "zach", status: .idle,
+            lastActivityAt: .now)
+        let claudeA = AgentSession(
+            tool: .claudeCode, projectName: "zach", status: .idle,
+            lastActivityAt: .now.addingTimeInterval(-3600))
+        let claudeB = AgentSession(
+            tool: .claudeCode, projectName: "zach", status: .idle,
+            lastActivityAt: .now)
+        for s in [old, newer, claudeA, claudeB] { store.upsert(s) }
+
+        let recentIds = Set(store.recent.map(\.id))
+        #expect(recentIds == Set([newer.id, claudeA.id, claudeB.id]))
+    }
+
     @Test func upsertMergesAndPreservesStartedAt() {
         let store = SessionStore()
         let original = AgentSession(

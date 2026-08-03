@@ -33,7 +33,26 @@ final class SessionStore {
     // Derived slices the popover renders.
     var attention: [AgentSession] { sessions.filter { $0.status.needsAttention } }
     var active:    [AgentSession] { sessions.filter { $0.status.isActive } }
-    var recent:    [AgentSession] { sessions.filter { !$0.status.needsAttention && !$0.status.isActive } }
+
+    /// Tools that mint a session per launch (Grok, OpenCode) leave trails
+    /// of identical finished rows; Recent keeps only the newest per
+    /// project for those. Claude and Codex sessions are distinct
+    /// conversations and all stay visible.
+    private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode]
+
+    var recent: [AgentSession] {
+        let finished = sessions.filter { !$0.status.needsAttention && !$0.status.isActive }
+        var newestByProject: [String: Date] = [:]
+        for session in finished where Self.launchScopedTools.contains(session.tool) {
+            let key = "\(session.tool.rawValue)|\(session.projectPath?.path ?? session.projectName)"
+            newestByProject[key] = max(newestByProject[key] ?? .distantPast, session.lastActivityAt)
+        }
+        return finished.filter { session in
+            guard Self.launchScopedTools.contains(session.tool) else { return true }
+            let key = "\(session.tool.rawValue)|\(session.projectPath?.path ?? session.projectName)"
+            return session.lastActivityAt >= newestByProject[key] ?? .distantPast
+        }
+    }
 
     var anyActive: Bool { !active.isEmpty }
     var attentionCount: Int { attention.count }

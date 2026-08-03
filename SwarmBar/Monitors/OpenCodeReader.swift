@@ -23,7 +23,14 @@ enum OpenCodeReader {
     nonisolated static let waitingAfter: TimeInterval = 30 * 60
     nonisolated static let recentPartLimit = 20
 
-    nonisolated static func sessions(dbPath: String, now: Date = .now) -> [AgentSession] {
+    /// liveDirectories: cwds of running opencode processes; sessions in any
+    /// other directory read idle. Pass nil to skip the liveness filter
+    /// (tests exercise status mapping without processes).
+    nonisolated static func sessions(
+        dbPath: String,
+        liveDirectories: Set<String>? = nil,
+        now: Date = .now
+    ) -> [AgentSession] {
         var db: OpaquePointer?
         let openResult = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil)
         guard openResult == SQLITE_OK, let db else {
@@ -68,7 +75,19 @@ enum OpenCodeReader {
                 lastActivityAt: updatedAt
             ))
         }
-        return demoteSuperseded(results).sorted { $0.startedAt > $1.startedAt }
+        var deduped = demoteSuperseded(results)
+        if let liveDirectories {
+            deduped = deduped.map { session in
+                guard let directory = session.projectPath?.path,
+                      !liveDirectories.contains(directory),
+                      session.status != .idle
+                else { return session }
+                var demoted = session
+                demoted.status = .idle
+                return demoted
+            }
+        }
+        return deduped.sorted { $0.startedAt > $1.startedAt }
     }
 
     /// Every opencode launch auto-creates a session in its directory, and
