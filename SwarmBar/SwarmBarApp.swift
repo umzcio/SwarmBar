@@ -7,7 +7,14 @@ struct SwarmBarApp: App {
     init() {
         let store = SessionStore()
         _store = State(initialValue: store)
-        Task { await MockSessionMonitor().start(into: store) }
+        // Real monitors by default; --mock replays the prototype simulation
+        // so the demo mode survives.
+        if CommandLine.arguments.contains("--mock") {
+            Task { await MockSessionMonitor().start(into: store) }
+        } else {
+            Task { await ClaudeCodeMonitor().start(into: store) }
+            Task { await CodexMonitor().start(into: store) }
+        }
     }
 
     var body: some Scene {

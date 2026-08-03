@@ -54,6 +54,14 @@ final class SessionStore {
         sessions.removeAll { $0.id == id }
     }
 
+    /// Replaces one tool's sessions with a freshly discovered set: upserts
+    /// each and drops that tool's sessions that no longer exist.
+    func sync(tool: AgentTool, sessions incoming: [AgentSession]) {
+        let incomingIds = Set(incoming.map(\.id))
+        for session in incoming { upsert(session) }
+        sessions.removeAll { $0.tool == tool && !incomingIds.contains($0.id) }
+    }
+
     func update(id: UUID, _ mutate: (inout AgentSession) -> Void) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[index])

@@ -36,7 +36,11 @@ targets:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - Tests
+      - path: Tests
+        excludes:
+          - Fixtures
+      - path: Tests/Fixtures
+        buildPhase: resources
     dependencies:
       - target: SwarmBar
     settings:
