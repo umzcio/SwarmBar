@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SwarmBar — Hexgrid Glyph</title>
+<style>
+  :root{
+    --bg:#0c0d14; --card:#15161f; --card-edge:rgba(255,255,255,.07);
+    --text:rgba(255,255,255,.92); --text-2:rgba(255,255,255,.55); --text-3:rgba(255,255,255,.35);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
+    background:var(--bg);color:var(--text);
+    -webkit-font-smoothing:antialiased;
+    padding:36px 32px 60px;
+  }
+  header{max-width:1000px;margin:0 auto 8px}
+  h1{font-size:22px;font-weight:800;letter-spacing:-.2px}
+  .sub{font-size:13px;color:var(--text-2);margin-top:6px;max-width:660px;line-height:1.6}
+
+  .controls{display:flex;align-items:center;gap:16px;margin-top:18px;flex-wrap:wrap}
+  .toggle{
+    display:inline-flex;gap:2px;
+    background:rgba(255,255,255,.06);border:1px solid var(--card-edge);
+    border-radius:9px;padding:3px;
+  }
+  .toggle button{
+    border:none;background:transparent;color:var(--text-2);
+    font:600 12.5px/1 -apple-system,sans-serif;padding:7px 14px;border-radius:6px;cursor:pointer;
+  }
+  .toggle button.sel{background:rgba(255,255,255,.14);color:var(--text)}
+  label.chk{font-size:12.5px;color:var(--text-2);display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+
+  .grid{
+    max-width:1000px;margin:26px auto 0;
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;
+  }
+  .card{
+    background:var(--card);border:1px solid var(--card-edge);border-radius:14px;
+    padding:16px 16px 14px;display:flex;flex-direction:column;gap:12px;
+  }
+  .card h2{font-size:14px;font-weight:700}
+  .card h2 span{color:var(--text-3);font-weight:500;font-size:12px;margin-left:6px}
+  .card p{font-size:12px;color:var(--text-2);line-height:1.55;min-height:44px}
+
+  .stage{
+    height:150px;border-radius:10px;display:flex;align-items:center;justify-content:center;
+    background:
+      radial-gradient(400px 200px at 50% 120%, rgba(60,70,140,.25), transparent 70%),
+      #101118;
+    border:1px solid rgba(255,255,255,.05);
+  }
+  .stage svg{color:var(--text)}
+
+  .strips{display:flex;flex-direction:column;gap:6px}
+  .strip{
+    height:30px;border-radius:7px;display:flex;align-items:center;justify-content:flex-end;
+    gap:12px;padding:0 12px;font-size:11px;font-weight:500;
+  }
+  .strip .mock{opacity:.55}
+  .strip-dark{background:linear-gradient(#26262e,#1e1e26);color:rgba(255,255,255,.9)}
+  .strip-light{background:linear-gradient(#f2f2f6,#e6e6ec);color:rgba(0,0,0,.85)}
+  .strip svg{color:currentColor}
+
+  /* ------------- glyph ------------- */
+  .dot{fill:currentColor;transform-box:fill-box;transform-origin:center}
+  .num{
+    fill:#0c0d14;font:800 5.6px -apple-system,sans-serif;
+    text-anchor:middle;dominant-baseline:central;
+    opacity:0;pointer-events:none;
+  }
+  body.nums .num{opacity:.85}
+
+  /* IDLE — solid, uniform, still (the resting brand mark) */
+  /* base opacity below is the idle look */
+  .dot{opacity:.95}
+
+  /* ATTENTION — center and ring flash in alternation, all variants */
+  body.attn .dot.center{animation:blinkC 1s steps(2,start) infinite}
+  body.attn .dot.outer{animation:blinkO 1s steps(2,start) infinite}
+  @keyframes blinkC{0%{opacity:.95}50%{opacity:.2}}
+  @keyframes blinkO{0%{opacity:.2}50%{opacity:.95}}
+
+  /* ACTIVE variants — all use the same numbered order, delays set inline */
+
+  /* 1) STEP — one dot lit at a time, hard steps, marching 1→7 */
+  body.act .v-step .dot{animation:stepK 1.05s steps(1) infinite}
+  @keyframes stepK{
+    0%{opacity:1}
+    14.28%{opacity:.28}
+    100%{opacity:.28}
+  }
+
+  /* 2) TRAIL — lit dot with a fading tail behind it */
+  body.act .v-trail .dot{animation:trailK 1.19s linear infinite}
+  @keyframes trailK{
+    0%{opacity:1}
+    22%{opacity:.62}
+    45%{opacity:.28}
+    100%{opacity:.28}
+  }
+
+  /* 3) WAVE — smooth overlapping brightness ripple in order */
+  body.act .v-wave .dot{animation:waveK 1.15s ease-in-out infinite}
+  @keyframes waveK{
+    0%,100%{opacity:.34;transform:scale(.94)}
+    18%{opacity:1;transform:scale(1.06)}
+  }
+
+  /* 4) FILL — dots switch on in order until full, flush, repeat (JS-driven) */
+  .v-fill .dot{transition:opacity .12s linear}
+  body.act .v-fill .dot.off{opacity:.24}
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+</style>
+</head>
+<body class="act">
+
+<header>
+  <h1>SwarmBar — hexgrid glyph</h1>
+  <div class="sub">
+    The mark is the circle.hexagongrid seven-dot hexagon, always. Idle: one solid
+    color, perfectly still. Active: the dots change brightness following your
+    numbered order (1 top-right → 2 top-left → 3 center → 4 bottom-right →
+    5 bottom-left → 6 mid-left → 7 mid-right), so the motion sketches an S
+    through the hexagon. Four treatments of that same sequence below. Needs
+    attention: center and ring flash in alternation, identical across variants.
+  </div>
+  <div class="controls">
+    <div class="toggle">
+      <button id="bIdle">Idle</button>
+      <button id="bAct" class="sel">Active</button>
+      <button id="bAttn">Needs attention</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="numChk"> Show order numbers</label>
+  </div>
+</header>
+
+<div class="grid" id="grid"></div>
+
+<script>
+/* ---------------------------------------------------------------- */
+/* geometry + the sequence (edit ORDER to change the sweep)          */
+/* ---------------------------------------------------------------- */
+const NS = "http://www.w3.org/2000/svg";
+const CX = 13, CY = 13, R = 7.6, DOT_R = 3.35;
+
+/* positions keyed by Zach's numbering */
+const POS = {
+  1: {x: CX + R*0.5,  y: CY - R*0.866},  // top-right
+  2: {x: CX - R*0.5,  y: CY - R*0.866},  // top-left
+  3: {x: CX,          y: CY},            // center
+  4: {x: CX + R*0.5,  y: CY + R*0.866},  // bottom-right
+  5: {x: CX - R*0.5,  y: CY + R*0.866},  // bottom-left
+  6: {x: CX - R,      y: CY},            // mid-left
+  7: {x: CX + R,      y: CY},            // mid-right
+};
+
+const ORDER = [1, 2, 3, 4, 5, 6, 7];  // the sweep, in the order dots light up
+const STEP = 0.15;                     // seconds per step
+
+function buildGlyph(variantClass){
+  const s = document.createElementNS(NS,"svg");
+  s.setAttribute("viewBox","0 0 26 26");
+  s.setAttribute("class","glyph "+variantClass);
+  ORDER.forEach((num, i)=>{
+    const p = POS[num];
+    const c = document.createElementNS(NS,"circle");
+    c.setAttribute("cx",p.x); c.setAttribute("cy",p.y); c.setAttribute("r",DOT_R);
+    c.setAttribute("class","dot " + (num === 3 ? "center" : "outer"));
+    c.dataset.seq = i;
+    c.style.animationDelay = (i*STEP)+"s";
+    s.appendChild(c);
+    const t = document.createElementNS(NS,"text");
+    t.setAttribute("x",p.x); t.setAttribute("y",p.y);
+    t.setAttribute("class","num");
+    t.textContent = num;
+    s.appendChild(t);
+  });
+  return s;
+}
+
+/* ---------------------------------------------------------------- */
+/* variants                                                          */
+/* ---------------------------------------------------------------- */
+const VARIANTS = [
+  { id:"v-step", name:"Step", note:"hard cuts · one lit dot",
+    blurb:"One dot at full brightness at a time, hard-cut in order. The most digital read: closest to how the sequence would feel as literal frame-swapped template images." },
+  { id:"v-trail", name:"Trail", note:"lit dot + fading tail",
+    blurb:"Same march, but each dot decays instead of cutting off, leaving a two-dot tail. The S sweep becomes easier to perceive because your eye gets a direction." },
+  { id:"v-wave", name:"Wave", note:"smooth ripple",
+    blurb:"Overlapping ease-in-out brightness so a soft wave rolls through the hexagon in order. The gentlest of the four: reads as alive without a hard rhythm." },
+  { id:"v-fill", name:"Fill", note:"accumulate · flush · repeat",
+    blurb:"Dots switch on in order and stay on until the hexagon is complete, then it flushes and starts over. Gives a faint progress feel: the swarm assembling." },
+];
+
+const grid = document.getElementById("grid");
+
+function strip(kind, variantId){
+  const d = document.createElement("div");
+  d.className = "strip strip-"+kind;
+  const g = buildGlyph(variantId);
+  g.setAttribute("width","15"); g.setAttribute("height","15");
+  d.appendChild(g);
+  d.insertAdjacentHTML("beforeend",
+    '<span class="mock">􀙇</span><span class="mock">🔋</span><span class="mock">9:41</span>');
+  d.prepend(g);
+  return d;
+}
+
+VARIANTS.forEach(v=>{
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `<h2>${v.name}<span>${v.note}</span></h2><p>${v.blurb}</p>`;
+
+  const stage = document.createElement("div");
+  stage.className = "stage";
+  const big = buildGlyph(v.id);
+  big.setAttribute("width","120"); big.setAttribute("height","120");
+  stage.appendChild(big);
+  card.appendChild(stage);
+
+  const strips = document.createElement("div");
+  strips.className = "strips";
+  strips.appendChild(strip("dark", v.id));
+  strips.appendChild(strip("light", v.id));
+  card.appendChild(strips);
+
+  grid.appendChild(card);
+});
+
+/* ---------------------------------------------------------------- */
+/* FILL variant ticker (accumulate → hold full → flush)              */
+/* ---------------------------------------------------------------- */
+const FILL_STEP = 0.45;   // seconds per fill step (slower than the sweep variants)
+let fillCount = 0;
+setInterval(()=>{
+  if (!document.body.classList.contains("act")) return;
+  fillCount = (fillCount + 1) % (ORDER.length + 2);   // 1..7 accumulate, 8 hold full, 0 flush
+  document.querySelectorAll(".v-fill .dot").forEach(d=>{
+    const lit = fillCount === ORDER.length + 1 ? true : (+d.dataset.seq < fillCount);
+    d.classList.toggle("off", !lit);
+  });
+}, FILL_STEP*1000);
+
+/* ---------------------------------------------------------------- */
+/* state toggle + numbers                                            */
+/* ---------------------------------------------------------------- */
+const btns = { idle: bIdle, act: bAct, attn: bAttn };
+function setState(state){
+  document.body.classList.toggle("act", state==="act");
+  document.body.classList.toggle("attn", state==="attn");
+  Object.entries(btns).forEach(([k,b])=> b.classList.toggle("sel", k===state));
+  if (state!=="act")
+    document.querySelectorAll(".v-fill .dot").forEach(d=> d.classList.remove("off"));
+}
+bIdle.onclick = ()=> setState("idle");
+bAct.onclick  = ()=> setState("act");
+bAttn.onclick = ()=> setState("attn");
+numChk.onchange = e => document.body.classList.toggle("nums", e.target.checked);
+</script>
+</body>
+</html>

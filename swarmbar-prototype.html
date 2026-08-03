@@ -76,24 +76,21 @@
   }
   .swarm-item:hover{background:rgba(255,255,255,.10)}
   .swarm-item.open{background:rgba(255,255,255,.16)}
-  .swarm-glyph{position:relative;width:18px;height:14px}
+  .swarm-glyph{position:relative;width:16px;height:16px}
   .swarm-dot{
-    position:absolute;width:5px;height:5px;border-radius:50%;
-    background:var(--text);opacity:.9;
+    position:absolute;width:4px;height:4px;border-radius:50%;
+    background:var(--text);opacity:.95;transition:opacity .18s linear;
   }
-  .swarm-dot:nth-child(1){left:0;top:5px}
-  .swarm-dot:nth-child(2){left:7px;top:0}
-  .swarm-dot:nth-child(3){left:7px;top:9px}
-  .swarm-dot:nth-child(4){left:13px;top:5px}
-  .swarming .swarm-dot{animation:buzz 1.6s ease-in-out infinite}
-  .swarming .swarm-dot:nth-child(2){animation-delay:.2s}
-  .swarming .swarm-dot:nth-child(3){animation-delay:.45s}
-  .swarming .swarm-dot:nth-child(4){animation-delay:.7s}
-  @keyframes buzz{
-    0%,100%{transform:translate(0,0);opacity:.9}
-    35%{transform:translate(.8px,-1.2px);opacity:.55}
-    70%{transform:translate(-.7px,.9px);opacity:.9}
-  }
+  /* circle.hexagongrid layout; children ordered by the fill sequence:
+     1 TR, 2 TL, 3 center, 4 BR, 5 BL, 6 ML, 7 MR */
+  .swarm-dot:nth-child(1){left:8.6px;top:1.5px}
+  .swarm-dot:nth-child(2){left:3.4px;top:1.5px}
+  .swarm-dot:nth-child(3){left:6px;top:6px}
+  .swarm-dot:nth-child(4){left:8.6px;top:10.5px}
+  .swarm-dot:nth-child(5){left:3.4px;top:10.5px}
+  .swarm-dot:nth-child(6){left:.8px;top:6px}
+  .swarm-dot:nth-child(7){left:11.2px;top:6px}
+  .swarm-dot.off{opacity:.25}
   .swarm-badge{
     min-width:16px;height:16px;padding:0 4px;border-radius:8px;
     background:var(--amber);color:#1a1206;font-size:11px;font-weight:700;
@@ -264,7 +261,7 @@
 
 <div class="hint">
   <b>SwarmBar</b> — menu bar prototype<br>
-  Click the <kbd>⸫ swarm icon</kbd> in the menu bar (top right) to toggle the popover.<br>
+  Click the <kbd>hexagon icon</kbd> in the menu bar (top right) to toggle the popover.<br>
   Sessions simulate live agent activity: approvals appear, timers tick, work completes.
 </div>
 
@@ -283,8 +280,9 @@
   <div class="mb-right">
     <div class="swarm-item" id="swarmItem" title="SwarmBar">
       <div class="swarm-glyph" id="swarmGlyph">
-        <div class="swarm-dot"></div><div class="swarm-dot"></div>
-        <div class="swarm-dot"></div><div class="swarm-dot"></div>
+        <div class="swarm-dot"></div><div class="swarm-dot"></div><div class="swarm-dot"></div>
+        <div class="swarm-dot"></div><div class="swarm-dot"></div><div class="swarm-dot"></div>
+        <div class="swarm-dot"></div>
       </div>
       <div class="swarm-badge hidden" id="swarmBadge">0</div>
     </div>
@@ -513,6 +511,23 @@ setInterval(() => {
     if (s) el.textContent = fmtElapsed(now() - s.startedAt);
   });
 }, 1000);
+
+/* menu bar glyph: fill animation (accumulate in S order → hold → flush) */
+let glyphFill = 0;
+setInterval(() => {
+  const glyph = $("swarmGlyph");
+  const dots = glyph.querySelectorAll(".swarm-dot");
+  if (!glyph.classList.contains("swarming")){
+    dots.forEach(d => d.classList.remove("off"));
+    glyphFill = 0;
+    return;
+  }
+  glyphFill = (glyphFill + 1) % (dots.length + 2);   // 1..7 accumulate, 8 hold full, 0 flush
+  dots.forEach((d, i) => {
+    const lit = glyphFill === dots.length + 1 ? true : (i < glyphFill);
+    d.classList.toggle("off", !lit);
+  });
+}, 450);
 
 /* clock */
 function tickClock(){

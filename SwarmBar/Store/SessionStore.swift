@@ -8,19 +8,22 @@ final class SessionStore {
     private(set) var sessions: [AgentSession] = []
     var isPaused = false
 
-    // Drives the menu bar glyph's light-up frame. The MenuBarExtra label
+    // Drives the menu bar glyph's animation frame. The MenuBarExtra label
     // only reliably re-renders on observable data changes, so the ticker
-    // lives here rather than in the label view.
+    // lives here rather than in the label view. Fill cycle steps at 450ms
+    // per the icon spec; the attention flash alternates at 1Hz. The phase
+    // only advances (and so the label only re-renders) while animating.
     private(set) var iconPhase = 0
     @ObservationIgnored private var iconTicker: Task<Void, Never>?
 
     init() {
         iconTicker = Task { [weak self] in
             while !Task.isCancelled {
+                let attention = (self?.attentionCount ?? 0) > 0
                 let active = self?.anyActive ?? false
-                try? await Task.sleep(for: .milliseconds(active ? 220 : 500))
+                try? await Task.sleep(for: .milliseconds(attention ? 500 : 450))
                 guard let self else { return }
-                if self.anyActive { self.iconPhase &+= 1 }
+                if self.attentionCount > 0 || self.anyActive { self.iconPhase &+= 1 }
             }
         }
     }

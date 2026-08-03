@@ -1,17 +1,17 @@
 import AppKit
 import SwiftUI
 
-/// Template-image constraint: encode state in shape and alpha, not color.
-/// The glyph is the hexagongrid dot cluster, solid at rest. While agents
-/// are active the dots light up in an order that traces an S through the
-/// hexagon, then completes the full shape before looping.
+/// Menu bar icon per the spec in CLAUDE.md and swarm-glyph-hexgrid.html
+/// (Fill variant). The circle.hexagongrid seven-dot hexagon at all times:
+/// solid when idle, the accumulate/hold/flush fill cycle while agents are
+/// active, and center/ring alternation when sessions need attention.
 struct MenuBarLabel: View {
     @Environment(SessionStore.self) private var store
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 3) {
-            Image(nsImage: HexSwarmGlyph.image(step: step))
+            Image(nsImage: glyph)
             if store.attentionCount > 0 {
                 Text("\(store.attentionCount)")
                     .font(.system(size: 11, weight: .bold))
@@ -20,46 +20,71 @@ struct MenuBarLabel: View {
         }
     }
 
-    private var step: Int? {
-        guard store.anyActive, !reduceMotion else { return nil }
-        return store.iconPhase % 8
+    private var glyph: NSImage {
+        if reduceMotion { return SwarmGlyphRenderer.solid() }
+        if store.attentionCount > 0 {
+            return SwarmGlyphRenderer.attentionFrame(centerLit: store.iconPhase % 2 == 0)
+        }
+        if store.anyActive {
+            return SwarmGlyphRenderer.fillFrame(store.iconPhase % 9)
+        }
+        return SwarmGlyphRenderer.solid()
     }
 }
 
-/// Seven dots matching circle.hexagongrid, rasterized to cached template
-/// NSImages (MenuBarExtra labels render SwiftUI drawing blank, and only
-/// re-render on observable data changes).
-enum HexSwarmGlyph {
-    /// Light-up order: trace the S (top-right, top-left, center,
-    /// bottom-right, bottom-left), then complete the hexagon with the two
-    /// side dots.
-    nonisolated static let sequence: [CGPoint] = {
-        let cx = 8.0, cy = 7.5, ring = 4.9
-        let dy = ring * sin(.pi / 3)
-        return [
-            CGPoint(x: cx + ring / 2, y: cy - dy),  // 1 top-right
-            CGPoint(x: cx - ring / 2, y: cy - dy),  // 2 top-left
-            CGPoint(x: cx, y: cy),                  // 3 center
-            CGPoint(x: cx + ring / 2, y: cy + dy),  // 4 bottom-right
-            CGPoint(x: cx - ring / 2, y: cy + dy),  // 5 bottom-left
-            CGPoint(x: cx - ring, y: cy),           // 6 middle-left
-            CGPoint(x: cx + ring, y: cy),           // 7 middle-right
-        ]
-    }()
+/// Draws the seven fixed circles into cached template NSImages, one frame
+/// per tick. (MenuBarExtra labels render SwiftUI drawing blank and only
+/// re-render on observable data changes, hence pre-rendered frames driven
+/// by the store's ticker.)
+enum SwarmGlyphRenderer {
+    /// Fill order: 1 top-right, 2 top-left, 3 center, 4 bottom-right,
+    /// 5 bottom-left, 6 mid-left, 7 mid-right. Geometry matches the
+    /// prototype's 16px glyph.
+    nonisolated static let sequence: [CGPoint] = [
+        CGPoint(x: 10.6, y: 3.5),   // 1 top-right
+        CGPoint(x: 5.4, y: 3.5),    // 2 top-left
+        CGPoint(x: 8.0, y: 8.0),    // 3 center
+        CGPoint(x: 10.6, y: 12.5),  // 4 bottom-right
+        CGPoint(x: 5.4, y: 12.5),   // 5 bottom-left
+        CGPoint(x: 2.8, y: 8.0),    // 6 mid-left
+        CGPoint(x: 13.2, y: 8.0),   // 7 mid-right
+    ]
 
-    @MainActor private static var cache: [Int: NSImage] = [:]
+    private static let centerIndex = 2
+    private static let unlitAlpha = 0.25
 
-    /// `step` 0...7 lights the first step+1 dots in sequence (7 holds the
-    /// completed hexagon for a beat); nil renders the solid resting glyph.
+    @MainActor private static var cache: [String: NSImage] = [:]
+
     @MainActor
-    static func image(step: Int?) -> NSImage {
-        let litCount = min((step ?? 6) + 1, sequence.count)
-        if let cached = cache[litCount] { return cached }
+    static func solid() -> NSImage {
+        frame(key: "solid") { _ in 1.0 }
+    }
 
-        let image = NSImage(size: NSSize(width: 16, height: 15), flipped: true) { _ in
+    /// One step of the fill cycle: 0 flushes to empty, 1...7 accumulate
+    /// that many dots in sequence, 8 holds the full hexagon.
+    @MainActor
+    static func fillFrame(_ step: Int) -> NSImage {
+        let litCount = step == 8 ? 7 : step
+        return frame(key: "fill-\(litCount)") { index in
+            index < litCount ? 1.0 : unlitAlpha
+        }
+    }
+
+    /// Needs-attention: center dot and outer ring lit in alternation.
+    @MainActor
+    static func attentionFrame(centerLit: Bool) -> NSImage {
+        frame(key: "attn-\(centerLit)") { index in
+            (index == centerIndex) == centerLit ? 1.0 : unlitAlpha
+        }
+    }
+
+    @MainActor
+    private static func frame(key: String, alpha: @escaping @Sendable (Int) -> Double) -> NSImage {
+        if let cached = cache[key] { return cached }
+        let image = NSImage(size: NSSize(width: 16, height: 16), flipped: true) { _ in
             for (index, point) in sequence.enumerated() {
-                let radius = 2.35
-                NSColor.black.withAlphaComponent(index < litCount ? 1.0 : 0.3).setFill()
+                let radius = 2.0
+                NSColor.black.withAlphaComponent(alpha(index)).setFill()
                 NSBezierPath(ovalIn: CGRect(
                     x: point.x - radius, y: point.y - radius,
                     width: radius * 2, height: radius * 2
@@ -68,7 +93,7 @@ enum HexSwarmGlyph {
             return true
         }
         image.isTemplate = true
-        cache[litCount] = image
+        cache[key] = image
         return image
     }
 }
