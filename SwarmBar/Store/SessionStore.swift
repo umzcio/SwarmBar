@@ -214,10 +214,10 @@ final class SessionStore {
             return
         }
         if session.tool == .kimiCode {
-            // Kimi's selector: Approve once is always the top option, so
-            // clamp up and confirm. PermissionResult (hook) records the
-            // outcome and clears the row.
-            answerTuiPrompt(session, keys: Array(repeating: "UP", count: 8) + ["\n"])
+            // Kimi's selector wraps, so navigation counts are unsafe;
+            // the option is read off the screen and answered by its own
+            // number. PermissionResult (hook) clears the row.
+            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnce(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -243,15 +243,33 @@ final class SessionStore {
             return
         }
         if session.tool == .kimiCode {
-            // Reject with feedback is the bottom option in every observed
-            // layout: clamp down, confirm, and submit the reason as the
-            // feedback text so the model knows where the deny came from.
-            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8)
-                + ["\n", "Denied from SwarmBar", "\n"])
+            answerNumberedPrompt(session, choose: TuiPromptLayout.reject(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
+    }
+
+    /// Reads the session's terminal, picks the option matching the intent,
+    /// and presses that number. Falls back to focusing the terminal when
+    /// the screen can't be read or no matching option is on it, so a
+    /// misread never sends a keystroke to an unknown selector.
+    private func answerNumberedPrompt(
+        _ session: AgentSession,
+        choose: @escaping @Sendable (String) -> Int?
+    ) {
+        let id = session.id
+        let path = session.projectPath
+        Task.detached {
+            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+                  let number = choose(screen),
+                  TerminalFocuser.sendKeys(
+                    sessionID: id, projectPath: path, keys: ["\(number)"])
+            else {
+                TerminalFocuser.focus(sessionID: id, projectPath: path)
+                return
+            }
+        }
     }
 
     private func answerTuiPrompt(_ session: AgentSession, keys: [String]) {

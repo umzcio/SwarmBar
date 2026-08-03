@@ -52,6 +52,28 @@ enum TerminalFocuser {
         return runScript(script) == "SENT"
     }
 
+    /// The visible screen text of the session's terminal (iTerm2 only).
+    /// Used to read a TUI selector's actual options before answering, so
+    /// keystrokes target a verified choice instead of a guessed position.
+    nonisolated static func screenText(sessionID: UUID, projectPath: URL? = nil) -> String? {
+        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+              isRunning("iTerm2") else { return nil }
+        let script = """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "/dev/\(tty)" then return (text of s)
+              end repeat
+            end repeat
+          end repeat
+          return ""
+        end tell
+        """
+        let text = run("/usr/bin/osascript", ["-e", script])
+        return (text?.isEmpty ?? true) ? nil : text
+    }
+
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {

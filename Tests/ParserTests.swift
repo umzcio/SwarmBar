@@ -144,3 +144,64 @@ struct KimiWireParserTests {
         #expect(KimiWireParser.parse(tail: tail) == nil)
     }
 }
+
+@MainActor
+struct TuiPromptLayoutTests {
+    let kimiShellPrompt = """
+      ▶ Run this command?
+
+      cwd: /Users/zach
+      $ ifconfig | grep -E "^(en|lo)" -A 5
+
+      ▶ 1. Approve once
+        2. Approve for this session
+        3. Reject
+        4. Reject with feedback
+
+      ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+    """
+
+    @Test func readsNumberedOptions() {
+        let options = TuiPromptLayout.options(in: kimiShellPrompt)
+        #expect(options.map(\.number) == [1, 2, 3, 4])
+        #expect(options.first?.label == "Approve once")
+    }
+
+    @Test func picksOnceOnlyApproveAndPlainReject() {
+        #expect(TuiPromptLayout.approveOnce(in: kimiShellPrompt) == 1)
+        #expect(TuiPromptLayout.reject(in: kimiShellPrompt) == 3)
+    }
+
+    @Test func reorderedLayoutStillResolvesByLabel() {
+        let screen = """
+          1. Approve for this session
+          2. Reject with feedback
+          3. Approve once
+          4. Reject
+        """
+        #expect(TuiPromptLayout.approveOnce(in: screen) == 3)
+        #expect(TuiPromptLayout.reject(in: screen) == 4)
+    }
+
+    @Test func latestBlockWins() {
+        let screen = """
+          1. Approve once
+          2. Reject
+          (older prompt above, answered)
+
+          1. Yes, proceed
+          2. Yes, and don't ask again
+          3. No, tell the agent what to do differently
+        """
+        #expect(TuiPromptLayout.options(in: screen).count == 3)
+        #expect(TuiPromptLayout.approveOnce(in: screen) == 1)
+        #expect(TuiPromptLayout.reject(in: screen) == 3)
+    }
+
+    @Test func screenWithoutSelectorYieldsNothing() {
+        let screen = "Here are your current macOS network settings:\n  IP address 10.0.0.1"
+        #expect(TuiPromptLayout.options(in: screen).isEmpty)
+        #expect(TuiPromptLayout.approveOnce(in: screen) == nil)
+        #expect(TuiPromptLayout.reject(in: screen) == nil)
+    }
+}
