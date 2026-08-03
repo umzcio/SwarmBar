@@ -133,7 +133,9 @@ final class HookServer: ApprovalResponding {
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let body = request.body
         let rawSessionID = body["session_id"] as? String
-        let sessionID = rawSessionID.flatMap(UUID.init(uuidString:))
+        // Claude and Grok use bare UUIDs; Kimi prefixes ("session_<uuid>"),
+        // which map through StableID exactly like KimiMonitor's rows.
+        let sessionID = rawSessionID.map { UUID(uuidString: $0) ?? StableID.uuid(for: $0) }
         let cwd = body["cwd"] as? String
 
         func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
@@ -170,7 +172,23 @@ final class HookServer: ApprovalResponding {
                 status: .waitingApproval(command: command),
                 sticky: true, cwd: cwd, accountLabel: request.accountLabel
             )
-            holdForDecision(sessionID: sessionID, kind: .claudeHook, connection: connection)
+            // Kimi's PermissionRequest is observation-only (its return is
+            // ignored), so it marks the row but cannot hold a decision.
+            if tool == .kimiCode {
+                finishEmpty()
+            } else {
+                holdForDecision(sessionID: sessionID, kind: .claudeHook, connection: connection)
+            }
+
+        case "PermissionResult":
+            cancelPending(sessionID: sessionID, respondEmpty: true)
+            store.clearHookOverride(sessionID: sessionID)
+            store.update(id: sessionID) { session in
+                if case .waitingApproval = session.status {
+                    session.status = .working(activity: "Working…")
+                }
+            }
+            finishEmpty()
 
         case "PreToolUse":
             store.applyHookEvent(
@@ -209,9 +227,17 @@ final class HookServer: ApprovalResponding {
     }
 
     /// Which tool a hook event came from. Grok Build's Claude-compat layer
-    /// runs the same hook commands, so check whether the session id belongs
-    /// to a live or on-disk Grok session before assuming Claude Code.
+    /// runs the same hook commands, and Kimi's own hooks post the same
+    /// schema, so check both before assuming Claude Code.
     nonisolated static func originTool(rawSessionID: String) -> AgentTool {
+        if rawSessionID.hasPrefix("session_") {
+            let index = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".kimi-code/session_index.jsonl")
+            if let text = try? String(contentsOf: index, encoding: .utf8),
+               text.contains(rawSessionID) {
+                return .kimiCode
+            }
+        }
         let grokRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".grok")
         let active = grokRoot.appendingPathComponent("active_sessions.json")
