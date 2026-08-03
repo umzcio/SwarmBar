@@ -246,3 +246,44 @@ struct GrokBuildMonitorTests {
         #expect(sessions.first?.status == .idle)
     }
 }
+
+@MainActor
+struct GrokUpdatesParserTests {
+    private func envelope(_ update: String) -> String {
+        "{\"method\":\"session/update\",\"params\":{\"update\":\(update)}}"
+    }
+
+    @Test func pendingQuestionIsWaitingWithPrompt() {
+        let tail = [
+            envelope("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Here you go:\"}}"),
+            envelope("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"c1\",\"title\":\"ask_user_question\",\"rawInput\":{\"questions\":[{\"question\":\"Should I order 47 rubber ducks?\"}]}}"),
+        ].joined(separator: "\n")
+        #expect(GrokUpdatesParser.parse(tail: tail)
+                == .waitingInput(prompt: "Should I order 47 rubber ducks?"))
+    }
+
+    @Test func trailingToolCallIsRunningTool() {
+        let tail = envelope("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"c2\",\"title\":\"run_command\"}")
+        #expect(GrokUpdatesParser.parse(tail: tail)
+                == .runningTool(activity: "Running run_command"))
+    }
+
+    @Test func stopAfterAgentMessageIsWaitingWithPreview() {
+        let tail = [
+            envelope("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"All done, ready for review.\"}}"),
+            envelope("{\"sessionUpdate\":\"hook_execution\",\"event_name\":\"stop\",\"runs\":[]}"),
+        ].joined(separator: "\n")
+        #expect(GrokUpdatesParser.parse(tail: tail)
+                == .waitingInput(prompt: "All done, ready for review."))
+    }
+
+    @Test func trailingThoughtIsWorking() {
+        let tail = envelope("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Hmm.\"}}")
+        #expect(GrokUpdatesParser.parse(tail: tail) == .working(activity: "Thinking…"))
+    }
+
+    @Test func metadataOnlyIsNil() {
+        let tail = "{\"method\":\"x\",\"params\":{\"update\":{\"other\":1}}}"
+        #expect(GrokUpdatesParser.parse(tail: tail) == nil)
+    }
+}

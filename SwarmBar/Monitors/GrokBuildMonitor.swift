@@ -73,6 +73,9 @@ struct GrokBuildMonitor: SessionMonitor {
                 continue
             }
             guard let entry = element as? [String: Any] else { continue }
+            // Stale entries can outlive a crashed process; a dead pid means
+            // the session is not actually live.
+            if let pid = entry["pid"] as? Int, kill(pid_t(pid), 0) != 0 { continue }
             for key in idKeys {
                 if let value = entry[key] as? String { ids.insert(value) }
             }
@@ -102,7 +105,11 @@ struct GrokBuildMonitor: SessionMonitor {
         let isActive = infoId.map { activeIds.contains($0) } ?? false
         let status: SessionStatus
         if isActive {
-            status = .working(activity: "Working…")
+            // A live process gets its real state from the update stream;
+            // recency only decides for exited sessions.
+            let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
+            status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
+                ?? .working(activity: "Working…")
         } else if age < waitingAfter {
             status = .waitingInput(prompt: lastAssistantPreview(dir: dir) ?? "")
         } else {

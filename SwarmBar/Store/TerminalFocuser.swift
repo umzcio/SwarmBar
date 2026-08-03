@@ -19,6 +19,32 @@ enum TerminalFocuser {
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID) -> String? {
+        if let pid = claudePid(forSession: id) ?? grokPid(forSession: id) {
+            let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name, !name.isEmpty, name != "??" { return name }
+        }
+        return nil
+    }
+
+    private nonisolated static func grokPid(forSession id: UUID) -> Int? {
+        let active = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok/active_sessions.json")
+        guard let data = try? Data(contentsOf: active),
+              let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { return nil }
+        for entry in entries {
+            guard let sessionId = entry["session_id"] as? String,
+                  sessionId.lowercased() == id.uuidString.lowercased(),
+                  let pid = entry["pid"] as? Int,
+                  kill(pid_t(pid), 0) == 0
+            else { continue }
+            return pid
+        }
+        return nil
+    }
+
+    private nonisolated static func claudePid(forSession id: UUID) -> Int? {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
@@ -33,9 +59,7 @@ enum TerminalFocuser {
                       let pid = json["pid"] as? Int,
                       kill(pid_t(pid), 0) == 0
                 else { continue }
-                let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let name, !name.isEmpty, name != "??" { return name }
+                return pid
             }
         }
         return nil

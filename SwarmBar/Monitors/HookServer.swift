@@ -123,18 +123,23 @@ final class HookServer: ApprovalResponding {
             .replacingOccurrences(of: "/hook/", with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let body = request.body
-        let sessionID = (body["session_id"] as? String).flatMap(UUID.init(uuidString:))
+        let rawSessionID = body["session_id"] as? String
+        let sessionID = rawSessionID.flatMap(UUID.init(uuidString:))
         let cwd = body["cwd"] as? String
 
         func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
 
-        guard let sessionID else { finishEmpty(); return }
+        guard let sessionID, let rawSessionID else { finishEmpty(); return }
+        // Grok Build imports Claude-compatible hooks from the shared
+        // settings and runs them too, so events arriving here are not
+        // necessarily Claude Code's.
+        let tool = Self.originTool(rawSessionID: rawSessionID)
 
         switch event {
         case "PermissionRequest", "PreToolUseHold":
             let command = Self.commandDescription(body)
             store.applyHookEvent(
-                sessionID: sessionID, tool: .claudeCode,
+                sessionID: sessionID, tool: tool,
                 status: .waitingApproval(command: command),
                 sticky: true, cwd: cwd, accountLabel: request.accountLabel
             )
@@ -142,7 +147,7 @@ final class HookServer: ApprovalResponding {
 
         case "PreToolUse":
             store.applyHookEvent(
-                sessionID: sessionID, tool: .claudeCode,
+                sessionID: sessionID, tool: tool,
                 status: .runningTool(activity: "Running \(Self.commandDescription(body))"),
                 sticky: false, cwd: cwd, accountLabel: request.accountLabel
             )
@@ -151,7 +156,7 @@ final class HookServer: ApprovalResponding {
         case "Stop", "SubagentStop":
             if event == "Stop" {
                 store.applyHookEvent(
-                    sessionID: sessionID, tool: .claudeCode,
+                    sessionID: sessionID, tool: tool,
                     status: .waitingInput(prompt: ""),
                     sticky: false, cwd: cwd, accountLabel: request.accountLabel
                 )
@@ -160,7 +165,7 @@ final class HookServer: ApprovalResponding {
 
         case "UserPromptSubmit":
             store.applyHookEvent(
-                sessionID: sessionID, tool: .claudeCode,
+                sessionID: sessionID, tool: tool,
                 status: .working(activity: "Thinking…"),
                 sticky: false, cwd: cwd, accountLabel: request.accountLabel
             )
@@ -174,6 +179,30 @@ final class HookServer: ApprovalResponding {
         default:
             finishEmpty()
         }
+    }
+
+    /// Which tool a hook event came from. Grok Build's Claude-compat layer
+    /// runs the same hook commands, so check whether the session id belongs
+    /// to a live or on-disk Grok session before assuming Claude Code.
+    nonisolated static func originTool(rawSessionID: String) -> AgentTool {
+        let grokRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok")
+        let active = grokRoot.appendingPathComponent("active_sessions.json")
+        if let data = try? Data(contentsOf: active),
+           let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+           entries.contains(where: { ($0["session_id"] as? String) == rawSessionID }) {
+            return .grokBuild
+        }
+        let sessionsDir = grokRoot.appendingPathComponent("sessions")
+        if let cwdDirs = try? FileManager.default.contentsOfDirectory(
+            at: sessionsDir, includingPropertiesForKeys: nil) {
+            for cwdDir in cwdDirs
+            where FileManager.default.fileExists(
+                atPath: cwdDir.appendingPathComponent(rawSessionID).path) {
+                return .grokBuild
+            }
+        }
+        return .claudeCode
     }
 
     private static func commandDescription(_ body: [String: Any]) -> String {
