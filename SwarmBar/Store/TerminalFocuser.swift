@@ -29,6 +29,7 @@ enum TerminalFocuser {
             case "\n":   "tell s to write text \"\""
             case "UP":   "tell s to write text ((character id 27) & \"[A\") newline NO"
             case "DOWN": "tell s to write text ((character id 27) & \"[B\") newline NO"
+            case "ESC":  "tell s to write text (character id 27) newline NO"
             default:     "tell s to write text \"\(key)\" newline NO"
             }
         }.joined(separator: "\n          delay 0.08\n          ")
@@ -53,7 +54,7 @@ enum TerminalFocuser {
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID) -> String? {
-        if let pid = claudePid(forSession: id) ?? grokPid(forSession: id) {
+        if let pid = claudePid(forSession: id) ?? grokPid(forSession: id) ?? codexPid(forSession: id) {
             let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let name, !name.isEmpty, name != "??" { return name }
@@ -74,6 +75,24 @@ enum TerminalFocuser {
                   kill(pid_t(pid), 0) == 0
             else { continue }
             return pid
+        }
+        return nil
+    }
+
+    /// Codex has no session-to-pid registry, but the codex process keeps
+    /// its rollout file (whose name ends in the session id) open for
+    /// appending, so lsof on that file names the owning process.
+    private nonisolated static func codexPid(forSession id: UUID) -> Int? {
+        let fm = FileManager.default
+        let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
+        let suffix = "\(id.uuidString.lowercased()).jsonl"
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return nil }
+        for case let file as URL in enumerator
+        where file.lastPathComponent.lowercased().hasSuffix(suffix) {
+            guard let output = run("/usr/sbin/lsof", ["-F", "p", file.path]) else { continue }
+            for line in output.split(separator: "\n") where line.hasPrefix("p") {
+                if let pid = Int(line.dropFirst()), kill(pid_t(pid), 0) == 0 { return pid }
+            }
         }
         return nil
     }

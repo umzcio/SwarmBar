@@ -77,4 +77,29 @@ struct CodexSessionParserTests {
         #expect(meta.cwd == "/Users/zach/GitHub/demo")
         #expect(meta.sessionId == "0198a6b9-1111-7abc-9def-0123456789ab")
     }
+
+    @Test func waitingApprovalFromUnansweredEscalatedCall() throws {
+        let status = try #require(CodexSessionParser.parse(
+            tail: fixture("codex-pending-approval"), now: now))
+        #expect(status == .waitingApproval(
+            command: "networksetup -listallnetworkservices && scutil --dns"))
+    }
+
+    @Test func answeredEscalatedCallIsNotPending() throws {
+        let resolved = try fixture("codex-pending-approval") + """
+        {"timestamp":"2026-08-01T10:04:30.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_2","call_id":"call_escalated","output":[{"type":"input_text","text":"Rejected(\\"approval request aborted\\")"}]}}
+        """
+        #expect(CodexSessionParser.pendingApproval(tail: resolved) == nil)
+        let status = try #require(CodexSessionParser.parse(tail: resolved, now: now))
+        #expect(status == .working(activity: "Working through tool results…"))
+    }
+
+    @Test func sandboxedCallWithoutOutputIsNotAnApproval() {
+        let tail = """
+        {"timestamp":"2026-08-01T10:04:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_plain","name":"exec","input":"const r = await tools.exec_command({\\"cmd\\":\\"ls\\",\\"workdir\\":\\"/Users/zach\\"});"}}
+        """
+        #expect(CodexSessionParser.pendingApproval(tail: tail) == nil)
+        #expect(CodexSessionParser.parse(tail: tail, now: now)
+                == .runningTool(activity: "Running exec"))
+    }
 }

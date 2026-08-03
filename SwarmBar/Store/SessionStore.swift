@@ -156,7 +156,15 @@ final class SessionStore {
             // (3-option shell prompts, 4-option edit prompts), but reject
             // is always last and plain approve-once second-from-last, so
             // navigate: clamp to the bottom, step up once, submit.
-            answerGrokPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
+            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
+            return
+        }
+        if session.tool == .codex {
+            // Codex's approval modal has labeled hotkeys: y approves once,
+            // esc rejects (ExecApproval decision Abort). Semantic keys, not
+            // positional, so no arrow navigation needed. The rollout records
+            // the outcome as the call's output line.
+            answerTuiPrompt(session, keys: ["y"])
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -174,14 +182,18 @@ final class SessionStore {
             // Reject is the last option in every observed layout: clamp to
             // the bottom and submit; the second newline submits the reject
             // feedback field empty.
-            answerGrokPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
+            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
+            return
+        }
+        if session.tool == .codex {
+            answerTuiPrompt(session, keys: ["ESC"])
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
     }
 
-    private func answerGrokPrompt(_ session: AgentSession, keys: [String]) {
+    private func answerTuiPrompt(_ session: AgentSession, keys: [String]) {
         let id = session.id
         let path = session.projectPath
         Task.detached {

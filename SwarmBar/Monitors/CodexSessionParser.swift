@@ -3,11 +3,22 @@ import Foundation
 /// Maps the tail of a Codex CLI rollout JSONL to a SessionStatus. Lines are
 /// {timestamp, type, payload}: event_msg carries lifecycle events
 /// (task_started, task_complete, turn_aborted), response_item carries
-/// function_call / function_call_output pairs.
+/// function_call / custom_tool_call and their output pairs.
+///
+/// Permission prompts: a call whose input asks for escalated sandbox
+/// permissions ("sandbox_permissions":"require_escalated", or the legacy
+/// "with_escalated_permissions":true) makes the TUI prompt before running,
+/// so a trailing escalated call with no matching output line means the
+/// prompt is on screen. The rollout itself records the resolution: approve
+/// runs the command and appends its output; deny (esc, ExecApproval
+/// decision Abort) appends a rejection output.
 enum CodexSessionParser {
     static let staleAfter: TimeInterval = 30 * 60
 
     static func parse(tail: String, now: Date = .now) -> SessionStatus? {
+        if let pending = pendingApproval(tail: tail) {
+            return .waitingApproval(command: pending)
+        }
         for raw in tail.split(separator: "\n").reversed() {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -35,10 +46,10 @@ enum CodexSessionParser {
                 }
             case "response_item":
                 switch payload["type"] as? String {
-                case "function_call":
+                case "function_call", "custom_tool_call":
                     let name = payload["name"] as? String ?? "tool"
                     return stale ? .idle : .runningTool(activity: "Running \(name)")
-                case "function_call_output":
+                case "function_call_output", "custom_tool_call_output":
                     return stale ? .idle : .working(activity: "Working through tool results…")
                 default:
                     continue
@@ -48,6 +59,61 @@ enum CodexSessionParser {
             }
         }
         return nil
+    }
+
+    /// The command of the newest escalated call that has no output line
+    /// yet, meaning its permission prompt is on screen. Answered calls end
+    /// the search: everything older is settled.
+    static func pendingApproval(tail: String) -> String? {
+        var answered = Set<String>()
+        var lines: [[String: Any]] = []
+        for raw in tail.split(separator: "\n") {
+            guard let data = raw.data(using: .utf8),
+                  let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  line["type"] as? String == "response_item",
+                  let payload = line["payload"] as? [String: Any],
+                  let type = payload["type"] as? String
+            else { continue }
+            if type.hasSuffix("_call_output"), let callId = payload["call_id"] as? String {
+                answered.insert(callId)
+            } else if type == "custom_tool_call" || type == "function_call" {
+                lines.append(payload)
+            }
+        }
+        guard let latest = lines.last else { return nil }
+        let input = (latest["input"] as? String) ?? (latest["arguments"] as? String) ?? ""
+        guard let callId = latest["call_id"] as? String,
+              !answered.contains(callId),
+              input.contains("require_escalated") || input.contains("\"with_escalated_permissions\":true")
+        else { return nil }
+        return field("cmd", in: input) ?? field("justification", in: input) ?? "escalated command"
+    }
+
+    /// Pulls a string field out of the call input, which is JS source for
+    /// custom_tool_call ("code mode") and plain JSON for function_call.
+    private static func field(_ name: String, in input: String) -> String? {
+        guard let range = input.range(of: "\"\(name)\":\"") else { return nil }
+        var value = ""
+        var escaped = false
+        for character in input[range.upperBound...] {
+            if escaped {
+                switch character {
+                case "n": value.append(" ")
+                case "t": value.append(" ")
+                default: value.append(character)
+                }
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "\"" {
+                break
+            } else {
+                value.append(character)
+            }
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count <= 90 ? trimmed : String(trimmed.prefix(90)) + "…"
     }
 
     /// The first line of a rollout file is session_meta with cwd and id.
