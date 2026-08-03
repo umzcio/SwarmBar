@@ -1,0 +1,4 @@
+<!-- OpenCode logomark. Adapted from ~/GitHub/opencode-logo-light.svg: the
+     mark's two-tone fills are preserved as alpha levels (frame full, inner
+     panel 55%) because the chip renders this as a template image. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 300" fill="none"><path d="M180 60H60V240H180V60ZM240 300H0V0H240V300Z" fill="black"/><path d="M180 240H60V120H180V240Z" fill="black" fill-opacity="0.55"/></svg>

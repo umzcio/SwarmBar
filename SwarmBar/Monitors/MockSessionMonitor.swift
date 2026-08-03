@@ -65,6 +65,9 @@ struct MockSessionMonitor: SessionMonitor {
             AgentSession(tool: .claudeCode, projectName: "aif-scanner",
                          status: .waitingApproval(command: Self.approvalCommands[0]),
                          startedAt: .now.addingTimeInterval(-5 * 60)),
+            AgentSession(tool: .openCode, projectName: "range-notes",
+                         status: .working(activity: Self.workActivities[5]),
+                         startedAt: .now.addingTimeInterval(-11 * 60)),
         ]
         for session in seeded.reversed() { store.upsert(session) }
     }
