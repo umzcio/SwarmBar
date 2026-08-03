@@ -18,7 +18,16 @@ final class HookServer: ApprovalResponding {
     private let store: SessionStore
     private var listener: NWListener?
 
+    /// How the held connection expects its decision encoded: Claude hooks
+    /// take the PermissionRequest hookSpecificOutput schema, the OpenCode
+    /// plugin takes a bare {"decision": "allow"|"deny"}.
+    private enum ApprovalKind {
+        case claudeHook
+        case openCodePlugin
+    }
+
     private struct PendingApproval {
+        let kind: ApprovalKind
         let respond: (Data) -> Void
         let timeout: Task<Void, Never>
     }
@@ -129,6 +138,24 @@ final class HookServer: ApprovalResponding {
 
         func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
 
+        // OpenCode's plugin bridge posts its own event shapes with ses_
+        // ids, which map through StableID like the poller's sessions do.
+        switch event {
+        case "OpenCodePermission":
+            handleOpenCodePermission(body, connection: connection)
+            return
+        case "OpenCodeReplied":
+            if let raw = body["sessionID"] as? String {
+                let id = StableID.uuid(for: raw)
+                cancelPending(sessionID: id, respondEmpty: true)
+                store.clearHookOverride(sessionID: id)
+            }
+            finishEmpty()
+            return
+        default:
+            break
+        }
+
         guard let sessionID, let rawSessionID else { finishEmpty(); return }
         // Grok Build imports Claude-compatible hooks from the shared
         // settings and runs them too, so events arriving here are not
@@ -143,7 +170,7 @@ final class HookServer: ApprovalResponding {
                 status: .waitingApproval(command: command),
                 sticky: true, cwd: cwd, accountLabel: request.accountLabel
             )
-            holdForDecision(sessionID: sessionID, connection: connection)
+            holdForDecision(sessionID: sessionID, kind: .claudeHook, connection: connection)
 
         case "PreToolUse":
             store.applyHookEvent(
@@ -205,6 +232,34 @@ final class HookServer: ApprovalResponding {
         return .claudeCode
     }
 
+    /// A permission.ask payload from the OpenCode plugin: the full
+    /// PermissionRequest (id per_..., sessionID ses_..., permission,
+    /// patterns, metadata) plus the plugin's project directory. For bash
+    /// asks the pattern is the command itself.
+    private func handleOpenCodePermission(_ body: [String: Any], connection: NWConnection) {
+        guard let rawSessionID = body["sessionID"] as? String else {
+            Self.respond(connection, json: Data("{}".utf8))
+            return
+        }
+        let sessionID = StableID.uuid(for: rawSessionID)
+        let permission = body["permission"] as? String ?? "tool"
+        let pattern = (body["patterns"] as? [Any])?.first as? String
+        let command: String = {
+            guard let pattern else { return permission }
+            if permission == "bash" {
+                let flattened = pattern.replacingOccurrences(of: "\n", with: " ")
+                return flattened.count <= 80 ? flattened : String(flattened.prefix(80)) + "…"
+            }
+            return "\(permission) \(URL(fileURLWithPath: pattern).lastPathComponent)"
+        }()
+        store.applyHookEvent(
+            sessionID: sessionID, tool: .openCode,
+            status: .waitingApproval(command: command),
+            sticky: true, cwd: body["directory"] as? String, accountLabel: nil
+        )
+        holdForDecision(sessionID: sessionID, kind: .openCodePlugin, connection: connection)
+    }
+
     private static func commandDescription(_ body: [String: Any]) -> String {
         let toolName = body["tool_name"] as? String ?? "tool"
         let input = body["tool_input"] as? [String: Any]
@@ -220,7 +275,7 @@ final class HookServer: ApprovalResponding {
 
     // MARK: - Pending decisions
 
-    private func holdForDecision(sessionID: UUID, connection: NWConnection) {
+    private func holdForDecision(sessionID: UUID, kind: ApprovalKind, connection: NWConnection) {
         // A newer request for the same session supersedes any stale one.
         cancelPending(sessionID: sessionID, respondEmpty: true)
         let timeout = Task { @MainActor [weak self] in
@@ -233,6 +288,7 @@ final class HookServer: ApprovalResponding {
             self?.store.clearHookOverride(sessionID: sessionID)
         }
         pendingApprovals[sessionID] = PendingApproval(
+            kind: kind,
             respond: { json in Self.respond(connection, json: json) },
             timeout: timeout
         )
@@ -250,20 +306,26 @@ final class HookServer: ApprovalResponding {
     }
 
     func resolveApproval(sessionID: UUID, allow: Bool) -> Bool {
-        guard pendingApprovals[sessionID] != nil else { return false }
-        // PermissionRequest decision schema: decision.behavior allow/deny.
-        // The docs guarantee allow and ask; deny is attempted for real
-        // rejection and fails open to the terminal prompt if the CLI
-        // rejects it.
-        let behavior: [String: Any] = allow
-            ? ["behavior": "allow"]
-            : ["behavior": "deny", "message": "Denied from SwarmBar"]
-        let decision: [String: Any] = [
-            "hookSpecificOutput": [
-                "hookEventName": "PermissionRequest",
-                "decision": behavior,
-            ],
-        ]
+        guard let pending = pendingApprovals[sessionID] else { return false }
+        let decision: [String: Any]
+        switch pending.kind {
+        case .claudeHook:
+            // PermissionRequest decision schema: decision.behavior
+            // allow/deny, both verified honored by the CLI.
+            let behavior: [String: Any] = allow
+                ? ["behavior": "allow"]
+                : ["behavior": "deny", "message": "Denied from SwarmBar"]
+            decision = [
+                "hookSpecificOutput": [
+                    "hookEventName": "PermissionRequest",
+                    "decision": behavior,
+                ],
+            ]
+        case .openCodePlugin:
+            // The plugin relays this through the server's own permission
+            // endpoint as respond once/reject.
+            decision = ["decision": allow ? "allow" : "deny"]
+        }
         let json = (try? JSONSerialization.data(withJSONObject: decision)) ?? Data("{}".utf8)
         finishPending(sessionID: sessionID, json: json)
         store.clearHookOverride(sessionID: sessionID)
