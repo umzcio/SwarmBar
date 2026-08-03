@@ -120,7 +120,7 @@ struct SummaryLine: View {
     }
 
     private var summary: Text {
-        let base = Text("\(store.sessions.count) sessions · ")
+        let base = Text("\(store.visibleCount) sessions · ")
         if store.attentionCount > 0 {
             let word = store.attentionCount == 1 ? "needs" : "need"
             return base + Text("\(store.attentionCount) \(word) you")

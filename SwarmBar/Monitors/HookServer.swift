@@ -200,7 +200,7 @@ final class HookServer: ApprovalResponding {
 
         case "SessionEnd":
             cancelPending(sessionID: sessionID, respondEmpty: true)
-            store.clearHookOverride(sessionID: sessionID)
+            store.markSessionEnded(sessionID)
             finishEmpty()
 
         default:

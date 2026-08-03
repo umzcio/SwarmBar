@@ -29,13 +29,13 @@ struct SessionStoreTests {
         let store = SessionStore()
         let old = AgentSession(
             tool: .grokBuild, projectName: "zach", status: .idle,
-            lastActivityAt: .now.addingTimeInterval(-3600))
+            lastActivityAt: .now.addingTimeInterval(-30 * 60))
         let newer = AgentSession(
             tool: .grokBuild, projectName: "zach", status: .idle,
             lastActivityAt: .now)
         let claudeA = AgentSession(
             tool: .claudeCode, projectName: "zach", status: .idle,
-            lastActivityAt: .now.addingTimeInterval(-3600))
+            lastActivityAt: .now.addingTimeInterval(-30 * 60))
         let claudeB = AgentSession(
             tool: .claudeCode, projectName: "zach", status: .idle,
             lastActivityAt: .now)
@@ -43,6 +43,36 @@ struct SessionStoreTests {
 
         let recentIds = Set(store.recent.map(\.id))
         #expect(recentIds == Set([newer.id, claudeA.id, claudeB.id]))
+    }
+
+    @Test func endedSessionsStayIdleThroughResync() {
+        let store = SessionStore()
+        let s = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .waitingInput(prompt: "still there?"), lastActivityAt: .now)
+        store.upsert(s)
+        store.markSessionEnded(s.id)
+        #expect(store.sessions.first?.status == .idle)
+
+        // The transcript still looks fresh on the next poll; the ended
+        // marker has to win over the parser's waiting verdict.
+        var fresh = s
+        fresh.status = .waitingInput(prompt: "still there?")
+        store.sync(tool: .claudeCode, sessions: [fresh])
+        #expect(store.sessions.first?.status == .idle)
+    }
+
+    @Test func recentDropsSessionsPastRetention() {
+        let store = SessionStore()
+        let fresh = session(.idle)
+        var stale = AgentSession(
+            tool: .claudeCode, projectName: "old-proj", status: .idle,
+            lastActivityAt: .now.addingTimeInterval(-SessionStore.recentRetention - 60))
+        stale.startedAt = stale.lastActivityAt
+        for s in [fresh, stale] { store.upsert(s) }
+
+        #expect(store.recent.map(\.id) == [fresh.id])
+        #expect(store.visibleCount == 1)
     }
 
     @Test func upsertMergesAndPreservesStartedAt() {

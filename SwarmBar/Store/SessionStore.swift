@@ -40,8 +40,16 @@ final class SessionStore {
     /// conversations and all stay visible.
     private static let launchScopedTools: Set<AgentTool> = [.grokBuild, .openCode]
 
+    /// How long a finished session stays in Recent. Discovery keeps a
+    /// longer window so quiet-but-open sessions are still found, but a
+    /// session that ended hours ago is history, not status.
+    static let recentRetention: TimeInterval = 60 * 60
+
     var recent: [AgentSession] {
-        let finished = sessions.filter { !$0.status.needsAttention && !$0.status.isActive }
+        let finished = sessions.filter {
+            !$0.status.needsAttention && !$0.status.isActive
+                && Date.now.timeIntervalSince($0.lastActivityAt) < Self.recentRetention
+        }
         var newestByProject: [String: Date] = [:]
         for session in finished where Self.launchScopedTools.contains(session.tool) {
             let key = "\(session.tool.rawValue)|\(session.projectPath?.path ?? session.projectName)"
@@ -53,6 +61,10 @@ final class SessionStore {
             return session.lastActivityAt >= newestByProject[key] ?? .distantPast
         }
     }
+
+    /// What the popover actually lists; the header counts this, not the
+    /// full discovery set.
+    var visibleCount: Int { attention.count + active.count + recent.count }
 
     var anyActive: Bool { !active.isEmpty }
     var attentionCount: Int { attention.count }
@@ -94,6 +106,9 @@ final class SessionStore {
         sessions.removeAll {
             $0.tool == tool && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
         }
+        for id in incomingIds where endedSessions.contains(id) {
+            update(id: id) { $0.status = .idle }
+        }
         reapplyHookOverrides()
     }
 
@@ -109,6 +124,18 @@ final class SessionStore {
 
     @ObservationIgnored private(set) var hookOverrides: [UUID: HookOverride] = [:]
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
+
+    /// Sessions whose tool reported the session over (Claude and Grok's
+    /// SessionEnd hook fires on /exit). The transcript keeps looking
+    /// fresh for a while, so without this an exited session reads as
+    /// waiting until the stale window catches up.
+    @ObservationIgnored private var endedSessions: Set<UUID> = []
+
+    func markSessionEnded(_ sessionID: UUID) {
+        endedSessions.insert(sessionID)
+        clearHookOverride(sessionID: sessionID)
+        update(id: sessionID) { $0.status = .idle }
+    }
 
     func applyHookEvent(
         sessionID: UUID,
