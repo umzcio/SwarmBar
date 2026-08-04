@@ -10,7 +10,7 @@ struct ClaudeHookTransformTests {
         let out = try ClaudeHookTransform.install(bare, scriptPath: "/tmp/swarmbar-hook.sh")
         #expect(ClaudeHookTransform.isInstalled(out))
         for (event, timeout) in ClaudeHookTransform.events {
-            #expect(out.contains("swarmbar-hook.sh \(event)"))
+            #expect(out.contains("swarmbar-hook.sh' \(event)"))
             #expect(out.contains("\"timeout\" : \(timeout)"))
         }
         // Untouched settings survive.
@@ -21,9 +21,9 @@ struct ClaudeHookTransformTests {
         let once = try ClaudeHookTransform.install(bare, scriptPath: "/old/swarmbar-hook.sh")
         let twice = try ClaudeHookTransform.install(once, scriptPath: "/new/swarmbar-hook.sh")
         #expect(!twice.contains("/old/"))
-        #expect(twice.contains("/new/swarmbar-hook.sh PermissionRequest"))
+        #expect(twice.contains("'/new/swarmbar-hook.sh' PermissionRequest"))
         // Exactly one entry per event.
-        let occurrences = twice.components(separatedBy: "swarmbar-hook.sh Stop").count - 1
+        let occurrences = twice.components(separatedBy: "swarmbar-hook.sh' Stop").count - 1
         #expect(occurrences == 1)
     }
 
@@ -44,6 +44,16 @@ struct ClaudeHookTransformTests {
             _ = try ClaudeHookTransform.install("not json {", scriptPath: "/x")
         }
     }
+
+    @Test func installQuotesPathsWithSpaces() throws {
+        let path = "/Users/x/Library/Application Support/SwarmBar/swarmbar-hook.sh"
+        let out = try ClaudeHookTransform.install(bare, scriptPath: path)
+        #expect(out.contains("bash '\(path)' PermissionRequest"))
+        #expect(ClaudeHookTransform.isInstalled(out))
+        // A prior install at the same spaced path is replaced, not duplicated.
+        let twice = try ClaudeHookTransform.install(out, scriptPath: path)
+        #expect(twice.components(separatedBy: "swarmbar-hook.sh' Stop").count - 1 == 1)
+    }
 }
 
 @MainActor
@@ -59,7 +69,7 @@ struct TomlHooksTransformTests {
         let out = TomlHooksTransform.install(base, scriptPath: "/tmp/swarmbar-kimi-hook.sh")
         #expect(TomlHooksTransform.isInstalled(out))
         #expect(out.contains(TomlHooksTransform.beginMarker))
-        #expect(out.contains("command = \"/tmp/swarmbar-kimi-hook.sh PermissionRequest\""))
+        #expect(out.contains("command = \"'/tmp/swarmbar-kimi-hook.sh' PermissionRequest\""))
         #expect(out.contains("[thinking]"))
     }
 
@@ -95,6 +105,14 @@ struct TomlHooksTransformTests {
         #expect(!twice.contains("/old/"))
         let markers = twice.components(separatedBy: TomlHooksTransform.beginMarker).count - 1
         #expect(markers == 1)
+    }
+
+    @Test func installQuotesPathsWithSpaces() {
+        let path = "/Users/x/Library/Application Support/SwarmBar/swarmbar-kimi-hook.sh"
+        let out = TomlHooksTransform.install(base, scriptPath: path)
+        #expect(out.contains("command = \"'\(path)' PermissionRequest\""))
+        #expect(!TomlHooksTransform.uninstall(out).contains("swarmbar"))
+        #expect(TomlHooksTransform.uninstall(out).contains("[thinking]"))
     }
 }
 
