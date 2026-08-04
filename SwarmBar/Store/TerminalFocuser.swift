@@ -45,7 +45,10 @@ enum TerminalFocuser {
             case "UP":   "tell s to write text ((character id 27) & \"[A\") newline NO"
             case "DOWN": "tell s to write text ((character id 27) & \"[B\") newline NO"
             case "ESC":  "tell s to write text (character id 27) newline NO"
-            default:     "tell s to write text \"\(key)\" newline NO"
+            // Escaped so a key carrying a quote or backslash cannot end the
+            // literal early and change the script. Digits and the fixed
+            // tokens above are unaffected, so existing behavior is identical.
+            default:     "tell s to write text \"\(AppleScriptLiteral.escape(key))\" newline NO"
             }
         }.joined(separator: "\n          delay 0.08\n          ")
         return """
@@ -95,6 +98,87 @@ enum TerminalFocuser {
         case promptChanged
         /// No live tty, or iTerm2 is not running.
         case noTerminal
+    }
+
+    // MARK: - Inline reply
+
+    enum ReplyOutcome: Equatable {
+        /// The paste was seen in the composer and Enter was sent.
+        case sent
+        /// The paste did not appear on screen, so Enter was NOT sent. The
+        /// text may be partially there; the user finishes at the terminal.
+        case pasteNotVisible
+        /// No live tty, or iTerm2 is not running.
+        case noTerminal
+    }
+
+    /// The iTerm2 script that pastes `text` into the session on `tty`. Pure,
+    /// so the emitted script can be asserted without driving a terminal.
+    ///
+    /// Uses bracketed paste (ESC[200~ ... ESC[201~) rather than typing: a TUI
+    /// that supports it takes the whole payload as literal content, so
+    /// embedded newlines land as line breaks instead of submitting the prompt
+    /// at the first one. This is a terminal-level protocol, so it is the same
+    /// mechanism for every tool rather than six per-app newline conventions.
+    ///
+    /// Deliberately contains NO submit. Pasting and pressing Enter are
+    /// separate steps so the paste can be verified on screen in between.
+    nonisolated static func pasteScript(tty: String, text: String) -> String {
+        let payload = AppleScriptLiteral.expression(text)
+        return """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "/dev/\(AppleScriptLiteral.escape(tty))" then
+                  set payload to \(payload)
+                  tell s to write text ((character id 27) & "[200~" & payload & (character id 27) & "[201~") newline NO
+                  return "PASTED"
+                end if
+              end repeat
+            end repeat
+          end repeat
+          return "MISS"
+        end tell
+        """
+    }
+
+    /// Pastes `text` into the session's composer, confirms it actually landed
+    /// by reading the screen back, and only then submits. Never presses Enter
+    /// on text it could not see: a half-delivered prompt left sitting in the
+    /// composer is recoverable, a half-delivered prompt that was submitted is
+    /// not.
+    nonisolated static func sendReply(
+        sessionID: UUID, projectPath: URL?, text: String
+    ) -> ReplyOutcome {
+        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+              isRunning("iTerm2"),
+              runScript(pasteScript(tty: tty, text: text)) == "PASTED"
+        else { return .noTerminal }
+
+        // Confirm on screen before submitting. A distinctive slice of the
+        // reply is enough, and the last line is what sits nearest the cursor.
+        guard let probe = verificationProbe(for: text),
+              let screen = screenText(sessionID: sessionID, projectPath: projectPath),
+              screen.contains(probe)
+        else { return .pasteNotVisible }
+
+        return runScript(keyScript(tty: tty, keys: ["\n"])) == "SENT"
+            ? .sent
+            : .pasteNotVisible
+    }
+
+    /// A slice of the reply to look for on screen. The composer may wrap or
+    /// re-indent long text, so match a short run from the final line rather
+    /// than the whole payload.
+    nonisolated static func verificationProbe(for text: String) -> String? {
+        let lastLine = text
+            .components(separatedBy: "\n")
+            .last { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard let trimmed = lastLine?.trimmingCharacters(in: .whitespaces),
+              !trimmed.isEmpty
+        else { return nil }
+        return String(trimmed.suffix(24))
     }
 
     /// Presses `number` only if line `number` on screen still contains

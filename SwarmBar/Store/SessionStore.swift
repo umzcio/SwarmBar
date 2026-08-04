@@ -440,10 +440,71 @@ final class SessionStore {
         }
     }
 
-    func openForReply(_ session: AgentSession) {
-        guard case .waitingInput = session.status else { return }
-        if session.projectPath != nil { openInTerminal(session); return }
-        update(id: session.id) { $0.status = .working(activity: "Continuing with your answer…") }
+    // MARK: - Inline reply
+
+    /// The session whose reply composer is open, if any. The popover drills
+    /// into the composer when this is set.
+    var replyingTo: UUID?
+
+    /// Whether a written reply can be delivered to this session. Both
+    /// repliable statuses mean the turn has ended, so the tool's composer is
+    /// idle and ready for text. A session that is working or running a tool
+    /// has a busy TUI, and an idle one may have exited with its tty reassigned.
+    nonisolated static func canReceiveReply(_ status: SessionStatus) -> Bool {
+        switch status {
+        case .waitingInput, .done: true
+        case .working, .runningTool, .waitingApproval, .idle: false
+        }
+    }
+
+    enum ReplyResult: Equatable {
+        case sent
+        /// Delivered nothing. The draft is still the user's to keep.
+        case failed(String)
+    }
+
+    /// Sends a written reply to a live session. Re-checks the status at send
+    /// time rather than trusting what the row said when the composer opened,
+    /// since the session may have started working while the user typed.
+    func sendReply(
+        _ session: AgentSession,
+        text: String,
+        completion: @escaping @MainActor (ReplyResult) -> Void
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            completion(.failed("Nothing to send.")); return
+        }
+        guard let current = sessions.first(where: { $0.id == session.id }) else {
+            completion(.failed("That session is gone.")); return
+        }
+        guard Self.canReceiveReply(current.status) else {
+            completion(.failed("That session is busy now, so nothing was sent."))
+            return
+        }
+
+        let id = session.id
+        let path = session.projectPath
+        Task.detached {
+            let outcome = TerminalFocuser.sendReply(
+                sessionID: id, projectPath: path, text: text)
+            await MainActor.run {
+                switch outcome {
+                case .sent:
+                    self.update(id: id) {
+                        $0.status = .working(activity: "Working on your reply…")
+                    }
+                    completion(.sent)
+                case .pasteNotVisible:
+                    TerminalFocuser.focus(sessionID: id, projectPath: path)
+                    completion(.failed(
+                        "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
+                case .noTerminal:
+                    completion(.failed(
+                        "Could not reach this session's terminal. Inline reply needs iTerm2."))
+                }
+            }
+        }
     }
 
     func openInTerminal(_ session: AgentSession) {

@@ -9,6 +9,19 @@ struct PopoverRootView: View {
     @State private var contentHeight: CGFloat = 100
 
     var body: some View {
+        // Drilling in replaces the list rather than opening a second window.
+        // The target lives on the store because the rows that open it are two
+        // layers down, and threading a closure through would be noisier than
+        // one observable field.
+        if let id = store.replyingTo,
+           let session = store.sessions.first(where: { $0.id == id }) {
+            ReplyComposer(session: session) { store.replyingTo = nil }
+        } else {
+            sessionList
+        }
+    }
+
+    private var sessionList: some View {
         VStack(spacing: 0) {
             PopoverHeader()
 

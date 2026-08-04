@@ -43,7 +43,7 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 6) {
-                        Button("Reply…") { store.openForReply(session) }
+                        Button("Reply…") { store.replyingTo = session.id }
                             .buttonStyle(ActionPill.reply)
                             .accessibilityLabel("Reply")
                         Button("Dismiss") { store.acknowledge(session) }
@@ -59,6 +59,13 @@ struct SessionRow: View {
                     Text(summary)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    // A finished turn is still steerable: its composer is
+                    // idle, so a reply can start the next turn.
+                    if session.processAlive {
+                        Button("Reply…") { store.replyingTo = session.id }
+                            .buttonStyle(ActionPill.reply)
+                            .accessibilityLabel("Reply")
+                    }
                 case .idle:
                     EmptyView()
                 }

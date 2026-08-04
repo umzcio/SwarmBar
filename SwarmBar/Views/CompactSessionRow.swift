@@ -43,8 +43,12 @@ struct CompactSessionRow: View {
                 MicroButton(.deny, help: "Deny") { store.deny(session) }
             }
             if case .waitingInput = session.status {
-                MicroButton(.reply, help: "Reply") { store.openForReply(session) }
+                MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
                 MicroButton(.dismiss, help: "Dismiss") { store.acknowledge(session) }
+            }
+            // A finished turn whose process is still up can be steered.
+            if case .done = session.status, session.processAlive {
+                MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
             }
 
             ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
