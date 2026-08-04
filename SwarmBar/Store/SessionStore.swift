@@ -349,7 +349,7 @@ final class SessionStore {
             // The Kimi-family selector wraps, so navigation counts are
             // unsafe; the option is read off the screen and answered by
             // its own number. PermissionResult (hook) clears the row.
-            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnce(in:))
+            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnceOption(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -376,7 +376,7 @@ final class SessionStore {
             return
         }
         if session.tool == .kimiCode || session.tool == .bearCode {
-            answerNumberedPrompt(session, choose: TuiPromptLayout.reject(in:))
+            answerNumberedPrompt(session, choose: TuiPromptLayout.rejectOption(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -395,18 +395,24 @@ final class SessionStore {
 
     private func answerNumberedPrompt(
         _ session: AgentSession,
-        choose: @escaping @Sendable (String) -> Int?
+        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
     ) {
         let id = session.id
         let path = session.projectPath
         Task.detached {
             guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
-                  let number = choose(screen),
-                  TerminalFocuser.sendKeys(
-                    sessionID: id, projectPath: path, keys: ["\(number)"])
+                  let option = choose(screen)
             else {
                 TerminalFocuser.focus(sessionID: id, projectPath: path)
                 return
+            }
+            let outcome = TerminalFocuser.answerNumbered(
+                sessionID: id, projectPath: path,
+                number: option.number, expectedLabel: option.label)
+            if outcome != .sent {
+                // The prompt moved or the terminal is gone. Never press a
+                // digit into an unverified selector; bring the user to it.
+                TerminalFocuser.focus(sessionID: id, projectPath: path)
             }
         }
     }
