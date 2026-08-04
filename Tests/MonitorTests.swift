@@ -457,3 +457,58 @@ struct TailWindowTests {
         #expect(!tail.isEmpty)
     }
 }
+
+@MainActor
+struct TailCacheTests {
+    private func tempFile(_ contents: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("f.jsonl")
+        try contents.write(to: file, atomically: true, encoding: .utf8)
+        return file
+    }
+
+    @Test func computesOnceForAnUnchangedFile() throws {
+        let file = try tempFile("a\n")
+        let cache = TailCache<String>()
+        var computeCount = 0
+        let modified = Date()
+        for _ in 0..<5 {
+            _ = cache.value(for: file, size: 2, modified: modified) {
+                computeCount += 1
+                return "parsed"
+            }
+        }
+        #expect(computeCount == 1)
+    }
+
+    @Test func recomputesWhenTheFileChanges() throws {
+        let file = try tempFile("a\n")
+        let cache = TailCache<String>()
+        var computeCount = 0
+        let first = Date()
+        _ = cache.value(for: file, size: 2, modified: first) {
+            computeCount += 1; return "one"
+        }
+        let second = first.addingTimeInterval(1)
+        let value = cache.value(for: file, size: 4, modified: second) {
+            computeCount += 1; return "two"
+        }
+        #expect(computeCount == 2)
+        #expect(value == "two")
+    }
+
+    @Test func retainDropsUnseenPaths() throws {
+        let file = try tempFile("a\n")
+        let cache = TailCache<String>()
+        let modified = Date()
+        _ = cache.value(for: file, size: 2, modified: modified) { "one" }
+        cache.retain(paths: [])
+        var recomputed = false
+        _ = cache.value(for: file, size: 2, modified: modified) {
+            recomputed = true; return "again"
+        }
+        #expect(recomputed)
+    }
+}
