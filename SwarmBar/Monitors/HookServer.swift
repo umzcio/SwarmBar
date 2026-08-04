@@ -29,6 +29,9 @@ final class HookServer: ApprovalResponding {
 
     private let store: SessionStore
     private var listener: NWListener?
+    /// nil means the token could not be persisted; run unauthenticated rather
+    /// than dropping every hook event.
+    private var tokenForRequests: String?
 
     /// How the held connection expects its decision encoded: Claude hooks
     /// take the PermissionRequest hookSpecificOutput schema, the OpenCode
@@ -51,6 +54,10 @@ final class HookServer: ApprovalResponding {
     }
 
     func start() {
+        // Must exist before any bridge script needs it: hand-installed
+        // scripts start looking for the file immediately, not only after a
+        // Settings toggle. nil is fail open, not a startup failure.
+        tokenForRequests = HookToken.loadOrCreate()
         do {
             let parameters = NWParameters.tcp
             parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -139,6 +146,7 @@ final class HookServer: ApprovalResponding {
     struct Request {
         var path: String
         var accountLabel: String?
+        var token: String?
         var body: [String: Any]
     }
 
@@ -161,6 +169,7 @@ final class HookServer: ApprovalResponding {
 
         var contentLength = 0
         var account: String?
+        var token: String?
         for line in lines.dropFirst() {
             let lower = line.lowercased()
             if lower.hasPrefix("content-length:") {
@@ -177,6 +186,9 @@ final class HookServer: ApprovalResponding {
                 let value = line.dropFirst("x-claude-account:".count)
                     .trimmingCharacters(in: .whitespaces)
                 account = value.isEmpty ? nil : value
+            } else if lower.hasPrefix("x-swarmbar-token:") {
+                token = line.dropFirst("x-swarmbar-token:".count)
+                    .trimmingCharacters(in: .whitespaces)
             }
         }
         let bodyData = data[headerEnd.upperBound...]
@@ -186,7 +198,8 @@ final class HookServer: ApprovalResponding {
         // An empty body is legitimate for some events; a non-empty body that is
         // not a JSON object is not, and must not be routed as if it were empty.
         if parsed == nil, !bodySlice.isEmpty { return .malformed }
-        return .complete(Request(path: String(parts[1]), accountLabel: account, body: parsed ?? [:]))
+        return .complete(Request(
+            path: String(parts[1]), accountLabel: account, token: token, body: parsed ?? [:]))
     }
 
     private static func respond(
@@ -203,6 +216,13 @@ final class HookServer: ApprovalResponding {
     // MARK: - Routing
 
     private func route(_ request: Request, connection: NWConnection) {
+        // Only bridges this app installed may change what the popover shows.
+        // A wrong or missing token gets the same empty answer a non-session
+        // event gets, so a misconfigured bridge fails open rather than hanging.
+        if let expected = tokenForRequests, !HookToken.matches(request.token, expected) {
+            Self.respond(connection, json: Data("{}".utf8))
+            return
+        }
         let event = request.path
             .replacingOccurrences(of: "/hook/", with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))

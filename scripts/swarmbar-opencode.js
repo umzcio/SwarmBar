@@ -13,7 +13,25 @@
 // resolves empty and nothing happens. permission.replied is forwarded so
 // SwarmBar clears its approval row no matter where the prompt was
 // answered.
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+
 const SWARMBAR = "http://127.0.0.1:48620"
+
+// Read once at plugin load. Fails open: if the file cannot be read (not
+// yet minted, permissions, different home directory), the token is just
+// empty and the request still goes out; the server decides from there.
+function loadToken() {
+  try {
+    return readFileSync(
+      `${homedir()}/Library/Application Support/SwarmBar/hook-token`,
+      "utf8"
+    ).trim()
+  } catch {
+    return ""
+  }
+}
+const TOKEN = loadToken()
 
 export const SwarmBarPlugin = async ({ client, directory }) => {
   return {
@@ -24,7 +42,7 @@ export const SwarmBarPlugin = async ({ client, directory }) => {
       if (event.type === "permission.replied") {
         fetch(`${SWARMBAR}/hook/OpenCodeReplied`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", "X-SwarmBar-Token": TOKEN },
           body: JSON.stringify(event.properties ?? {}),
         }).catch(() => {})
       }
@@ -36,7 +54,7 @@ async function relay(client, input, directory) {
   try {
     const res = await fetch(`${SWARMBAR}/hook/OpenCodePermission`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-SwarmBar-Token": TOKEN },
       body: JSON.stringify({ ...input, directory }),
       signal: AbortSignal.timeout(350_000),
     })

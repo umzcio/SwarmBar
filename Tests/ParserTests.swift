@@ -278,4 +278,47 @@ struct HookRequestParsingTests {
         }
         #expect(parsed.body.isEmpty)
     }
+
+    @Test func capturesTheSwarmBarTokenHeader() {
+        let data = request(
+            headers: "Content-Length: 2\r\nX-SwarmBar-Token: sample-header-value", body: "{}")
+        guard case .complete(let parsed) = HookServer.parseRequest(data) else {
+            Issue.record("expected a complete parse"); return
+        }
+        #expect(parsed.token == "sample-header-value")
+    }
+
+    @Test func missingTokenHeaderParsesAsNil() {
+        let body = "{}"
+        let data = request(headers: "Content-Length: \(body.utf8.count)", body: body)
+        guard case .complete(let parsed) = HookServer.parseRequest(data) else {
+            Issue.record("expected a complete parse"); return
+        }
+        #expect(parsed.token == nil)
+    }
+}
+
+@MainActor
+struct HookTokenTests {
+    @Test func matchesOnlyTheExactToken() {
+        #expect(HookToken.matches("abc123", "abc123"))
+        #expect(!HookToken.matches("abc124", "abc123"))
+        #expect(!HookToken.matches("abc123x", "abc123"))
+        #expect(!HookToken.matches("", "abc123"))
+        #expect(!HookToken.matches(nil, "abc123"))
+    }
+
+    @Test func mintedTokensAreLongAndUrlSafe() throws {
+        let token = try #require(HookToken.loadOrCreate())
+        #expect(token.count >= 40)
+        #expect(!token.contains("/"))
+        #expect(!token.contains("+"))
+        #expect(!token.contains("="))
+    }
+
+    @Test func loadingTwiceReturnsTheSameToken() throws {
+        let first = try #require(HookToken.loadOrCreate())
+        let second = try #require(HookToken.loadOrCreate())
+        #expect(first == second)
+    }
 }
