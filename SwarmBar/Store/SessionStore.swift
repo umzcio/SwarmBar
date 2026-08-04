@@ -9,6 +9,9 @@ final class SessionStore {
     private(set) var sessions: [AgentSession] = []
     var isPaused = false
 
+    /// Live state of the hook bridge, surfaced in Settings. Set by HookServer.
+    var hookServerState: HookServer.ServerState = .starting
+
     // Drives the menu bar glyph's animation frame. The MenuBarExtra label
     // only reliably re-renders on observable data changes, so the ticker
     // lives here rather than in the label view. Fill cycle steps at 450ms

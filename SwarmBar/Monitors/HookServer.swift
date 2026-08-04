@@ -8,6 +8,15 @@ import Network
 /// loopback only.
 @MainActor
 final class HookServer: ApprovalResponding {
+    /// Whether the local hook bridge is actually accepting connections.
+    /// Config detection alone cannot answer this: the entries can be
+    /// installed correctly while another process holds the port.
+    enum ServerState: Equatable {
+        case starting
+        case listening
+        case unavailable(String)
+    }
+
     static let port: UInt16 = 48620
     /// Held-decision window. Kept under the hook command's own timeout so
     /// the fail-open path is a clean empty response, not a killed process.
@@ -52,11 +61,28 @@ final class HookServer: ApprovalResponding {
             listener.newConnectionHandler = { connection in
                 Task { @MainActor [weak self] in self?.accept(connection) }
             }
+            listener.stateUpdateHandler = { state in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    switch state {
+                    case .ready:
+                        self.store.hookServerState = .listening
+                    case .failed(let error):
+                        // Port taken (another SwarmBar, or something else
+                        // holding 48620) means remote approve and deny are
+                        // dead while the polling monitors still look healthy.
+                        self.store.hookServerState = .unavailable(error.localizedDescription)
+                    case .cancelled:
+                        self.store.hookServerState = .unavailable("Stopped")
+                    default:
+                        break
+                    }
+                }
+            }
             listener.start(queue: .main)
             self.listener = listener
         } catch {
-            // Port taken (another SwarmBar?) or sandbox issue; hooks fail
-            // open and the polling monitors still work.
+            store.hookServerState = .unavailable(error.localizedDescription)
         }
     }
 
