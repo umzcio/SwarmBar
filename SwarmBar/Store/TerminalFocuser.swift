@@ -11,9 +11,17 @@ enum TerminalFocuser {
            focusRunningTerminal(device: "/dev/\(tty)") {
             return
         }
-        if let path = projectPath?.path {
-            _ = run("/usr/bin/open", ["-a", "Terminal", path])
-        }
+        // `open -a Terminal` on a regular file hands the file to Terminal to
+        // run, so only ever pass a real directory. Project paths can come
+        // from a hook payload, which is not trusted input.
+        guard let path = projectPath?.path, isDirectory(path) else { return }
+        _ = run("/usr/bin/open", ["-a", "Terminal", path])
+    }
+
+    nonisolated static func isDirectory(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        return exists && isDir.boolValue
     }
 
     /// Sends keystrokes to the session's tty via iTerm2 (the only terminal

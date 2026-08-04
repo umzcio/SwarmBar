@@ -397,3 +397,30 @@ struct GrokPermissionDetectionTests {
         #expect(GrokUpdatesParser.pendingToolCommand(tail: tail) == "rm -rf build/")
     }
 }
+
+@MainActor
+struct ProjectPathValidationTests {
+    @Test func acceptsAnExistingDirectory() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        #expect(TerminalFocuser.isDirectory(dir.path))
+    }
+
+    @Test func rejectsARegularFile() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("payload.sh")
+        try "#!/bin/bash\necho hi\n".write(to: file, atomically: true, encoding: .utf8)
+        #expect(!TerminalFocuser.isDirectory(file.path))
+    }
+
+    @Test func rejectsAMissingPath() {
+        #expect(!TerminalFocuser.isDirectory("/nope/does/not/exist"))
+    }
+
+    @Test func rejectsEmptyAndRelativeJunk() {
+        #expect(!TerminalFocuser.isDirectory(""))
+    }
+}
