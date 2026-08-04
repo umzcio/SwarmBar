@@ -155,6 +155,14 @@ struct PopoverFooter: View {
             Button {
                 openSettings()
                 NSApp.activate()
+                // The Settings scene restores its last frame, which can be
+                // anywhere (including where UI automation once dragged it);
+                // a menu bar app's settings should just open centered.
+                DispatchQueue.main.async {
+                    NSApp.windows
+                        .first { $0.identifier?.rawValue.contains("Settings") == true }?
+                        .center()
+                }
             } label: {
                 Label("Settings", systemImage: "gearshape")
                     .labelStyle(.titleAndIcon)
