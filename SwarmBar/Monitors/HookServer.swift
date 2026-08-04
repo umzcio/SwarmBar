@@ -8,15 +8,30 @@ import Network
 /// loopback only.
 @MainActor
 final class HookServer: ApprovalResponding {
+    /// Whether the local hook bridge is actually accepting connections.
+    /// Config detection alone cannot answer this: the entries can be
+    /// installed correctly while another process holds the port.
+    enum ServerState: Equatable {
+        case starting
+        case listening
+        case unavailable(String)
+    }
+
     static let port: UInt16 = 48620
     /// Held-decision window. Kept under the hook command's own timeout so
     /// the fail-open path is a clean empty response, not a killed process.
     /// Long on purpose: the popover is a glance-later surface, and once
     /// this expires the prompt can only be answered at the terminal.
     static let decisionHold: Duration = .seconds(345)
+    /// Largest hook payload accepted. Well above any real Claude or OpenCode
+    /// payload, well under the 512 KB read ceiling in `receive`.
+    static let maxBodyBytes = 256 * 1024
 
     private let store: SessionStore
     private var listener: NWListener?
+    /// nil means the token could not be persisted; run unauthenticated rather
+    /// than dropping every hook event.
+    private var tokenForRequests: String?
 
     /// How the held connection expects its decision encoded: Claude hooks
     /// take the PermissionRequest hookSpecificOutput schema, the OpenCode
@@ -28,6 +43,7 @@ final class HookServer: ApprovalResponding {
 
     private struct PendingApproval {
         let kind: ApprovalKind
+        let connection: NWConnection
         let respond: (Data) -> Void
         let timeout: Task<Void, Never>
     }
@@ -38,6 +54,10 @@ final class HookServer: ApprovalResponding {
     }
 
     func start() {
+        // Must exist before any bridge script needs it: hand-installed
+        // scripts start looking for the file immediately, not only after a
+        // Settings toggle. nil is fail open, not a startup failure.
+        tokenForRequests = HookToken.loadOrCreate()
         do {
             let parameters = NWParameters.tcp
             parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -48,19 +68,56 @@ final class HookServer: ApprovalResponding {
             listener.newConnectionHandler = { connection in
                 Task { @MainActor [weak self] in self?.accept(connection) }
             }
+            listener.stateUpdateHandler = { state in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    switch state {
+                    case .ready:
+                        self.store.hookServerState = .listening
+                    case .failed(let error):
+                        // Port taken (another SwarmBar, or something else
+                        // holding 48620) means remote approve and deny are
+                        // dead while the polling monitors still look healthy.
+                        self.store.hookServerState = .unavailable(error.localizedDescription)
+                    case .cancelled:
+                        self.store.hookServerState = .unavailable("Stopped")
+                    default:
+                        break
+                    }
+                }
+            }
             listener.start(queue: .main)
             self.listener = listener
         } catch {
-            // Port taken (another SwarmBar?) or sandbox issue; hooks fail
-            // open and the polling monitors still work.
+            store.hookServerState = .unavailable(error.localizedDescription)
         }
     }
 
     // MARK: - Connections
 
     private func accept(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor [weak self] in self?.dropPending(for: connection) }
+            default:
+                break
+            }
+        }
         connection.start(queue: .main)
         receive(connection, buffer: Data())
+    }
+
+    /// A held hook client went away (process killed, its own timeout fired,
+    /// the prompt was answered at the terminal). The row must stop offering
+    /// buttons that can no longer answer anything.
+    private func dropPending(for connection: NWConnection) {
+        guard let (sessionID, pending) = pendingApprovals
+            .first(where: { $0.value.connection === connection })
+        else { return }
+        pending.timeout.cancel()
+        pendingApprovals.removeValue(forKey: sessionID)
+        store.clearHookOverride(sessionID: sessionID)
     }
 
     private func receive(_ connection: NWConnection, buffer: Data) {
@@ -70,57 +127,88 @@ final class HookServer: ApprovalResponding {
                 var buffer = buffer
                 if let data { buffer.append(data) }
                 if error != nil { connection.cancel(); return }
-                if let request = Self.parseRequest(buffer) {
+                switch Self.parseRequest(buffer) {
+                case .complete(let request):
                     self.route(request, connection: connection)
-                } else if isComplete {
+                case .malformed:
                     connection.cancel()
-                } else if buffer.count > 512 * 1024 {
-                    connection.cancel()
-                } else {
-                    self.receive(connection, buffer: buffer)
+                case .incomplete:
+                    if isComplete || buffer.count > 512 * 1024 {
+                        connection.cancel()
+                    } else {
+                        self.receive(connection, buffer: buffer)
+                    }
                 }
             }
         }
     }
 
-    private struct Request {
+    struct Request {
         var path: String
         var accountLabel: String?
+        var token: String?
         var body: [String: Any]
     }
 
-    private static func parseRequest(_ data: Data) -> Request? {
-        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+    /// Parsing a request either completes, needs more bytes, or is refused.
+    /// The distinction matters: `incomplete` means keep receiving, `malformed`
+    /// means close the connection rather than route an empty body.
+    enum ParseOutcome {
+        case complete(Request)
+        case incomplete
+        case malformed
+    }
+
+    static func parseRequest(_ data: Data) -> ParseOutcome {
+        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return .incomplete }
         let headerText = String(decoding: data[..<headerEnd.lowerBound], as: UTF8.self)
         let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
+        guard let requestLine = lines.first else { return .malformed }
         let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "POST" else { return nil }
+        guard parts.count >= 2, parts[0] == "POST" else { return .malformed }
 
         var contentLength = 0
         var account: String?
+        var token: String?
         for line in lines.dropFirst() {
             let lower = line.lowercased()
             if lower.hasPrefix("content-length:") {
-                contentLength = Int(line.dropFirst("content-length:".count)
-                    .trimmingCharacters(in: .whitespaces)) ?? 0
+                let raw = line.dropFirst("content-length:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                // A missing header means an empty body; a present but bogus,
+                // negative, or oversized one is a refusal. Data.prefix traps on
+                // a negative length, so this guard is load bearing.
+                guard let value = Int(raw), value >= 0, value <= Self.maxBodyBytes else {
+                    return .malformed
+                }
+                contentLength = value
             } else if lower.hasPrefix("x-claude-account:") {
                 let value = line.dropFirst("x-claude-account:".count)
                     .trimmingCharacters(in: .whitespaces)
                 account = value.isEmpty ? nil : value
+            } else if lower.hasPrefix("x-swarmbar-token:") {
+                token = line.dropFirst("x-swarmbar-token:".count)
+                    .trimmingCharacters(in: .whitespaces)
             }
         }
         let bodyData = data[headerEnd.upperBound...]
-        guard bodyData.count >= contentLength else { return nil }
-        let body = (try? JSONSerialization.jsonObject(with: Data(bodyData.prefix(contentLength))))
-            as? [String: Any] ?? [:]
-        return Request(path: String(parts[1]), accountLabel: account, body: body)
+        guard bodyData.count >= contentLength else { return .incomplete }
+        let bodySlice = Data(bodyData.prefix(contentLength))
+        let parsed = (try? JSONSerialization.jsonObject(with: bodySlice)) as? [String: Any]
+        // An empty body is legitimate for some events; a non-empty body that is
+        // not a JSON object is not, and must not be routed as if it were empty.
+        if parsed == nil, !bodySlice.isEmpty { return .malformed }
+        return .complete(Request(
+            path: String(parts[1]), accountLabel: account, token: token, body: parsed ?? [:]))
     }
 
-    private static func respond(_ connection: NWConnection, json: Data) {
+    private static func respond(
+        _ connection: NWConnection, json: Data, completion: ((Bool) -> Void)? = nil
+    ) {
         var response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(json.count)\r\nConnection: close\r\n\r\n".utf8)
         response.append(json)
-        connection.send(content: response, completion: .contentProcessed { _ in
+        connection.send(content: response, completion: .contentProcessed { error in
+            completion?(error == nil)
             connection.cancel()
         })
     }
@@ -128,6 +216,13 @@ final class HookServer: ApprovalResponding {
     // MARK: - Routing
 
     private func route(_ request: Request, connection: NWConnection) {
+        // Only bridges this app installed may change what the popover shows.
+        // A wrong or missing token gets the same empty answer a non-session
+        // event gets, so a misconfigured bridge fails open rather than hanging.
+        if let expected = tokenForRequests, !HookToken.matches(request.token, expected) {
+            Self.respond(connection, json: Data("{}".utf8))
+            return
+        }
         let event = request.path
             .replacingOccurrences(of: "/hook/", with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -154,7 +249,7 @@ final class HookServer: ApprovalResponding {
         case "OpenCodeReplied":
             if let raw = body["sessionID"] as? String {
                 let id = StableID.uuid(for: raw)
-                cancelPending(sessionID: id, respondEmpty: true)
+                cancelPending(sessionID: id)
                 store.clearHookOverride(sessionID: id)
             }
             finishEmpty()
@@ -189,7 +284,7 @@ final class HookServer: ApprovalResponding {
             }
 
         case "PermissionResult":
-            cancelPending(sessionID: sessionID, respondEmpty: true)
+            cancelPending(sessionID: sessionID)
             store.clearHookOverride(sessionID: sessionID)
             store.update(id: sessionID) { session in
                 if case .waitingApproval = session.status {
@@ -225,7 +320,7 @@ final class HookServer: ApprovalResponding {
             finishEmpty()
 
         case "SessionEnd":
-            cancelPending(sessionID: sessionID, respondEmpty: true)
+            cancelPending(sessionID: sessionID)
             store.markSessionEnded(sessionID)
             finishEmpty()
 
@@ -319,7 +414,7 @@ final class HookServer: ApprovalResponding {
 
     private func holdForDecision(sessionID: UUID, kind: ApprovalKind, connection: NWConnection) {
         // A newer request for the same session supersedes any stale one.
-        cancelPending(sessionID: sessionID, respondEmpty: true)
+        cancelPending(sessionID: sessionID)
         let timeout = Task { @MainActor [weak self] in
             try? await Task.sleep(for: Self.decisionHold)
             guard !Task.isCancelled else { return }
@@ -331,6 +426,7 @@ final class HookServer: ApprovalResponding {
         }
         pendingApprovals[sessionID] = PendingApproval(
             kind: kind,
+            connection: connection,
             respond: { json in Self.respond(connection, json: json) },
             timeout: timeout
         )
@@ -342,13 +438,19 @@ final class HookServer: ApprovalResponding {
         pending.respond(json)
     }
 
-    private func cancelPending(sessionID: UUID, respondEmpty: Bool) {
-        guard respondEmpty else { return }
+    private func cancelPending(sessionID: UUID) {
         finishPending(sessionID: sessionID, json: Data("{}".utf8))
     }
 
     func resolveApproval(sessionID: UUID, allow: Bool) -> Bool {
         guard let pending = pendingApprovals[sessionID] else { return false }
+        switch pending.connection.state {
+        case .cancelled, .failed:
+            dropPending(for: pending.connection)
+            return false
+        default:
+            break
+        }
         let decision: [String: Any]
         switch pending.kind {
         case .claudeHook:
@@ -369,7 +471,14 @@ final class HookServer: ApprovalResponding {
             decision = ["decision": allow ? "allow" : "deny"]
         }
         let json = (try? JSONSerialization.data(withJSONObject: decision)) ?? Data("{}".utf8)
-        finishPending(sessionID: sessionID, json: json)
+        pendingApprovals.removeValue(forKey: sessionID)
+        pending.timeout.cancel()
+        Self.respond(pending.connection, json: json) { [weak self] delivered in
+            guard !delivered else { return }
+            Task { @MainActor in
+                self?.store.noteApprovalDeliveryFailed(sessionID: sessionID)
+            }
+        }
         store.clearHookOverride(sessionID: sessionID)
         return true
     }

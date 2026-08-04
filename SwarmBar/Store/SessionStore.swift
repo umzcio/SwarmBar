@@ -9,6 +9,9 @@ final class SessionStore {
     private(set) var sessions: [AgentSession] = []
     var isPaused = false
 
+    /// Live state of the hook bridge, surfaced in Settings. Set by HookServer.
+    var hookServerState: HookServer.ServerState = .starting
+
     // Drives the menu bar glyph's animation frame. The MenuBarExtra label
     // only reliably re-renders on observable data changes, so the ticker
     // lives here rather than in the label view. Fill cycle steps at 450ms
@@ -236,6 +239,15 @@ final class SessionStore {
             }
         }
         alertedKeys.formIntersection(current)
+    }
+
+    /// The held hook connection broke before the decision reached the agent.
+    /// The row said "Running"; say plainly that it did not land, so the user
+    /// goes to the terminal instead of trusting a false confirmation.
+    func noteApprovalDeliveryFailed(sessionID: UUID) {
+        update(id: sessionID) { session in
+            session.status = .waitingInput(prompt: "Answer at the terminal, SwarmBar could not deliver")
+        }
     }
 
     // Called by row buttons. Mock sessions (no projectPath) transition state

@@ -62,6 +62,7 @@ struct SwarmBarApp: App {
 
         Settings {
             SettingsView()
+                .environment(store)
         }
     }
 }

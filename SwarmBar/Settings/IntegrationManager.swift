@@ -31,6 +31,12 @@ final class IntegrationManager {
 
     private(set) var states: [AgentTool: InstallState] = [:]
 
+    /// Marks a bridge script that sends the SwarmBar-Token header. An
+    /// installed copy in Application Support without this marker predates
+    /// the token and would silently fail open, so it counts as not
+    /// installed until the toggle overwrites it.
+    static let bridgeMarker = "swarmbar-bridge-v2"
+
     private let fm = FileManager.default
     private var home: URL { fm.homeDirectoryForCurrentUser }
 
@@ -58,14 +64,28 @@ final class IntegrationManager {
             return .toolMissing
         }
         let text = (try? String(contentsOf: settings, encoding: .utf8)) ?? ""
-        return ClaudeHookTransform.isInstalled(text) ? .installed : .notInstalled
+        guard ClaudeHookTransform.isInstalled(text) else { return .notInstalled }
+        return scriptIsCurrent(named: "swarmbar-hook.sh") ? .installed : .notInstalled
     }
 
     private func detectTomlTool(configDir: String) -> InstallState {
         let dir = home.appendingPathComponent(configDir)
         guard fm.fileExists(atPath: dir.path) else { return .toolMissing }
         let text = (try? String(contentsOf: dir.appendingPathComponent("config.toml"), encoding: .utf8)) ?? ""
-        return TomlHooksTransform.isInstalled(text) ? .installed : .notInstalled
+        guard TomlHooksTransform.isInstalled(text) else { return .notInstalled }
+        return scriptIsCurrent(named: "swarmbar-kimi-hook.sh") ? .installed : .notInstalled
+    }
+
+    /// True unless the toggle previously copied an older script into
+    /// Application Support that predates the token. A config referencing a
+    /// hand-installed script that lives elsewhere (pointing straight at the
+    /// repo's scripts/, already updated in place) has no copy here at all,
+    /// so it is left alone.
+    private func scriptIsCurrent(named name: String) -> Bool {
+        let installed = appSupport.appendingPathComponent(name)
+        guard fm.fileExists(atPath: installed.path) else { return true }
+        let text = (try? String(contentsOf: installed, encoding: .utf8)) ?? ""
+        return text.contains(Self.bridgeMarker)
     }
 
     private func detectOpenCode() -> InstallState {

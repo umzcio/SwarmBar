@@ -112,6 +112,7 @@ struct GeneralSettingsTab: View {
 // MARK: - Providers
 
 struct ProvidersSettingsTab: View {
+    @Environment(SessionStore.self) private var store
     @State private var manager = IntegrationManager()
 
     private static let bridgeTools: [AgentTool] = [.claudeCode, .kimiCode, .bearCode, .openCode]
@@ -119,6 +120,28 @@ struct ProvidersSettingsTab: View {
 
     var body: some View {
         SettingsCardList {
+            SettingsCard {
+                HStack(spacing: 11) {
+                    Image(systemName: bridgeSymbol)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(bridgeTint)
+                        .frame(width: 28, height: 28)
+                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 7))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Hook bridge")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(bridgeDetail)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 12)
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 11)
+            }
+            .padding(.bottom, 12)
+
             SettingsGroupLabel("Approval bridges")
             SettingsCard {
                 ForEach(Array(Self.bridgeTools.enumerated()), id: \.element) { index, tool in
@@ -143,6 +166,25 @@ struct ProvidersSettingsTab: View {
                 .padding(.top, 10)
         }
         .onAppear { manager.refresh() }
+    }
+
+    private var bridgeSymbol: String {
+        if case .listening = store.hookServerState { return "antenna.radiowaves.left.and.right" }
+        return "exclamationmark.triangle"
+    }
+
+    private var bridgeTint: Color {
+        if case .listening = store.hookServerState { return .secondary }
+        return .orange
+    }
+
+    private var bridgeDetail: String {
+        switch store.hookServerState {
+        case .starting:    "Starting up"
+        case .listening:   "Listening on 127.0.0.1:\(HookServer.port)"
+        case .unavailable(let reason):
+            "Not listening, so remote approve and deny will not reach your agents. \(reason)"
+        }
     }
 }
 
