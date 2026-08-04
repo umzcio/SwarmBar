@@ -239,9 +239,10 @@ final class SessionStore {
     }
 
     // Called by row buttons. Mock sessions (no projectPath) transition state
-    // directly. Real sessions are read-only per CLAUDE.md: the buttons bring
-    // you to the session's terminal instead of writing to the tool's files;
-    // proper control channels are a later design.
+    // directly. Real sessions are answered through their tool's own control
+    // channel: a held hook decision where one is pending, otherwise tty
+    // keystrokes for the TUI tools, falling back to focusing the terminal
+    // when nothing can be answered remotely. Session state is never written.
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
