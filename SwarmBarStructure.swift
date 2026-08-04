@@ -1,35 +1,34 @@
 //
-//  SwarmBar — SwiftUI structure sketch
+//  SwarmBar, phase 1 structure sketch (SUPERSEDED)
 //
-//  A single-file sketch of the app architecture matching the HTML prototype.
-//  In the real project, split roughly like this:
+//  This file is the original single-file architecture sketch. It is not
+//  compiled and it is NOT a description of the current app. It is kept as
+//  a record of the starting shape.
 //
-//  SwarmBar/
-//  ├── SwarmBarApp.swift            // @main, MenuBarExtra
-//  ├── Models/
-//  │   ├── AgentTool.swift
-//  │   ├── SessionStatus.swift
-//  │   └── AgentSession.swift
-//  ├── Store/
-//  │   └── SessionStore.swift       // single source of truth
-//  ├── Monitors/
-//  │   ├── SessionMonitor.swift     // protocol
-//  │   ├── ClaudeCodeMonitor.swift  // tails ~/.claude/projects/**/*.jsonl + hooks
-//  │   ├── CodexMonitor.swift
-//  │   └── KimiMonitor.swift
-//  └── Views/
-//      ├── MenuBarLabel.swift
-//      ├── PopoverRootView.swift
-//      ├── SessionSection.swift
-//      ├── SessionRow.swift         // comfortable
-//      ├── CompactSessionRow.swift  // dense
-//      └── Components/ (StatusDot, ToolChip, ApprovalActions)
+//  Do not "fill in its stubs". Where it disagrees with the code, the code
+//  is right. Known divergences as of commit 0cc0b66:
+//
+//    - AgentTool here has three cases; the app has six (adds bearCode,
+//      openCode, grokBuild). See SwarmBar/Models/AgentTool.swift.
+//    - `recent` here is simply "not attention and not active". The app
+//      adds a one hour retention window and collapses launch-scoped tool
+//      trails per project. See SwarmBar/Store/SessionStore.swift.
+//    - Density lives in @AppStorage("compactRows") read by the views, not
+//      on the store.
+//    - MenuBarLabel takes no parameters; it reads the store from the
+//      environment and renders pre-cached glyph frames.
+//    - Whole subsystems are absent here: HookServer, TerminalFocuser,
+//      ProcessLiveness, TuiPromptLayout, StableID, every parser, and the
+//      Settings/ directory.
+//
+//  For the current architecture and its rules, read CLAUDE.md.
 //
 
 import SwiftUI
 
 // MARK: - Models -----------------------------------------------------------
 
+// SUPERSEDED: the app has six cases. See SwarmBar/Models/AgentTool.swift.
 enum AgentTool: String, CaseIterable, Identifiable {
     case claudeCode, codex, kimiCode
     var id: String { rawValue }
@@ -124,6 +123,7 @@ final class SessionStore {
     // Density preference persists across launches.
     // (@AppStorage doesn't work directly inside @Observable —
     //  wrap UserDefaults manually or keep it in the view layer.)
+    // SUPERSEDED: density is @AppStorage("compactRows"), read in the views.
     var isCompact: Bool {
         get { UserDefaults.standard.bool(forKey: "compactRows") }
         set { UserDefaults.standard.set(newValue, forKey: "compactRows") }
@@ -132,6 +132,7 @@ final class SessionStore {
     // Derived slices the popover renders.
     var attention: [AgentSession] { sessions.filter { $0.status.needsAttention } }
     var active:    [AgentSession] { sessions.filter { $0.status.isActive } }
+    // SUPERSEDED: the app adds retention and launch-scoped collapsing.
     var recent:    [AgentSession] { sessions.filter { !$0.status.needsAttention && !$0.status.isActive } }
 
     var anyActive: Bool { !active.isEmpty }
