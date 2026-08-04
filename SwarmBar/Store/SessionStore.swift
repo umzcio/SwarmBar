@@ -299,7 +299,7 @@ final class SessionStore {
             // is always last and plain approve-once second-from-last, so
             // navigate: clamp to the bottom, step up once, submit.
             guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
+            answerTuiPrompt(session, keys: TuiAnswer.grokApprove)
             return
         }
         if session.tool == .codex {
@@ -307,7 +307,7 @@ final class SessionStore {
             // esc rejects (ExecApproval decision Abort). Semantic keys, not
             // positional, so no arrow navigation needed. The rollout records
             // the outcome as the call's output line.
-            answerTuiPrompt(session, keys: ["y"])
+            answerTuiPrompt(session, keys: TuiAnswer.codexApprove)
             return
         }
         if session.tool == .kimiCode || session.tool == .bearCode {
@@ -333,11 +333,11 @@ final class SessionStore {
             // the bottom and submit; the second newline submits the reject
             // feedback field empty.
             guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
+            answerTuiPrompt(session, keys: TuiAnswer.grokDeny)
             return
         }
         if session.tool == .codex {
-            answerTuiPrompt(session, keys: ["ESC"])
+            answerTuiPrompt(session, keys: TuiAnswer.codexDeny)
             return
         }
         if session.tool == .kimiCode || session.tool == .bearCode {
