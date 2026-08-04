@@ -14,6 +14,9 @@ final class HookServer: ApprovalResponding {
     /// Long on purpose: the popover is a glance-later surface, and once
     /// this expires the prompt can only be answered at the terminal.
     static let decisionHold: Duration = .seconds(345)
+    /// Largest hook payload accepted. Well above any real Claude or OpenCode
+    /// payload, well under the 512 KB read ceiling in `receive`.
+    static let maxBodyBytes = 256 * 1024
 
     private let store: SessionStore
     private var listener: NWListener?
@@ -70,40 +73,59 @@ final class HookServer: ApprovalResponding {
                 var buffer = buffer
                 if let data { buffer.append(data) }
                 if error != nil { connection.cancel(); return }
-                if let request = Self.parseRequest(buffer) {
+                switch Self.parseRequest(buffer) {
+                case .complete(let request):
                     self.route(request, connection: connection)
-                } else if isComplete {
+                case .malformed:
                     connection.cancel()
-                } else if buffer.count > 512 * 1024 {
-                    connection.cancel()
-                } else {
-                    self.receive(connection, buffer: buffer)
+                case .incomplete:
+                    if isComplete || buffer.count > 512 * 1024 {
+                        connection.cancel()
+                    } else {
+                        self.receive(connection, buffer: buffer)
+                    }
                 }
             }
         }
     }
 
-    private struct Request {
+    struct Request {
         var path: String
         var accountLabel: String?
         var body: [String: Any]
     }
 
-    private static func parseRequest(_ data: Data) -> Request? {
-        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+    /// Parsing a request either completes, needs more bytes, or is refused.
+    /// The distinction matters: `incomplete` means keep receiving, `malformed`
+    /// means close the connection rather than route an empty body.
+    enum ParseOutcome {
+        case complete(Request)
+        case incomplete
+        case malformed
+    }
+
+    static func parseRequest(_ data: Data) -> ParseOutcome {
+        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return .incomplete }
         let headerText = String(decoding: data[..<headerEnd.lowerBound], as: UTF8.self)
         let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
+        guard let requestLine = lines.first else { return .malformed }
         let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "POST" else { return nil }
+        guard parts.count >= 2, parts[0] == "POST" else { return .malformed }
 
         var contentLength = 0
         var account: String?
         for line in lines.dropFirst() {
             let lower = line.lowercased()
             if lower.hasPrefix("content-length:") {
-                contentLength = Int(line.dropFirst("content-length:".count)
-                    .trimmingCharacters(in: .whitespaces)) ?? 0
+                let raw = line.dropFirst("content-length:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                // A missing header means an empty body; a present but bogus,
+                // negative, or oversized one is a refusal. Data.prefix traps on
+                // a negative length, so this guard is load bearing.
+                guard let value = Int(raw), value >= 0, value <= Self.maxBodyBytes else {
+                    return .malformed
+                }
+                contentLength = value
             } else if lower.hasPrefix("x-claude-account:") {
                 let value = line.dropFirst("x-claude-account:".count)
                     .trimmingCharacters(in: .whitespaces)
@@ -111,10 +133,13 @@ final class HookServer: ApprovalResponding {
             }
         }
         let bodyData = data[headerEnd.upperBound...]
-        guard bodyData.count >= contentLength else { return nil }
-        let body = (try? JSONSerialization.jsonObject(with: Data(bodyData.prefix(contentLength))))
-            as? [String: Any] ?? [:]
-        return Request(path: String(parts[1]), accountLabel: account, body: body)
+        guard bodyData.count >= contentLength else { return .incomplete }
+        let bodySlice = Data(bodyData.prefix(contentLength))
+        let parsed = (try? JSONSerialization.jsonObject(with: bodySlice)) as? [String: Any]
+        // An empty body is legitimate for some events; a non-empty body that is
+        // not a JSON object is not, and must not be routed as if it were empty.
+        if parsed == nil, !bodySlice.isEmpty { return .malformed }
+        return .complete(Request(path: String(parts[1]), accountLabel: account, body: parsed ?? [:]))
     }
 
     private static func respond(_ connection: NWConnection, json: Data) {

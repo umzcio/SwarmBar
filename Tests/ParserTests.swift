@@ -205,3 +205,77 @@ struct TuiPromptLayoutTests {
         #expect(TuiPromptLayout.reject(in: screen) == nil)
     }
 }
+
+@MainActor
+struct HookRequestParsingTests {
+    private func request(headers: String, body: String) -> Data {
+        Data("POST /hook/PermissionRequest HTTP/1.1\r\n\(headers)\r\n\r\n\(body)".utf8)
+    }
+
+    @Test func parsesAWellFormedRequest() {
+        let body = "{\"session_id\":\"abc\",\"cwd\":\"/tmp\"}"
+        let data = request(headers: "Content-Length: \(body.utf8.count)", body: body)
+        guard case .complete(let parsed) = HookServer.parseRequest(data) else {
+            Issue.record("expected a complete parse"); return
+        }
+        #expect(parsed.path == "/hook/PermissionRequest")
+        #expect(parsed.body["session_id"] as? String == "abc")
+    }
+
+    @Test func refusesNegativeContentLength() {
+        let data = request(headers: "Content-Length: -1", body: "{}")
+        guard case .malformed = HookServer.parseRequest(data) else {
+            Issue.record("expected malformed"); return
+        }
+    }
+
+    @Test func refusesNonNumericContentLength() {
+        let data = request(headers: "Content-Length: banana", body: "{}")
+        guard case .malformed = HookServer.parseRequest(data) else {
+            Issue.record("expected malformed"); return
+        }
+    }
+
+    @Test func refusesOversizedContentLength() {
+        let data = request(headers: "Content-Length: 999999999", body: "{}")
+        guard case .malformed = HookServer.parseRequest(data) else {
+            Issue.record("expected malformed"); return
+        }
+    }
+
+    @Test func refusesABodyThatIsNotJSON() {
+        let body = "not json at all"
+        let data = request(headers: "Content-Length: \(body.utf8.count)", body: body)
+        guard case .malformed = HookServer.parseRequest(data) else {
+            Issue.record("expected malformed"); return
+        }
+    }
+
+    @Test func refusesNonPostVerbs() {
+        let data = Data("GET /hook/Stop HTTP/1.1\r\nContent-Length: 0\r\n\r\n".utf8)
+        guard case .malformed = HookServer.parseRequest(data) else {
+            Issue.record("expected malformed"); return
+        }
+    }
+
+    @Test func waitsForMoreBytesWhenTheBodyIsShort() {
+        let data = request(headers: "Content-Length: 40", body: "{\"a\":1}")
+        guard case .incomplete = HookServer.parseRequest(data) else {
+            Issue.record("expected incomplete"); return
+        }
+    }
+
+    @Test func waitsWhenHeadersAreNotYetTerminated() {
+        guard case .incomplete = HookServer.parseRequest(Data("POST /hook/Stop HTTP/1.1\r\n".utf8)) else {
+            Issue.record("expected incomplete"); return
+        }
+    }
+
+    @Test func allowsAMissingContentLengthAsAnEmptyBody() {
+        let data = Data("POST /hook/Stop HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
+        guard case .complete(let parsed) = HookServer.parseRequest(data) else {
+            Issue.record("expected a complete parse"); return
+        }
+        #expect(parsed.body.isEmpty)
+    }
+}
