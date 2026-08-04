@@ -171,6 +171,48 @@ struct SessionStoreTests {
         #expect(!SessionStatus.idle.isActive)
         #expect(!SessionStatus.done(summary: "x").isActive)
     }
+
+    @Test func iconAnimatesOnlyWhenThereIsSomethingToShow() {
+        let store = SessionStore()
+        #expect(!store.iconNeedsAnimation)
+
+        let working = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .working(activity: "Editing"))
+        store.upsert(working)
+        #expect(store.iconNeedsAnimation)
+
+        store.pauseAll()
+        #expect(!store.iconNeedsAnimation)
+        store.pauseAll()
+        #expect(store.iconNeedsAnimation)
+
+        // A pending approval animates even when paused.
+        store.isPaused = true
+        store.upsert(AgentSession(
+            tool: .claudeCode, projectName: "proj2",
+            status: .waitingApproval(command: "rm -rf /tmp/x")))
+        #expect(store.iconNeedsAnimation)
+    }
+
+    @Test func idleSessionsDoNotAnimate() {
+        let store = SessionStore()
+        store.upsert(AgentSession(
+            tool: .claudeCode, projectName: "proj", status: .idle))
+        store.upsert(AgentSession(
+            tool: .codex, projectName: "proj2", status: .done(summary: "Merged")))
+        #expect(!store.iconNeedsAnimation)
+    }
+
+    @Test func theIconPhaseAdvancesWhileActive() async throws {
+        let store = SessionStore()
+        store.upsert(AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .working(activity: "Editing")))
+        let before = store.iconPhase
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(store.iconPhase > before)
+    }
 }
 
 @MainActor

@@ -18,15 +18,37 @@ final class SessionStore {
     @ObservationIgnored private var iconTicker: Task<Void, Never>?
 
     init() {
-        iconTicker = Task { [weak self] in
-            while !Task.isCancelled {
-                let flashing = (self?.approvalCount ?? 0) > 0
-                try? await Task.sleep(for: .milliseconds(flashing ? 500 : 450))
-                guard let self else { return }
-                if self.approvalCount > 0 || (self.anyActive && !self.isPaused) {
+        // No ticker until something needs to animate; see refreshIconTicker.
+    }
+
+    /// Starts the animation ticker when the glyph has a frame to advance and
+    /// tears it down when it does not, so a resting menu bar app is not
+    /// waking the main actor twice a second forever.
+    private func refreshIconTicker() {
+        if iconNeedsAnimation {
+            guard iconTicker == nil else { return }
+            iconTicker = Task { [weak self] in
+                while !Task.isCancelled {
+                    let flashing = (self?.approvalCount ?? 0) > 0
+                    try? await Task.sleep(for: .milliseconds(flashing ? 500 : 450))
+                    guard let self, !Task.isCancelled else { return }
+                    guard self.iconNeedsAnimation else {
+                        // Clearing the handle here is load bearing. Without it
+                        // the property keeps pointing at a finished Task, and
+                        // the next refreshIconTicker sees a non-nil handle,
+                        // skips starting a ticker, and the icon freezes for
+                        // the life of the process.
+                        self.iconTicker = nil
+                        return
+                    }
                     self.iconPhase &+= 1
                 }
             }
+        } else {
+            iconTicker?.cancel()
+            iconTicker = nil
+            // Leave iconPhase where it is; the label renders solid() when
+            // nothing is animating, so the stale phase is never shown.
         }
     }
 
@@ -89,6 +111,15 @@ final class SessionStore {
         }.count
     }
 
+    /// Whether the menu bar glyph has a frame to advance. Mirrors what
+    /// MenuBarLabel actually renders: the attention flash for pending
+    /// approvals, the fill cycle while agents work and the app is not
+    /// paused, and nothing otherwise.
+    var iconNeedsAnimation: Bool {
+        if approvalCount > 0 { return true }
+        return anyActive && !isPaused
+    }
+
     // Called by monitors.
     func upsert(_ session: AgentSession) {
         if let index = sessions.firstIndex(where: { $0.id == session.id }) {
@@ -100,10 +131,12 @@ final class SessionStore {
             sessions.insert(session, at: 0)
         }
         noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     func remove(id: UUID) {
         sessions.removeAll { $0.id == id }
+        refreshIconTicker()
     }
 
     /// Replaces one tool's sessions with a freshly discovered set: upserts
@@ -143,6 +176,7 @@ final class SessionStore {
         reapplyHookOverrides()
         pruneAlertRecords()
         noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     /// Forgets bookkeeping for sessions the store no longer holds, so a
@@ -258,6 +292,7 @@ final class SessionStore {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[index])
         noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     // MARK: - Attention notifications
@@ -408,6 +443,7 @@ final class SessionStore {
 
     func pauseAll() {
         isPaused.toggle()
+        refreshIconTicker()
     }
 }
 
