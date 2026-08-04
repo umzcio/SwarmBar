@@ -79,6 +79,53 @@ enum TerminalFocuser {
         return (text?.isEmpty ?? true) ? nil : text
     }
 
+    enum AnswerOutcome: Equatable {
+        /// The digit was written to a selector that still showed the expected
+        /// label at that number.
+        case sent
+        /// The screen changed between reading and writing, so nothing was sent.
+        case promptChanged
+        /// No live tty, or iTerm2 is not running.
+        case noTerminal
+    }
+
+    /// Presses `number` only if line `number` on screen still contains
+    /// `expectedLabel`. Read and write happen in one script so the prompt
+    /// cannot advance in between: two round trips left a window in which a
+    /// digit could land in a different selector.
+    nonisolated static func answerNumbered(
+        sessionID: UUID, projectPath: URL?, number: Int, expectedLabel: String
+    ) -> AnswerOutcome {
+        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+              isRunning("iTerm2") else { return .noTerminal }
+        let needle = expectedLabel.replacingOccurrences(of: "\"", with: "")
+        let script = """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "/dev/\(tty)" then
+                  set screenText to (text of s)
+                  if screenText contains "\(needle)" then
+                    tell s to write text "\(number)" newline NO
+                    return "SENT"
+                  else
+                    return "CHANGED"
+                  end if
+                end if
+              end repeat
+            end repeat
+          end repeat
+          return "MISS"
+        end tell
+        """
+        switch runScript(script) {
+        case "SENT":    return .sent
+        case "CHANGED": return .promptChanged
+        default:        return .noTerminal
+        }
+    }
+
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
