@@ -15,6 +15,13 @@ enum IntegrationTransformError: Error, LocalizedError {
     }
 }
 
+/// Wraps a path in single quotes so a shell runs it as one word even when it
+/// contains spaces. Embedded single quotes are closed, escaped, and reopened,
+/// which is the only sequence a POSIX shell accepts inside single quotes.
+func shellQuoted(_ path: String) -> String {
+    "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
 /// ~/.claude/settings.json: hook entries under hooks.<Event> arrays.
 enum ClaudeHookTransform {
     static let events: [(name: String, timeout: Int)] = [
@@ -36,7 +43,7 @@ enum ClaudeHookTransform {
             entries.append([
                 "hooks": [[
                     "type": "command",
-                    "command": "bash \(scriptPath) \(event)",
+                    "command": "bash \(shellQuoted(scriptPath)) \(event)",
                     "timeout": timeout,
                 ]],
             ])
@@ -104,7 +111,7 @@ enum TomlHooksTransform {
             block.append("")
             block.append("[[hooks]]")
             block.append("event = \"\(event)\"")
-            block.append("command = \"\(scriptPath) \(event)\"")
+            block.append("command = \"\(shellQuoted(scriptPath)) \(event)\"")
             if let timeout { block.append("timeout = \(timeout)") }
         }
         block.append(endMarker)
