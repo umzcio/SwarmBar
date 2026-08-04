@@ -15,6 +15,12 @@ struct SettingsView: View {
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
         }
         .frame(width: 440)
+        .background(
+            // Esc closes the window, as it should for a utility panel.
+            Button("") { NSApp.keyWindow?.close() }
+                .keyboardShortcut(.cancelAction)
+                .hidden()
+        )
     }
 }
 
