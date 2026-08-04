@@ -99,6 +99,7 @@ final class SessionStore {
         } else {
             sessions.insert(session, at: 0)
         }
+        noteAttentionTransitions()
     }
 
     func remove(id: UUID) {
@@ -128,6 +129,7 @@ final class SessionStore {
             }
         }
         reapplyHookOverrides()
+        noteAttentionTransitions()
     }
 
     // MARK: - Hook events
@@ -213,6 +215,27 @@ final class SessionStore {
     func update(id: UUID, _ mutate: (inout AgentSession) -> Void) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[index])
+        noteAttentionTransitions()
+    }
+
+    // MARK: - Attention notifications
+
+    /// Called once per session per entry into a needs-attention status;
+    /// the app wires this to AgentNotifier, tests to a collector.
+    @ObservationIgnored var attentionAlertHandler: ((AgentSession) -> Void)?
+    @ObservationIgnored private var alertedKeys: Set<String> = []
+
+    private func noteAttentionTransitions() {
+        var current: Set<String> = []
+        for session in sessions where session.status.needsAttention {
+            let key = "\(session.id)|\(session.status.label)"
+            current.insert(key)
+            if !alertedKeys.contains(key) {
+                alertedKeys.insert(key)
+                attentionAlertHandler?(session)
+            }
+        }
+        alertedKeys.formIntersection(current)
     }
 
     // Called by row buttons. Mock sessions (no projectPath) transition state

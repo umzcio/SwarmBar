@@ -1,85 +1,95 @@
+import ServiceManagement
 import SwiftUI
 
-/// The integrations panel. Two honest groups: bridges that install into a
-/// tool's config, and capabilities that are built in. The switch carries
-/// the state; the detail line says what the channel is, because a row
-/// that needs its status written twice is a row that says nothing.
+/// Settings in the System Settings idiom: toolbar tabs for General
+/// (behavior), Providers (per-tool approval wiring), and Notifications
+/// (alerts when an agent needs you).
 struct SettingsView: View {
+    var body: some View {
+        TabView {
+            GeneralSettingsTab()
+                .tabItem { Label("General", systemImage: "gearshape") }
+            ProvidersSettingsTab()
+                .tabItem { Label("Providers", systemImage: "circle.hexagongrid") }
+            NotificationSettingsTab()
+                .tabItem { Label("Notifications", systemImage: "bell.badge") }
+        }
+        .frame(width: 440)
+    }
+}
+
+// MARK: - General
+
+struct GeneralSettingsTab: View {
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @AppStorage("compactRows") private var compactRows = false
+
+    var body: some View {
+        SettingsCardList {
+            SettingsCard {
+                SettingsToggleRow(
+                    symbol: "power",
+                    title: "Launch at login",
+                    detail: "Start SwarmBar when you sign in",
+                    isOn: $launchAtLogin
+                )
+                .onChange(of: launchAtLogin) { _, enable in
+                    do {
+                        if enable {
+                            try SMAppService.mainApp.register()
+                        } else {
+                            try SMAppService.mainApp.unregister()
+                        }
+                    } catch {
+                        launchAtLogin = SMAppService.mainApp.status == .enabled
+                    }
+                }
+                SettingsDivider()
+                SettingsToggleRow(
+                    symbol: "rectangle.compress.vertical",
+                    title: "Compact rows",
+                    detail: "Single-line sessions in the popover",
+                    isOn: $compactRows
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Providers
+
+struct ProvidersSettingsTab: View {
     @State private var manager = IntegrationManager()
 
     private static let bridgeTools: [AgentTool] = [.claudeCode, .kimiCode, .bearCode, .openCode]
     private static let builtInTools: [AgentTool] = [.codex, .grokBuild]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-                .padding(.horizontal, 20)
-                .padding(.top, 16)
-                .padding(.bottom, 14)
+        SettingsCardList {
+            SettingsGroupLabel("Approval bridges")
+            SettingsCard {
+                ForEach(Array(Self.bridgeTools.enumerated()), id: \.element) { index, tool in
+                    if index > 0 { SettingsDivider() }
+                    IntegrationRow(tool: tool, manager: manager)
+                }
+            }
 
-            groupLabel("Approval bridges")
-            card(tools: Self.bridgeTools)
-
-            groupLabel("Built in")
-                .padding(.top, 14)
-            card(tools: Self.builtInTools)
+            SettingsGroupLabel("Built in")
+                .padding(.top, 12)
+            SettingsCard {
+                ForEach(Array(Self.builtInTools.enumerated()), id: \.element) { index, tool in
+                    if index > 0 { SettingsDivider() }
+                    IntegrationRow(tool: tool, manager: manager)
+                }
+            }
 
             Text("Configs are backed up beside the original before the first change.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
-                .padding(.horizontal, 20)
-                .padding(.top, 12)
-                .padding(.bottom, 16)
+                .padding(.horizontal, 6)
+                .padding(.top, 10)
         }
-        .frame(width: 440)
         .onAppear { manager.refresh() }
-    }
-
-    private var header: some View {
-        HStack(spacing: 11) {
-            Image(nsImage: SwarmGlyphRenderer.solid())
-                .renderingMode(.template)
-                .resizable()
-                .frame(width: 26, height: 26)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("SwarmBar")
-                    .font(.system(size: 15, weight: .bold))
-                    .kerning(-0.2)
-                Text("Approve and deny from the menu bar. Monitoring needs no setup.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private func groupLabel(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.caption.weight(.bold))
-            .kerning(0.7)
-            .foregroundStyle(.tertiary)
-            .padding(.horizontal, 22)
-            .padding(.bottom, 6)
-    }
-
-    private func card(tools: [AgentTool]) -> some View {
-        VStack(spacing: 0) {
-            ForEach(Array(tools.enumerated()), id: \.element) { index, tool in
-                if index > 0 {
-                    Divider()
-                        .overlay(.white.opacity(0.06))
-                        .padding(.leading, 54)
-                }
-                IntegrationRow(tool: tool, manager: manager)
-            }
-        }
-        .background(.white.opacity(0.045), in: .rect(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(.white.opacity(0.07), lineWidth: 1)
-        )
-        .padding(.horizontal, 16)
     }
 }
 
@@ -160,5 +170,130 @@ private struct IntegrationRow: View {
     private func detailStyle(_ state: IntegrationManager.InstallState) -> AnyShapeStyle {
         if case .failed = state { return AnyShapeStyle(.orange) }
         return AnyShapeStyle(.secondary)
+    }
+}
+
+// MARK: - Notifications
+
+struct NotificationSettingsTab: View {
+    @AppStorage("notifyApprovals") private var notifyApprovals = true
+    @AppStorage("notifyWaiting") private var notifyWaiting = false
+    @AppStorage("notifySound") private var notifySound = true
+
+    var body: some View {
+        SettingsCardList {
+            SettingsCard {
+                SettingsToggleRow(
+                    symbol: "exclamationmark.circle",
+                    symbolTint: .orange,
+                    title: "Approval requests",
+                    detail: "Notify when an agent asks permission",
+                    isOn: $notifyApprovals
+                )
+                SettingsDivider()
+                SettingsToggleRow(
+                    symbol: "bubble.left",
+                    symbolTint: .blue,
+                    title: "Waiting on you",
+                    detail: "Notify when an agent asks a question",
+                    isOn: $notifyWaiting
+                )
+                SettingsDivider()
+                SettingsToggleRow(
+                    symbol: "speaker.wave.2",
+                    title: "Sound",
+                    detail: "Play the alert sound with notifications",
+                    isOn: $notifySound
+                )
+            }
+
+            Text("A session posts once when it starts needing you, not on every poll.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 6)
+                .padding(.top, 10)
+        }
+    }
+}
+
+// MARK: - Shared pieces
+
+private struct SettingsCardList<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            content
+        }
+        .padding(16)
+        .frame(width: 440, alignment: .leading)
+    }
+}
+
+private struct SettingsCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .background(.white.opacity(0.045), in: .rect(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(.white.opacity(0.07), lineWidth: 1)
+            )
+    }
+}
+
+private struct SettingsGroupLabel: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title.uppercased())
+            .font(.caption.weight(.bold))
+            .kerning(0.7)
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 6)
+            .padding(.bottom, 6)
+    }
+}
+
+private struct SettingsDivider: View {
+    var body: some View {
+        Divider()
+            .overlay(.white.opacity(0.06))
+            .padding(.leading, 54)
+    }
+}
+
+private struct SettingsToggleRow: View {
+    let symbol: String
+    var symbolTint: Color = .secondary
+    let title: String
+    let detail: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(spacing: 11) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(symbolTint)
+                .frame(width: 28, height: 28)
+                .background(.white.opacity(0.06), in: .rect(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Toggle("", isOn: $isOn)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .tint(.orange)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
     }
 }

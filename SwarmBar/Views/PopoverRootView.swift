@@ -148,7 +148,6 @@ struct SummaryLine: View {
 }
 
 struct PopoverFooter: View {
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -157,29 +156,12 @@ struct PopoverFooter: View {
                 openSettings()
                 NSApp.activate()
             } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12, weight: .medium))
+                Label("Settings", systemImage: "gearshape")
+                    .labelStyle(.titleAndIcon)
+                    .font(.callout)
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
-            .help("Settings")
-
-            Toggle("Launch at login", isOn: $launchAtLogin)
-                .toggleStyle(.checkbox)
-                .controlSize(.small)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .onChange(of: launchAtLogin) { _, enable in
-                    do {
-                        if enable {
-                            try SMAppService.mainApp.register()
-                        } else {
-                            try SMAppService.mainApp.unregister()
-                        }
-                    } catch {
-                        launchAtLogin = SMAppService.mainApp.status == .enabled
-                    }
-                }
             Spacer()
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.borderless)
