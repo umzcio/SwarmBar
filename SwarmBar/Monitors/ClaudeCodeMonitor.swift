@@ -8,6 +8,10 @@ import Foundation
 struct ClaudeCodeMonitor: SessionMonitor {
     nonisolated static let discoveryWindow: TimeInterval = 8 * 60 * 60
     nonisolated static let tailBytes = 64 * 1024
+    /// Ceiling for the growing tail read. A single record larger than this is
+    /// pathological; giving up keeps a runaway file from being read whole on
+    /// every poll.
+    nonisolated static let maxTailBytes = 4 * 1024 * 1024
 
     func start(into store: SessionStore) async {
         while !Task.isCancelled {
@@ -75,18 +79,36 @@ struct ClaudeCodeMonitor: SessionMonitor {
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 
+    /// The trailing complete lines of a JSONL file. Starts at `tailBytes` and
+    /// doubles until the window holds at least one full record, because a
+    /// single record larger than the window would otherwise yield only a
+    /// fragment and drop the session from discovery entirely. Reading from
+    /// offset 0 always counts as complete.
     nonisolated static func tail(of file: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd() else { return nil }
-        let offset = size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0
-        try? handle.seek(toOffset: offset)
-        guard let data = try? handle.readToEnd() else { return nil }
-        var text = String(decoding: data, as: UTF8.self)
-        // A mid-file seek can land mid-line; drop the partial first line.
-        if offset > 0, let newline = text.firstIndex(of: "\n") {
-            text = String(text[text.index(after: newline)...])
+
+        var window = UInt64(tailBytes)
+        while true {
+            let offset = size > window ? size - window : 0
+            try? handle.seek(toOffset: offset)
+            guard let data = try? handle.readToEnd() else { return nil }
+            let text = String(decoding: data, as: UTF8.self)
+            if offset == 0 { return text }
+            // The window's first newline marks the end of the partial first
+            // line, unless it is the file's own trailing newline, in which
+            // case the whole window is occupied by one oversized record with
+            // nothing complete after it, so this window doesn't hold a full
+            // record yet and needs to grow.
+            if let newline = text.firstIndex(of: "\n") {
+                let remainder = text[text.index(after: newline)...]
+                if !remainder.isEmpty {
+                    return String(remainder)
+                }
+            }
+            if window >= UInt64(maxTailBytes) { return nil }
+            window = min(window * 2, UInt64(maxTailBytes))
         }
-        return text
     }
 }

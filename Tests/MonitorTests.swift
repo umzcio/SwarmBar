@@ -397,3 +397,63 @@ struct GrokPermissionDetectionTests {
         #expect(GrokUpdatesParser.pendingToolCommand(tail: tail) == "rm -rf build/")
     }
 }
+
+@MainActor
+struct TailWindowTests {
+    private func writeFile(_ lines: [String]) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("session.jsonl")
+        try lines.joined(separator: "\n").appending("\n").write(
+            to: file, atomically: true, encoding: .utf8)
+        return file
+    }
+
+    @Test func readsSmallFilesWhole() throws {
+        let file = try writeFile(["{\"a\":1}", "{\"a\":2}"])
+        let tail = ClaudeCodeMonitor.tail(of: file)
+        #expect(tail?.contains("{\"a\":1}") == true)
+        #expect(tail?.contains("{\"a\":2}") == true)
+    }
+
+    @Test func dropsThePartialFirstLineOnALargeFile() throws {
+        let filler = String(repeating: "x", count: 2000)
+        let lines = (0..<100).map { "{\"n\":\($0),\"pad\":\"\(filler)\"}" }
+        let file = try writeFile(lines)
+        guard let tail = ClaudeCodeMonitor.tail(of: file) else {
+            Issue.record("no tail")
+            return
+        }
+        // Every retained line is a complete record.
+        for line in tail.split(separator: "\n") {
+            #expect(line.hasPrefix("{"))
+            #expect(line.hasSuffix("}"))
+        }
+    }
+
+    @Test func growsTheWindowForARecordLargerThanTheDefault() throws {
+        // One record well over the 64 KB default window, as the last line.
+        let huge = String(repeating: "y", count: 200 * 1024)
+        let file = try writeFile(["{\"n\":1}", "{\"big\":\"\(huge)\"}"])
+        guard let tail = ClaudeCodeMonitor.tail(of: file) else {
+            Issue.record("no tail")
+            return
+        }
+        #expect(tail.contains("\"big\""))
+        // The record is whole, not a fragment.
+        #expect(tail.contains("{\"big\""))
+    }
+
+    @Test func aParserCanStillReadTheGrownTail() throws {
+        let huge = String(repeating: "z", count: 100 * 1024)
+        let file = try writeFile([
+            "{\"type\":\"user\",\"pad\":\"\(huge)\"}",
+        ])
+        guard let tail = ClaudeCodeMonitor.tail(of: file) else {
+            Issue.record("no tail")
+            return
+        }
+        #expect(!tail.isEmpty)
+    }
+}
