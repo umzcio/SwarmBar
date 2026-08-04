@@ -29,9 +29,40 @@ struct SettingsView: View {
 struct GeneralSettingsTab: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @AppStorage("compactRows") private var compactRows = false
+    @State private var updates = UpdateChecker()
 
     var body: some View {
         SettingsCardList {
+            SettingsCard {
+                HStack(spacing: 11) {
+                    Image(nsImage: SwarmGlyphRenderer.solid())
+                        .renderingMode(.template)
+                        .resizable()
+                        .frame(width: 26, height: 26)
+                        .foregroundStyle(.secondary)
+                        .padding(1)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SwarmBar")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(versionLine)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(versionStyle)
+                    }
+                    Spacer(minLength: 12)
+                    if case .available(_, let url) = updates.status {
+                        Button("View release") { NSWorkspace.shared.open(url) }
+                            .controlSize(.small)
+                    } else {
+                        Button("Check for updates") { updates.check() }
+                            .controlSize(.small)
+                            .disabled(updates.status == .checking)
+                    }
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 11)
+            }
+            .padding(.bottom, 12)
+
             SettingsCard {
                 SettingsToggleRow(
                     symbol: "power",
@@ -59,6 +90,22 @@ struct GeneralSettingsTab: View {
                 )
             }
         }
+    }
+
+    private var versionLine: String {
+        let base = "Version \(UpdateChecker.currentVersion) (\(UpdateChecker.currentBuild))"
+        switch updates.status {
+        case .idle:                     return base
+        case .checking:                 return "Checking for updates…"
+        case .upToDate:                 return "\(base) · Up to date"
+        case .available(let v, _):      return "\(base) · \(v) available"
+        case .failed(let message):      return "\(base) · \(message)"
+        }
+    }
+
+    private var versionStyle: AnyShapeStyle {
+        if case .available = updates.status { return AnyShapeStyle(.orange) }
+        return AnyShapeStyle(.secondary)
     }
 }
 
