@@ -123,13 +123,35 @@ final class SessionStore {
         for (id, ackTime) in acknowledgedAt {
             guard let session = sessions.first(where: { $0.id == id }) else { continue }
             if session.lastActivityAt > ackTime {
+                // The dismissal is over: genuinely new activity. Re-arm the
+                // alert so the next question is announced.
                 acknowledgedAt.removeValue(forKey: id)
+                alertedStatus.removeValue(forKey: id)
             } else if case .waitingInput(let prompt) = session.status {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
         reapplyHookOverrides()
+        pruneAlertRecords()
         noteAttentionTransitions()
+    }
+
+    /// Drops alert records for sessions that are settled: no longer needing
+    /// attention after this cycle's overrides are applied, or gone entirely.
+    /// Doing this once per sync (rather than inside every mutation) is what
+    /// keeps a mid-sync status flicker from re-arming the alert.
+    ///
+    /// Dismissed sessions keep their record even though `acknowledgedAt`
+    /// forces them to done. The poller re-derives the waiting verdict from
+    /// the unchanged transcript every cycle, so pruning them here would let
+    /// the next poll read as a fresh transition and alert again.
+    private func pruneAlertRecords() {
+        let stillWaiting = Set(
+            sessions.filter { $0.status.needsAttention }.map(\.id)
+        )
+        alertedStatus = alertedStatus.filter {
+            stillWaiting.contains($0.key) || acknowledgedAt[$0.key] != nil
+        }
     }
 
     // MARK: - Hook events
@@ -223,19 +245,20 @@ final class SessionStore {
     /// Called once per session per entry into a needs-attention status;
     /// the app wires this to AgentNotifier, tests to a collector.
     @ObservationIgnored var attentionAlertHandler: ((AgentSession) -> Void)?
-    @ObservationIgnored private var alertedKeys: Set<String> = []
+
+    /// The attention status each session was last alerted for. Keyed by
+    /// session so a status that flickers mid-sync (the poller overwrites a
+    /// held approval before reapplyHookOverrides restores it) cannot look
+    /// like a fresh transition on the next pass.
+    @ObservationIgnored private var alertedStatus: [UUID: String] = [:]
 
     private func noteAttentionTransitions() {
-        var current: Set<String> = []
         for session in sessions where session.status.needsAttention {
-            let key = "\(session.id)|\(session.status.label)"
-            current.insert(key)
-            if !alertedKeys.contains(key) {
-                alertedKeys.insert(key)
-                attentionAlertHandler?(session)
-            }
+            let label = session.status.label
+            guard alertedStatus[session.id] != label else { continue }
+            alertedStatus[session.id] = label
+            attentionAlertHandler?(session)
         }
-        alertedKeys.formIntersection(current)
     }
 
     // Called by row buttons. Mock sessions (no projectPath) transition state

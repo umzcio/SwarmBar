@@ -130,3 +130,80 @@ struct SessionStoreTests {
         #expect(!SessionStatus.done(summary: "x").isActive)
     }
 }
+
+@MainActor
+struct AttentionAlertTests {
+    private func approval(_ command: String) -> AgentSession {
+        AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .waitingApproval(command: command))
+    }
+
+    @Test func alertsOnceWhileAnApprovalStaysPending() {
+        let store = SessionStore()
+        var alerts: [AgentSession] = []
+        store.attentionAlertHandler = { alerts.append($0) }
+
+        let pending = approval("git push origin main")
+        store.applyHookEvent(
+            sessionID: pending.id, tool: .claudeCode,
+            status: .waitingApproval(command: "git push origin main"),
+            sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+        #expect(alerts.count == 1)
+
+        // Three polls where the transcript still reads as a running tool.
+        var polled = pending
+        polled.status = .runningTool(activity: "Running git")
+        for _ in 0..<3 {
+            store.sync(tool: .claudeCode, sessions: [polled])
+        }
+        #expect(alerts.count == 1)
+    }
+
+    @Test func alertsAgainAfterTheApprovalResolves() {
+        let store = SessionStore()
+        var alerts: [AgentSession] = []
+        store.attentionAlertHandler = { alerts.append($0) }
+
+        let s = approval("rm -rf /tmp/x")
+        store.applyHookEvent(
+            sessionID: s.id, tool: .claudeCode,
+            status: .waitingApproval(command: "rm -rf /tmp/x"),
+            sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+        #expect(alerts.count == 1)
+
+        // Resolved: the override clears and a poll shows it working.
+        store.clearHookOverride(sessionID: s.id)
+        var working = s
+        working.status = .working(activity: "Working…")
+        store.sync(tool: .claudeCode, sessions: [working])
+        #expect(alerts.count == 1)
+
+        // A second, later approval on the same session alerts again.
+        store.applyHookEvent(
+            sessionID: s.id, tool: .claudeCode,
+            status: .waitingApproval(command: "curl example.com"),
+            sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+        #expect(alerts.count == 2)
+    }
+
+    @Test func doesNotRealertADismissedWaitingRow() {
+        let store = SessionStore()
+        var alerts: [AgentSession] = []
+        store.attentionAlertHandler = { alerts.append($0) }
+
+        var s = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .waitingInput(prompt: "Which one?"),
+            lastActivityAt: .now)
+        store.upsert(s)
+        #expect(alerts.count == 1)
+
+        store.acknowledge(store.sessions[0])
+        // The unchanged transcript keeps re-deriving the waiting verdict.
+        s.status = .waitingInput(prompt: "Which one?")
+        for _ in 0..<3 { store.sync(tool: .claudeCode, sessions: [s]) }
+        #expect(alerts.count == 1)
+    }
+}
