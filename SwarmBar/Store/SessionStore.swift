@@ -232,6 +232,7 @@ final class SessionStore {
             // (3-option shell prompts, 4-option edit prompts), but reject
             // is always last and plain approve-once second-from-last, so
             // navigate: clamp to the bottom, step up once, submit.
+            guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
             answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
             return
         }
@@ -265,6 +266,7 @@ final class SessionStore {
             // Reject is the last option in every observed layout: clamp to
             // the bottom and submit; the second newline submits the reject
             // feedback field empty.
+            guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
             answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
             return
         }
@@ -284,6 +286,12 @@ final class SessionStore {
     /// and presses that number. Falls back to focusing the terminal when
     /// the screen can't be read or no matching option is on it, so a
     /// misread never sends a keystroke to an unknown selector.
+    /// The settings toggle for Grok's remote answers; off means Approve
+    /// and Deny just focus the terminal.
+    static var grokKeystrokesEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "grokKeystrokeAnswers") as? Bool) ?? true
+    }
+
     private func answerNumberedPrompt(
         _ session: AgentSession,
         choose: @escaping @Sendable (String) -> Int?

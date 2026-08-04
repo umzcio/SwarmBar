@@ -149,9 +149,21 @@ struct SummaryLine: View {
 
 struct PopoverFooter: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         HStack {
+            Button {
+                openSettings()
+                NSApp.activate()
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Settings")
+
             Toggle("Launch at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
                 .controlSize(.small)

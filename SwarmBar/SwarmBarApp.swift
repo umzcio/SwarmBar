@@ -35,5 +35,9 @@ struct SwarmBarApp: App {
                 .environment(store)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView()
+        }
     }
 }

@@ -18,6 +18,10 @@ targets:
           - Resources
       - path: SwarmBar/Resources
         buildPhase: resources
+      - path: scripts
+        buildPhase: resources
+        excludes:
+          - swarmbar-kimi-sample.sh
     info:
       path: SwarmBar/Info.plist
       properties:
