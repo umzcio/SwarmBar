@@ -42,24 +42,37 @@ struct ClaudeCodeMonitor: SessionMonitor {
         return roots
     }
 
+    /// Caches only the raw tail text, never the parsed status: parse takes
+    /// `now` and can downgrade a status to idle once it goes stale, so a
+    /// cached parse would freeze that time-dependent verdict and the row
+    /// would stop updating even though the file itself is fine. Re-parsing
+    /// a cached tail is cheap; re-reading the file is the expensive part.
+    private nonisolated static let tailCache = TailCache<String>()
+
     nonisolated static func discover(now: Date) -> [AgentSession] {
         let fm = FileManager.default
         var sessions: [AgentSession] = []
+        var seenPaths = Set<String>()
+        let livePids = TerminalFocuser.claudePidsBySession()
         for root in roots() {
             let projectDirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
             for projectDir in projectDirs {
                 let files = (try? fm.contentsOfDirectory(
                     at: projectDir,
-                    includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey]
+                    includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
                 )) ?? []
                 for file in files where file.pathExtension == "jsonl" {
                     guard let values = try? file.resourceValues(
-                            forKeys: [.contentModificationDateKey, .creationDateKey]),
+                            forKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]),
                           let mtime = values.contentModificationDate,
                           now.timeIntervalSince(mtime) < discoveryWindow,
-                          let id = UUID(uuidString: file.deletingPathExtension().lastPathComponent),
-                          let tail = tail(of: file),
-                          let parsed = ClaudeSessionParser.parse(tail: tail, now: now)
+                          let id = UUID(uuidString: file.deletingPathExtension().lastPathComponent)
+                    else { continue }
+                    seenPaths.insert(file.path)
+                    guard let cachedTail = tailCache.value(
+                            for: file, size: values.fileSize ?? 0, modified: mtime,
+                            compute: { tail(of: file) }),
+                          let parsed = ClaudeSessionParser.parse(tail: cachedTail, now: now)
                     else { continue }
                     let cwd = parsed.cwd ?? ClaudeSessionParser.decodeProjectDir(projectDir.lastPathComponent)
                     let projectPath = cwd.map { URL(fileURLWithPath: $0) }
@@ -71,11 +84,12 @@ struct ClaudeCodeMonitor: SessionMonitor {
                         status: parsed.status,
                         startedAt: values.creationDate ?? mtime,
                         lastActivityAt: mtime,
-                        processAlive: TerminalFocuser.claudePid(forSession: id) != nil
+                        processAlive: livePids[id.uuidString.lowercased()] != nil
                     ))
                 }
             }
         }
+        tailCache.retain(paths: seenPaths)
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 

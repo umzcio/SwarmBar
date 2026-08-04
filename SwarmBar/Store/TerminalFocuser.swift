@@ -155,6 +155,70 @@ enum TerminalFocuser {
         return nil
     }
 
+    /// sessionId to pid for every live Claude session record, read once.
+    /// Discovery calls this instead of `claudePid(forSession:)` per
+    /// session: same walk and re-parse cost, paid once per poll instead of
+    /// once per session per poll. `claudePid(forSession:)` stays for the
+    /// answer path (TerminalFocuser.tty), where a single lookup is fine.
+    nonisolated static func claudePidsBySession() -> [String: Int] {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        var result: [String: Int] = [:]
+        let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
+        for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
+            let sessionsDir = entry.appendingPathComponent("sessions")
+            let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
+            for record in records where record.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: record),
+                      let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      let sessionId = (json["sessionId"] as? String)?.lowercased(),
+                      let pid = json["pid"] as? Int,
+                      kill(pid_t(pid), 0) == 0
+                else { continue }
+                result[sessionId] = pid
+            }
+        }
+        return result
+    }
+
+    /// pid for every codex rollout file currently held open, in one sweep.
+    /// The per session version (`codexPid(forSession:)`) walks the whole
+    /// sessions tree and spawns lsof each time; discovery called it once
+    /// per session per poll.
+    ///
+    /// This does not filter lsof by process name (`-c codex`): there was
+    /// no live Codex process available to confirm that filter matches the
+    /// real process name, so this takes the slower but verifiably correct
+    /// path the plan describes as the fallback: an unfiltered system-wide
+    /// lsof, with results narrowed by the `~/.codex/sessions` path prefix
+    /// instead of by process name.
+    nonisolated static func codexPidsBySessionSuffix() -> [String: Int] {
+        let sessionsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions").path
+        guard let output = run("/usr/sbin/lsof", ["-F", "pn"]) else { return [:] }
+        var result: [String: Int] = [:]
+        var currentPid: Int?
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("p") {
+                currentPid = Int(line.dropFirst())
+            } else if line.hasPrefix("n"), let pid = currentPid {
+                let path = String(line.dropFirst())
+                guard path.hasPrefix(sessionsRoot),
+                      path.hasSuffix(".jsonl"),
+                      let name = path.split(separator: "/").last,
+                      name.hasPrefix("rollout-"), name.count >= 42
+                else { continue }
+                // <36-char-uuid>.jsonl is 42 characters; this must match
+                // the "\(id.uuidString.lowercased()).jsonl" lookup key
+                // exactly, or every lookup misses and every Codex session
+                // reads as dead.
+                let suffix = String(name.suffix(42))
+                result[suffix.lowercased()] = pid
+            }
+        }
+        return result
+    }
+
     // MARK: - tty -> terminal tab
 
     private nonisolated static func focusRunningTerminal(device: String) -> Bool {
