@@ -25,6 +25,12 @@ enum TerminalFocuser {
     nonisolated static func sendKeys(sessionID: UUID, projectPath: URL? = nil, keys: [String]) -> Bool {
         guard let tty = tty(forSession: sessionID, projectPath: projectPath),
               isRunning("iTerm2") else { return false }
+        return runScript(keyScript(tty: tty, keys: keys)) == "SENT"
+    }
+
+    /// The iTerm2 script that writes `keys` to the session on `tty`. Pure, so
+    /// the emitted script can be asserted without driving a terminal.
+    nonisolated static func keyScript(tty: String, keys: [String]) -> String {
         let writes = keys.map { key in
             switch key {
             case "\n":   "tell s to write text \"\""
@@ -34,7 +40,7 @@ enum TerminalFocuser {
             default:     "tell s to write text \"\(key)\" newline NO"
             }
         }.joined(separator: "\n          delay 0.08\n          ")
-        let script = """
+        return """
         tell application "iTerm2"
           repeat with w in windows
             repeat with t in tabs of w
@@ -49,7 +55,6 @@ enum TerminalFocuser {
           return "MISS"
         end tell
         """
-        return runScript(script) == "SENT"
     }
 
     /// The visible screen text of the session's terminal (iTerm2 only).
