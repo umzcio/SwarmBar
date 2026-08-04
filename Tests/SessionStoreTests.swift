@@ -73,6 +73,48 @@ struct SessionStoreTests {
         #expect(store.sessions.first?.status == .idle)
     }
 
+    @Test func resumedSessionsRecoverFromEnded() {
+        let store = SessionStore()
+        let s = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .waitingInput(prompt: "still there?"),
+            lastActivityAt: .now.addingTimeInterval(-60))
+        store.upsert(s)
+        store.markSessionEnded(s.id)
+        #expect(store.sessions.first?.status == .idle)
+
+        // Resumed: same id, activity strictly newer than the exit.
+        var resumed = s
+        resumed.status = .working(activity: "Working…")
+        resumed.lastActivityAt = .now.addingTimeInterval(60)
+        store.sync(tool: .claudeCode, sessions: [resumed])
+        #expect(store.sessions.first?.status == .working(activity: "Working…"))
+
+        // And it stays recovered on subsequent polls.
+        store.sync(tool: .claudeCode, sessions: [resumed])
+        #expect(store.sessions.first?.status == .working(activity: "Working…"))
+    }
+
+    @Test func endedRecordsAreDroppedWhenTheSessionDisappears() {
+        let store = SessionStore()
+        let s = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .waitingInput(prompt: "?"), lastActivityAt: .now)
+        store.upsert(s)
+        store.markSessionEnded(s.id)
+
+        // The session ages out of discovery entirely.
+        store.sync(tool: .claudeCode, sessions: [])
+        #expect(store.sessions.isEmpty)
+
+        // A brand new session reusing that id is not born idle.
+        var reborn = s
+        reborn.status = .working(activity: "Working…")
+        reborn.lastActivityAt = .now
+        store.sync(tool: .claudeCode, sessions: [reborn])
+        #expect(store.sessions.first?.status == .working(activity: "Working…"))
+    }
+
     @Test func recentDropsSessionsPastRetention() {
         let store = SessionStore()
         let fresh = session(.idle)

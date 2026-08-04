@@ -117,8 +117,16 @@ final class SessionStore {
         sessions.removeAll {
             $0.tool == tool && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
         }
-        for id in incomingIds where endedSessions.contains(id) {
-            update(id: id) { $0.status = .idle }
+        for id in incomingIds {
+            guard let endedAt = endedSessions[id] else { continue }
+            if let session = sessions.first(where: { $0.id == id }),
+               session.lastActivityAt > endedAt {
+                // Genuinely new activity after the exit: the session was
+                // resumed and owns its status again.
+                endedSessions.removeValue(forKey: id)
+            } else {
+                update(id: id) { $0.status = .idle }
+            }
         }
         for (id, ackTime) in acknowledgedAt {
             guard let session = sessions.first(where: { $0.id == id }) else { continue }
@@ -131,9 +139,19 @@ final class SessionStore {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
+        pruneSessionRecords()
         reapplyHookOverrides()
         pruneAlertRecords()
         noteAttentionTransitions()
+    }
+
+    /// Forgets bookkeeping for sessions the store no longer holds, so a
+    /// long-running app does not accumulate entries for sessions that aged
+    /// out of discovery.
+    private func pruneSessionRecords() {
+        let known = Set(sessions.map(\.id))
+        endedSessions = endedSessions.filter { known.contains($0.key) }
+        acknowledgedAt = acknowledgedAt.filter { known.contains($0.key) }
     }
 
     /// Drops alert records for sessions that are settled: no longer needing
@@ -168,13 +186,15 @@ final class SessionStore {
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
     /// Sessions whose tool reported the session over (Claude and Grok's
-    /// SessionEnd hook fires on /exit). The transcript keeps looking
-    /// fresh for a while, so without this an exited session reads as
-    /// waiting until the stale window catches up.
-    @ObservationIgnored private var endedSessions: Set<UUID> = []
+    /// SessionEnd hook fires on /exit), and when. The transcript keeps
+    /// looking fresh for a while, so without this an exited session reads
+    /// as waiting until the stale window catches up. Keeping the timestamp
+    /// (rather than just the id) is what lets a resumed session recover:
+    /// claude --resume reuses the id and appends to the same transcript.
+    @ObservationIgnored private var endedSessions: [UUID: Date] = [:]
 
     func markSessionEnded(_ sessionID: UUID) {
-        endedSessions.insert(sessionID)
+        endedSessions[sessionID] = .now
         clearHookOverride(sessionID: sessionID)
         update(id: sessionID) { $0.status = .idle }
     }
