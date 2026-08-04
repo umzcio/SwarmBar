@@ -31,6 +31,7 @@ final class HookServer: ApprovalResponding {
 
     private struct PendingApproval {
         let kind: ApprovalKind
+        let connection: NWConnection
         let respond: (Data) -> Void
         let timeout: Task<Void, Never>
     }
@@ -62,8 +63,28 @@ final class HookServer: ApprovalResponding {
     // MARK: - Connections
 
     private func accept(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor [weak self] in self?.dropPending(for: connection) }
+            default:
+                break
+            }
+        }
         connection.start(queue: .main)
         receive(connection, buffer: Data())
+    }
+
+    /// A held hook client went away (process killed, its own timeout fired,
+    /// the prompt was answered at the terminal). The row must stop offering
+    /// buttons that can no longer answer anything.
+    private func dropPending(for connection: NWConnection) {
+        guard let (sessionID, pending) = pendingApprovals
+            .first(where: { $0.value.connection === connection })
+        else { return }
+        pending.timeout.cancel()
+        pendingApprovals.removeValue(forKey: sessionID)
+        store.clearHookOverride(sessionID: sessionID)
     }
 
     private func receive(_ connection: NWConnection, buffer: Data) {
@@ -142,10 +163,13 @@ final class HookServer: ApprovalResponding {
         return .complete(Request(path: String(parts[1]), accountLabel: account, body: parsed ?? [:]))
     }
 
-    private static func respond(_ connection: NWConnection, json: Data) {
+    private static func respond(
+        _ connection: NWConnection, json: Data, completion: ((Bool) -> Void)? = nil
+    ) {
         var response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(json.count)\r\nConnection: close\r\n\r\n".utf8)
         response.append(json)
-        connection.send(content: response, completion: .contentProcessed { _ in
+        connection.send(content: response, completion: .contentProcessed { error in
+            completion?(error == nil)
             connection.cancel()
         })
     }
@@ -174,7 +198,7 @@ final class HookServer: ApprovalResponding {
         case "OpenCodeReplied":
             if let raw = body["sessionID"] as? String {
                 let id = StableID.uuid(for: raw)
-                cancelPending(sessionID: id, respondEmpty: true)
+                cancelPending(sessionID: id)
                 store.clearHookOverride(sessionID: id)
             }
             finishEmpty()
@@ -209,7 +233,7 @@ final class HookServer: ApprovalResponding {
             }
 
         case "PermissionResult":
-            cancelPending(sessionID: sessionID, respondEmpty: true)
+            cancelPending(sessionID: sessionID)
             store.clearHookOverride(sessionID: sessionID)
             store.update(id: sessionID) { session in
                 if case .waitingApproval = session.status {
@@ -245,7 +269,7 @@ final class HookServer: ApprovalResponding {
             finishEmpty()
 
         case "SessionEnd":
-            cancelPending(sessionID: sessionID, respondEmpty: true)
+            cancelPending(sessionID: sessionID)
             store.markSessionEnded(sessionID)
             finishEmpty()
 
@@ -339,7 +363,7 @@ final class HookServer: ApprovalResponding {
 
     private func holdForDecision(sessionID: UUID, kind: ApprovalKind, connection: NWConnection) {
         // A newer request for the same session supersedes any stale one.
-        cancelPending(sessionID: sessionID, respondEmpty: true)
+        cancelPending(sessionID: sessionID)
         let timeout = Task { @MainActor [weak self] in
             try? await Task.sleep(for: Self.decisionHold)
             guard !Task.isCancelled else { return }
@@ -351,6 +375,7 @@ final class HookServer: ApprovalResponding {
         }
         pendingApprovals[sessionID] = PendingApproval(
             kind: kind,
+            connection: connection,
             respond: { json in Self.respond(connection, json: json) },
             timeout: timeout
         )
@@ -362,13 +387,19 @@ final class HookServer: ApprovalResponding {
         pending.respond(json)
     }
 
-    private func cancelPending(sessionID: UUID, respondEmpty: Bool) {
-        guard respondEmpty else { return }
+    private func cancelPending(sessionID: UUID) {
         finishPending(sessionID: sessionID, json: Data("{}".utf8))
     }
 
     func resolveApproval(sessionID: UUID, allow: Bool) -> Bool {
         guard let pending = pendingApprovals[sessionID] else { return false }
+        switch pending.connection.state {
+        case .cancelled, .failed:
+            dropPending(for: pending.connection)
+            return false
+        default:
+            break
+        }
         let decision: [String: Any]
         switch pending.kind {
         case .claudeHook:
@@ -389,7 +420,14 @@ final class HookServer: ApprovalResponding {
             decision = ["decision": allow ? "allow" : "deny"]
         }
         let json = (try? JSONSerialization.data(withJSONObject: decision)) ?? Data("{}".utf8)
-        finishPending(sessionID: sessionID, json: json)
+        pendingApprovals.removeValue(forKey: sessionID)
+        pending.timeout.cancel()
+        Self.respond(pending.connection, json: json) { [weak self] delivered in
+            guard !delivered else { return }
+            Task { @MainActor in
+                self?.store.noteApprovalDeliveryFailed(sessionID: sessionID)
+            }
+        }
         store.clearHookOverride(sessionID: sessionID)
         return true
     }

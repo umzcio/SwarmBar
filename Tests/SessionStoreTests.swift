@@ -130,3 +130,33 @@ struct SessionStoreTests {
         #expect(!SessionStatus.done(summary: "x").isActive)
     }
 }
+
+/// Self-contained: plan 013's approval test suite is not present on this
+/// branch, so this is its own minimal suite with a local fake responder.
+@MainActor
+struct ApprovalDeliveryHonestyTests {
+    private final class NoPendingApproval: ApprovalResponding {
+        func resolveApproval(sessionID: UUID, allow: Bool) -> Bool { false }
+    }
+
+    @Test func approveDoesNotClaimSuccessWhenNothingIsPending() {
+        let store = SessionStore()
+        let responder = NoPendingApproval()
+        store.approvalResponder = responder
+
+        // A real session (has a projectPath), so a responder that reports
+        // nothing was pending falls through to "open the terminal" rather
+        // than the mock fallback that flips status unconditionally.
+        let session = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .waitingApproval(command: "git push"))
+        store.upsert(session)
+
+        store.approve(session)
+
+        // The responder reported no pending approval; the row must not
+        // claim the command is running.
+        #expect(store.sessions[0].status == .waitingApproval(command: "git push"))
+    }
+}

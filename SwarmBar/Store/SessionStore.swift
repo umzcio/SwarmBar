@@ -238,6 +238,15 @@ final class SessionStore {
         alertedKeys.formIntersection(current)
     }
 
+    /// The held hook connection broke before the decision reached the agent.
+    /// The row said "Running"; say plainly that it did not land, so the user
+    /// goes to the terminal instead of trusting a false confirmation.
+    func noteApprovalDeliveryFailed(sessionID: UUID) {
+        update(id: sessionID) { session in
+            session.status = .waitingInput(prompt: "Answer at the terminal, SwarmBar could not deliver")
+        }
+    }
+
     // Called by row buttons. Mock sessions (no projectPath) transition state
     // directly. Real sessions are read-only per CLAUDE.md: the buttons bring
     // you to the session's terminal instead of writing to the tool's files;
