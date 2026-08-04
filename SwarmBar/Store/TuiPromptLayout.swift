@@ -16,27 +16,40 @@ enum TuiPromptLayout {
         var label: String
     }
 
-    /// The numbered options of the last selector block on screen. Lines
-    /// look like "  1. Approve once" (Kimi) with the marker glyph and
-    /// indentation varying by tool.
+    /// The numbered options of the selector block nearest the bottom of the
+    /// screen. A block is a run of ascending "N. Label" lines separated only
+    /// by blank lines: agent prose often contains numbered lists, and pressing
+    /// a digit chosen from one of those would answer a selector nobody read.
     nonisolated static func options(in screen: String) -> [Option] {
-        var found: [Option] = []
+        var blocks: [[Option]] = []
+        var current: [Option] = []
+
+        func endBlock() {
+            if current.count >= 2 { blocks.append(current) }
+            current = []
+        }
+
         for raw in screen.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = raw.trimmingCharacters(in: .whitespaces)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "▶►> \u{2502}\u{258F}"))
                 .trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }          // blank lines do not break a block
             guard let dot = line.firstIndex(of: "."),
                   let number = Int(line[line.startIndex..<dot]),
                   (1...9).contains(number)
-            else { continue }
+            else { endBlock(); continue }         // prose ends the block
             let label = line[line.index(after: dot)...]
                 .trimmingCharacters(in: .whitespaces)
-            guard !label.isEmpty else { continue }
-            // A new "1." starts a fresh block; keep only the latest.
-            if number == 1 { found.removeAll() }
-            if number == found.count + 1 { found.append(Option(number: number, label: label)) }
+            guard !label.isEmpty else { endBlock(); continue }
+            if number == 1 { endBlock() }
+            if number == current.count + 1 {
+                current.append(Option(number: number, label: label))
+            } else {
+                endBlock()
+            }
         }
-        return found
+        endBlock()
+        return blocks.last ?? []
     }
 
     /// The option number that approves this one call, preferring the
@@ -59,9 +72,29 @@ enum TuiPromptLayout {
         let options = options(in: screen)
         let rejections = options.filter { option in
             let label = option.label.lowercased()
-            return label.contains("reject") || label.contains("deny") || label.hasPrefix("no")
+            if label.contains("reject") || label.contains("deny") { return true }
+            // "No", "No, ...", "No thanks" are rejections; "Note:", "Not now",
+            // and "No changes needed" are not selector rejections.
+            let firstWord = label.split(whereSeparator: { $0 == " " || $0 == "," }).first
+            return firstWord == "no"
         }
         let plain = rejections.first { !$0.label.lowercased().contains("feedback") }
         return (plain ?? rejections.first)?.number
+    }
+
+    /// `approveOnce`, but carrying the label so the caller can verify it is
+    /// still on screen at that number before pressing.
+    nonisolated static func approveOnceOption(in screen: String) -> Option? {
+        approveOnce(in: screen).flatMap { number in
+            options(in: screen).first { $0.number == number }
+        }
+    }
+
+    /// `reject`, but carrying the label so the caller can verify it is
+    /// still on screen at that number before pressing.
+    nonisolated static func rejectOption(in screen: String) -> Option? {
+        reject(in: screen).flatMap { number in
+            options(in: screen).first { $0.number == number }
+        }
     }
 }

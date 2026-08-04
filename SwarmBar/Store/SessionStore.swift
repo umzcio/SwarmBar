@@ -21,15 +21,37 @@ final class SessionStore {
     @ObservationIgnored private var iconTicker: Task<Void, Never>?
 
     init() {
-        iconTicker = Task { [weak self] in
-            while !Task.isCancelled {
-                let flashing = (self?.approvalCount ?? 0) > 0
-                try? await Task.sleep(for: .milliseconds(flashing ? 500 : 450))
-                guard let self else { return }
-                if self.approvalCount > 0 || (self.anyActive && !self.isPaused) {
+        // No ticker until something needs to animate; see refreshIconTicker.
+    }
+
+    /// Starts the animation ticker when the glyph has a frame to advance and
+    /// tears it down when it does not, so a resting menu bar app is not
+    /// waking the main actor twice a second forever.
+    private func refreshIconTicker() {
+        if iconNeedsAnimation {
+            guard iconTicker == nil else { return }
+            iconTicker = Task { [weak self] in
+                while !Task.isCancelled {
+                    let flashing = (self?.approvalCount ?? 0) > 0
+                    try? await Task.sleep(for: .milliseconds(flashing ? 500 : 450))
+                    guard let self, !Task.isCancelled else { return }
+                    guard self.iconNeedsAnimation else {
+                        // Clearing the handle here is load bearing. Without it
+                        // the property keeps pointing at a finished Task, and
+                        // the next refreshIconTicker sees a non-nil handle,
+                        // skips starting a ticker, and the icon freezes for
+                        // the life of the process.
+                        self.iconTicker = nil
+                        return
+                    }
                     self.iconPhase &+= 1
                 }
             }
+        } else {
+            iconTicker?.cancel()
+            iconTicker = nil
+            // Leave iconPhase where it is; the label renders solid() when
+            // nothing is animating, so the stale phase is never shown.
         }
     }
 
@@ -92,6 +114,15 @@ final class SessionStore {
         }.count
     }
 
+    /// Whether the menu bar glyph has a frame to advance. Mirrors what
+    /// MenuBarLabel actually renders: the attention flash for pending
+    /// approvals, the fill cycle while agents work and the app is not
+    /// paused, and nothing otherwise.
+    var iconNeedsAnimation: Bool {
+        if approvalCount > 0 { return true }
+        return anyActive && !isPaused
+    }
+
     // Called by monitors.
     func upsert(_ session: AgentSession) {
         if let index = sessions.firstIndex(where: { $0.id == session.id }) {
@@ -103,10 +134,12 @@ final class SessionStore {
             sessions.insert(session, at: 0)
         }
         noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     func remove(id: UUID) {
         sessions.removeAll { $0.id == id }
+        refreshIconTicker()
     }
 
     /// Replaces one tool's sessions with a freshly discovered set: upserts
@@ -120,19 +153,60 @@ final class SessionStore {
         sessions.removeAll {
             $0.tool == tool && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
         }
-        for id in incomingIds where endedSessions.contains(id) {
-            update(id: id) { $0.status = .idle }
+        for id in incomingIds {
+            guard let endedAt = endedSessions[id] else { continue }
+            if let session = sessions.first(where: { $0.id == id }),
+               session.lastActivityAt > endedAt {
+                // Genuinely new activity after the exit: the session was
+                // resumed and owns its status again.
+                endedSessions.removeValue(forKey: id)
+            } else {
+                update(id: id) { $0.status = .idle }
+            }
         }
         for (id, ackTime) in acknowledgedAt {
             guard let session = sessions.first(where: { $0.id == id }) else { continue }
             if session.lastActivityAt > ackTime {
+                // The dismissal is over: genuinely new activity. Re-arm the
+                // alert so the next question is announced.
                 acknowledgedAt.removeValue(forKey: id)
+                alertedStatus.removeValue(forKey: id)
             } else if case .waitingInput(let prompt) = session.status {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
+        pruneSessionRecords()
         reapplyHookOverrides()
+        pruneAlertRecords()
         noteAttentionTransitions()
+        refreshIconTicker()
+    }
+
+    /// Forgets bookkeeping for sessions the store no longer holds, so a
+    /// long-running app does not accumulate entries for sessions that aged
+    /// out of discovery.
+    private func pruneSessionRecords() {
+        let known = Set(sessions.map(\.id))
+        endedSessions = endedSessions.filter { known.contains($0.key) }
+        acknowledgedAt = acknowledgedAt.filter { known.contains($0.key) }
+    }
+
+    /// Drops alert records for sessions that are settled: no longer needing
+    /// attention after this cycle's overrides are applied, or gone entirely.
+    /// Doing this once per sync (rather than inside every mutation) is what
+    /// keeps a mid-sync status flicker from re-arming the alert.
+    ///
+    /// Dismissed sessions keep their record even though `acknowledgedAt`
+    /// forces them to done. The poller re-derives the waiting verdict from
+    /// the unchanged transcript every cycle, so pruning them here would let
+    /// the next poll read as a fresh transition and alert again.
+    private func pruneAlertRecords() {
+        let stillWaiting = Set(
+            sessions.filter { $0.status.needsAttention }.map(\.id)
+        )
+        alertedStatus = alertedStatus.filter {
+            stillWaiting.contains($0.key) || acknowledgedAt[$0.key] != nil
+        }
     }
 
     // MARK: - Hook events
@@ -149,13 +223,15 @@ final class SessionStore {
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
     /// Sessions whose tool reported the session over (Claude and Grok's
-    /// SessionEnd hook fires on /exit). The transcript keeps looking
-    /// fresh for a while, so without this an exited session reads as
-    /// waiting until the stale window catches up.
-    @ObservationIgnored private var endedSessions: Set<UUID> = []
+    /// SessionEnd hook fires on /exit), and when. The transcript keeps
+    /// looking fresh for a while, so without this an exited session reads
+    /// as waiting until the stale window catches up. Keeping the timestamp
+    /// (rather than just the id) is what lets a resumed session recover:
+    /// claude --resume reuses the id and appends to the same transcript.
+    @ObservationIgnored private var endedSessions: [UUID: Date] = [:]
 
     func markSessionEnded(_ sessionID: UUID) {
-        endedSessions.insert(sessionID)
+        endedSessions[sessionID] = .now
         clearHookOverride(sessionID: sessionID)
         update(id: sessionID) { $0.status = .idle }
     }
@@ -219,6 +295,7 @@ final class SessionStore {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[index])
         noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     // MARK: - Attention notifications
@@ -226,19 +303,20 @@ final class SessionStore {
     /// Called once per session per entry into a needs-attention status;
     /// the app wires this to AgentNotifier, tests to a collector.
     @ObservationIgnored var attentionAlertHandler: ((AgentSession) -> Void)?
-    @ObservationIgnored private var alertedKeys: Set<String> = []
+
+    /// The attention status each session was last alerted for. Keyed by
+    /// session so a status that flickers mid-sync (the poller overwrites a
+    /// held approval before reapplyHookOverrides restores it) cannot look
+    /// like a fresh transition on the next pass.
+    @ObservationIgnored private var alertedStatus: [UUID: String] = [:]
 
     private func noteAttentionTransitions() {
-        var current: Set<String> = []
         for session in sessions where session.status.needsAttention {
-            let key = "\(session.id)|\(session.status.label)"
-            current.insert(key)
-            if !alertedKeys.contains(key) {
-                alertedKeys.insert(key)
-                attentionAlertHandler?(session)
-            }
+            let label = session.status.label
+            guard alertedStatus[session.id] != label else { continue }
+            alertedStatus[session.id] = label
+            attentionAlertHandler?(session)
         }
-        alertedKeys.formIntersection(current)
     }
 
     /// The held hook connection broke before the decision reached the agent.
@@ -269,7 +347,7 @@ final class SessionStore {
             // is always last and plain approve-once second-from-last, so
             // navigate: clamp to the bottom, step up once, submit.
             guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["UP", "\n"])
+            answerTuiPrompt(session, keys: TuiAnswer.grokApprove)
             return
         }
         if session.tool == .codex {
@@ -277,14 +355,14 @@ final class SessionStore {
             // esc rejects (ExecApproval decision Abort). Semantic keys, not
             // positional, so no arrow navigation needed. The rollout records
             // the outcome as the call's output line.
-            answerTuiPrompt(session, keys: ["y"])
+            answerTuiPrompt(session, keys: TuiAnswer.codexApprove)
             return
         }
         if session.tool == .kimiCode || session.tool == .bearCode {
             // The Kimi-family selector wraps, so navigation counts are
             // unsafe; the option is read off the screen and answered by
             // its own number. PermissionResult (hook) clears the row.
-            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnce(in:))
+            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnceOption(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -303,15 +381,15 @@ final class SessionStore {
             // the bottom and submit; the second newline submits the reject
             // feedback field empty.
             guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: Array(repeating: "DOWN", count: 8) + ["\n", "\n"])
+            answerTuiPrompt(session, keys: TuiAnswer.grokDeny)
             return
         }
         if session.tool == .codex {
-            answerTuiPrompt(session, keys: ["ESC"])
+            answerTuiPrompt(session, keys: TuiAnswer.codexDeny)
             return
         }
         if session.tool == .kimiCode || session.tool == .bearCode {
-            answerNumberedPrompt(session, choose: TuiPromptLayout.reject(in:))
+            answerNumberedPrompt(session, choose: TuiPromptLayout.rejectOption(in:))
             return
         }
         if session.projectPath != nil { openInTerminal(session); return }
@@ -330,18 +408,24 @@ final class SessionStore {
 
     private func answerNumberedPrompt(
         _ session: AgentSession,
-        choose: @escaping @Sendable (String) -> Int?
+        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
     ) {
         let id = session.id
         let path = session.projectPath
         Task.detached {
             guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
-                  let number = choose(screen),
-                  TerminalFocuser.sendKeys(
-                    sessionID: id, projectPath: path, keys: ["\(number)"])
+                  let option = choose(screen)
             else {
                 TerminalFocuser.focus(sessionID: id, projectPath: path)
                 return
+            }
+            let outcome = TerminalFocuser.answerNumbered(
+                sessionID: id, projectPath: path,
+                number: option.number, expectedLabel: option.label)
+            if outcome != .sent {
+                // The prompt moved or the terminal is gone. Never press a
+                // digit into an unverified selector; bring the user to it.
+                TerminalFocuser.focus(sessionID: id, projectPath: path)
             }
         }
     }
@@ -378,6 +462,7 @@ final class SessionStore {
 
     func pauseAll() {
         isPaused.toggle()
+        refreshIconTicker()
     }
 }
 

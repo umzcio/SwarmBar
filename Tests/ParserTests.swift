@@ -204,6 +204,65 @@ struct TuiPromptLayoutTests {
         #expect(TuiPromptLayout.approveOnce(in: screen) == nil)
         #expect(TuiPromptLayout.reject(in: screen) == nil)
     }
+
+    @Test func agentProseWithANumberedListIsNotASelector() {
+        let screen = """
+          Here is my plan:
+
+          1. Read the config
+          2. Patch the parser
+
+          Anything else you want changed?
+        """
+        // A plan is a contiguous numbered run, so it parses as a block, but
+        // it must not produce an approve or reject answer.
+        #expect(TuiPromptLayout.approveOnce(in: screen) == nil)
+        #expect(TuiPromptLayout.reject(in: screen) == nil)
+    }
+
+    @Test func aSingleNumberedLineIsNotASelector() {
+        #expect(TuiPromptLayout.options(in: "  1. Approve once").isEmpty)
+    }
+
+    @Test func proseBreaksABlock() {
+        let screen = """
+          1. Approve once
+          some explanatory prose here
+          2. Reject
+        """
+        #expect(TuiPromptLayout.options(in: screen).isEmpty)
+    }
+
+    @Test func theBottomMostBlockWinsOverAnEarlierOne() {
+        let screen = """
+          1. Approve once
+          2. Reject
+
+          Older prompt above.
+
+          1. Yes, proceed
+          2. No, stop
+        """
+        let options = TuiPromptLayout.options(in: screen)
+        #expect(options.count == 2)
+        #expect(options.first?.label == "Yes, proceed")
+        #expect(TuiPromptLayout.reject(in: screen) == 2)
+    }
+
+    @Test func rejectDoesNotMatchNotesOrNotNow() {
+        let screen = """
+          1. Approve once
+          2. Note: this touches production
+          3. Not now, ask me later
+        """
+        // None of these are a selector rejection.
+        #expect(TuiPromptLayout.reject(in: screen) == nil)
+    }
+
+    @Test func optionHelpersCarryTheLabel() {
+        #expect(TuiPromptLayout.approveOnceOption(in: kimiShellPrompt)?.label == "Approve once")
+        #expect(TuiPromptLayout.rejectOption(in: kimiShellPrompt)?.number == 3)
+    }
 }
 
 @MainActor
