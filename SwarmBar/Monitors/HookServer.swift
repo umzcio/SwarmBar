@@ -136,7 +136,12 @@ final class HookServer: ApprovalResponding {
         // Claude and Grok use bare UUIDs; Kimi prefixes ("session_<uuid>"),
         // which map through StableID exactly like KimiMonitor's rows.
         let sessionID = rawSessionID.map { UUID(uuidString: $0) ?? StableID.uuid(for: $0) }
-        let cwd = body["cwd"] as? String
+        // A hook payload's cwd becomes a session's projectPath, which is handed
+        // to the terminal integration. Anything that is not a real directory is
+        // dropped rather than displayed.
+        let cwd = (body["cwd"] as? String).flatMap {
+            TerminalFocuser.isDirectory($0) ? $0 : nil
+        }
 
         func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
 
