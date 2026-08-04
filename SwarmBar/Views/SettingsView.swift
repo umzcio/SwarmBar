@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// The integrations panel: one row per tool showing whether its approval
+/// The integrations panel, styled in the popover's own language rather
+/// than stock Form chrome: one row per tool showing whether its approval
 /// bridge is installed, with a toggle where there is something to
 /// install. Monitors need nothing; this is only the approve/deny wiring.
 struct SettingsView: View {
@@ -8,22 +9,35 @@ struct SettingsView: View {
     @AppStorage("grokKeystrokeAnswers") private var grokKeystrokes = true
 
     var body: some View {
-        Form {
-            Section {
-                ForEach(AgentTool.allCases) { tool in
+        VStack(alignment: .leading, spacing: 0) {
+            Text("APPROVALS")
+                .font(.subheadline.weight(.bold))
+                .kerning(0.6)
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 8)
+
+            VStack(spacing: 0) {
+                ForEach(Array(AgentTool.allCases.enumerated()), id: \.element) { index, tool in
+                    if index > 0 {
+                        Divider().padding(.leading, 52)
+                    }
                     row(for: tool)
                 }
-            } header: {
-                Text("Approvals")
-            } footer: {
-                Text("Session monitoring works without any setup. These switches install each tool's approve and deny bridge; configs are backed up beside the original before the first change.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
             }
+            .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: 10))
+            .padding(.horizontal, 16)
+
+            Text("Session monitoring works without any setup. These switches install each tool's approve and deny bridge; configs are backed up beside the original before the first change.")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 20)
+                .padding(.top, 10)
+                .padding(.bottom, 18)
         }
-        .formStyle(.grouped)
-        .frame(width: 460)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 430)
         .onAppear { manager.refresh() }
     }
 
@@ -31,34 +45,53 @@ struct SettingsView: View {
     private func row(for tool: AgentTool) -> some View {
         let state = manager.states[tool] ?? .toolMissing
         HStack(spacing: 10) {
-            ToolChip(tool: tool, size: 24)
-            VStack(alignment: .leading, spacing: 1) {
+            ToolChip(tool: tool, size: 26)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(tool.label)
-                    .font(.body.weight(.medium))
-                Text(state.label)
+                    .font(.headline)
+                Text(detailText(tool, state))
                     .font(.callout)
                     .foregroundStyle(stateStyle(state))
+                    .lineLimit(2)
             }
-            Spacer()
-            switch state {
-            case .installed, .notInstalled, .failed:
-                Toggle("", isOn: Binding(
-                    get: { state == .installed },
-                    set: { manager.setEnabled(tool, $0) }
-                ))
+            Spacer(minLength: 12)
+            control(for: tool, state: state)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private func control(for tool: AgentTool, state: IntegrationManager.InstallState) -> some View {
+        switch state {
+        case .installed, .notInstalled, .failed:
+            Toggle("", isOn: Binding(
+                get: { state == .installed },
+                set: { manager.setEnabled(tool, $0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .labelsHidden()
+            .tint(.orange)
+        case .noSetupNeeded where tool == .grokBuild:
+            Toggle("", isOn: $grokKeystrokes)
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .labelsHidden()
-            case .noSetupNeeded where tool == .grokBuild:
-                Toggle("Keystroke answers", isOn: $grokKeystrokes)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .help("Off: Approve and Deny just focus the terminal instead of answering the prompt remotely.")
-            case .noSetupNeeded, .toolMissing:
-                EmptyView()
-            }
+                .tint(.orange)
+                .help("Off: Approve and Deny focus the terminal instead of answering the prompt remotely.")
+        case .noSetupNeeded, .toolMissing:
+            EmptyView()
         }
-        .padding(.vertical, 2)
+    }
+
+    private func detailText(_ tool: AgentTool, _ state: IntegrationManager.InstallState) -> String {
+        if tool == .grokBuild, state == .noSetupNeeded {
+            return grokKeystrokes
+                ? "Keystroke answers on"
+                : "Focus-only: buttons open the terminal"
+        }
+        return state.label
     }
 
     private func stateStyle(_ state: IntegrationManager.InstallState) -> AnyShapeStyle {
