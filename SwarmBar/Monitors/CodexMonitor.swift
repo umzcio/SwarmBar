@@ -6,6 +6,24 @@ import Foundation
 struct CodexMonitor: SessionMonitor {
     nonisolated static let discoveryWindow: TimeInterval = 8 * 60 * 60
 
+    /// Read once, computed once per file version; see CachedMeta below for
+    /// why this one is safe to cache in full.
+    private struct CachedMeta: Sendable {
+        let cwd: String?
+        let sessionId: String?
+    }
+
+    /// Caches only the raw tail text, never the parsed SessionStatus:
+    /// CodexSessionParser.parse takes `now` and downgrades to idle once a
+    /// line goes stale (staleAfter), so a cached parse would freeze that
+    /// time-dependent verdict. Re-parsing a cached tail is cheap.
+    private nonisolated static let tailCache = TailCache<String>()
+
+    /// The 16 KB head only carries session_meta (cwd, session id), a pure
+    /// function of the file's bytes with no time dependency, so the parsed
+    /// meta itself is safe to cache in full, unlike the tail's status.
+    private nonisolated static let headCache = TailCache<CachedMeta>()
+
     func start(into store: SessionStore) async {
         while !Task.isCancelled {
             if !store.isPaused {
@@ -23,23 +41,36 @@ struct CodexMonitor: SessionMonitor {
             .appendingPathComponent(".codex/sessions")
         guard let enumerator = fm.enumerator(
             at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey]
+            includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
         ) else { return [] }
 
         var sessions: [AgentSession] = []
+        var seenPaths = Set<String>()
+        let livePids = TerminalFocuser.codexPidsBySessionSuffix()
         for case let file as URL in enumerator {
             guard file.pathExtension == "jsonl",
                   file.lastPathComponent.hasPrefix("rollout-"),
                   let values = try? file.resourceValues(
-                    forKeys: [.contentModificationDateKey, .creationDateKey]),
+                    forKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]),
                   let mtime = values.contentModificationDate,
-                  now.timeIntervalSince(mtime) < discoveryWindow,
-                  let tail = ClaudeCodeMonitor.tail(of: file),
-                  let status = CodexSessionParser.parse(tail: tail, now: now)
+                  now.timeIntervalSince(mtime) < discoveryWindow
+            else { continue }
+            let size = values.fileSize ?? 0
+            seenPaths.insert(file.path)
+
+            guard let cachedTail = tailCache.value(
+                    for: file, size: size, modified: mtime,
+                    compute: { ClaudeCodeMonitor.tail(of: file) }),
+                  let status = CodexSessionParser.parse(tail: cachedTail, now: now)
             else { continue }
 
-            let head = headText(of: file)
-            let meta = CodexSessionParser.meta(head: head)
+            let meta = headCache.value(
+                for: file, size: size, modified: mtime,
+                compute: {
+                    let raw = CodexSessionParser.meta(head: headText(of: file))
+                    return CachedMeta(cwd: raw.cwd, sessionId: raw.sessionId)
+                }
+            ) ?? CachedMeta(cwd: nil, sessionId: nil)
             let id = meta.sessionId.flatMap(UUID.init(uuidString:))
                 ?? fallbackId(for: file.lastPathComponent)
             let projectPath = meta.cwd.map { URL(fileURLWithPath: $0) }
@@ -51,9 +82,11 @@ struct CodexMonitor: SessionMonitor {
                 status: status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                processAlive: TerminalFocuser.codexPid(forSession: id) != nil
+                processAlive: livePids["\(id.uuidString.lowercased()).jsonl"] != nil
             ))
         }
+        tailCache.retain(paths: seenPaths)
+        headCache.retain(paths: seenPaths)
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 
