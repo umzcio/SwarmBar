@@ -212,6 +212,34 @@ final class IntegrationManager {
         if fm.fileExists(atPath: resolved.path), !fm.fileExists(atPath: backup.path) {
             try fm.copyItem(at: resolved, to: backup)
         }
-        try text.write(to: resolved, atomically: true, encoding: .utf8)
+        try Self.writePreservingLinks(text, to: resolved)
+    }
+
+    /// Writes `text` to `url` so that every hardlink to it sees the new
+    /// content.
+    ///
+    /// An atomic write stages a temp file and renames it over the
+    /// destination, which swaps in a fresh inode: any other hardlink keeps
+    /// pointing at the old one and silently goes stale. Config files shared
+    /// between agent profiles by hardlink would then be updated in one place
+    /// only, so a toggle would look applied while most profiles kept the old
+    /// hooks.
+    ///
+    /// Symlinks are not affected either way (the caller has already resolved
+    /// them), so the common single-link case keeps the atomic write and its
+    /// crash safety. Only a genuinely hardlinked file takes the in place
+    /// path, where preserving the inode is worth losing atomicity.
+    nonisolated static func writePreservingLinks(_ text: String, to url: URL) throws {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let links = (attributes?[.referenceCount] as? Int) ?? 1
+        guard links > 1 else {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data(text.utf8))
+        try handle.synchronize()
     }
 }
