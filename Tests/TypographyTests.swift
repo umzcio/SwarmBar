@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import Testing
 @testable import SwarmBar
@@ -60,5 +61,55 @@ struct TypographyTests {
             let caption = SwarmText.caption.size * scale
             #expect(abs(title / caption - 1.4) < 0.0001)
         }
+    }
+
+    // MARK: - Popover scale
+
+    @Test func mediumIsExactlyTheDesignedSize() {
+        // Medium must be 1.0, or the ramp above no longer describes what
+        // ships by default and the prototype comparison is meaningless.
+        #expect(PopoverScale.medium.factor == 1.0)
+    }
+
+    @Test func theStepsAreOrderedAndDistinct() {
+        #expect(PopoverScale.small.factor < PopoverScale.medium.factor)
+        #expect(PopoverScale.medium.factor < PopoverScale.large.factor)
+    }
+
+    /// A garbage or absent stored value must fall back, never trap: this
+    /// reads straight out of user defaults.
+    @Test func storedValuesDegradeToMedium() {
+        #expect(PopoverScale.stored("large") == .large)
+        #expect(PopoverScale.stored("") == .medium)
+        #expect(PopoverScale.stored("enormous") == .medium)
+    }
+
+    /// Renders a real row and measures its HEIGHT at each scale.
+    ///
+    /// Height, not width: a compact row's height is set by its tallest
+    /// fixed element (the 20pt approve/deny buttons, the 18pt tool chip),
+    /// so it moves only if those frames actually multiply by the scale.
+    /// Width was tried first and proved worthless as a check, because the
+    /// type scales on its own and the row got wider even with every frame
+    /// multiplication deleted. The negative control is the point: this
+    /// test is only worth having if removing a `* scale` makes it fail.
+    @Test func theScaleReachesTheRowsFixedDimensions() {
+        let session = AgentSession(
+            tool: .claudeCode, projectName: "swarmbar",
+            status: .waitingApproval(command: "rm -rf /tmp/x"))
+        let store = SessionStore()
+        store.upsert(session)
+
+        func height(_ scale: PopoverScale) -> CGFloat {
+            let view = CompactSessionRow(session: session)
+                .environment(store)
+                .environment(\.swarmScale, scale.factor)
+            return NSHostingView(rootView: view).fittingSize.height
+        }
+
+        let medium = height(.medium), large = height(.large)
+        // 20pt buttons at 1.15 are 23pt, so the row has to grow by about
+        // 3pt. Font growth alone moves it by less than one point.
+        #expect(large - medium >= 2, "fixed dimensions are not scaling (grew \(large - medium)pt)")
     }
 }

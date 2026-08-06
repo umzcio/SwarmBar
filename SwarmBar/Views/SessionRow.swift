@@ -3,11 +3,12 @@ import SwiftUI
 /// Comfortable: two-plus lines, inline approval card.
 struct SessionRow: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            ToolChip(tool: session.tool, size: 26)
+            ToolChip(tool: session.tool, size: 26 * scale)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(session.projectName)

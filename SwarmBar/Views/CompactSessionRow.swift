@@ -3,17 +3,18 @@ import SwiftUI
 /// Compact: everything on one ~28pt line.
 struct CompactSessionRow: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
     var body: some View {
         HStack(spacing: 8) {
             StatusDot(status: session.status)
                 .id(session.status.label)
-            ToolChip(tool: session.tool, size: 18)
+            ToolChip(tool: session.tool, size: 18 * scale)
             Text(session.projectName)
                 .swarmFont(.rowTitleCompact)
                 .lineLimit(1)
-                .frame(maxWidth: 118, alignment: .leading)
+                .frame(maxWidth: 118 * scale, alignment: .leading)
 
             Group {
                 switch session.status {
@@ -63,6 +64,8 @@ struct CompactSessionRow: View {
 }
 
 struct MicroButton: View {
+    @Environment(\.swarmScale) private var scale
+
     enum Kind {
         case approve, deny, reply, dismiss
 
@@ -91,7 +94,7 @@ struct MicroButton: View {
             Image(systemName: kind.symbol)
                 .swarmFont(.iconSmall)
                 .foregroundStyle(foreground)
-                .frame(width: 20, height: 20)
+                .frame(width: 20 * scale, height: 20 * scale)
                 .background(background, in: .rect(cornerRadius: 6))
         }
         .buttonStyle(.plain)

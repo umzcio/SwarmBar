@@ -5,6 +5,7 @@ import SwiftUI
 /// parent gives this view a fresh identity per status kind so the
 /// repeatForever loops restart on category changes.
 struct StatusDot: View {
+    @Environment(\.swarmScale) private var scale
     let status: SessionStatus
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -13,7 +14,7 @@ struct StatusDot: View {
     var body: some View {
         Circle()
             .fill(status.tint)
-            .frame(width: 7, height: 7)
+            .frame(width: 7 * scale, height: 7 * scale)
             .opacity(status.blinks && phase ? 0.25 : 1)
             .background {
                 if status.pulses && !reduceMotion {

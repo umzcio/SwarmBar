@@ -4,6 +4,7 @@ import SwiftUI
 /// open, so writing a reply stays in one window instead of opening a second.
 struct ReplyComposer: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.swarmScale) private var scale
     let session: AgentSession
     let onClose: () -> Void
 
@@ -20,7 +21,7 @@ struct ReplyComposer: View {
             editor
             footer
         }
-        .frame(width: 380)
+        .frame(width: 380 * scale)
         .onAppear { editorFocused = true }
     }
 
@@ -30,13 +31,13 @@ struct ReplyComposer: View {
                 Image(systemName: "chevron.left")
                     .swarmFont(.bodyEmphasis)
                     .foregroundStyle(.secondary)
-                    .frame(width: 22, height: 22)
+                    .frame(width: 22 * scale, height: 22 * scale)
             }
             .buttonStyle(.plain)
             .keyboardShortcut(.cancelAction)
             .help("Back")
 
-            ToolChip(tool: session.tool, size: 22)
+            ToolChip(tool: session.tool, size: 22 * scale)
             VStack(alignment: .leading, spacing: 1) {
                 Text(session.projectName)
                     .swarmFont(.rowTitle)
@@ -76,7 +77,7 @@ struct ReplyComposer: View {
         TextEditor(text: $text)
             .swarmFont(.editor)
             .scrollContentBackground(.hidden)
-            .frame(height: 120)
+            .frame(height: 120 * scale)
             .padding(6)
             .background(.white.opacity(0.05), in: .rect(cornerRadius: 8))
             .overlay(

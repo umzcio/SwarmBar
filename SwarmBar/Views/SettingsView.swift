@@ -29,6 +29,7 @@ struct SettingsView: View {
 struct GeneralSettingsTab: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @AppStorage("compactRows") private var compactRows = false
+    @AppStorage("popoverScale") private var popoverScale = PopoverScale.medium.rawValue
     @State private var updates = UpdateChecker()
 
     var body: some View {
@@ -88,6 +89,21 @@ struct GeneralSettingsTab: View {
                     detail: "Single-line sessions in the popover",
                     isOn: $compactRows
                 )
+                SettingsDivider()
+                SettingsPickerRow(
+                    symbol: "textformat.size",
+                    title: "Text size",
+                    detail: "Scales the whole popover, not just the text"
+                ) {
+                    Picker("", selection: $popoverScale) {
+                        ForEach(PopoverScale.allCases) { scale in
+                            Text(scale.label).tag(scale.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 168)
+                }
             }
         }
     }
@@ -357,6 +373,37 @@ private struct SettingsDivider: View {
         Divider()
             .overlay(.white.opacity(0.06))
             .padding(.leading, 54)
+    }
+}
+
+/// Same shape as `SettingsToggleRow`, with an arbitrary control on the
+/// trailing edge instead of a switch.
+private struct SettingsPickerRow<Control: View>: View {
+    let symbol: String
+    var symbolTint: Color = .secondary
+    let title: String
+    let detail: String
+    @ViewBuilder let control: Control
+
+    var body: some View {
+        HStack(spacing: 11) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(symbolTint)
+                .frame(width: 28, height: 28)
+                .background(.white.opacity(0.06), in: .rect(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            control
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
     }
 }
 

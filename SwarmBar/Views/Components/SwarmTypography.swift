@@ -115,10 +115,58 @@ enum SwarmText: CaseIterable {
     }
 }
 
+/// The popover's overall size, exposed in Settings as Text size.
+///
+/// This deliberately scales the whole surface, not just the type. The
+/// popover is a fixed 380pt frame, so growing the text alone would spend
+/// the extra size on truncation: the first casualty is the monospaced
+/// command in an approval row, which is the one thing that must never be
+/// abbreviated. Width, icon chips, and the project-name column all move by
+/// the same factor, so the layout keeps its proportions and only the
+/// physical size changes.
+///
+/// Independent of Compact rows, which controls density (how much vertical
+/// room a session takes) rather than legibility. Compact plus large is a
+/// deliberately supported combination: many sessions, still readable.
+///
+/// What scales and what does not: content dimensions move (width, type,
+/// icon chips, the project-name column, the composer's editor, the scroll
+/// cap), while padding and inter-element spacing stay fixed. That keeps
+/// the two settings cleanly separated, since gutters are exactly what
+/// Compact rows is for, and it stops the popover from ballooning at large.
+enum PopoverScale: String, CaseIterable, Identifiable {
+    case small, medium, large
+
+    var id: String { rawValue }
+
+    /// Medium is 1.0 by definition: it is the size the HTML prototype
+    /// specifies, and the size every `SwarmText` case records.
+    var factor: CGFloat {
+        switch self {
+        case .small:  0.9
+        case .medium: 1.0
+        case .large:  1.15
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .small:  "Small"
+        case .medium: "Medium"
+        case .large:  "Large"
+        }
+    }
+
+    /// Tolerates a missing or garbage stored value rather than trapping,
+    /// since this comes straight from user defaults.
+    static func stored(_ raw: String) -> PopoverScale {
+        PopoverScale(rawValue: raw) ?? .medium
+    }
+}
+
 extension EnvironmentValues {
-    /// Multiplies every `SwarmText` size. 1.0 is the size the HTML
-    /// prototype specifies. The popover's own width has to move with this
-    /// or larger text just truncates inside a fixed 380pt frame.
+    /// Multiplies every `SwarmText` size and every fixed dimension in the
+    /// popover. See `PopoverScale` for why both move together.
     @Entry var swarmScale: CGFloat = 1.0
 }
 

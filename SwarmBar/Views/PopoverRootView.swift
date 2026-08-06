@@ -3,6 +3,9 @@ import SwiftUI
 
 struct PopoverRootView: View {
     @Environment(SessionStore.self) private var store
+    @AppStorage("popoverScale") private var scaleSetting = PopoverScale.medium.rawValue
+
+    private var scale: CGFloat { PopoverScale.stored(scaleSetting).factor }
 
     // MenuBarExtra windows size to their content's ideal height, which
     // collapses a ScrollView to zero; measure the content instead.
@@ -13,12 +16,15 @@ struct PopoverRootView: View {
         // The target lives on the store because the rows that open it are two
         // layers down, and threading a closure through would be noisier than
         // one observable field.
-        if let id = store.replyingTo,
-           let session = store.sessions.first(where: { $0.id == id }) {
-            ReplyComposer(session: session) { store.replyingTo = nil }
-        } else {
-            sessionList
+        Group {
+            if let id = store.replyingTo,
+               let session = store.sessions.first(where: { $0.id == id }) {
+                ReplyComposer(session: session) { store.replyingTo = nil }
+            } else {
+                sessionList
+            }
         }
+        .environment(\.swarmScale, scale)
     }
 
     private var sessionList: some View {
@@ -68,11 +74,11 @@ struct PopoverRootView: View {
                     contentHeight = height
                 }
             }
-            .frame(height: min(contentHeight, 480))
+            .frame(height: min(contentHeight, 480 * scale))
 
             PopoverFooter()
         }
-        .frame(width: 380)
+        .frame(width: 380 * scale)
     }
 }
 
@@ -108,6 +114,7 @@ struct PopoverHeader: View {
 }
 
 struct HeaderIconButton: View {
+    @Environment(\.swarmScale) private var scale
     let symbol: String
     var active: Bool = false
     var tint: Color? = nil
@@ -129,7 +136,7 @@ struct HeaderIconButton: View {
                 .swarmFont(.icon)
                 .foregroundStyle(tint.map(AnyShapeStyle.init)
                                  ?? (active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary)))
-                .frame(width: 26, height: 26)
+                .frame(width: 26 * scale, height: 26 * scale)
                 .background(.primary.opacity(active ? 0.14 : 0),
                             in: .rect(cornerRadius: 7))
         }
