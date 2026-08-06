@@ -28,7 +28,7 @@ struct ReplyComposer: View {
         HStack(spacing: 9) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 12, weight: .semibold))
+                    .swarmFont(.bodyEmphasis)
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
             }
@@ -39,10 +39,10 @@ struct ReplyComposer: View {
             ToolChip(tool: session.tool, size: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text(session.projectName)
-                    .font(.system(size: 13, weight: .semibold))
+                    .swarmFont(.rowTitle)
                     .lineLimit(1)
                 Text("Reply to \(session.tool.label)")
-                    .font(.caption)
+                    .swarmFont(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -63,7 +63,7 @@ struct ReplyComposer: View {
         }()
         if let asked {
             Text("\u{201C}\(asked)\u{201D}")
-                .font(.callout)
+                .swarmFont(.body)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,7 +74,7 @@ struct ReplyComposer: View {
 
     private var editor: some View {
         TextEditor(text: $text)
-            .font(.system(size: 12.5))
+            .swarmFont(.editor)
             .scrollContentBackground(.hidden)
             .frame(height: 120)
             .padding(6)
@@ -93,13 +93,13 @@ struct ReplyComposer: View {
         VStack(alignment: .leading, spacing: 8) {
             if let error {
                 Text(error)
-                    .font(.caption)
+                    .swarmFont(.caption)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Text("Return adds a line, Command Return sends")
-                    .font(.caption2)
+                    .swarmFont(.captionMedium)
                     .foregroundStyle(.tertiary)
                 Spacer()
                 Button("Send") { send() }

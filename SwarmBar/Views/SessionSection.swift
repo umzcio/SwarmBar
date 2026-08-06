@@ -16,7 +16,7 @@ struct SessionSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title.uppercased())
-                .font(.subheadline.weight(.bold))
+                .swarmFont(.sectionHeader)
                 .kerning(0.6)
                 .foregroundStyle(emphasis == .attention ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
                 .padding(.horizontal, 16)

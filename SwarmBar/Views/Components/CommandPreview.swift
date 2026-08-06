@@ -15,7 +15,7 @@ struct CommandPreview: View {
 
     var body: some View {
         Text("$ \(command)")
-            .font(.system(.subheadline, design: .monospaced))
+            .swarmFont(.mono)
             .foregroundStyle(.orange)
             .lineLimit(1)
             .truncationMode(.tail)

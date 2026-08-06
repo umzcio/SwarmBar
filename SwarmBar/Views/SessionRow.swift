@@ -11,7 +11,7 @@ struct SessionRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(session.projectName)
-                        .font(.headline)
+                        .swarmFont(.rowTitleStrong)
                         .lineLimit(1)
                     Spacer()
                     ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
@@ -23,11 +23,11 @@ struct SessionRow: View {
                     StatusDot(status: session.status)
                         .id(session.status.label)
                     Text("\(session.status.label) · \(session.tool.label)")
-                        .font(.subheadline.weight(.semibold))
+                        .swarmFont(.metaEmphasis)
                         .foregroundStyle(session.status.tint)
                     if let account = session.accountLabel {
                         Text(account)
-                            .font(.caption2.weight(.semibold))
+                            .swarmFont(.captionEmphasis)
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -39,7 +39,7 @@ struct SessionRow: View {
                 case .waitingInput(let prompt):
                     if !prompt.isEmpty {
                         Text("\u{201C}\(prompt)\u{201D}")
-                            .font(.callout)
+                            .swarmFont(.body)
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 6) {
@@ -52,12 +52,12 @@ struct SessionRow: View {
                     }
                 case .working(let activity), .runningTool(let activity):
                     Text(activity)
-                        .font(.callout)
+                        .swarmFont(.body)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 case .done(let summary):
                     Text(summary)
-                        .font(.callout)
+                        .swarmFont(.body)
                         .foregroundStyle(.secondary)
                     // A finished turn is still steerable: its composer is
                     // idle, so a reply can start the next turn.

@@ -22,7 +22,7 @@ struct ActionPill: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.callout.weight(.semibold))
+            .swarmFont(.bodyEmphasis)
             .padding(.horizontal, 11)
             .padding(.vertical, 4)
             .foregroundStyle(foreground)

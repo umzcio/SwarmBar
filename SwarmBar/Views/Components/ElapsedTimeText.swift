@@ -11,7 +11,7 @@ struct ElapsedTimeText: View {
             Text(ago
                  ? Self.agoFormat(context.date.timeIntervalSince(since))
                  : Self.format(context.date.timeIntervalSince(since)))
-                .font(.subheadline)
+                .swarmFont(.meta)
                 .monospacedDigit()
                 .foregroundStyle(.tertiary)
         }

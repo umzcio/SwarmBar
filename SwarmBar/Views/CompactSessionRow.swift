@@ -11,7 +11,7 @@ struct CompactSessionRow: View {
                 .id(session.status.label)
             ToolChip(tool: session.tool, size: 18)
             Text(session.projectName)
-                .font(.system(size: 12.5, weight: .semibold))
+                .swarmFont(.rowTitleCompact)
                 .lineLimit(1)
                 .frame(maxWidth: 118, alignment: .leading)
 
@@ -19,7 +19,7 @@ struct CompactSessionRow: View {
                 switch session.status {
                 case .waitingApproval(let command):
                     Text("$ \(command)")
-                        .font(.system(size: 10.5, design: .monospaced))
+                        .swarmFont(.monoCompact)
                         .foregroundStyle(.orange)
                 case .waitingInput(let prompt):
                     Text(prompt.isEmpty ? "Waiting on you" : "\u{201C}\(prompt)\u{201D}")
@@ -34,7 +34,7 @@ struct CompactSessionRow: View {
                     Text("")
                 }
             }
-            .font(.system(size: 11.5))
+            .swarmFont(.detail)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -89,7 +89,7 @@ struct MicroButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: kind.symbol)
-                .font(.system(size: 10, weight: .bold))
+                .swarmFont(.iconSmall)
                 .foregroundStyle(foreground)
                 .frame(width: 20, height: 20)
                 .background(background, in: .rect(cornerRadius: 6))

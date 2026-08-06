@@ -29,7 +29,7 @@ struct PopoverRootView: View {
                 VStack(spacing: 0) {
                     if store.visibleCount == 0 {
                         Text("No agent sessions")
-                            .font(.callout)
+                            .swarmFont(.body)
                             .foregroundStyle(.tertiary)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 24)
@@ -84,7 +84,7 @@ struct PopoverHeader: View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text("SwarmBar")
-                    .font(.system(size: 14, weight: .bold))
+                    .swarmFont(.title)
                 SummaryLine()
             }
             Spacer()
@@ -126,7 +126,7 @@ struct HeaderIconButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 12, weight: .medium))
+                .swarmFont(.icon)
                 .foregroundStyle(tint.map(AnyShapeStyle.init)
                                  ?? (active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary)))
                 .frame(width: 26, height: 26)
@@ -143,7 +143,7 @@ struct SummaryLine: View {
 
     var body: some View {
         summary
-            .font(.callout)
+            .swarmFont(.body)
             .foregroundStyle(.secondary)
     }
 
@@ -179,14 +179,14 @@ struct PopoverFooter: View {
             } label: {
                 Label("Settings", systemImage: "gearshape")
                     .labelStyle(.titleAndIcon)
-                    .font(.callout)
+                    .swarmFont(.body)
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
             Spacer()
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.borderless)
-                .font(.callout)
+                .swarmFont(.body)
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12)
