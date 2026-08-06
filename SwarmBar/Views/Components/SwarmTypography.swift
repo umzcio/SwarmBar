@@ -19,10 +19,15 @@ import SwiftUI
 /// MenuBarLabel, whose size is dictated by the menu bar's height rather
 /// than by preference.
 ///
-/// Note for whoever tunes this next: sixteen roles is more type than a
-/// 380pt popover needs. The duplication is inherited, not designed, and
-/// consolidating it is a real design decision (it moves pixels), so it was
-/// left for a deliberate pass rather than smuggled into a refactor.
+/// Eighteen roles looks like a lot for a 380pt popover, and an earlier
+/// version of this comment called it inherited duplication. That was
+/// wrong, so before consolidating anything, know what was checked:
+/// no two roles share a (size, weight, design) triple, so there is
+/// nothing mechanically redundant to merge; the eight distinct sizes come
+/// straight from swarmbar-prototype.html, half points included (it uses
+/// 10, 10.5, 11, 11.5, 12, 12.5, 13, 14, 15). The prototype is the design
+/// spec, so collapsing the ramp would be a deliberate divergence FROM the
+/// spec, not a cleanup toward it. Change the prototype first.
 enum SwarmText: CaseIterable {
     /// "SwarmBar" in the popover header.
     case title
