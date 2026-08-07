@@ -99,6 +99,10 @@ struct MicroButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        // The icon carries no text, so without this VoiceOver announces
+        // an anonymous button. `help` is a tooltip and is NOT read as a
+        // label; the two are separate and both are needed.
+        .accessibilityLabel(help)
     }
 
     private var foreground: AnyShapeStyle {

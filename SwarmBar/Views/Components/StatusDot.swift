@@ -24,6 +24,10 @@ struct StatusDot: View {
                 }
             }
             .onAppear { start() }
+            // Decorative: the colour repeats what the adjacent status text
+            // already says, in both densities. Announcing it would just
+            // add an anonymous element before every row.
+            .accessibilityHidden(true)
     }
 
     private func start() {

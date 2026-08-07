@@ -36,6 +36,7 @@ struct ReplyComposer: View {
             .buttonStyle(.plain)
             .keyboardShortcut(.cancelAction)
             .help("Back")
+            .accessibilityLabel("Back")
 
             ToolChip(tool: session.tool, size: 22 * scale)
             VStack(alignment: .leading, spacing: 1) {

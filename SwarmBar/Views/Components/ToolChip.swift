@@ -22,6 +22,10 @@ struct ToolChip: View {
         .frame(width: size, height: size)
         .background(tool.tint.gradient, in: .rect(cornerRadius: size * 0.27))
         .help(tool.label)
+        // A compact row names the tool nowhere else, so this chip is the
+        // only thing carrying it. Comfortable rows say it in text too, and
+        // hearing it twice there beats not hearing it at all in compact.
+        .accessibilityLabel(tool.label)
     }
 }
 

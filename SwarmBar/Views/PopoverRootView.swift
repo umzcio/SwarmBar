@@ -142,6 +142,10 @@ struct HeaderIconButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        // Icon-only, so it needs a spoken name as well as a tooltip. The
+        // help text already describes the action it will perform, which is
+        // what a label should say.
+        .accessibilityLabel(help)
     }
 }
 
