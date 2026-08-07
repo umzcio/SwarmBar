@@ -113,3 +113,23 @@ struct TypographyTests {
         #expect(large - medium >= 2, "fixed dimensions are not scaling (grew \(large - medium)pt)")
     }
 }
+
+/// Only the attach rule is covered here. Whether a row's buttons win a
+/// click over the double-click gesture is deliberately NOT tested: see
+/// SessionRowInteraction's doc comment and HANDOFF.md for why no
+/// in-process test can observe it, and what to check by hand instead.
+@MainActor
+struct SessionRowInteractionTests {
+    @Test func theGestureIsAttachedOnlyWhenItCouldFire() {
+        #expect(SessionRowInteraction.attachesDoubleClick(
+            enabled: true, hasProjectPath: true))
+        // Setting off: no recognizer, so single clicks keep their speed.
+        #expect(!SessionRowInteraction.attachesDoubleClick(
+            enabled: false, hasProjectPath: true))
+        // Nothing to open: attaching would cost the delay for no action.
+        #expect(!SessionRowInteraction.attachesDoubleClick(
+            enabled: true, hasProjectPath: false))
+        #expect(!SessionRowInteraction.attachesDoubleClick(
+            enabled: false, hasProjectPath: false))
+    }
+}

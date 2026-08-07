@@ -88,6 +88,25 @@ extension View {
     }
 }
 
+/// The part of a row's interaction rules that can be tested without a
+/// running UI.
+///
+/// What CANNOT be tested here, and is therefore a manual check (see
+/// HANDOFF.md, "Row interactions"): that the row's own buttons win a
+/// click over the double-click gesture. SwiftUI renders the whole row into
+/// one NSView, its accessibility children do not surface in process, and
+/// hitTest cannot tell a button click from a row click, so no in-process
+/// test can observe which one wins. Do not add a test that claims to.
+enum SessionRowInteraction {
+    /// A double-click recognizer is attached only when it could actually
+    /// fire. Attaching it always and returning early inside the handler
+    /// looks equivalent and is not: the recognizer still makes every
+    /// single click wait to see whether a second one follows.
+    static func attachesDoubleClick(enabled: Bool, hasProjectPath: Bool) -> Bool {
+        enabled && hasProjectPath
+    }
+}
+
 private struct SessionRowInteractions: ViewModifier {
     @AppStorage("doubleClickOpensTerminal") private var doubleClickOpens = true
     let session: AgentSession
@@ -103,7 +122,8 @@ private struct SessionRowInteractions: ViewModifier {
             // disambiguation delay, and the row's buttons are clicked far
             // more often than its background.
             .modifier(DoubleClickToOpen(
-                enabled: doubleClickOpens && canOpen,
+                enabled: SessionRowInteraction.attachesDoubleClick(
+                    enabled: doubleClickOpens, hasProjectPath: canOpen),
                 action: { store.openInTerminal(session) }
             ))
     }
