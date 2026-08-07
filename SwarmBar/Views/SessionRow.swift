@@ -75,17 +75,61 @@ struct SessionRow: View {
         .padding(8)
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
-        .sessionContextMenu(session, store: store)
+        .sessionRowInteractions(session, store: store)
     }
 }
 
 extension View {
-    func sessionContextMenu(_ session: AgentSession, store: SessionStore) -> some View {
-        contextMenu {
+    /// The interactions a session row offers whatever its density: the
+    /// context menu, and the optional double-click shortcut to its
+    /// terminal. Both rows apply this, so the two densities cannot drift.
+    func sessionRowInteractions(_ session: AgentSession, store: SessionStore) -> some View {
+        modifier(SessionRowInteractions(session: session, store: store))
+    }
+}
+
+private struct SessionRowInteractions: ViewModifier {
+    @AppStorage("doubleClickOpensTerminal") private var doubleClickOpens = true
+    let session: AgentSession
+    let store: SessionStore
+
+    private var canOpen: Bool { session.projectPath != nil }
+
+    func body(content: Content) -> some View {
+        menu(content)
+            // Attached only when it can actually do something, rather than
+            // attached always and guarded inside. A double-click recognizer
+            // that is never going to fire still costs every single click a
+            // disambiguation delay, and the row's buttons are clicked far
+            // more often than its background.
+            .modifier(DoubleClickToOpen(
+                enabled: doubleClickOpens && canOpen,
+                action: { store.openInTerminal(session) }
+            ))
+    }
+
+    private func menu(_ content: Content) -> some View {
+        content.contextMenu {
             Button("Open in Terminal") { store.openInTerminal(session) }
-                .disabled(session.projectPath == nil)
+                .disabled(!canOpen)
             Button("Copy project path") { store.copyProjectPath(session) }
-                .disabled(session.projectPath == nil)
+                .disabled(!canOpen)
+        }
+    }
+}
+
+private struct DoubleClickToOpen: ViewModifier {
+    let enabled: Bool
+    let action: () -> Void
+
+    func body(content: Content) -> some View {
+        if enabled {
+            // Not simultaneousGesture: the row's own buttons must win the
+            // click. Approve and Deny sit inside this hit area, and double
+            // clicking Approve must approve once, not also open a terminal.
+            content.onTapGesture(count: 2, perform: action)
+        } else {
+            content
         }
     }
 }

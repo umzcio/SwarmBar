@@ -30,6 +30,7 @@ struct GeneralSettingsTab: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @AppStorage("compactRows") private var compactRows = false
     @AppStorage("popoverScale") private var popoverScale = PopoverScale.medium.rawValue
+    @AppStorage("doubleClickOpensTerminal") private var doubleClickOpensTerminal = true
     @State private var updates = UpdateChecker()
 
     var body: some View {
@@ -104,6 +105,13 @@ struct GeneralSettingsTab: View {
                     .labelsHidden()
                     .frame(width: 168)
                 }
+                SettingsDivider()
+                SettingsToggleRow(
+                    symbol: "cursorarrow.click.2",
+                    title: "Double-click opens Terminal",
+                    detail: "Jump to a session's terminal from its row",
+                    isOn: $doubleClickOpensTerminal
+                )
             }
         }
     }
