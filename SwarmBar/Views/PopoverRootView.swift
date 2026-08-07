@@ -191,10 +191,16 @@ struct PopoverFooter: View {
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
             Spacer()
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.borderless)
-                .swarmFont(.body)
-                .foregroundStyle(.secondary)
+            Button {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                Label("Quit", systemImage: "power")
+                    .labelStyle(.titleAndIcon)
+                    .swarmFont(.body)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Quit")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
