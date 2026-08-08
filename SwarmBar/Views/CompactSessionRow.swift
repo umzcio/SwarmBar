@@ -11,10 +11,12 @@ struct CompactSessionRow: View {
             StatusDot(status: session.status)
                 .id(session.status.label)
             ToolChip(tool: session.tool, size: 18 * scale)
+                .doubleClickOpensTerminal(session, store: store)
             Text(session.projectName)
                 .swarmFont(.rowTitleCompact)
                 .lineLimit(1)
                 .frame(maxWidth: 118 * scale, alignment: .leading)
+                .doubleClickOpensTerminal(session, store: store)
 
             Group {
                 switch session.status {
@@ -38,6 +40,7 @@ struct CompactSessionRow: View {
             .swarmFont(.detail)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .doubleClickOpensTerminal(session, store: store)
 
             if case .waitingApproval = session.status {
                 MicroButton(.approve, help: "Approve") { store.approve(session) }

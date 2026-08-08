@@ -9,6 +9,7 @@ struct SessionRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             ToolChip(tool: session.tool, size: 26 * scale)
+                .doubleClickOpensTerminal(session, store: store)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(session.projectName)
@@ -17,6 +18,7 @@ struct SessionRow: View {
                     Spacer()
                     ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
                 }
+                .doubleClickOpensTerminal(session, store: store)
                 HStack(spacing: 5) {
                     // Fresh identity per status kind restarts the pulse/blink
                     // loop; without it the repeatForever animation freezes
@@ -31,7 +33,9 @@ struct SessionRow: View {
                             .swarmFont(.captionEmphasis)
                             .foregroundStyle(.tertiary)
                     }
+                    Spacer(minLength: 0)
                 }
+                .doubleClickOpensTerminal(session, store: store)
 
                 switch session.status {
                 case .waitingApproval(let command):
@@ -80,11 +84,26 @@ struct SessionRow: View {
 }
 
 extension View {
-    /// The interactions a session row offers whatever its density: the
-    /// context menu, and the optional double-click shortcut to its
-    /// terminal. Both rows apply this, so the two densities cannot drift.
+    /// The context menu, applied to the whole row in both densities.
     func sessionRowInteractions(_ session: AgentSession, store: SessionStore) -> some View {
         modifier(SessionRowInteractions(session: session, store: store))
+    }
+
+    /// The double-click shortcut to a session's terminal.
+    ///
+    /// Deliberately NOT applied to the whole row. A row sets
+    /// `contentShape(.rect)` so its hover highlight and context menu cover
+    /// the full area, which makes the row one hit-test surface sitting in
+    /// front of its own buttons. A tap recognizer attached there intercepts
+    /// clicks meant for Approve and Deny, and the row needed two or three
+    /// clicks to respond. Attaching it behind the content does not help
+    /// either: the content shape absorbs the hit first.
+    ///
+    /// So it goes on the identity area only, the chip and the text, which
+    /// have no controls in them. Approve, Deny, Reply and Dismiss are
+    /// siblings of that area and never see this gesture.
+    func doubleClickOpensTerminal(_ session: AgentSession, store: SessionStore) -> some View {
+        modifier(DoubleClickToOpen(session: session, store: store))
     }
 }
 
@@ -108,27 +127,12 @@ enum SessionRowInteraction {
 }
 
 private struct SessionRowInteractions: ViewModifier {
-    @AppStorage("doubleClickOpensTerminal") private var doubleClickOpens = true
     let session: AgentSession
     let store: SessionStore
 
     private var canOpen: Bool { session.projectPath != nil }
 
     func body(content: Content) -> some View {
-        menu(content)
-            // Attached only when it can actually do something, rather than
-            // attached always and guarded inside. A double-click recognizer
-            // that is never going to fire still costs every single click a
-            // disambiguation delay, and the row's buttons are clicked far
-            // more often than its background.
-            .modifier(DoubleClickToOpen(
-                enabled: SessionRowInteraction.attachesDoubleClick(
-                    enabled: doubleClickOpens, hasProjectPath: canOpen),
-                action: { store.openInTerminal(session) }
-            ))
-    }
-
-    private func menu(_ content: Content) -> some View {
         content.contextMenu {
             Button("Open in Terminal") { store.openInTerminal(session) }
                 .disabled(!canOpen)
@@ -139,15 +143,19 @@ private struct SessionRowInteractions: ViewModifier {
 }
 
 private struct DoubleClickToOpen: ViewModifier {
-    let enabled: Bool
-    let action: () -> Void
+    @AppStorage("doubleClickOpensTerminal") private var enabled = true
+    let session: AgentSession
+    let store: SessionStore
 
     func body(content: Content) -> some View {
-        if enabled {
-            // Not simultaneousGesture: the row's own buttons must win the
-            // click. Approve and Deny sit inside this hit area, and double
-            // clicking Approve must approve once, not also open a terminal.
-            content.onTapGesture(count: 2, perform: action)
+        if SessionRowInteraction.attachesDoubleClick(
+            enabled: enabled, hasProjectPath: session.projectPath != nil) {
+            // Attached only when it could fire. A recognizer that will
+            // never fire still makes every single click here wait to see
+            // whether a second one follows.
+            content
+                .contentShape(.rect)
+                .onTapGesture(count: 2) { store.openInTerminal(session) }
         } else {
             content
         }
