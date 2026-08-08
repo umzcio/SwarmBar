@@ -1,13 +1,17 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/swarmbar-Agent_Status_At_A_Glance-F59E0B?style=for-the-badge&labelColor=1C1917" alt="SwarmBar" />
+  <img src="assets/logo.png" alt="SwarmBar" width="140" />
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-pre--release-F59E0B?style=flat-square" alt="pre-release" />
-  <img src="https://img.shields.io/badge/license-MIT-F59E0B?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/stack-Swift%206%20%7C%20SwiftUI-1C1917?style=flat-square" alt="Stack" />
-  <img src="https://img.shields.io/badge/platform-macOS%2026%2B-34d399?style=flat-square" alt="macOS 26+" />
-  <img src="https://img.shields.io/badge/dependencies-0-34d399?style=flat-square" alt="Zero dependencies" />
+  <img src="https://img.shields.io/badge/swarmbar-Agent_Status_At_A_Glance-FF9F0A?style=for-the-badge&labelColor=0C0D14" alt="SwarmBar" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/status-pre--release-FF9F0A?style=flat-square" alt="pre-release" />
+  <img src="https://img.shields.io/badge/license-MIT-FF9F0A?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/badge/stack-Swift%206%20%7C%20SwiftUI-0C0D14?style=flat-square" alt="Stack" />
+  <img src="https://img.shields.io/badge/platform-macOS%2026%2B-30D158?style=flat-square" alt="macOS 26+" />
+  <img src="https://img.shields.io/badge/dependencies-0-30D158?style=flat-square" alt="Zero dependencies" />
 </p>
 
 <p align="center">
@@ -129,7 +133,16 @@ scripts/        Bridge scripts installed into Application Support
 
 ## Quick Start
 
-No signed release yet, so build it from source.
+### Install
+
+Signed and notarized builds are published to the
+[Releases](https://github.com/umzcio/SwarmBar/releases) page. Download the latest, drag it to
+`/Applications`, and launch it. There is no Dock icon by design: look for the hexagon in the menu
+bar.
+
+The first release is still in preparation. Until it lands, build from source below.
+
+### Build from source
 
 **Prerequisites:** macOS 26+, Xcode with the macOS 26 SDK, and
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
@@ -143,7 +156,7 @@ xcodebuild -project SwarmBar.xcodeproj -scheme SwarmBar -configuration Release b
 ```
 
 The built app lands in the Xcode derived data path printed at the end of the build. Copy it to
-`/Applications` and launch it. It has no Dock icon by design.
+`/Applications` and launch it.
 
 `xcodegen generate` has to run whenever files are added, since `project.yml` is the source of truth
 and the `.xcodeproj` is generated and gitignored.
@@ -165,7 +178,7 @@ approvals appear immediately.
 
 ## Roadmap
 
-- Developer ID signing and notarization so there is a release to download
+- Ship the first signed and notarized release
 - Terminal.app support for keystroke answers and inline reply
 - Remote sessions over SSH
 - User-defined agents beyond the six built in

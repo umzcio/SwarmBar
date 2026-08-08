@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30.4 30.4">
+  <!-- The SwarmBar hexagon: seven dots, same geometry as the menu bar glyph
+       and the app icon (CX/CY 15.2, R 7.6, DOT_R 3.35, lit in order 1-7).
+       Kept in sync with swarm-glyph-hexgrid.html and the SwarmBar-web favicon. -->
+  <rect width="30.4" height="30.4" rx="6.992" fill="#0c0d14"/>
+  <g fill="#ececee">
+    <circle cx="19" cy="8.618" r="3.35"/>
+    <circle cx="11.4" cy="8.618" r="3.35"/>
+    <circle cx="15.2" cy="15.2" r="3.35"/>
+    <circle cx="19" cy="21.78" r="3.35"/>
+    <circle cx="11.4" cy="21.78" r="3.35"/>
+    <circle cx="7.6" cy="15.2" r="3.35"/>
+    <circle cx="22.8" cy="15.2" r="3.35"/>
+  </g>
+</svg>
