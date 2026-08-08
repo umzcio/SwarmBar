@@ -994,43 +994,122 @@ struct AntigravityTranscriptTests {
     }
 }
 
-/// The database is in WAL mode while agy is running, and a read-only
-/// connection cannot create the -shm file SQLite then needs. Against the
-/// real database the OPEN succeeded and only the first prepare failed with
-/// SQLITE_CANTOPEN, so a reader that checks the open alone reports an empty
-/// table instead of an error, and the tool silently shows no sessions.
+/// Both SQLite-backed tools run their databases in WAL mode, and a
+/// read-only connection cannot create the `-shm` file SQLite then needs.
+/// Against a real database the OPEN succeeded and only the first prepare
+/// failed with SQLITE_CANTOPEN, so a reader that checks the open alone
+/// reports an empty table instead of an error, and the tool's sessions
+/// disappear from the popover with nothing to say why.
+///
+/// These tests hinge on the fixture actually reproducing that shape, so the
+/// first one is a negative control: it asserts the plain read-only path
+/// FAILS here. Without it the rest would pass just as happily against a
+/// database that never needed the fallback, which is no evidence at all.
 @MainActor
-struct AntigravityWALTests {
-    private func makeWALDatabase() throws -> String {
+struct SQLiteWALFallbackTests {
+    /// A WAL database with no shared-memory file, in a directory that
+    /// cannot be written, so SQLite cannot make one. That is the state a
+    /// writing process leaves behind, and it is what defeats a read-only
+    /// connection.
+    private func makeWALDatabaseWithoutSharedMemory(
+        table: String, insert: String
+    ) throws -> String {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("conversation_summaries.db").path
+        let path = dir.appendingPathComponent("state.db").path
         var db: OpaquePointer?
         #expect(sqlite3_open(path, &db) == SQLITE_OK)
-        let sql = """
-        PRAGMA journal_mode=WAL;
+        #expect(sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(db, table, nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(db, insert, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+        try? FileManager.default.removeItem(atPath: path + "-shm")
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        return path
+    }
+
+    private func canQuery(_ path: String, table: String, direct: Bool) -> Bool {
+        let probe: (OpaquePointer) -> Bool? = { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "SELECT count(*) FROM \(table)", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            sqlite3_finalize(statement)
+            return true
+        }
+        let result = direct
+            ? SQLiteSnapshot.readDirect(dbPath: path, probe)
+            : SQLiteSnapshot.read(dbPath: path, probe)
+        return result ?? false
+    }
+
+    private var summariesTable: String {
+        """
         CREATE TABLE conversation_summaries(
           conversation_id text, title text, preview text, workspace_uris text,
           status text, not_fully_idle numeric, killed numeric,
           parent_conversation_id text, last_modified_time datetime);
+        """
+    }
+
+    private var summariesRow: String {
+        """
         INSERT INTO conversation_summaries VALUES
           ('c1','Title','Preview','["file:///tmp/proj"]','',0,0,'','2026-08-08 15:00:00');
         """
-        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
-        // Left open on purpose: this is what a running agy looks like, and
-        // it keeps the WAL hot so the read-only path really is refused.
-        return path
     }
 
-    @Test func rowsAreReadableWhileTheWriteAheadLogIsHot() throws {
-        let path = try makeWALDatabase()
+    /// The negative control. If this ever passes, the fixture stopped
+    /// reproducing the problem and every other test here proves nothing.
+    @Test func aPlainReadOnlyConnectionCannotReadThisDatabase() throws {
+        let path = try makeWALDatabaseWithoutSharedMemory(
+            table: summariesTable, insert: summariesRow)
+        #expect(canQuery(path, table: "conversation_summaries", direct: true) == false)
+    }
+
+    @Test func theSnapshotFallbackReadsItAnyway() throws {
+        let path = try makeWALDatabaseWithoutSharedMemory(
+            table: summariesTable, insert: summariesRow)
+        #expect(canQuery(path, table: "conversation_summaries", direct: false))
+    }
+
+    @Test func antigravityRowsSurviveIt() throws {
+        let path = try makeWALDatabaseWithoutSharedMemory(
+            table: summariesTable, insert: summariesRow)
         let rows = AntigravityReader.rows(dbPath: path)
-        #expect(rows.count == 1, "a hot WAL must not read as an empty table")
+        #expect(rows.count == 1, "a WAL database must not read as an empty table")
         #expect(rows.first?.workspace == "/tmp/proj")
+    }
+
+    /// OpenCode has never actually hit this: it leaves a readable -shm
+    /// beside its database, which is the only reason its plain read-only
+    /// connection has been working. That is a property of how the tool
+    /// happens to run, not a guarantee.
+    @Test func openCodeSessionsSurviveIt() throws {
+        let now = Date.now
+        let updated = Int(now.timeIntervalSince1970 * 1000)
+        let path = try makeWALDatabaseWithoutSharedMemory(
+            table: """
+                CREATE TABLE session(
+                  id TEXT, directory TEXT, title TEXT, parent_id TEXT,
+                  time_created INTEGER, time_updated INTEGER);
+                CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER);
+                CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+                """,
+            insert: """
+                INSERT INTO session VALUES
+                  ('s1','/tmp/proj','Title',NULL,\(updated),\(updated));
+                """
+        )
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.count == 1, "a WAL database must not read as no sessions")
+        #expect(sessions.first?.projectName == "proj")
     }
 
     @Test func aMissingDatabaseIsEmptyRatherThanACrash() {
         #expect(AntigravityReader.rows(dbPath: "/nope/missing.db").isEmpty)
+        #expect(OpenCodeReader.sessions(dbPath: "/nope/missing.db").isEmpty)
     }
 }

@@ -124,64 +124,12 @@ enum AntigravityReader {
     }
 
     nonisolated static func rows(dbPath: String = defaultDatabasePath()) -> [Row] {
-        // Straight read-only first. It succeeds whenever the write-ahead log
-        // has been checkpointed away, which is the common case.
-        if let rows = query(dbPath: dbPath, uri: "file:\(dbPath)?mode=ro") { return rows }
-
-        // It fails while agy holds a hot WAL: a read-only connection cannot
-        // create the -shm file SQLite needs, and every statement comes back
-        // SQLITE_CANTOPEN. Verified against a real database, where the
-        // read-only open SUCCEEDED and only the first prepare failed, so
-        // checking the open alone would have reported an empty table rather
-        // than an error.
-        //
-        // `immutable=1` also opens it, and is wrong: it tells SQLite the
-        // file cannot change, so the WAL is ignored and the newest
-        // conversations, the only ones a status bar cares about, are the
-        // exact ones missing.
-        //
-        // So take a copy and read that. The database is a few tens of KB,
-        // the copy is temporary, and the original is still never written to.
-        guard let snapshot = snapshot(of: dbPath) else { return [] }
-        defer { try? FileManager.default.removeItem(at: snapshot.deletingLastPathComponent()) }
-        return query(dbPath: snapshot.path, uri: snapshot.path) ?? []
-    }
-
-    /// Copies the database and its sidecars into a throwaway directory so
-    /// the WAL can be replayed without touching the original.
-    private nonisolated static func snapshot(of dbPath: String) -> URL? {
-        let fm = FileManager.default
-        let dir = fm.temporaryDirectory.appendingPathComponent("swarmbar-agy-\(UUID().uuidString)")
-        guard (try? fm.createDirectory(at: dir, withIntermediateDirectories: true)) != nil
-        else { return nil }
-        let source = URL(fileURLWithPath: dbPath)
-        let destination = dir.appendingPathComponent(source.lastPathComponent)
-        guard (try? fm.copyItem(at: source, to: destination)) != nil else {
-            try? fm.removeItem(at: dir)
-            return nil
-        }
-        // Without these the copy is whatever was last checkpointed.
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = URL(fileURLWithPath: dbPath + suffix)
-            guard fm.fileExists(atPath: sidecar.path) else { continue }
-            try? fm.copyItem(at: sidecar, to: dir.appendingPathComponent(sidecar.lastPathComponent))
-        }
-        return destination
+        SQLiteSnapshot.read(dbPath: dbPath, query) ?? []
     }
 
     /// Returns nil when the database cannot be read, which is different from
-    /// an empty table and is what lets the caller fall back.
-    private nonisolated static func query(dbPath: String, uri: String) -> [Row]? {
-        var db: OpaquePointer?
-        let flags = uri.hasPrefix("file:")
-            ? SQLITE_OPEN_READONLY | SQLITE_OPEN_URI
-            : SQLITE_OPEN_READWRITE
-        guard sqlite3_open_v2(uri, &db, flags, nil) == SQLITE_OK else {
-            sqlite3_close(db)
-            return nil
-        }
-        defer { sqlite3_close(db) }
-
+    /// an empty table and is what lets SQLiteSnapshot fall back to a copy.
+    private nonisolated static func query(db: OpaquePointer) -> [Row]? {
         let sql = """
             SELECT conversation_id, title, preview, workspace_uris, status,
                    not_fully_idle, killed, parent_conversation_id, last_modified_time

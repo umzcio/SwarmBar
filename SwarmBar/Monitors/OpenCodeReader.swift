@@ -31,15 +31,25 @@ enum OpenCodeReader {
         liveDirectories: Set<String>? = nil,
         now: Date = .now
     ) -> [AgentSession] {
-        var db: OpaquePointer?
-        let openResult = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil)
-        guard openResult == SQLITE_OK, let db else {
-            sqlite3_close(db)
-            return []
-        }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 200)
+        // OpenCode runs its database in WAL mode too, so this needs the same
+        // copy-and-read fallback Antigravity did. It has never actually
+        // fired here: opencode leaves a readable -shm beside the database,
+        // which is the only reason the plain read-only connection has been
+        // working. That is a property of how the tool happens to run, not a
+        // guarantee, and when it stops holding the whole tool goes silently
+        // empty. See SQLiteSnapshot for why the failure is so quiet.
+        SQLiteSnapshot.read(dbPath: dbPath) { db in
+            sessions(db: db, liveDirectories: liveDirectories, now: now)
+        } ?? []
+    }
 
+    /// Returns nil when the database cannot be read, which is different
+    /// from having no sessions and is what lets SQLiteSnapshot fall back.
+    private nonisolated static func sessions(
+        db: OpaquePointer,
+        liveDirectories: Set<String>?,
+        now: Date
+    ) -> [AgentSession]? {
         // parent_id is set on a session spawned by another session. Filtering
         // in SQL rather than in Swift keeps subagents from ever becoming rows.
         // No local database had a non-null parent_id when this was written,
@@ -50,7 +60,9 @@ enum OpenCodeReader {
             WHERE parent_id IS NULL
             """
         var sessionStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sessionSQL, -1, &sessionStmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, sessionSQL, -1, &sessionStmt, nil) == SQLITE_OK else {
+            return nil
+        }
         defer { sqlite3_finalize(sessionStmt) }
 
         var results: [AgentSession] = []
