@@ -34,11 +34,17 @@ struct KimiMonitor: SessionMonitor {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
     }
 
-    /// BearCode is Zach's own fork of the kimi-code engine: identical state
-    /// layout under ~/.bearcode, identical wire protocol and hooks, but it
-    /// runs as `node .../bearcode-cli/.../main.mjs`, so liveness matches on
-    /// the command line instead of a process name.
+    /// BearCode is a fork of the kimi-code engine: identical state layout
+    /// under ~/.bearcode, identical wire protocol and hooks.
+    ///
+    /// Liveness has to match two shapes. From 0.34.0 it sets
+    /// `process.title`, so it appears as a bare `bearcode` like Kimi does.
+    /// Before that it ran as `node .../bearcode-cli/.../main.mjs` and only
+    /// the command line identified it. Matching just one of these silently
+    /// breaks the other: when the rename landed, every BearCode session
+    /// read as dead and Approve fell through to opening a blank terminal.
     struct BearCode: SessionMonitor {
+        nonisolated static let processName = "bearcode"
         nonisolated static let commandPattern = "bearcode-cli/apps/kimi-code/dist/main.mjs"
 
         func start(into store: SessionStore) async {
@@ -51,7 +57,8 @@ struct KimiMonitor: SessionMonitor {
                         KimiMonitor.discover(
                             root: root,
                             liveCounts: ProcessLiveness.directoryCounts(
-                                commandPattern: Self.commandPattern),
+                                processName: Self.processName,
+                                orCommandPattern: Self.commandPattern),
                             now: now,
                             tool: .bearCode
                         )

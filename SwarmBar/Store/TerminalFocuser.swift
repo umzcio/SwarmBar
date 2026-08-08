@@ -239,8 +239,14 @@ enum TerminalFocuser {
     private nonisolated static func kimiPid(projectPath: URL?) -> Int? {
         guard let path = projectPath?.path else { return nil }
         return ProcessLiveness.pid(processName: "kimi", cwd: path)
+            // BearCode from 0.34.0 renames itself via process.title, so the
+            // command-line match alone stopped resolving a pid here. With no
+            // pid there is no tty, the selector cannot be read, and Approve
+            // degraded to opening an empty terminal window.
             ?? ProcessLiveness.pid(
-                commandPattern: KimiMonitor.BearCode.commandPattern, cwd: path)
+                processName: KimiMonitor.BearCode.processName,
+                orCommandPattern: KimiMonitor.BearCode.commandPattern,
+                cwd: path)
     }
 
     private nonisolated static func grokPid(forSession id: UUID) -> Int? {

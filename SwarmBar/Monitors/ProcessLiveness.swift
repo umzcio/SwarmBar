@@ -22,6 +22,26 @@ enum ProcessLiveness {
         counts(pgrepArgs: ["-f", commandPattern])
     }
 
+    /// Match either the process name or the command line, and merge.
+    ///
+    /// BearCode 0.34.0 sets `process.title`, which collapses its command
+    /// line from `node .../dist/main.mjs` to a bare `bearcode`, so the
+    /// command-line match that used to find it returns nothing. Older
+    /// builds are the reverse: they run as `node` and only the command line
+    /// identifies them. Trying both keeps either vintage working.
+    ///
+    /// Merged with `max` rather than summed, so a process that somehow
+    /// satisfied both matches is still counted once.
+    nonisolated static func directoryCounts(
+        processName: String, orCommandPattern pattern: String
+    ) -> [String: Int] {
+        var merged = directoryCounts(processName: processName)
+        for (path, count) in directoryCounts(commandPattern: pattern) {
+            merged[path] = max(merged[path] ?? 0, count)
+        }
+        return merged
+    }
+
     private nonisolated static func counts(pgrepArgs: [String]) -> [String: Int] {
         guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return [:] }
         var counts: [String: Int] = [:]
@@ -41,6 +61,14 @@ enum ProcessLiveness {
 
     nonisolated static func pid(commandPattern: String, cwd: String) -> Int? {
         pid(pgrepArgs: ["-f", commandPattern], cwd: cwd)
+    }
+
+    /// Name first, command line second. See the merged `directoryCounts`
+    /// above for why both are needed.
+    nonisolated static func pid(
+        processName: String, orCommandPattern pattern: String, cwd: String
+    ) -> Int? {
+        pid(processName: processName, cwd: cwd) ?? pid(commandPattern: pattern, cwd: cwd)
     }
 
     private nonisolated static func pid(pgrepArgs: [String], cwd: String) -> Int? {
