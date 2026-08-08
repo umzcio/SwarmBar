@@ -53,6 +53,11 @@ final class IntegrationManager {
             ? .noSetupNeeded : .toolMissing
         states[.grokBuild] = fm.fileExists(atPath: home.appendingPathComponent(".grok").path)
             ? .noSetupNeeded : .toolMissing
+        // Read only for now: the conversation database gives status without
+        // any bridge, and approve/deny is not wired. See AntigravityMonitor.
+        states[.antigravity] = fm.fileExists(
+            atPath: home.appendingPathComponent(".gemini/antigravity-cli").path)
+            ? .noSetupNeeded : .toolMissing
         states[.kimiCode] = detectTomlTool(configDir: ".kimi-code")
         states[.bearCode] = detectTomlTool(configDir: ".bearcode")
         states[.openCode] = detectOpenCode()
@@ -112,7 +117,7 @@ final class IntegrationManager {
                 try toggleToml(configDir: ".bearcode", enabled: enabled)
             case .openCode:
                 try toggleOpenCode(enabled)
-            case .codex, .grokBuild:
+            case .codex, .grokBuild, .antigravity:
                 break
             }
             refresh()

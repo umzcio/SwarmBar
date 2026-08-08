@@ -676,3 +676,150 @@ struct OpenCodeSubagentTests {
         #expect(sessions.first?.projectName == "proj")
     }
 }
+
+/// Antigravity (`agy`) keeps one row per conversation in a sqlite table.
+/// The interpretation is deliberately conservative: every row sampled when
+/// this was written had an empty `status` and `not_fully_idle` = 0, so the
+/// vocabulary is unknown and nothing may be invented from it.
+@MainActor
+struct AntigravityTests {
+    private func row(
+        id: String = "c1", title: String = "Fix the parser", preview: String = "Editing",
+        workspace: String? = "/Users/x/proj", status: String = "",
+        busy: Bool = false, killed: Bool = false, parent: String = "",
+        modified: Date = .now
+    ) -> AntigravityReader.Row {
+        .init(conversationID: id, title: title, preview: preview, workspace: workspace,
+              status: status, notFullyIdle: busy, killed: killed,
+              parentID: parent, lastModified: modified)
+    }
+
+    // MARK: - Workspace
+
+    @Test func theWorkspaceComesOutOfTheFileURIArray() {
+        #expect(AntigravityReader.workspacePath(fromURIs: #"["file:///Users/x/proj"]"#) == "/Users/x/proj")
+    }
+
+    /// --add-dir appends more entries. Only the first is the project.
+    @Test func extraWorkspacesDoNotChangeTheProject() {
+        let json = #"["file:///Users/x/proj","file:///Users/x/other"]"#
+        #expect(AntigravityReader.workspacePath(fromURIs: json) == "/Users/x/proj")
+    }
+
+    @Test func aMissingOrJunkWorkspaceIsNil() {
+        #expect(AntigravityReader.workspacePath(fromURIs: "[]") == nil)
+        #expect(AntigravityReader.workspacePath(fromURIs: "") == nil)
+        #expect(AntigravityReader.workspacePath(fromURIs: "not json") == nil)
+    }
+
+    // MARK: - Timestamps
+
+    /// The column is declared `datetime`, which SQLite does not enforce, so
+    /// both the shell rendering and the RFC3339 a Go driver writes appear.
+    @Test func bothTimestampSpellingsParse() {
+        #expect(AntigravityReader.parseTimestamp("2026-08-08 15:04:05") != nil)
+        #expect(AntigravityReader.parseTimestamp("2026-08-08T15:04:05Z") != nil)
+        #expect(AntigravityReader.parseTimestamp("2026-08-08T15:04:05.123Z") != nil)
+    }
+
+    /// An unreadable timestamp drops the row. Defaulting to now would park
+    /// a months-old conversation at the top of Active forever.
+    @Test func anUnreadableTimestampIsNilRatherThanNow() {
+        #expect(AntigravityReader.parseTimestamp("") == nil)
+        #expect(AntigravityReader.parseTimestamp("whenever") == nil)
+    }
+
+    // MARK: - Subagents
+
+    /// The child names its parent, so the child is what gets filtered. Same
+    /// conclusion as Grok, Codex and OpenCode: read the tool's own
+    /// statement of parentage.
+    @Test func subagentConversationsAreNotRows() {
+        let sessions = AntigravityMonitor.discover(
+            rows: [row(id: "parent"), row(id: "child", parent: "parent")], now: .now)
+        #expect(sessions.count == 1)
+    }
+
+    // MARK: - Status
+
+    @Test func aKilledConversationIsDone() {
+        let status = AntigravitySessionState.status(for: row(killed: true), age: 5)
+        if case .done = status {} else { Issue.record("expected done, got \(status)") }
+    }
+
+    @Test func theBusyFlagMeansWorking() {
+        let status = AntigravitySessionState.status(for: row(busy: true), age: 9_999)
+        if case .working = status {} else { Issue.record("expected working, got \(status)") }
+    }
+
+    /// With no flags set, recency decides, exactly as Kimi did before its
+    /// events had been sampled.
+    @Test func recencyDecidesWhenTheDatabaseSaysNothing() {
+        if case .working = AntigravitySessionState.status(for: row(), age: 10) {} else {
+            Issue.record("recent should read as working")
+        }
+        #expect(AntigravitySessionState.status(for: row(), age: 3600) == .idle)
+    }
+
+    /// The important property: an unrecognised status must express no
+    /// opinion so recency still applies. Guessing a state from an unknown
+    /// string is how a row ends up confidently wrong.
+    @Test func anUnknownStatusStringIsNotInterpreted() {
+        #expect(AntigravitySessionState.mappedStatus("", row: row()) == nil)
+        #expect(AntigravitySessionState.mappedStatus("something_new", row: row()) == nil)
+    }
+
+    @Test func aStaleConversationIsNotARowAtAll() {
+        let old = Date.now.addingTimeInterval(-9 * 60 * 60)
+        #expect(AntigravityMonitor.discover(rows: [row(modified: old)], now: .now).isEmpty)
+    }
+
+    /// The title is real, human text here, unlike most tools, so it is kept
+    /// for the row tooltip while the project name stays the label.
+    @Test func theTitleIsCarriedOntoTheSession() {
+        let sessions = AntigravityMonitor.discover(rows: [row()], now: .now)
+        #expect(sessions.first?.title == "Fix the parser")
+        #expect(sessions.first?.projectName == "proj")
+    }
+}
+
+/// The database is in WAL mode while agy is running, and a read-only
+/// connection cannot create the -shm file SQLite then needs. Against the
+/// real database the OPEN succeeded and only the first prepare failed with
+/// SQLITE_CANTOPEN, so a reader that checks the open alone reports an empty
+/// table instead of an error, and the tool silently shows no sessions.
+@MainActor
+struct AntigravityWALTests {
+    private func makeWALDatabase() throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("conversation_summaries.db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        let sql = """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE conversation_summaries(
+          conversation_id text, title text, preview text, workspace_uris text,
+          status text, not_fully_idle numeric, killed numeric,
+          parent_conversation_id text, last_modified_time datetime);
+        INSERT INTO conversation_summaries VALUES
+          ('c1','Title','Preview','["file:///tmp/proj"]','',0,0,'','2026-08-08 15:00:00');
+        """
+        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
+        // Left open on purpose: this is what a running agy looks like, and
+        // it keeps the WAL hot so the read-only path really is refused.
+        return path
+    }
+
+    @Test func rowsAreReadableWhileTheWriteAheadLogIsHot() throws {
+        let path = try makeWALDatabase()
+        let rows = AntigravityReader.rows(dbPath: path)
+        #expect(rows.count == 1, "a hot WAL must not read as an empty table")
+        #expect(rows.first?.workspace == "/tmp/proj")
+    }
+
+    @Test func aMissingDatabaseIsEmptyRatherThanACrash() {
+        #expect(AntigravityReader.rows(dbPath: "/nope/missing.db").isEmpty)
+    }
+}

@@ -140,7 +140,7 @@ struct ProvidersSettingsTab: View {
     @State private var manager = IntegrationManager()
 
     private static let bridgeTools: [AgentTool] = [.claudeCode, .kimiCode, .bearCode, .openCode]
-    private static let builtInTools: [AgentTool] = [.codex, .grokBuild]
+    private static let builtInTools: [AgentTool] = [.codex, .grokBuild, .antigravity]
 
     var body: some View {
         SettingsCardList {
@@ -292,6 +292,7 @@ private struct IntegrationRow: View {
         case .bearCode:   return "Hooks in config.toml, answers on screen"
         case .openCode:   return "Plugin inside the opencode server"
         case .codex:      return "Reads the session log, answers with hotkeys"
+        case .antigravity: return "Reads the conversation database, view only"
         case .grokBuild:
             return grokKeystrokes
                 ? "Answers by typing into the terminal"

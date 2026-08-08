@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum AgentTool: String, CaseIterable, Identifiable, Sendable {
-    case claudeCode, codex, kimiCode, bearCode, openCode, grokBuild
+    case claudeCode, codex, kimiCode, bearCode, openCode, grokBuild, antigravity
     var id: String { rawValue }
 
     var label: String {
@@ -12,6 +12,8 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .bearCode:   "BearCode"
         case .openCode:   "OpenCode"
         case .grokBuild:  "Grok Build"
+        // Google retired the `gemini` CLI in favour of `agy`.
+        case .antigravity: "Antigravity"
         }
     }
 
@@ -23,6 +25,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .bearCode:   "B"
         case .openCode:   "O"
         case .grokBuild:  "X"
+        case .antigravity: "▲"
         }
     }
 
@@ -36,6 +39,8 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .bearCode:   "bearcode"
         case .openCode:   "opencode"
         case .grokBuild:  "xai"
+        // No bundled logomark yet, so the glyph is used.
+        case .antigravity: nil
         }
     }
 
@@ -47,6 +52,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .bearCode:   Color(red: 0.87, green: 0.54, blue: 0.20)
         case .openCode:   Color(red: 0.42, green: 0.40, blue: 0.39)
         case .grokBuild:  Color(red: 0.29, green: 0.31, blue: 0.36)
+        case .antigravity: Color(red: 0.26, green: 0.52, blue: 0.96)
         }
     }
 }

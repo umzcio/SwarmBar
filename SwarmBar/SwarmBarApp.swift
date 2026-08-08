@@ -47,6 +47,7 @@ struct SwarmBarApp: App {
             Task { await KimiMonitor.BearCode().start(into: store) }
             Task { await OpenCodeMonitor().start(into: store) }
             Task { await GrokBuildMonitor().start(into: store) }
+            Task { await AntigravityMonitor().start(into: store) }
         }
     }
 
