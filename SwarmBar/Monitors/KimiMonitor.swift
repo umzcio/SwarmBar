@@ -70,6 +70,36 @@ struct KimiMonitor: SessionMonitor {
         }
     }
 
+    /// The working directory from state.json.
+    ///
+    /// The 0.34.0 engine renamed this key from `workDir` to `cwd`. Both are
+    /// read because a state directory outlives an upgrade: files written by
+    /// the old engine sit beside files written by the new one.
+    nonisolated static func stateWorkDir(_ json: [String: Any]?) -> String? {
+        (json?["workDir"] as? String) ?? (json?["cwd"] as? String)
+    }
+
+    /// The last-updated stamp from state.json.
+    ///
+    /// Also changed in 0.34.0, from an ISO 8601 string to a number. The
+    /// number is epoch milliseconds, so it is scaled by magnitude rather
+    /// than assumed: a seconds value for any plausible date is far below
+    /// the threshold, and reading milliseconds as seconds would place the
+    /// session tens of thousands of years in the future and hide it behind
+    /// the discovery window forever.
+    ///
+    /// Returning nil here is not harmless. `discover` skips a session whose
+    /// activity cannot be dated at all, so before this parsed, a session
+    /// new enough to have no wire log yet would not appear.
+    nonisolated static func stateUpdatedAt(_ json: [String: Any]?) -> Date? {
+        if let text = json?["updatedAt"] as? String {
+            return ClaudeSessionParser.date(text)
+        }
+        guard let number = json?["updatedAt"] as? Double, number > 0 else { return nil }
+        let seconds = number > 1_000_000_000_000 ? number / 1000 : number
+        return Date(timeIntervalSince1970: seconds)
+    }
+
     nonisolated static func discover(
         root: URL,
         liveCounts: [String: Int]? = nil,
@@ -104,8 +134,8 @@ struct KimiMonitor: SessionMonitor {
 
             let stateData = try? Data(contentsOf: sessionDir.appendingPathComponent("state.json"))
             let stateJSON = stateData.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
-            let stateWorkDir = stateJSON?["workDir"] as? String
-            let stateUpdatedAt = (stateJSON?["updatedAt"] as? String).flatMap { ClaudeSessionParser.date($0) }
+            let stateWorkDir = Self.stateWorkDir(stateJSON)
+            let stateUpdatedAt = Self.stateUpdatedAt(stateJSON)
 
             let wirePath = sessionDir.appendingPathComponent("agents/main/wire.jsonl")
             let wireValues = try? wirePath.resourceValues(

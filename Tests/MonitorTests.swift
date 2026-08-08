@@ -539,3 +539,51 @@ struct TailCacheTests {
         #expect(recomputed)
     }
 }
+
+/// The Kimi-family engine changed state.json's shape in 0.34.0. These are
+/// the two keys `discover` reads from it, and both moved at once.
+///
+/// The bug this guards is quiet: with both returning nil the monitor still
+/// worked, because the session index supplies the working directory and the
+/// wire log's mtime supplies a timestamp. It only bites a session new enough
+/// to have no wire log yet, which `discover` then skips entirely.
+@MainActor
+struct KimiStateShapeTests {
+    @Test func readsBothSpellingsOfTheWorkingDirectory() {
+        // Pre-0.34.0
+        #expect(KimiMonitor.stateWorkDir(["workDir": "/a"]) == "/a")
+        // 0.34.0 renamed it
+        #expect(KimiMonitor.stateWorkDir(["cwd": "/b"]) == "/b")
+        // A state dir outlives an upgrade, so both can be present
+        #expect(KimiMonitor.stateWorkDir(["workDir": "/a", "cwd": "/b"]) == "/a")
+        #expect(KimiMonitor.stateWorkDir([:]) == nil)
+        #expect(KimiMonitor.stateWorkDir(nil) == nil)
+    }
+
+    @Test func readsTheIsoStringTheOldEngineWrote() {
+        let parsed = KimiMonitor.stateUpdatedAt(["updatedAt": "2026-08-01T10:00:00.000Z"])
+        #expect(parsed != nil)
+    }
+
+    @Test func readsTheEpochMillisecondsTheNewEngineWrites() {
+        // The real value observed in a 0.34.0 session directory.
+        let parsed = KimiMonitor.stateUpdatedAt(["updatedAt": 1_786_160_685_042 as Double])
+        #expect(parsed == Date(timeIntervalSince1970: 1_786_160_685.042))
+    }
+
+    /// Milliseconds read as seconds would land tens of thousands of years
+    /// out and the session would sit outside the discovery window forever,
+    /// so the scale is decided by magnitude rather than assumed.
+    @Test func secondsAndMillisecondsAreBothUnderstood() {
+        let millis = KimiMonitor.stateUpdatedAt(["updatedAt": 1_786_160_685_042 as Double])
+        let seconds = KimiMonitor.stateUpdatedAt(["updatedAt": 1_786_160_685 as Double])
+        #expect(millis == seconds.map { $0.addingTimeInterval(0.042) })
+    }
+
+    @Test func rejectsJunkRatherThanInventingADate() {
+        #expect(KimiMonitor.stateUpdatedAt([:]) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(nil) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 0 as Double]) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "not a date"]) == nil)
+    }
+}
