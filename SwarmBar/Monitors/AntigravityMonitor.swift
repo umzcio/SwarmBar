@@ -75,10 +75,14 @@ struct AntigravityMonitor: SessionMonitor {
             // is the evidence, and it outranks any timestamp.
             sessions.append(session(
                 id: id,
-                workspace: entry?.workspace,
+                // history.jsonl is keyed by conversation id, except on a
+                // session's FIRST prompt, where the line carries no id at
+                // all: agy writes it before the conversation has one. The
+                // process cwd covers that gap, and the two agreed wherever
+                // both existed.
+                workspace: entry?.workspace ?? workingDirectory(pid),
                 title: nil,
-                status: AntigravityTranscript.status(for: steps)
-                    ?? .working(activity: entry?.prompt ?? "Working…"),
+                status: status(home: home, id: id, steps: steps, entry: entry),
                 lastActivity: steps.last?.createdAt ?? entry?.sentAt ?? now,
                 pid: pid,
                 alive: true
@@ -105,6 +109,34 @@ struct AntigravityMonitor: SessionMonitor {
         }
 
         return sessions.sorted { $0.lastActivityAt > $1.lastActivityAt }
+    }
+
+    /// A pending question outranks the transcript, because the transcript
+    /// cannot see one: it writes a line per FINISHED step, so a prompt
+    /// sitting on screen is invisible to it and the session reads as
+    /// merely running a tool. That is exactly what the popover showed on
+    /// the first live prompt, an orange row's worth of "needs you" filed
+    /// quietly under Active.
+    private nonisolated static func status(
+        home: URL,
+        id: String,
+        steps: [AntigravityTranscript.Step],
+        entry: AntigravityReader.HistoryEntry?
+    ) -> SessionStatus {
+        let dbPath = AntigravityConversation.conversationPath(home: home, conversationID: id).path
+        if let pending = AntigravityConversation.pendingQuestion(dbPath: dbPath) {
+            return pending.isApproval
+                ? .waitingApproval(command: pending.question)
+                : .waitingInput(prompt: pending.question)
+        }
+        return AntigravityTranscript.status(for: steps)
+            ?? .working(activity: entry?.prompt ?? "Working…")
+    }
+
+    /// Where the process was launched, which is the workspace whenever
+    /// history.jsonl cannot name one.
+    private nonisolated static func workingDirectory(_ pid: Int) -> String? {
+        ProcessLiveness.cwd(pid: pid)
     }
 
     private nonisolated static func session(

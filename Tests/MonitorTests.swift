@@ -994,6 +994,71 @@ struct AntigravityTranscriptTests {
     }
 }
 
+/// A prompt waiting on the user is the one thing the transcript cannot
+/// report, since it writes a line per FINISHED step. It lives only in
+/// conversations/<id>.db, and these are the shapes sampled live while agy
+/// held a real prompt on screen.
+@MainActor
+struct AntigravityPendingQuestionTests {
+    /// Verbatim from the pending step's metadata blob, which is a protobuf
+    /// carrying the tool call's arguments as a plain JSON string.
+    private let realMetadata = #"""
+        \#u{08}a1iua9we\#u{12}\#u{0c}ask_question{"questions":[{"is_multi_select":false,"options":["Approve","Deny"],"question":"Do you approve writing a file containing 'hello'?"}],"toolAction":"Asking for permission","toolSummary":"Ask permission to write file"}
+        """#
+
+    @Test func theQuestionIsLiftedOutOfTheProtobuf() throws {
+        let pending = try #require(AntigravityConversation.question(inText: realMetadata))
+        #expect(pending.question == "Do you approve writing a file containing 'hello'?")
+        #expect(pending.options == ["Approve", "Deny"])
+        #expect(pending.isApproval)
+    }
+
+    /// Approve and deny earn the orange row with its own buttons. Anything
+    /// else is a question answered in words, and must not be presented as
+    /// if a wrong tap could approve a command.
+    @Test func aQuestionThatIsNotApproveOrDenyIsNotAnApproval() {
+        let text = #"""
+            {"questions":[{"options":["server.js","index.js"],"question":"Which file did you mean?"}]}
+            """#
+        let pending = AntigravityConversation.question(inText: text)
+        #expect(pending?.options == ["server.js", "index.js"])
+        #expect(pending?.isApproval == false)
+    }
+
+    /// The questions carry braces and quotes of their own, so finding the
+    /// end of the JSON means counting braces while respecting strings.
+    @Test func bracesInsideTheQuestionDoNotEndTheObject() throws {
+        let text = #"""
+            noise{"questions":[{"question":"Run `echo {a}` and \"quote\" it?","options":["Approve","Deny"]}]}more noise
+            """#
+        let pending = try #require(AntigravityConversation.question(inText: text))
+        #expect(pending.question == #"Run `echo {a}` and "quote" it?"#)
+        #expect(pending.isApproval)
+    }
+
+    /// No evidence of a prompt must never become a prompt.
+    @Test func metadataWithoutAQuestionIsNotOne() {
+        #expect(AntigravityConversation.question(inText: "") == nil)
+        #expect(AntigravityConversation.question(inText: "ask_question") == nil)
+        #expect(AntigravityConversation.question(
+            inText: #"{"questions":[{"question":""}]}"#) == nil)
+        #expect(AntigravityConversation.question(
+            inText: #"{"questions":[{"question":"unterminated"#) == nil)
+    }
+
+    @Test func aMissingConversationDatabaseHasNoPendingQuestion() {
+        #expect(AntigravityConversation.pendingQuestion(dbPath: "/nope/missing.db") == nil)
+    }
+
+    /// Every settled step sampled reported status 3 and the pending one
+    /// reported 9, so "not 3" is what marks a step unsettled. Reading it
+    /// the other way round, as "9 means pending", would ascribe a meaning
+    /// to a value seen exactly once.
+    @Test func onlyStatusThreeCountsAsSettled() {
+        #expect(AntigravityConversation.doneStatus == 3)
+    }
+}
+
 /// Both SQLite-backed tools run their databases in WAL mode, and a
 /// read-only connection cannot create the `-shm` file SQLite then needs.
 /// Against a real database the OPEN succeeded and only the first prepare

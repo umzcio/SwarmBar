@@ -122,6 +122,11 @@ enum ProcessLiveness {
         return nil
     }
 
+    /// The working directory a process was launched in.
+    nonisolated static func cwd(pid: Int) -> String? {
+        cwds(pid: pid).first
+    }
+
     private nonisolated static func cwds(pid: Int) -> [String] {
         guard let output = run("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]) else {
             return []
