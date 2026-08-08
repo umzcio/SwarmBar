@@ -1,6 +1,6 @@
 name: SwarmBar
 options:
-  bundleIdPrefix: com.zach
+  bundleIdPrefix: app.swarmbar
   deploymentTarget:
     macOS: "26.0"
   createIntermediateGroups: true
@@ -33,7 +33,7 @@ targets:
       - sdk: libsqlite3.tbd
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.zach.SwarmBar
+        PRODUCT_BUNDLE_IDENTIFIER: app.swarmbar.SwarmBar
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
         CODE_SIGN_STYLE: Automatic
@@ -55,7 +55,7 @@ targets:
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/SwarmBar.app/Contents/MacOS/SwarmBar
         BUNDLE_LOADER: $(TEST_HOST)
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: com.zach.SwarmBarTests
+        PRODUCT_BUNDLE_IDENTIFIER: app.swarmbar.SwarmBarTests
 schemes:
   SwarmBar:
     build:
