@@ -39,8 +39,7 @@ enum AgentTool: String, CaseIterable, Identifiable, Sendable {
         case .bearCode:   "bearcode"
         case .openCode:   "opencode"
         case .grokBuild:  "xai"
-        // No bundled logomark yet, so the glyph is used.
-        case .antigravity: nil
+        case .antigravity: "antigravity"
         }
     }
 
