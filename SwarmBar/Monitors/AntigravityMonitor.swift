@@ -1,14 +1,31 @@
 import Foundation
 
-/// Turns Antigravity's conversation rows into sessions.
+/// Turns Antigravity conversations into sessions.
 ///
-/// Phase 1 deliberately stops at listing them. Approve and deny are not
-/// wired: `agy --dangerously-skip-permissions` proves a permission prompt
-/// exists, and the binary contains Claude's hook event names alongside a
-/// `plugin import claude` command, which suggests the Claude-compatible
-/// bridge SwarmBar already speaks. None of that is verified, and answering
-/// a real prompt wrongly is the one mistake in this app that cannot be
-/// taken back, so it waits for a live round.
+/// Antigravity is unusual in splitting live state from finished state
+/// completely, and the split is what this monitor is built around.
+///
+/// A conversation gains its row in `conversation_summaries.db` when it
+/// ENDS. While it runs there is no row at all, so the first version of this
+/// monitor, which read only that table, listed finished conversations and
+/// showed nothing in progress: the exact opposite of what a status bar is
+/// for. Live sessions come from three files instead:
+///
+/// - `presence/<id>.lock`, held open for the life of the session, which
+///   names the conversation and hands over the pid running it,
+/// - `history.jsonl`, the only record of a running conversation's
+///   workspace,
+/// - `brain/<id>/.system_generated/logs/transcript.jsonl`, one named step
+///   per line, which gives the status.
+///
+/// The summaries table is still read, for conversations that have ended
+/// recently enough to belong in Recent.
+///
+/// Approve and deny are not wired. `agy --dangerously-skip-permissions`
+/// proves a permission prompt exists, and the conversation database has a
+/// `permissions` blob per step, but no sample of a pending one has been
+/// captured. Answering a real prompt wrongly is the one mistake in this app
+/// that cannot be taken back, so it waits for a live round.
 struct AntigravityMonitor: SessionMonitor {
     /// Matches the other monitors: a conversation untouched for longer than
     /// this is history, not status.
@@ -18,45 +35,111 @@ struct AntigravityMonitor: SessionMonitor {
         while !Task.isCancelled {
             if !store.isPaused {
                 let now = Date.now
-                let sessions = await Task.detached { Self.discover(now: now) }.value
+                let sessions = await Task.detached {
+                    let home = AntigravityReader.defaultHome()
+                    return Self.discover(
+                        home: home,
+                        rows: AntigravityReader.rows(),
+                        live: AntigravityReader.liveConversations(home: home),
+                        history: AntigravityReader.history(
+                            atPath: home.appendingPathComponent("history.jsonl").path),
+                        now: now
+                    )
+                }.value
                 store.sync(tool: .antigravity, sessions: sessions)
             }
             try? await Task.sleep(for: .seconds(5))
         }
     }
 
+    /// Defaults are inert rather than live, so a test that supplies one
+    /// input does not silently pick up this machine's real sessions through
+    /// the others.
     nonisolated static func discover(
-        rows: [AntigravityReader.Row] = AntigravityReader.rows(),
+        home: URL = AntigravityReader.defaultHome(),
+        rows: [AntigravityReader.Row] = [],
+        live: [String: Int] = [:],
+        history: [String: AntigravityReader.HistoryEntry] = [:],
+        transcript: (URL) -> String? = { ClaudeCodeMonitor.tail(of: $0) },
         now: Date
     ) -> [AgentSession] {
-        // A subagent names its parent, so the parent declares nothing and
-        // the child declares itself. Same conclusion as every other tool:
-        // read the tool's own statement of parentage, never infer it.
-        let sessions = rows.filter { $0.parentID.isEmpty }
+        var sessions: [AgentSession] = []
 
-        return sessions.compactMap { row -> AgentSession? in
-            let age = now.timeIntervalSince(row.lastModified)
-            guard age >= 0, age < discoveryWindow else { return nil }
-            let path = row.workspace.map { URL(fileURLWithPath: $0) }
-            return AgentSession(
-                id: StableID.uuid(for: row.conversationID),
-                tool: .antigravity,
-                projectName: path?.lastPathComponent
-                    ?? (row.title.isEmpty ? "agy session" : row.title),
-                projectPath: path,
-                status: AntigravitySessionState.status(for: row, age: age),
-                startedAt: row.lastModified,
-                lastActivityAt: row.lastModified,
-                title: row.title.isEmpty ? nil : row.title,
-                processAlive: AntigravitySessionState.isAlive(row, age: age)
-            )
+        for (id, pid) in live {
+            let entry = history[id]
+            let steps = transcript(
+                AntigravityReader.transcriptPath(home: home, conversationID: id)
+            ).map(AntigravityTranscript.steps(in:)) ?? []
+            // A session whose process is alive belongs in Active even
+            // between turns, so there is no discovery window here: the lock
+            // is the evidence, and it outranks any timestamp.
+            sessions.append(session(
+                id: id,
+                workspace: entry?.workspace,
+                title: nil,
+                status: AntigravityTranscript.status(for: steps)
+                    ?? .working(activity: entry?.prompt ?? "Working…"),
+                lastActivity: steps.last?.createdAt ?? entry?.sentAt ?? now,
+                pid: pid,
+                alive: true
+            ))
         }
-        .sorted { $0.lastActivityAt > $1.lastActivityAt }
+
+        for row in rows where live[row.conversationID] == nil {
+            let age = now.timeIntervalSince(row.lastModified)
+            guard age >= 0, age < discoveryWindow else { continue }
+            // A subagent names its parent, so the parent declares nothing
+            // and the child declares itself. Same conclusion as every other
+            // tool: read the tool's own statement of parentage, never infer
+            // it.
+            guard row.parentID.isEmpty else { continue }
+            sessions.append(session(
+                id: row.conversationID,
+                workspace: row.workspace ?? history[row.conversationID]?.workspace,
+                title: row.title.isEmpty ? nil : row.title,
+                status: AntigravitySessionState.status(for: row, age: age),
+                lastActivity: row.lastModified,
+                pid: nil,
+                alive: AntigravitySessionState.isAlive(row, age: age)
+            ))
+        }
+
+        return sessions.sorted { $0.lastActivityAt > $1.lastActivityAt }
+    }
+
+    private nonisolated static func session(
+        id: String,
+        workspace: String?,
+        title: String?,
+        status: SessionStatus,
+        lastActivity: Date,
+        pid: Int?,
+        alive: Bool
+    ) -> AgentSession {
+        let path = workspace.map { URL(fileURLWithPath: $0) }
+        return AgentSession(
+            id: StableID.uuid(for: id),
+            tool: .antigravity,
+            projectName: path?.lastPathComponent
+                ?? (title.map { $0.isEmpty ? nil : $0 } ?? nil)
+                ?? "agy session",
+            projectPath: path,
+            status: status,
+            startedAt: lastActivity,
+            lastActivityAt: lastActivity,
+            pid: pid.map { pid_t($0) },
+            title: title,
+            processAlive: alive
+        )
     }
 }
 
-/// The interpretation half, kept separate and pure so it can be tested and,
-/// more importantly, corrected once real sessions have been sampled.
+/// The interpretation half for FINISHED conversations, the ones read from
+/// the summaries table. A live session's status comes from its transcript
+/// instead, which names its states rather than numbering them.
+///
+/// Kept separate and pure so it can be tested and, more importantly,
+/// corrected once real values have been sampled.
 enum AntigravitySessionState {
     /// How recently a conversation must have moved to count as working,
     /// when the database offers nothing better.

@@ -783,6 +783,217 @@ struct AntigravityTests {
     }
 }
 
+/// The half that matters for a status bar: a conversation gains its
+/// summaries row only when it ENDS, so a live session is invisible to the
+/// table and has to be found from the presence lock, history.jsonl and the
+/// transcript instead.
+@MainActor
+struct AntigravityLiveSessionTests {
+    private let home = URL(fileURLWithPath: "/tmp/agy-home")
+
+    private func historyEntry(
+        workspace: String = "/Users/x/proj", prompt: String = "what does the server do",
+        sentAt: Date = .now
+    ) -> AntigravityReader.HistoryEntry {
+        .init(workspace: workspace, prompt: prompt, sentAt: sentAt)
+    }
+
+    // MARK: - Discovery
+
+    /// The bug this whole path exists to fix: with agy running there is no
+    /// summaries row at all, and the monitor showed nothing.
+    @Test func aLiveConversationIsARowWithNoDatabaseEntry() {
+        let sessions = AntigravityMonitor.discover(
+            home: home,
+            rows: [],
+            live: ["live-id": 4242],
+            history: ["live-id": historyEntry()],
+            transcript: { _ in try? fixture("agy-working") },
+            now: .now
+        )
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.projectName == "proj")
+        #expect(sessions.first?.pid == 4242)
+        #expect(sessions.first?.processAlive == true)
+    }
+
+    /// The lock outranks the table. A conversation that appears in both
+    /// must not produce two rows, and the live reading is the true one.
+    @Test func aLiveConversationIsNotAlsoListedFromTheTable() {
+        let row = AntigravityReader.Row(
+            conversationID: "live-id", title: "t", preview: "p",
+            workspace: "/Users/x/proj", status: "", notFullyIdle: false,
+            killed: false, parentID: "", lastModified: .now)
+        let sessions = AntigravityMonitor.discover(
+            home: home, rows: [row], live: ["live-id": 1],
+            history: ["live-id": historyEntry()],
+            transcript: { _ in try? fixture("agy-done") }, now: .now)
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.pid == 1)
+    }
+
+    /// A live session between turns still belongs in Active, so the
+    /// discovery window that retires stale table rows must not apply to it.
+    /// The held lock is the evidence and it outranks any timestamp.
+    @Test func aLiveConversationSurvivesTheDiscoveryWindow() {
+        let old = Date.now.addingTimeInterval(-20 * 60 * 60)
+        let sessions = AntigravityMonitor.discover(
+            home: home, live: ["live-id": 7],
+            history: ["live-id": historyEntry(sentAt: old)],
+            transcript: { _ in nil }, now: .now)
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.processAlive == true)
+    }
+
+    /// history.jsonl is the only record of a running conversation's
+    /// workspace, so without it the row has no project to name.
+    @Test func withoutHistoryTheLiveRowStillAppears() {
+        let sessions = AntigravityMonitor.discover(
+            home: home, live: ["live-id": 7], transcript: { _ in nil }, now: .now)
+        #expect(sessions.first?.projectName == "agy session")
+        #expect(sessions.first?.projectPath == nil)
+    }
+
+    // MARK: - The presence lock
+
+    @Test func theLockFilenameIsTheConversationID() {
+        #expect(AntigravityReader.conversationID(
+            fromLockPath: "/Users/x/.gemini/antigravity-cli/presence/abc-123.lock") == "abc-123")
+    }
+
+    @Test func aPathThatIsNotALockIsNotASession() {
+        #expect(AntigravityReader.conversationID(fromLockPath: "/tmp/notes.txt") == nil)
+        #expect(AntigravityReader.conversationID(fromLockPath: "/tmp/.lock") == nil)
+    }
+
+    // MARK: - history.jsonl
+
+    @Test func historyMapsConversationsToWorkspaces() {
+        let text = """
+            {"display":"first","timestamp":1786223614380,"workspace":"/a","conversationId":"c1"}
+            {"display":"second","timestamp":1786223769712,"workspace":"/b","conversationId":"c2"}
+            """
+        let entries = AntigravityReader.history(atPath: "", tail: text)
+        #expect(entries["c1"]?.workspace == "/a")
+        #expect(entries["c2"]?.prompt == "second")
+    }
+
+    /// One line per prompt, so a long conversation has many. The newest is
+    /// the workspace it is in now.
+    @Test func theLastLineForAConversationWins() {
+        let text = """
+            {"display":"first","timestamp":1,"workspace":"/old","conversationId":"c1"}
+            {"display":"second","timestamp":2,"workspace":"/new","conversationId":"c1"}
+            """
+        #expect(AntigravityReader.history(atPath: "", tail: text)["c1"]?.workspace == "/new")
+    }
+
+    @Test func junkHistoryLinesAreSkipped() {
+        let text = """
+            not json
+            {"display":"no id","timestamp":1,"workspace":"/a"}
+            {"display":"ok","timestamp":1786223614380,"workspace":"/a","conversationId":"c1"}
+            """
+        #expect(AntigravityReader.history(atPath: "", tail: text).count == 1)
+    }
+}
+
+/// The transcript names its steps where the conversation database numbers
+/// them, so it, not the database, is what the status is read from.
+@MainActor
+struct AntigravityTranscriptTests {
+    private func steps(_ name: String) throws -> [AntigravityTranscript.Step] {
+        AntigravityTranscript.steps(in: try fixture(name))
+    }
+
+    @Test func aTrailingPlannerResponseWithToolCallsIsRunningTool() throws {
+        let status = AntigravityTranscript.status(for: try steps("agy-running-tool"))
+        #expect(status == .runningTool(activity: "Viewing server.js"))
+    }
+
+    /// A tool result with no planner step after it means the model is still
+    /// mid-turn. This fixture also has its lines out of order, which is how
+    /// the real file is written.
+    @Test func aTrailingToolResultIsWorking() throws {
+        let status = AntigravityTranscript.status(for: try steps("agy-working"))
+        #expect(status == .working(activity: "List directory"))
+    }
+
+    /// The turn boundary: a planner response with text and no tool calls.
+    @Test func aTrailingPlannerResponseWithTextEndsTheTurn() throws {
+        let status = AntigravityTranscript.status(for: try steps("agy-done"))
+        if case .done(let summary) = status {
+            #expect(summary.hasPrefix("The server is a small Express app"))
+        } else {
+            Issue.record("expected done, got \(String(describing: status))")
+        }
+    }
+
+    /// Steps arrive out of order, so the newest is the highest index and
+    /// never simply the last line.
+    @Test func stepsAreOrderedByIndexNotByLine() throws {
+        let parsed = try steps("agy-working")
+        #expect(parsed.map(\.index) == [0, 1, 2, 3])
+    }
+
+    /// SYSTEM steps are scaffolding the runtime writes around a turn, and
+    /// one of them is usually the newest line even while the agent works.
+    @Test func systemStepsDoNotDecideTheStatus() {
+        let text = """
+            {"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"All set."}
+            {"step_index":1,"source":"SYSTEM","type":"EPHEMERAL_MESSAGE","status":"DONE","content":"scaffolding"}
+            """
+        let status = AntigravityTranscript.status(for: AntigravityTranscript.steps(in: text))
+        if case .done = status {} else {
+            Issue.record("the system step should not have decided this")
+        }
+    }
+
+    /// A user prompt with nothing after it means the agent owes a reply.
+    @Test func aTrailingUserInputIsWorking() {
+        let text = #"""
+            {"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nfix the build\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nignore me\n</ADDITIONAL_METADATA>"}
+            """#
+        #expect(AntigravityTranscript.status(for: AntigravityTranscript.steps(in: text))
+            == .working(activity: "fix the build"))
+    }
+
+    /// A finished turn that asks something is waiting on the user, which is
+    /// the same rule every other tool's transcript gets.
+    @Test func aFinishedTurnThatAsksSomethingWaits() {
+        let text = """
+            {"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Which file did you mean?"}
+            """
+        let status = AntigravityTranscript.status(for: AntigravityTranscript.steps(in: text))
+        if case .waitingInput = status {} else {
+            Issue.record("expected waiting on you, got \(String(describing: status))")
+        }
+    }
+
+    @Test func anEmptyOrUnreadableTranscriptHasNoOpinion() {
+        #expect(AntigravityTranscript.status(for: []) == nil)
+        #expect(AntigravityTranscript.steps(in: "not json\n\n").isEmpty)
+    }
+
+    /// Every value in a tool call's args is a JSON document encoded as a
+    /// string, so a plain string arrives wrapped in its own quotes.
+    @Test func toolArgumentsAreDoubleEncoded() {
+        #expect(AntigravityTranscript.unwrapJSONString("\"Viewing server.js\"") == "Viewing server.js")
+        #expect(AntigravityTranscript.unwrapJSONString("Viewing server.js") == "Viewing server.js")
+    }
+
+    /// A tool call with no toolAction still names its tool.
+    @Test func aToolCallWithoutAnActionFallsBackToItsName() {
+        let calls: [[String: Any]] = [["name": "run_command", "args": [:]]]
+        #expect(AntigravityTranscript.toolActions(calls) == ["Run command"])
+    }
+
+    @Test func typeNamesAreHumanized() {
+        #expect(AntigravityTranscript.humanize("LIST_DIRECTORY") == "List directory")
+        #expect(AntigravityTranscript.humanize("VIEW_FILE") == "View file")
+    }
+}
+
 /// The database is in WAL mode while agy is running, and a read-only
 /// connection cannot create the -shm file SQLite then needs. Against the
 /// real database the OPEN succeeded and only the first prepare failed with

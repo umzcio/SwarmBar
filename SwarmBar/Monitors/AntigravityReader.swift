@@ -32,10 +32,83 @@ enum AntigravityReader {
         let lastModified: Date
     }
 
-    nonisolated static func defaultDatabasePath() -> String {
+    /// One conversation's workspace and the time its last prompt was sent,
+    /// as recorded in history.jsonl.
+    struct HistoryEntry: Sendable, Equatable {
+        let workspace: String
+        let prompt: String
+        let sentAt: Date
+    }
+
+    nonisolated static func defaultHome() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/antigravity-cli/conversation_summaries.db")
-            .path
+            .appendingPathComponent(".gemini/antigravity-cli")
+    }
+
+    nonisolated static func defaultDatabasePath() -> String {
+        defaultHome().appendingPathComponent("conversation_summaries.db").path
+    }
+
+    /// Where a live session's own state lives. The id is the conversation
+    /// id, which the presence lock names outright.
+    nonisolated static func transcriptPath(home: URL, conversationID: String) -> URL {
+        home
+            .appendingPathComponent("brain")
+            .appendingPathComponent(conversationID)
+            .appendingPathComponent(".system_generated/logs/transcript.jsonl")
+    }
+
+    nonisolated static func presenceDirectory(home: URL) -> URL {
+        home.appendingPathComponent("presence")
+    }
+
+    /// The conversation id a presence lock is named for, or nil if the path
+    /// is not one.
+    nonisolated static func conversationID(fromLockPath path: String) -> String? {
+        let name = (path as NSString).lastPathComponent
+        guard name.hasSuffix(".lock") else { return nil }
+        let id = String(name.dropLast(".lock".count))
+        return id.isEmpty ? nil : id
+    }
+
+    /// Every live conversation, mapped to the pid running it.
+    nonisolated static func liveConversations(home: URL = defaultHome()) -> [String: Int] {
+        let held = ProcessLiveness.openFiles(
+            processName: "agy", inDirectory: presenceDirectory(home: home).path)
+        var live: [String: Int] = [:]
+        for (path, pid) in held {
+            guard let id = conversationID(fromLockPath: path) else { continue }
+            live[id] = pid
+        }
+        return live
+    }
+
+    /// history.jsonl is the only place a RUNNING session's workspace is
+    /// written down: the summaries table gains its row when a conversation
+    /// ends, so a live one has no row to read a workspace from. One line per
+    /// prompt, newest last, and the last line for an id wins because that is
+    /// the workspace the session is in now.
+    nonisolated static func history(
+        atPath path: String, tail: String? = nil
+    ) -> [String: HistoryEntry] {
+        let text = tail ?? ClaudeCodeMonitor.tail(of: URL(fileURLWithPath: path)) ?? ""
+        var entries: [String: HistoryEntry] = [:]
+        for line in text.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let id = json["conversationId"] as? String, !id.isEmpty,
+                  let workspace = json["workspace"] as? String, !workspace.isEmpty
+            else { continue }
+            // Milliseconds since the epoch, unlike every timestamp in the
+            // summaries table, which are datetime strings.
+            let millis = (json["timestamp"] as? Double) ?? 0
+            entries[id] = HistoryEntry(
+                workspace: workspace,
+                prompt: json["display"] as? String ?? "",
+                sentAt: Date(timeIntervalSince1970: millis / 1000)
+            )
+        }
+        return entries
     }
 
     /// `workspace_uris` is a JSON array of file URLs. The first entry is the

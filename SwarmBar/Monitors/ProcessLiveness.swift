@@ -42,6 +42,48 @@ enum ProcessLiveness {
         return merged
     }
 
+    /// Which files under the given directory are held open right now by a
+    /// process of the given name, mapped to the pid holding each one.
+    ///
+    /// Antigravity is the only tool that publishes its own session-to-pid
+    /// map: it holds `presence/<conversation-id>.lock` open for the life of
+    /// the session. That beats matching by working directory, which cannot
+    /// tell two sessions in one repo apart, and it names the session
+    /// outright rather than inferring it.
+    ///
+    /// A lock file left behind by a crash is not open by anything, so
+    /// asking the kernel who holds it, rather than trusting the file to
+    /// exist, is what makes this a liveness check.
+    nonisolated static func openFiles(
+        processName: String, inDirectory directory: String
+    ) -> [String: Int] {
+        guard let pidText = run("/usr/bin/pgrep", ["-x", processName]) else { return [:] }
+        let pids = pidText.split(separator: "\n")
+            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard !pids.isEmpty else { return [:] }
+        // One lsof for every pid at once; -Fpn prints a p<pid> line then an
+        // n<path> line per open file, so the current p line owns the paths
+        // that follow it.
+        guard let output = run(
+            "/usr/sbin/lsof",
+            ["-a", "-p", pids.map(String.init).joined(separator: ","), "-Fpn"]
+        ) else { return [:] }
+
+        let prefix = directory.hasSuffix("/") ? directory : directory + "/"
+        var held: [String: Int] = [:]
+        var current: Int?
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("p") {
+                current = Int(line.dropFirst())
+            } else if line.hasPrefix("n") {
+                let path = String(line.dropFirst())
+                guard path.hasPrefix(prefix), let pid = current else { continue }
+                held[path] = pid
+            }
+        }
+        return held
+    }
+
     private nonisolated static func counts(pgrepArgs: [String]) -> [String: Int] {
         guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return [:] }
         var counts: [String: Int] = [:]
