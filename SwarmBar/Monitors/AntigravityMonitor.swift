@@ -61,6 +61,7 @@ struct AntigravityMonitor: SessionMonitor {
         live: [String: Int] = [:],
         history: [String: AntigravityReader.HistoryEntry] = [:],
         transcript: (URL) -> String? = { ClaudeCodeMonitor.tail(of: $0) },
+        screen: (Int) -> String? = { TerminalFocuser.screenText(pid: $0) },
         now: Date
     ) -> [AgentSession] {
         var sessions: [AgentSession] = []
@@ -82,7 +83,9 @@ struct AntigravityMonitor: SessionMonitor {
                 // both existed.
                 workspace: entry?.workspace ?? workingDirectory(pid),
                 title: nil,
-                status: status(home: home, id: id, steps: steps, entry: entry),
+                status: status(
+                    home: home, id: id, pid: pid,
+                    steps: steps, entry: entry, screen: screen),
                 lastActivity: steps.last?.createdAt ?? entry?.sentAt ?? now,
                 pid: pid,
                 alive: true
@@ -120,14 +123,33 @@ struct AntigravityMonitor: SessionMonitor {
     private nonisolated static func status(
         home: URL,
         id: String,
+        pid: Int,
         steps: [AntigravityTranscript.Step],
-        entry: AntigravityReader.HistoryEntry?
+        entry: AntigravityReader.HistoryEntry?,
+        screen: (Int) -> String?
     ) -> SessionStatus {
         let dbPath = AntigravityConversation.conversationPath(home: home, conversationID: id).path
-        if let pending = AntigravityConversation.pendingQuestion(dbPath: dbPath) {
-            return pending.isApproval
-                ? .waitingApproval(command: pending.question)
-                : .waitingInput(prompt: pending.question)
+        if let pending = AntigravityConversation.pending(dbPath: dbPath) {
+            if let question = pending.question {
+                return pending.isApproval
+                    ? .waitingApproval(command: question)
+                    : .waitingInput(prompt: question)
+            }
+            // An ordinary tool call that has not settled. The database
+            // cannot say whether it is held at a permission gate or simply
+            // running: sampled live while agy waited on "Allow creation of
+            // this file?", the row was an unremarkable write_to_file call
+            // with nothing to distinguish it. The terminal is the only
+            // thing that knows, so it decides, and only here, where a step
+            // is already known to be unsettled.
+            //
+            // With no readable terminal the row stays Running tool, which
+            // is the reading that was already being shown and is wrong
+            // only in being too quiet.
+            let showing = screen(pid).map { TuiPromptLayout.options(in: $0).count >= 2 } ?? false
+            return showing
+                ? .waitingApproval(command: pending.summary)
+                : .runningTool(activity: pending.summary)
         }
         return AntigravityTranscript.status(for: steps)
             ?? .working(activity: entry?.prompt ?? "Working…")

@@ -849,7 +849,8 @@ struct AntigravityLiveSessionTests {
     /// workspace, so without it the row has no project to name.
     @Test func withoutHistoryTheLiveRowStillAppears() {
         let sessions = AntigravityMonitor.discover(
-            home: home, live: ["live-id": 7], transcript: { _ in nil }, now: .now)
+            home: home, live: ["live-id": 7], transcript: { _ in nil },
+            screen: { _ in nil }, now: .now)
         #expect(sessions.first?.projectName == "agy session")
         #expect(sessions.first?.projectPath == nil)
     }
@@ -1007,7 +1008,7 @@ struct AntigravityPendingQuestionTests {
         """#
 
     @Test func theQuestionIsLiftedOutOfTheProtobuf() throws {
-        let pending = try #require(AntigravityConversation.question(inText: realMetadata))
+        let pending = try #require(AntigravityConversation.pending(inText: realMetadata))
         #expect(pending.question == "Do you approve writing a file containing 'hello'?")
         #expect(pending.options == ["Approve", "Deny"])
         #expect(pending.isApproval)
@@ -1020,7 +1021,7 @@ struct AntigravityPendingQuestionTests {
         let text = #"""
             {"questions":[{"options":["server.js","index.js"],"question":"Which file did you mean?"}]}
             """#
-        let pending = AntigravityConversation.question(inText: text)
+        let pending = AntigravityConversation.pending(inText: text)
         #expect(pending?.options == ["server.js", "index.js"])
         #expect(pending?.isApproval == false)
     }
@@ -1031,23 +1032,66 @@ struct AntigravityPendingQuestionTests {
         let text = #"""
             noise{"questions":[{"question":"Run `echo {a}` and \"quote\" it?","options":["Approve","Deny"]}]}more noise
             """#
-        let pending = try #require(AntigravityConversation.question(inText: text))
+        let pending = try #require(AntigravityConversation.pending(inText: text))
         #expect(pending.question == #"Run `echo {a}` and "quote" it?"#)
         #expect(pending.isApproval)
     }
 
     /// No evidence of a prompt must never become a prompt.
     @Test func metadataWithoutAQuestionIsNotOne() {
-        #expect(AntigravityConversation.question(inText: "") == nil)
-        #expect(AntigravityConversation.question(inText: "ask_question") == nil)
-        #expect(AntigravityConversation.question(
+        #expect(AntigravityConversation.pending(inText: "") == nil)
+        #expect(AntigravityConversation.pending(inText: "ask_question") == nil)
+        #expect(AntigravityConversation.pending(
             inText: #"{"questions":[{"question":""}]}"#) == nil)
-        #expect(AntigravityConversation.question(
+        #expect(AntigravityConversation.pending(
             inText: #"{"questions":[{"question":"unterminated"#) == nil)
     }
 
     @Test func aMissingConversationDatabaseHasNoPendingQuestion() {
-        #expect(AntigravityConversation.pendingQuestion(dbPath: "/nope/missing.db") == nil)
+        #expect(AntigravityConversation.pending(dbPath: "/nope/missing.db") == nil)
+    }
+
+    // MARK: - The other kind of prompt
+
+    /// agy gates ordinary tool calls too ("Allow creation of this file?"),
+    /// and that step is verbatim below: a plain write_to_file call with an
+    /// unsettled status and NOTHING to say a person is being asked. No
+    /// permissions blob, no task details. It is indistinguishable from the
+    /// same tool merely running, which is why the monitor corroborates
+    /// this kind against the terminal.
+    private let nativeGateMetadata = #"""
+        \#u{08}kuez57q6\#u{12}\#u{0d}write_to_file{"CodeContent":"hello","Description":"Writes a file that says hello","Overwrite":false,"TargetFile":"/Users/zach/GitHub/hello.txt","toolAction":"Writing file","toolSummary":"Write hello.txt"}
+        """#
+
+    @Test func aGatedToolCallIsPendingWithNoQuestion() throws {
+        let pending = try #require(AntigravityConversation.pending(inText: nativeGateMetadata))
+        #expect(pending.question == nil)
+        #expect(pending.summary == "Write hello.txt")
+        #expect(pending.isApproval == false)
+        #expect(pending.label == "Write hello.txt")
+    }
+
+    /// toolAction carries it when there is no summary.
+    @Test func theActionDescribesTheCallWhenNoSummaryExists() {
+        let pending = AntigravityConversation.pending(
+            inText: #"{"TargetFile":"/tmp/x","toolAction":"Writing file"}"#)
+        #expect(pending?.summary == "Writing file")
+    }
+
+    /// agy's own permission gate, copied off a real terminal. The answer
+    /// path resolves it by label like any other selector, which is why
+    /// this is a layout worth keeping.
+    @Test func theNativeGateResolvesByLabel() {
+        let screen = """
+            Allow creation of this file?
+            > 1. Yes, allow creation
+              2. No, deny creation
+
+              ↑/↓ Navigate · tab Amend · f full diff
+            """
+        #expect(TuiPromptLayout.approveOnce(in: screen) == 1)
+        #expect(TuiPromptLayout.reject(in: screen) == 2)
+        #expect(TuiPromptLayout.selector(in: screen).cursor == 1)
     }
 
     /// Every settled step sampled reported status 3 and the pending one

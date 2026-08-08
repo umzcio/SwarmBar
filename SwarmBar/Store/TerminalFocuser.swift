@@ -72,8 +72,24 @@ enum TerminalFocuser {
     /// Used to read a TUI selector's actual options before answering, so
     /// keystrokes target a verified choice instead of a guessed position.
     nonisolated static func screenText(sessionID: UUID, projectPath: URL? = nil) -> String? {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
-              isRunning("iTerm2") else { return nil }
+        guard let tty = tty(forSession: sessionID, projectPath: projectPath)
+        else { return nil }
+        return screenText(tty: tty)
+    }
+
+    /// The same read for a caller that already knows the pid, which is the
+    /// monitors: Antigravity's presence lock hands one over, and the
+    /// terminal is the only place that says whether its unsettled step is
+    /// waiting on the user or merely running.
+    nonisolated static func screenText(pid: Int) -> String? {
+        let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let name, !name.isEmpty, name != "??" else { return nil }
+        return screenText(tty: name)
+    }
+
+    nonisolated static func screenText(tty: String) -> String? {
+        guard isRunning("iTerm2") else { return nil }
         let script = """
         tell application "iTerm2"
           repeat with w in windows
