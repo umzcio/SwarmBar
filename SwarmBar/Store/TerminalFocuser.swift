@@ -224,6 +224,7 @@ enum TerminalFocuser {
         let pid = claudePid(forSession: id)
             ?? grokPid(forSession: id)
             ?? codexPid(forSession: id)
+            ?? antigravityPid(forSession: id)
             ?? kimiPid(projectPath: projectPath)
         if let pid {
             let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
@@ -231,6 +232,17 @@ enum TerminalFocuser {
             if let name, !name.isEmpty, name != "??" { return name }
         }
         return nil
+    }
+
+    /// Antigravity publishes the cleanest session-to-pid map of any tool
+    /// here: it holds presence/<conversation-id>.lock open for the life of
+    /// the session, so the kernel already knows which pid is which
+    /// conversation. No directory matching, and two sessions in one repo
+    /// stay distinguishable.
+    private nonisolated static func antigravityPid(forSession id: UUID) -> Int? {
+        AntigravityReader.liveConversations()
+            .first { StableID.uuid(for: $0.key) == id }?
+            .value
     }
 
     /// Kimi (and its BearCode fork) have no session-to-pid registry, but
