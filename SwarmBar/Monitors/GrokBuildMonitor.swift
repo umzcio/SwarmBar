@@ -27,6 +27,29 @@ struct GrokBuildMonitor: SessionMonitor {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".grok")
     }
 
+    /// The session ids that are subagents of another session in the same
+    /// directory, taken from each session's own `subagents/<id>/` listing.
+    ///
+    /// Read from the parent's declaration rather than guessed from the
+    /// child's shape. A subagent directory is missing `terminal/` and
+    /// `subagents/`, so absence of those looks like a usable heuristic, but
+    /// it also describes a top-level session that has not spawned anything
+    /// or is not attached to a terminal, and hiding one of those would lose
+    /// a real row silently.
+    nonisolated static func subagentIDs(in sessionDirs: [URL]) -> Set<String> {
+        let fm = FileManager.default
+        var ids: Set<String> = []
+        for dir in sessionDirs {
+            let listing = (try? fm.contentsOfDirectory(
+                at: dir.appendingPathComponent("subagents"),
+                includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+            for child in listing where isDirectory(child) {
+                ids.insert(child.lastPathComponent)
+            }
+        }
+        return ids
+    }
+
     nonisolated static func discover(root: URL, now: Date) -> [AgentSession] {
         let fm = FileManager.default
         let activeIds = activeSessionIDs(root: root)
@@ -40,8 +63,15 @@ struct GrokBuildMonitor: SessionMonitor {
             guard isDirectory(cwdDir) else { continue }
             let sessionDirs = (try? fm.contentsOfDirectory(
                 at: cwdDir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+            let subagents = subagentIDs(in: sessionDirs)
             for sessionDir in sessionDirs {
                 guard isDirectory(sessionDir),
+                      // A subagent gets a full session directory beside its
+                      // parent's, so promoting every directory turned one
+                      // Grok run into a row per subagent, all sharing the
+                      // project's name and flipping between Active and
+                      // Recent as they started and finished.
+                      !subagents.contains(sessionDir.lastPathComponent),
                       let session = parseSession(dir: sessionDir, activeIds: activeIds, now: now)
                 else { continue }
                 sessions.append(session)

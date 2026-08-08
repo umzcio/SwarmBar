@@ -587,3 +587,59 @@ struct KimiStateShapeTests {
         #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "not a date"]) == nil)
     }
 }
+
+/// Grok gives every subagent its own session directory beside its parent's,
+/// so walking the directory listing turned one run into a row per subagent.
+/// They all carried the project's name and flipped between Active and
+/// Recent as they started and finished.
+@MainActor
+struct GrokSubagentTests {
+    private func makeTree() throws -> (root: URL, dirs: [URL]) {
+        let fm = FileManager.default
+        let cwdDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        // Shaped after a real capture: one parent declaring three subagents,
+        // plus an unrelated top-level session that spawned nothing.
+        let parent = cwdDir.appendingPathComponent("019fdf57-parent")
+        let children = ["019fdf7a-a", "019fdf7a-b", "019fdf7a-c"]
+        let loner = cwdDir.appendingPathComponent("019fcad1-loner")
+        for child in children {
+            try fm.createDirectory(
+                at: parent.appendingPathComponent("subagents/\(child)"),
+                withIntermediateDirectories: true)
+        }
+        try fm.createDirectory(at: loner, withIntermediateDirectories: true)
+        var dirs = [parent, loner]
+        for child in children {
+            let dir = cwdDir.appendingPathComponent(child)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            dirs.append(dir)
+        }
+        return (cwdDir, dirs)
+    }
+
+    @Test func subagentsAreIdentifiedFromTheParentsListing() throws {
+        let (_, dirs) = try makeTree()
+        let ids = GrokBuildMonitor.subagentIDs(in: dirs)
+        #expect(ids == ["019fdf7a-a", "019fdf7a-b", "019fdf7a-c"])
+    }
+
+    /// The parent stays. It is the session the user is actually talking to.
+    @Test func theParentIsNotMistakenForItsOwnChild() throws {
+        let (_, dirs) = try makeTree()
+        let ids = GrokBuildMonitor.subagentIDs(in: dirs)
+        #expect(!ids.contains("019fdf57-parent"))
+    }
+
+    /// A top-level session that never spawned anything has no subagents
+    /// directory, which must not be read as "is a subagent". Guessing from
+    /// the child's shape rather than the parent's declaration would lose it.
+    @Test func aSessionThatSpawnedNothingSurvives() throws {
+        let (_, dirs) = try makeTree()
+        let ids = GrokBuildMonitor.subagentIDs(in: dirs)
+        #expect(!ids.contains("019fcad1-loner"))
+    }
+
+    @Test func noSubagentsMeansNothingIsFiltered() {
+        #expect(GrokBuildMonitor.subagentIDs(in: []).isEmpty)
+    }
+}
