@@ -183,6 +183,70 @@ struct TuiPromptLayoutTests {
         #expect(TuiPromptLayout.reject(in: screen) == 4)
     }
 
+    // MARK: - Arrow navigation
+
+    /// Antigravity's prompt, copied off a real terminal. It advertises
+    /// arrows and enter and says nothing about digits, so it is walked to
+    /// rather than typed at.
+    let antigravityPrompt = """
+      ? Do you approve writing a file containing 'hello'?
+
+      Question
+
+      Question 1/1: Do you approve writing a file containing 'hello'?
+
+      > 1. Approve
+        2. Deny
+        3. Write-in...
+
+        ↑/↓ Navigate · enter Select · esc Skip
+    """
+
+    @Test func theCursorIsReadOffTheMarkedLine() {
+        let selector = TuiPromptLayout.selector(in: antigravityPrompt)
+        #expect(selector.options.map(\.label) == ["Approve", "Deny", "Write-in..."])
+        #expect(selector.cursor == 1)
+        #expect(selector.cursorLine == "> 1. Approve")
+    }
+
+    /// The whole point of reading the cursor: the distance is computed,
+    /// not assumed. Deny is one down from Approve here, and would be a
+    /// different move on a prompt that opened elsewhere.
+    @Test func theMoveIsComputedFromWhereTheCursorActuallyIs() {
+        #expect(TuiPromptLayout.reject(in: antigravityPrompt) == 2)
+        let move = TuiPromptLayout.navigation(from: 1, to: 2)
+        #expect(move?.key == "DOWN")
+        #expect(move?.presses == 1)
+    }
+
+    /// Never more presses than the distance within the list, so a wrapping
+    /// selector cannot come back around. Eight blind DOWNs on a four-item
+    /// Kimi prompt landed on "Approve once" and approved a denied command.
+    @Test func theMoveNeverOvershootsTheList() {
+        #expect(TuiPromptLayout.navigation(from: 3, to: 1)?.key == "UP")
+        #expect(TuiPromptLayout.navigation(from: 3, to: 1)?.presses == 2)
+        #expect(TuiPromptLayout.navigation(from: 2, to: 2)?.presses == 0)
+    }
+
+    /// With no cursor drawn there is no distance to compute, and the
+    /// caller falls back to focusing the terminal rather than guessing
+    /// that the cursor starts at the top.
+    @Test func anUnmarkedSelectorHasNoCursor() {
+        let selector = TuiPromptLayout.selector(in: """
+              1. Approve
+              2. Deny
+            """)
+        #expect(selector.options.count == 2)
+        #expect(selector.cursor == nil)
+        #expect(selector.cursorLine == nil)
+    }
+
+    /// The marker the Kimi family draws is a different glyph, and it is
+    /// read the same way, so this path is not Antigravity-only.
+    @Test func theKimiCursorIsReadToo() {
+        #expect(TuiPromptLayout.selector(in: kimiShellPrompt).cursor == 1)
+    }
+
     @Test func latestBlockWins() {
         let screen = """
           1. Approve once

@@ -218,6 +218,7 @@ private struct IntegrationRow: View {
     let manager: IntegrationManager
 
     @AppStorage("grokKeystrokeAnswers") private var grokKeystrokes = true
+    @AppStorage("antigravityKeystrokeAnswers") private var antigravityKeystrokes = true
     @State private var hovering = false
 
     var body: some View {
@@ -292,7 +293,10 @@ private struct IntegrationRow: View {
         case .bearCode:   return "Hooks in config.toml, answers on screen"
         case .openCode:   return "Plugin inside the opencode server"
         case .codex:      return "Reads the session log, answers with hotkeys"
-        case .antigravity: return "Reads the conversation database, view only"
+        case .antigravity:
+            return antigravityKeystrokes
+                ? "Reads the conversation database, answers on screen"
+                : "Reads the conversation database, focus only"
         case .grokBuild:
             return grokKeystrokes
                 ? "Answers by typing into the terminal"

@@ -419,6 +419,14 @@ final class SessionStore {
             answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnceOption(in:))
             return
         }
+        if session.tool == .antigravity {
+            // Antigravity's prompt offers arrows and enter, and says
+            // nothing about digits, so it is walked to rather than typed
+            // at. See answerByNavigation.
+            guard Self.antigravityKeystrokesEnabled else { openInTerminal(session); return }
+            answerByNavigation(session, choose: TuiPromptLayout.approveOnceOption(in:))
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         let executable = command.split(separator: " ").first.map(String.init) ?? command
         update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
@@ -446,6 +454,11 @@ final class SessionStore {
             answerNumberedPrompt(session, choose: TuiPromptLayout.rejectOption(in:))
             return
         }
+        if session.tool == .antigravity {
+            guard Self.antigravityKeystrokesEnabled else { openInTerminal(session); return }
+            answerByNavigation(session, choose: TuiPromptLayout.rejectOption(in:))
+            return
+        }
         if session.projectPath != nil { openInTerminal(session); return }
         update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
     }
@@ -458,6 +471,13 @@ final class SessionStore {
     /// and Deny just focus the terminal.
     static var grokKeystrokesEnabled: Bool {
         (UserDefaults.standard.object(forKey: "grokKeystrokeAnswers") as? Bool) ?? true
+    }
+
+    /// The same escape hatch for Antigravity. Its answers are keystrokes
+    /// too, so it gets the same off switch, and off means Approve and Deny
+    /// just focus the terminal.
+    static var antigravityKeystrokesEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "antigravityKeystrokeAnswers") as? Bool) ?? true
     }
 
     private func answerNumberedPrompt(
@@ -481,6 +501,41 @@ final class SessionStore {
                 // digit into an unverified selector; bring the user to it.
                 TerminalFocuser.focus(sessionID: id, projectPath: path)
             }
+        }
+    }
+
+    /// Reads the selector, works out the distance from the cursor to the
+    /// option wanted, and walks there with arrow keys.
+    ///
+    /// Antigravity's prompt advertises only "↑/↓ Navigate · enter Select",
+    /// so unlike the Kimi family there is no evidence it takes a digit at
+    /// all, and a digit is what once turned a Grok deny into an approve.
+    /// Every step here is computed from the screen: which options exist,
+    /// which one the cursor is on, and therefore how far to move. Nothing
+    /// about the layout is assumed, so a redesigned prompt falls through
+    /// to focusing the terminal instead of pressing into the unknown.
+    private func answerByNavigation(
+        _ session: AgentSession,
+        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
+    ) {
+        let id = session.id
+        let path = session.projectPath
+        Task.detached {
+            func giveUp() { TerminalFocuser.focus(sessionID: id, projectPath: path) }
+            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+                  let option = choose(screen)
+            else { giveUp(); return }
+            let selector = TuiPromptLayout.selector(in: screen)
+            guard let cursor = selector.cursor,
+                  let cursorLine = selector.cursorLine,
+                  let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
+            else { giveUp(); return }
+
+            let outcome = TerminalFocuser.answerByNavigation(
+                sessionID: id, projectPath: path,
+                key: move.key, presses: move.presses,
+                expectedCursorLine: cursorLine, expectedLabel: option.label)
+            if outcome != .sent { giveUp() }
         }
     }
 

@@ -16,22 +16,60 @@ enum TuiPromptLayout {
         var label: String
     }
 
+    /// A selector as it is drawn, including which option the cursor sits
+    /// on. Tools answered by arrow keys need that; tools answered by digit
+    /// do not, and ignore it.
+    struct Selector: Equatable {
+        var options: [Option]
+        /// The option the cursor marks, when the screen marks one.
+        var cursor: Int?
+        /// That line exactly as drawn, marker included ("> 1. Approve").
+        /// Re-confirming the LABEL before pressing would prove nothing
+        /// about the cursor, since the label is on screen wherever the
+        /// cursor happens to be. The marked line is the thing that moves.
+        var cursorLine: String?
+    }
+
+    /// Characters a TUI draws to the left of the highlighted row.
+    nonisolated static let cursorMarkers = CharacterSet(charactersIn: "▶►>❯›➜")
+
+    /// Which arrow key, pressed how many times, moves the cursor from
+    /// where it is to the option wanted.
+    ///
+    /// Only ever the distance WITHIN the list, so this never presses past
+    /// an end and wrapping cannot come into it. That is the whole point:
+    /// Kimi's selector wraps, and eight blind DOWNs on a four-item prompt
+    /// came back around to "Approve once" and approved a denied command.
+    nonisolated static func navigation(from cursor: Int, to target: Int) -> (key: String, presses: Int)? {
+        guard cursor > 0, target > 0 else { return nil }
+        if target == cursor { return ("DOWN", 0) }
+        return target > cursor
+            ? ("DOWN", target - cursor)
+            : ("UP", cursor - target)
+    }
+
     /// The numbered options of the selector block nearest the bottom of the
     /// screen. A block is a run of ascending "N. Label" lines separated only
     /// by blank lines: agent prose often contains numbered lists, and pressing
     /// a digit chosen from one of those would answer a selector nobody read.
     nonisolated static func options(in screen: String) -> [Option] {
-        var blocks: [[Option]] = []
-        var current: [Option] = []
+        selector(in: screen).options
+    }
+
+    nonisolated static func selector(in screen: String) -> Selector {
+        var blocks: [Selector] = []
+        var current = Selector(options: [], cursor: nil)
 
         func endBlock() {
-            if current.count >= 2 { blocks.append(current) }
-            current = []
+            if current.options.count >= 2 { blocks.append(current) }
+            current = Selector(options: [], cursor: nil, cursorLine: nil)
         }
 
         for raw in screen.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►> \u{2502}\u{258F}"))
+            let stripped = raw.trimmingCharacters(in: .whitespaces)
+            let marked = stripped.unicodeScalars.first.map(cursorMarkers.contains) ?? false
+            let line = stripped
+                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{258F}"))
                 .trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }          // blank lines do not break a block
             guard let dot = line.firstIndex(of: "."),
@@ -42,14 +80,18 @@ enum TuiPromptLayout {
                 .trimmingCharacters(in: .whitespaces)
             guard !label.isEmpty else { endBlock(); continue }
             if number == 1 { endBlock() }
-            if number == current.count + 1 {
-                current.append(Option(number: number, label: label))
+            if number == current.options.count + 1 {
+                current.options.append(Option(number: number, label: label))
+                if marked {
+                    current.cursor = number
+                    current.cursorLine = stripped
+                }
             } else {
                 endBlock()
             }
         }
         endBlock()
-        return blocks.last ?? []
+        return blocks.last ?? Selector(options: [], cursor: nil)
     }
 
     /// The option number that approves this one call, preferring the

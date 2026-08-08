@@ -218,6 +218,65 @@ enum TerminalFocuser {
         }
     }
 
+    /// Moves the selector's cursor to a labeled option and submits.
+    ///
+    /// For tools whose prompts take arrow keys rather than digits. Like
+    /// `answerNumbered`, the read and the press are one script, so the
+    /// prompt cannot advance between confirming what is on screen and
+    /// acting on it: two round trips leave a window in which the keys land
+    /// in a selector nobody read.
+    ///
+    /// The caller computes the presses from a screen it has already read,
+    /// and this re-confirms that same screen before sending. Confirming
+    /// the label alone would not be enough, since the cursor may have
+    /// moved while the label stayed put, so the marked line is checked
+    /// too.
+    nonisolated static func answerByNavigation(
+        sessionID: UUID,
+        projectPath: URL?,
+        key: String,
+        presses: Int,
+        expectedCursorLine: String,
+        expectedLabel: String
+    ) -> AnswerOutcome {
+        guard presses >= 0, key == "UP" || key == "DOWN",
+              let tty = tty(forSession: sessionID, projectPath: projectPath),
+              isRunning("iTerm2")
+        else { return .noTerminal }
+
+        let arrow = key == "UP" ? "[A" : "[B"
+        let moves = (0..<presses)
+            .map { _ in "tell s to write text ((character id 27) & \"\(arrow)\") newline NO" }
+            .joined(separator: "\n                    delay 0.08\n                    ")
+        let script = """
+        tell application "iTerm2"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "/dev/\(tty)" then
+                  set screenText to (text of s)
+                  if screenText contains "\(AppleScriptLiteral.escape(expectedLabel))" ¬
+                    and screenText contains "\(AppleScriptLiteral.escape(expectedCursorLine))" then
+                    \(moves.isEmpty ? "" : moves + "\n                    delay 0.08")
+                    tell s to write text ""
+                    return "SENT"
+                  else
+                    return "CHANGED"
+                  end if
+                end if
+              end repeat
+            end repeat
+          end repeat
+          return "MISS"
+        end tell
+        """
+        switch runScript(script) {
+        case "SENT":    return .sent
+        case "CHANGED": return .promptChanged
+        default:        return .noTerminal
+        }
+    }
+
     // MARK: - Session -> tty
 
     private nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
