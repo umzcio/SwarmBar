@@ -5,3 +5,10 @@ build/
 xcuserdata/
 
 .claude/worktrees/
+
+# Local working notes and audit plans. Deliberately untracked: they carry
+# absolute paths, account labels, and the layout of the BearCode fork.
+# Purged from history 2026-08-07, so do not re-add them.
+CLAUDE.md
+HANDOFF.md
+plans/
