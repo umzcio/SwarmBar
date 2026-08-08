@@ -9,6 +9,38 @@ final class SessionStore {
     private(set) var sessions: [AgentSession] = []
     var isPaused = false
 
+    /// Tools the user has switched off in Settings. A tool that is off is
+    /// not shown at all: no rows, no hook events, nothing.
+    ///
+    /// This exists because the Providers switch used to control only the
+    /// approval bridge, so turning Claude Code off removed its hooks and
+    /// left every Claude row exactly where it was. Nobody reads a switch
+    /// next to a tool's name as "keep listing it, just answer prompts
+    /// differently".
+    private(set) var disabledTools: Set<AgentTool> = []
+
+    /// Injectable so tests cannot write to the real preferences. They did:
+    /// the first version read and wrote UserDefaults.standard directly, and
+    /// running the suite switched Grok Build off in the shipping app.
+    @ObservationIgnored private let defaults: UserDefaults
+
+    func isEnabled(_ tool: AgentTool) -> Bool { !disabledTools.contains(tool) }
+
+    func setToolEnabled(_ tool: AgentTool, _ enabled: Bool) {
+        if enabled { disabledTools.remove(tool) } else { disabledTools.insert(tool) }
+        defaults.set(disabledTools.map(\.rawValue), forKey: Self.disabledToolsKey)
+        if !enabled {
+            // Drop what is already on screen, rather than waiting for a
+            // poll that will now never come.
+            sessions.removeAll { $0.tool == tool }
+            for id in hookOverrides.keys where !sessions.contains(where: { $0.id == id }) {
+                hookOverrides.removeValue(forKey: id)
+            }
+        }
+        noteAttentionTransitions()
+        refreshIconTicker()
+    }
+
     /// Live state of the hook bridge, surfaced in Settings. Set by HookServer.
     var hookServerState: HookServer.ServerState = .starting
 
@@ -20,9 +52,14 @@ final class SessionStore {
     private(set) var iconPhase = 0
     @ObservationIgnored private var iconTicker: Task<Void, Never>?
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let raw = defaults.stringArray(forKey: Self.disabledToolsKey) ?? []
+        self.disabledTools = Set(raw.compactMap(AgentTool.init(rawValue:)))
         // No ticker until something needs to animate; see refreshIconTicker.
     }
+
+    private static let disabledToolsKey = "disabledTools"
 
     /// Starts the animation ticker when the glyph has a frame to advance and
     /// tears it down when it does not, so a resting menu bar app is not
@@ -151,6 +188,13 @@ final class SessionStore {
     /// approvals) until resolved, others for a grace window that covers
     /// polling lag.
     func sync(tool: AgentTool, sessions incoming: [AgentSession]) {
+        guard isEnabled(tool) else {
+            if sessions.contains(where: { $0.tool == tool }) {
+                sessions.removeAll { $0.tool == tool }
+                refreshIconTicker()
+            }
+            return
+        }
         let incomingIds = Set(incoming.map(\.id))
         for session in incoming { upsert(session) }
         sessions.removeAll {
@@ -260,6 +304,9 @@ final class SessionStore {
         accountLabel: String?,
         title: String? = nil
     ) {
+        // Hooks arrive independently of polling, so a disabled tool would
+        // otherwise reappear the moment one of its agents did anything.
+        guard isEnabled(tool) else { return }
         hookOverrides[sessionID] = HookOverride(status: status, at: .now, sticky: sticky)
         if sessions.contains(where: { $0.id == sessionID }) {
             update(id: sessionID) { session in

@@ -321,3 +321,69 @@ struct ApprovalDeliveryHonestyTests {
         #expect(store.sessions[0].status == .waitingApproval(command: "git push"))
     }
 }
+
+/// Switching a tool off in Settings used to remove only its approval
+/// bridge, so every row for that tool stayed in the popover. The switch
+/// sits beside the tool's name; it has to mean "show this tool".
+@MainActor
+struct ToolVisibilityTests {
+    /// A throwaway domain per test. Using .standard here wrote to the real
+    /// app's preferences and switched a tool off in the shipping build.
+    private func makeStore() -> SessionStore {
+        SessionStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+    }
+
+    private func session(_ tool: AgentTool) -> AgentSession {
+        AgentSession(tool: tool, projectName: "proj", status: .working(activity: "Working…"))
+    }
+
+    @Test func switchingAToolOffClearsItsRowsImmediately() {
+        let store = makeStore()
+        store.upsert(session(.claudeCode))
+        store.upsert(session(.codex))
+        #expect(store.sessions.count == 2)
+
+        store.setToolEnabled(.claudeCode, false)
+
+        #expect(!store.sessions.contains { $0.tool == .claudeCode })
+        #expect(store.sessions.contains { $0.tool == .codex })
+    }
+
+    /// Waiting for the next poll would leave rows on screen for seconds,
+    /// and for a tool whose monitor is idle, indefinitely.
+    @Test func aDisabledToolsPollsAreDiscarded() {
+        let store = makeStore()
+        store.setToolEnabled(.claudeCode, false)
+        store.sync(tool: .claudeCode, sessions: [session(.claudeCode)])
+        #expect(store.sessions.isEmpty)
+    }
+
+    /// Hooks arrive independently of polling, so without this a disabled
+    /// tool reappears the moment one of its agents does anything.
+    @Test func aDisabledToolsHookEventsAreIgnored() {
+        let store = makeStore()
+        store.setToolEnabled(.grokBuild, false)
+        store.applyHookEvent(
+            sessionID: UUID(), tool: .grokBuild,
+            status: .waitingApproval(command: "rm -rf /"),
+            sticky: true, cwd: nil, accountLabel: nil)
+        #expect(store.sessions.isEmpty)
+        #expect(store.attentionCount == 0)
+    }
+
+    @Test func switchingItBackOnLetsRowsReturn() {
+        let store = makeStore()
+        store.setToolEnabled(.claudeCode, false)
+        store.sync(tool: .claudeCode, sessions: [session(.claudeCode)])
+        #expect(store.sessions.isEmpty)
+
+        store.setToolEnabled(.claudeCode, true)
+        store.sync(tool: .claudeCode, sessions: [session(.claudeCode)])
+        #expect(store.sessions.count == 1)
+    }
+
+    @Test func everyToolIsOnUntilItIsSwitchedOff() {
+        let store = makeStore()
+        for tool in AgentTool.allCases { #expect(store.isEnabled(tool)) }
+    }
+}

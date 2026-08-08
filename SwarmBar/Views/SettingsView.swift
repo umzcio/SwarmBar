@@ -183,7 +183,7 @@ struct ProvidersSettingsTab: View {
                 }
             }
 
-            Text("Configs are backed up beside the original before the first change.")
+            Text("Applies to new sessions. Agents already running keep the hooks they started with. Configs are backed up beside the original before the first change.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 6)
@@ -213,6 +213,7 @@ struct ProvidersSettingsTab: View {
 }
 
 private struct IntegrationRow: View {
+    @Environment(SessionStore.self) private var store
     let tool: AgentTool
     let manager: IntegrationManager
 
@@ -244,35 +245,47 @@ private struct IntegrationRow: View {
     @ViewBuilder
     private func control(_ state: IntegrationManager.InstallState) -> some View {
         switch state {
-        case .installed, .notInstalled, .failed:
+        case .toolMissing:
+            EmptyView()
+        default:
+            // One switch, and it means what the row implies: show this
+            // tool. For a tool with a bridge it installs or removes that
+            // as well, which is ALL it used to do. That is why switching
+            // Claude Code off pulled its hooks and left every Claude row
+            // sitting in the popover.
             Toggle("", isOn: Binding(
-                get: { state == .installed },
-                set: { manager.setEnabled(tool, $0) }
+                get: { store.isEnabled(tool) },
+                set: { on in
+                    store.setToolEnabled(tool, on)
+                    if state != .noSetupNeeded { manager.setEnabled(tool, on) }
+                }
             ))
             .toggleStyle(.switch)
             .controlSize(.small)
             .labelsHidden()
             .tint(.orange)
-        case .noSetupNeeded where tool == .grokBuild:
-            Toggle("", isOn: $grokKeystrokes)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .labelsHidden()
-                .tint(.orange)
-                .help("Off: Approve and Deny focus the terminal instead of answering the prompt remotely.")
-        case .noSetupNeeded:
-            Text("Always on")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        case .toolMissing:
-            EmptyView()
+            .help(state == .noSetupNeeded
+                  ? "Show \(tool.label) sessions in SwarmBar"
+                  : "Show \(tool.label) sessions, and install its approval bridge")
         }
     }
 
-    /// What the channel is, not a restatement of the switch.
+    /// What the channel is, plus whether it is currently wired up.
+    ///
+    /// This used to describe the channel only, on the reasoning that
+    /// restating the switch is redundant. It is not: the switch was the
+    /// single piece of feedback a toggle produced, the text was identical
+    /// either way, and turning a bridge off looked like nothing had
+    /// happened. That is what "disabling a hook does not work" turned out
+    /// to be, with the write itself working correctly all along.
     private func detail(_ state: IntegrationManager.InstallState) -> String {
         if case .failed(let message) = state { return message }
         if state == .toolMissing { return "Not installed on this Mac" }
+        guard store.isEnabled(tool) else { return "Hidden from the popover" }
+        return channel
+    }
+
+    private var channel: String {
         switch tool {
         case .claudeCode: return "Hook bridge in settings.json, held decisions"
         case .kimiCode:   return "Hooks in config.toml, answers on screen"
