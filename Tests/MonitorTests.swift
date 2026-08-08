@@ -94,7 +94,7 @@ struct OpenCodeReaderTests {
         var db: OpaquePointer?
         #expect(sqlite3_open(path, &db) == SQLITE_OK)
         let schema = """
-        CREATE TABLE session(id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+        CREATE TABLE session(id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT);
         CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER);
         CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
         """
@@ -115,7 +115,7 @@ struct OpenCodeReaderTests {
         let now = Date.now
         let updated = Int64((now.timeIntervalSince1970 * 1000).rounded())
         insert(dbPath: path, sql: """
-        INSERT INTO session VALUES ('s1', '/tmp/proj-1', 'title', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('s1', '/tmp/proj-1', 'title', \(updated - 1000), \(updated));
         INSERT INTO message VALUES ('m1', 's1', \(updated));
         INSERT INTO part VALUES ('p1', 'm1', '{"type":"step-start"}');
         """)
@@ -131,7 +131,7 @@ struct OpenCodeReaderTests {
         let updatedDate = now.addingTimeInterval(-5 * 60)
         let updated = Int64((updatedDate.timeIntervalSince1970 * 1000).rounded())
         insert(dbPath: path, sql: """
-        INSERT INTO session VALUES ('s2', '/tmp/proj-2', 'title', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('s2', '/tmp/proj-2', 'title', \(updated - 1000), \(updated));
         INSERT INTO message VALUES ('m2', 's2', \(updated));
         INSERT INTO part VALUES ('p1', 'm2', '{"type":"text","text":"Done, want me to continue?"}');
         INSERT INTO part VALUES ('p2', 'm2', '{"type":"step-finish"}');
@@ -147,7 +147,7 @@ struct OpenCodeReaderTests {
         let updatedDate = now.addingTimeInterval(-2 * 60 * 60)
         let updated = Int64((updatedDate.timeIntervalSince1970 * 1000).rounded())
         insert(dbPath: path, sql: """
-        INSERT INTO session VALUES ('s3', '/tmp/proj-3', 'title', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('s3', '/tmp/proj-3', 'title', \(updated - 1000), \(updated));
         INSERT INTO message VALUES ('m3', 's3', \(updated));
         INSERT INTO part VALUES ('p1', 'm3', '{"type":"step-finish"}');
         """)
@@ -167,13 +167,13 @@ struct OpenCodeReaderTests {
         let older = Int64(((now.timeIntervalSince1970 - 10 * 60) * 1000).rounded())
         let newer = Int64((now.timeIntervalSince1970 * 1000).rounded())
         insert(dbPath: path, sql: """
-        INSERT INTO session VALUES ('ghost', '/tmp/proj-4', 'title', \(older - 1000), \(older));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('ghost', '/tmp/proj-4', 'title', \(older - 1000), \(older));
         INSERT INTO message VALUES ('m4', 'ghost', \(older));
         INSERT INTO part VALUES ('p1', 'm4', '{"type":"text","text":"abandoned"}');
-        INSERT INTO session VALUES ('live', '/tmp/proj-4', 'title', \(newer - 1000), \(newer));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('live', '/tmp/proj-4', 'title', \(newer - 1000), \(newer));
         INSERT INTO message VALUES ('m5', 'live', \(newer));
         INSERT INTO part VALUES ('p2', 'm5', '{"type":"step-start"}');
-        INSERT INTO session VALUES ('other', '/tmp/proj-5', 'title', \(older - 1000), \(older));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('other', '/tmp/proj-5', 'title', \(older - 1000), \(older));
         INSERT INTO message VALUES ('m6', 'other', \(older));
         INSERT INTO part VALUES ('p3', 'm6', '{"type":"text","text":"different directory"}');
         """)
@@ -194,10 +194,10 @@ struct OpenCodeReaderTests {
         let now = Date.now
         let updated = Int64((now.timeIntervalSince1970 * 1000).rounded())
         insert(dbPath: path, sql: """
-        INSERT INTO session VALUES ('live', '/tmp/proj-live', 'title', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('live', '/tmp/proj-live', 'title', \(updated - 1000), \(updated));
         INSERT INTO message VALUES ('m1', 'live', \(updated));
         INSERT INTO part VALUES ('p1', 'm1', '{"type":"step-start"}');
-        INSERT INTO session VALUES ('dead', '/tmp/proj-dead', 'title', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('dead', '/tmp/proj-dead', 'title', \(updated - 1000), \(updated));
         INSERT INTO message VALUES ('m2', 'dead', \(updated));
         INSERT INTO part VALUES ('p2', 'm2', '{"type":"step-start"}');
         """)
@@ -641,5 +641,38 @@ struct GrokSubagentTests {
 
     @Test func noSubagentsMeansNothingIsFiltered() {
         #expect(GrokBuildMonitor.subagentIDs(in: []).isEmpty)
+    }
+}
+
+/// OpenCode records a spawned session's parent in `session.parent_id`.
+/// Those are subagents and must not become rows: every other tool that
+/// stores subagents beside their parent leaked them into the popover,
+/// where they share the project's name and can never need the user.
+@MainActor
+struct OpenCodeSubagentTests {
+    @Test func childSessionsAreExcluded() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        let now = Date.now
+        let updated = Int64((now.timeIntervalSince1970 * 1000).rounded())
+        let sql = """
+        CREATE TABLE session(id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT);
+        CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER);
+        CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('parent', '/tmp/proj', 't', \(updated - 1000), \(updated));
+        INSERT INTO session (id, directory, title, time_created, time_updated, parent_id) VALUES ('child', '/tmp/proj', 't', \(updated - 1000), \(updated), 'parent');
+        INSERT INTO message VALUES ('m1', 'parent', \(updated));
+        INSERT INTO part VALUES ('p1', 'm1', '{"type":"step-start"}');
+        INSERT INTO message VALUES ('m2', 'child', \(updated));
+        INSERT INTO part VALUES ('p2', 'm2', '{"type":"step-start"}');
+        """
+        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.count == 1, "the child session should not be a row")
+        #expect(sessions.first?.projectName == "proj")
     }
 }

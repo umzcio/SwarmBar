@@ -118,14 +118,35 @@ enum CodexSessionParser {
 
     /// The first line of a rollout file is session_meta with cwd and id.
     static func meta(head: String) -> (cwd: String?, sessionId: String?) {
+        let payload = metaPayload(head: head)
+        return (payload?["cwd"] as? String, payload?["session_id"] as? String)
+    }
+
+    /// Whether this rollout belongs to a subagent rather than to the
+    /// session a person is talking to.
+    ///
+    /// Codex gives every spawned subagent its own rollout file next to its
+    /// parent's, so without this one Codex run fills the popover: of 172
+    /// rollouts on the machine where this was found, 147 were subagents.
+    ///
+    /// Taken from Codex's own `thread_source`, which is `subagent` for a
+    /// spawned thread and `user` for a real one. Rollouts written before
+    /// multi-agent support have no marker at all, and those are kept: an
+    /// absent field means "not known to be a subagent", and treating it as
+    /// one would silently hide genuine sessions.
+    static func isSubagent(head: String) -> Bool {
+        metaPayload(head: head)?["thread_source"] as? String == "subagent"
+    }
+
+    private static func metaPayload(head: String) -> [String: Any]? {
         for raw in head.split(separator: "\n") {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   line["type"] as? String == "session_meta",
                   let payload = line["payload"] as? [String: Any]
             else { continue }
-            return (payload["cwd"] as? String, payload["session_id"] as? String)
+            return payload
         }
-        return (nil, nil)
+        return nil
     }
 }

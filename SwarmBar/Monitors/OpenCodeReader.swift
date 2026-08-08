@@ -40,7 +40,15 @@ enum OpenCodeReader {
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 200)
 
-        let sessionSQL = "SELECT id, directory, time_created, time_updated FROM session"
+        // parent_id is set on a session spawned by another session. Filtering
+        // in SQL rather than in Swift keeps subagents from ever becoming rows.
+        // No local database had a non-null parent_id when this was written,
+        // so this is here to stop the leak the other tools already showed
+        // rather than to fix an observed one.
+        let sessionSQL = """
+            SELECT id, directory, time_created, time_updated FROM session
+            WHERE parent_id IS NULL
+            """
         var sessionStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sessionSQL, -1, &sessionStmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(sessionStmt) }

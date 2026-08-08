@@ -381,3 +381,94 @@ struct HookTokenTests {
         #expect(first == second)
     }
 }
+
+/// Codex writes every spawned subagent its own rollout file beside its
+/// parent's. On the machine where this was found, 147 of 172 rollouts were
+/// subagents, so one Codex run filled the popover with rows carrying the
+/// project's name that could never need the user.
+@MainActor
+struct CodexSubagentTests {
+    private func meta(_ payload: String) -> String {
+        #"{"type":"session_meta","payload":\#(payload)}"#
+    }
+
+    @Test func aSpawnedThreadIsASubagent() {
+        let head = meta(#"{"cwd":"/tmp/p","session_id":"abc","thread_source":"subagent","agent_nickname":"Cicero"}"#)
+        #expect(CodexSessionParser.isSubagent(head: head))
+    }
+
+    @Test func aRealSessionIsNot() {
+        let head = meta(#"{"cwd":"/tmp/p","session_id":"abc","thread_source":"user"}"#)
+        #expect(!CodexSessionParser.isSubagent(head: head))
+    }
+
+    /// Rollouts written before Codex had multi-agent support carry no
+    /// marker. An absent field means "not known to be a subagent", so they
+    /// are kept: reading absence as "subagent" would hide real sessions,
+    /// which is a worse failure than showing one row too many.
+    @Test func anOlderRolloutWithNoMarkerIsKept() {
+        let head = meta(#"{"cwd":"/tmp/p","session_id":"abc"}"#)
+        #expect(!CodexSessionParser.isSubagent(head: head))
+    }
+
+    @Test func junkDoesNotCrashOrMisclassify() {
+        #expect(!CodexSessionParser.isSubagent(head: ""))
+        #expect(!CodexSessionParser.isSubagent(head: "not json"))
+        #expect(!CodexSessionParser.isSubagent(head: #"{"type":"event_msg"}"#))
+    }
+
+    /// cwd and session_id still parse from the same line the flag rides on.
+    @Test func theRestOfTheMetadataStillParses() {
+        let head = meta(#"{"cwd":"/tmp/p","session_id":"abc","thread_source":"subagent"}"#)
+        let parsed = CodexSessionParser.meta(head: head)
+        #expect(parsed.cwd == "/tmp/p")
+        #expect(parsed.sessionId == "abc")
+    }
+}
+
+/// Codex embeds base_instructions in its session_meta line, so the first
+/// line of a rollout is now about 19 KB. The head window used to be a flat
+/// 16 KB, which cut that line in half: it failed to parse, so every Codex
+/// session lost its cwd and session id, showed as "codex session" with no
+/// project path, and the subagent flag on the same line never registered.
+@MainActor
+struct CodexHeadWindowTests {
+    private func rollout(firstLineBytes: Int) throws -> URL {
+        let padding = String(repeating: "x", count: max(0, firstLineBytes - 200))
+        let meta = #"{"type":"session_meta","payload":{"cwd":"/tmp/proj","session_id":"abc","thread_source":"subagent","base_instructions":"\#(padding)"}}"#
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        try (meta + "\n" + #"{"type":"event_msg"}"# + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    @Test func aSmallHeadStillParses() throws {
+        let head = CodexMonitor.headText(of: try rollout(firstLineBytes: 500))
+        #expect(CodexSessionParser.meta(head: head).cwd == "/tmp/proj")
+    }
+
+    /// The size that broke it. A real rollout measured 18,901 bytes.
+    @Test func aNineteenKilobyteMetaLineParses() throws {
+        let head = CodexMonitor.headText(of: try rollout(firstLineBytes: 19_000))
+        let parsed = CodexSessionParser.meta(head: head)
+        #expect(parsed.cwd == "/tmp/proj")
+        #expect(parsed.sessionId == "abc")
+        #expect(CodexSessionParser.isSubagent(head: head))
+    }
+
+    /// Headroom, so the next time Codex adds a field this does not silently
+    /// regress to nameless rows.
+    @Test func aMuchLargerMetaLineStillParses() throws {
+        let head = CodexMonitor.headText(of: try rollout(firstLineBytes: 300_000))
+        #expect(CodexSessionParser.meta(head: head).cwd == "/tmp/proj")
+    }
+
+    /// A file with no newline must not be read without bound.
+    @Test func theWindowIsCapped() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        try String(repeating: "x", count: 2 * CodexMonitor.maxHeadBytes)
+            .write(to: url, atomically: true, encoding: .utf8)
+        #expect(CodexMonitor.headText(of: url).count <= CodexMonitor.maxHeadBytes)
+    }
+}
