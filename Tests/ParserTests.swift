@@ -329,6 +329,64 @@ struct TuiPromptLayoutTests {
     }
 }
 
+/// What the approval row's command slot says. It is the whole content of
+/// an approval request, so a tool whose description falls back to its own
+/// name tells the user nothing about what they are approving.
+@MainActor
+struct HookCommandDescriptionTests {
+    @Test func bashShowsItsCommand() {
+        #expect(HookServer.commandDescription([
+            "tool_name": "Bash",
+            "tool_input": ["command": "rm -rf build"],
+        ]) == "rm -rf build")
+    }
+
+    @Test func aFileToolNamesTheFile() {
+        #expect(HookServer.commandDescription([
+            "tool_name": "Write",
+            "tool_input": ["file_path": "/tmp/proj/server.js"],
+        ]) == "Write server.js")
+    }
+
+    /// The row used to read "$ AskUserQuestion", which names the mechanism
+    /// and says nothing about what is being asked.
+    @Test func aQuestionShowsTheQuestion() {
+        #expect(HookServer.commandDescription([
+            "tool_name": "AskUserQuestion",
+            "tool_input": ["questions": [["question": "Which database should we use?"]]],
+        ]) == "Which database should we use?")
+    }
+
+    @Test func severalQuestionsShowTheFirstAndACount() {
+        #expect(HookServer.commandDescription([
+            "tool_name": "AskUserQuestion",
+            "tool_input": ["questions": [
+                ["question": "Which database?"],
+                ["question": "Which host?"],
+                ["question": "Which region?"],
+            ]],
+        ]) == "Which database? (+2 more)")
+    }
+
+    /// Read by shape, not by tool name, so a renamed tool with the same
+    /// input still reads properly.
+    @Test func theQuestionIsFoundWithoutMatchingTheToolName() {
+        #expect(HookServer.commandDescription([
+            "tool_name": "AskTheHuman",
+            "tool_input": ["questions": [["question": "Ship it?"]]],
+        ]) == "Ship it?")
+    }
+
+    /// Anything without a question falls back to what it did before.
+    @Test func anEmptyOrAbsentQuestionFallsBack() {
+        #expect(HookServer.questionText(["questions": []]) == nil)
+        #expect(HookServer.questionText(["questions": [["question": "   "]]]) == nil)
+        #expect(HookServer.commandDescription([
+            "tool_name": "Glob", "tool_input": ["pattern": "**/*.swift"],
+        ]) == "Glob")
+    }
+}
+
 @MainActor
 struct HookRequestParsingTests {
     private func request(headers: String, body: String) -> Data {

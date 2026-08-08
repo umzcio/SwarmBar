@@ -404,17 +404,41 @@ final class HookServer: ApprovalResponding {
         holdForDecision(sessionID: sessionID, kind: .openCodePlugin, connection: connection)
     }
 
-    private static func commandDescription(_ body: [String: Any]) -> String {
+    static func commandDescription(_ body: [String: Any]) -> String {
         let toolName = body["tool_name"] as? String ?? "tool"
         let input = body["tool_input"] as? [String: Any]
         if toolName == "Bash", let command = input?["command"] as? String {
-            let flattened = command.replacingOccurrences(of: "\n", with: " ")
-            return flattened.count <= 80 ? flattened : String(flattened.prefix(80)) + "…"
+            return shorten(command)
         }
+        // A question the agent wants to put to the user. The row used to
+        // read "$ AskUserQuestion", which names the mechanism and says
+        // nothing about what is being asked, and the question is the
+        // entire content of the request. Approving lets the agent ask it;
+        // the answer still happens wherever the session is.
+        if let question = questionText(input) { return shorten(question) }
         if let path = input?["file_path"] as? String {
             return "\(toolName) \(URL(fileURLWithPath: path).lastPathComponent)"
         }
         return toolName
+    }
+
+    /// The first question of an AskUserQuestion call, with a count when
+    /// there are more. Read structurally rather than by tool name, so a
+    /// renamed tool with the same shape still reads properly, and anything
+    /// without a question falls through to the old description.
+    nonisolated static func questionText(_ input: [String: Any]?) -> String? {
+        guard let questions = input?["questions"] as? [[String: Any]],
+              let first = questions.first,
+              let question = (first["question"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty
+        else { return nil }
+        return questions.count > 1 ? "\(question) (+\(questions.count - 1) more)" : question
+    }
+
+    private nonisolated static func shorten(_ text: String, limit: Int = 80) -> String {
+        let flattened = text.replacingOccurrences(of: "\n", with: " ")
+        return flattened.count <= limit ? flattened : String(flattened.prefix(limit)) + "…"
     }
 
     // MARK: - Pending decisions
