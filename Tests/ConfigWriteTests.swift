@@ -70,3 +70,54 @@ struct ConfigWriteTests {
         #expect(try String(contentsOf: file, encoding: .utf8).contains("fresh"))
     }
 }
+
+/// The Kimi family's hook list. UserPromptSubmit was added to mark the
+/// start of a user turn, replacing a recency guess that was wrong in both
+/// directions: a session thinking quietly read as idle, and a session that
+/// had just finished read as working for another two minutes.
+@MainActor
+struct KimiHookEventsTests {
+    private var names: [String] { TomlHooksTransform.events.map(\.name) }
+
+    @Test func aUserTurnIsNowSignalled() {
+        #expect(names.contains("UserPromptSubmit"))
+    }
+
+    /// The events that must keep working. UserPromptSubmit is additive and
+    /// must not have displaced the approval path.
+    @Test func theApprovalEventsSurvive() {
+        for required in ["PermissionRequest", "PermissionResult", "PreToolUse", "Stop", "SessionEnd"] {
+            #expect(names.contains(required), "\(required) was dropped")
+        }
+    }
+
+    /// The whole reason UserPromptSubmit was chosen over TurnStarted. Any
+    /// event name outside the legacy engine's 16 would make a build running
+    /// KIMI_CODE_LEGACY_FLAG discard the entire hooks block, approvals
+    /// included, because `hooks` is not an entry-keyed config section.
+    @Test func everyEventExistsInBothEnginesEnums() {
+        let legacySixteen: Set<String> = [
+            "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest",
+            "PermissionResult", "UserPromptSubmit", "Stop", "StopFailure", "Interrupt",
+            "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop",
+            "PreCompact", "PostCompact", "Notification",
+        ]
+        for name in names {
+            #expect(legacySixteen.contains(name),
+                    "\(name) is not in the legacy enum and would drop the whole hooks block")
+        }
+    }
+
+    @Test func installWritesTheNewEvent() {
+        let written = TomlHooksTransform.install("", scriptPath: "/tmp/hook.sh")
+        #expect(written.contains("event = \"UserPromptSubmit\""))
+        #expect(written.contains("event = \"PermissionRequest\""))
+    }
+
+    @Test func uninstallStillRemovesEverything() {
+        let written = TomlHooksTransform.install("", scriptPath: "/tmp/hook.sh")
+        let cleaned = TomlHooksTransform.uninstall(written)
+        #expect(!cleaned.contains("UserPromptSubmit"))
+        #expect(!TomlHooksTransform.isInstalled(cleaned))
+    }
+}

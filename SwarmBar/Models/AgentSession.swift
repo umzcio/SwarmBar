@@ -11,6 +11,12 @@ struct AgentSession: Identifiable, Equatable, Sendable {
                                   // show this for waiting/idle states
     var pid: pid_t?               // liveness checks
     var accountLabel: String?     // e.g. GMAIL / TEAM / CIO, from hook env
+    /// The tool's own name for this session, when it has one. Kimi and
+    /// BearCode put `sessionTitle` on every hook payload. Several rows
+    /// often share a project name, so this is what tells them apart.
+    /// Shown as the row's tooltip rather than replacing the project name,
+    /// which is the label the prototype specifies.
+    var title: String?
     /// Whether the tool's process still runs. A live session that just
     /// finished a turn belongs in Active, not buried in Recent history.
     var processAlive: Bool
@@ -25,6 +31,7 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         lastActivityAt: Date? = nil,
         pid: pid_t? = nil,
         accountLabel: String? = nil,
+        title: String? = nil,
         processAlive: Bool = false
     ) {
         self.id = id
@@ -36,6 +43,7 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         self.lastActivityAt = lastActivityAt ?? startedAt
         self.pid = pid
         self.accountLabel = accountLabel
+        self.title = title
         self.processAlive = processAlive
     }
 

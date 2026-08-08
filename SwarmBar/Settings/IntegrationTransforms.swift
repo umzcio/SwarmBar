@@ -93,10 +93,22 @@ enum TomlHooksTransform {
     static let beginMarker = "# >>> SwarmBar hooks >>>"
     static let endMarker = "# <<< SwarmBar hooks <<<"
 
+    /// Deliberately NOT TurnStarted, which 0.32.0 added and which would be
+    /// the more direct signal. It exists only in the newer engine's enum,
+    /// and because `hooks` is not an entry-keyed config section, a build
+    /// that does not recognise one event name drops the WHOLE block, taking
+    /// approvals with it. The legacy engine is still selectable at runtime
+    /// via KIMI_CODE_LEGACY_FLAG, which cannot be read when writing config.
+    ///
+    /// UserPromptSubmit is in both engines' enums, so it is safe on any
+    /// build, and it is also the better signal for a status bar: it marks
+    /// a turn the USER started, not the agent continuing itself after a
+    /// stop hook, a retry, or a compaction.
     static let events: [(name: String, timeout: Int?)] = [
         ("PermissionRequest", nil),
         ("PermissionResult", nil),
         ("PreToolUse", 10),
+        ("UserPromptSubmit", 5),
         ("Stop", 10),
         ("SessionEnd", nil),
     ]

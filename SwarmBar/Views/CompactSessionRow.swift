@@ -61,7 +61,7 @@ struct CompactSessionRow: View {
         .padding(.horizontal, 8)
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
-        .help(session.projectName)
+        .help(session.title ?? session.projectName)
         .sessionRowInteractions(session, store: store)
     }
 }

@@ -237,6 +237,13 @@ final class HookServer: ApprovalResponding {
         let cwd = (body["cwd"] as? String).flatMap {
             TerminalFocuser.isDirectory($0) ? $0 : nil
         }
+        // The Kimi family puts sessionTitle on every payload. Several rows
+        // routinely share a project name, so this is what distinguishes
+        // them. Absent for tools that do not send it, which is fine: the
+        // store only overwrites when a real value arrives.
+        let sessionTitle = (body["sessionTitle"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
 
         func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
 
@@ -270,7 +277,7 @@ final class HookServer: ApprovalResponding {
             store.applyHookEvent(
                 sessionID: sessionID, tool: tool,
                 status: .waitingApproval(command: command),
-                sticky: true, cwd: cwd, accountLabel: request.accountLabel
+                sticky: true, cwd: cwd, accountLabel: request.accountLabel, title: sessionTitle
             )
             // Only Claude honors a held decision response. Kimi's
             // PermissionRequest is observation-only, and Grok 0.2.118
@@ -297,7 +304,7 @@ final class HookServer: ApprovalResponding {
             store.applyHookEvent(
                 sessionID: sessionID, tool: tool,
                 status: .runningTool(activity: "Running \(Self.commandDescription(body))"),
-                sticky: false, cwd: cwd, accountLabel: request.accountLabel
+                sticky: false, cwd: cwd, accountLabel: request.accountLabel, title: sessionTitle
             )
             finishEmpty()
 
@@ -306,7 +313,7 @@ final class HookServer: ApprovalResponding {
                 store.applyHookEvent(
                     sessionID: sessionID, tool: tool,
                     status: .waitingInput(prompt: ""),
-                    sticky: false, cwd: cwd, accountLabel: request.accountLabel
+                    sticky: false, cwd: cwd, accountLabel: request.accountLabel, title: sessionTitle
                 )
             }
             finishEmpty()
@@ -315,7 +322,7 @@ final class HookServer: ApprovalResponding {
             store.applyHookEvent(
                 sessionID: sessionID, tool: tool,
                 status: .working(activity: "Thinking…"),
-                sticky: false, cwd: cwd, accountLabel: request.accountLabel
+                sticky: false, cwd: cwd, accountLabel: request.accountLabel, title: sessionTitle
             )
             finishEmpty()
 

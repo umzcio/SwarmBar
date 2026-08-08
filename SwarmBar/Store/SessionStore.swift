@@ -129,6 +129,9 @@ final class SessionStore {
             var merged = session
             merged.startedAt = sessions[index].startedAt
             merged.accountLabel = session.accountLabel ?? sessions[index].accountLabel
+            // Monitors never learn a title (it arrives on hook payloads), so
+            // without this every poll would wipe one the hooks had supplied.
+            merged.title = session.title ?? sessions[index].title
             sessions[index] = merged
         } else {
             sessions.insert(session, at: 0)
@@ -254,7 +257,8 @@ final class SessionStore {
         status: SessionStatus,
         sticky: Bool,
         cwd: String?,
-        accountLabel: String?
+        accountLabel: String?,
+        title: String? = nil
     ) {
         hookOverrides[sessionID] = HookOverride(status: status, at: .now, sticky: sticky)
         if sessions.contains(where: { $0.id == sessionID }) {
@@ -262,6 +266,9 @@ final class SessionStore {
                 session.status = status
                 session.lastActivityAt = .now
                 if let accountLabel { session.accountLabel = accountLabel }
+                // Only overwrite with a real value: a later hook that
+                // carries no title must not erase one an earlier hook gave.
+                if let title, !title.isEmpty { session.title = title }
             }
         } else {
             // Hook fired before the poller discovered the transcript.

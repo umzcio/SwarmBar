@@ -79,6 +79,11 @@ struct SessionRow: View {
         .padding(8)
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
+        // The project name stays the row's label, as the prototype
+        // specifies. The tool's own title for the session goes here, where
+        // it disambiguates several rows sharing one project without
+        // changing the layout.
+        .help(session.title ?? session.projectName)
         .sessionRowInteractions(session, store: store)
     }
 }
