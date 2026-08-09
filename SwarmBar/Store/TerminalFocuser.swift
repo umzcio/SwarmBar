@@ -363,7 +363,8 @@ enum TerminalFocuser {
         guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return nil }
         for case let file as URL in enumerator
         where file.lastPathComponent.lowercased().hasSuffix(suffix) {
-            guard let output = run("/usr/sbin/lsof", ["-F", "p", file.path]) else { continue }
+            guard let output = run("/usr/sbin/lsof", ["-n", "-P", "-F", "p", file.path])
+            else { continue }
             for line in output.split(separator: "\n") where line.hasPrefix("p") {
                 if let pid = Int(line.dropFirst()), kill(pid_t(pid), 0) == 0 { return pid }
             }
@@ -429,10 +430,20 @@ enum TerminalFocuser {
     /// path the plan describes as the fallback: an unfiltered system-wide
     /// lsof, with results narrowed by the `~/.codex/sessions` path prefix
     /// instead of by process name.
+    ///
+    /// `-n` and `-P` are load bearing for speed, not for output. Without
+    /// them lsof reverse-resolves every network socket on the machine, and
+    /// this call is on a five second poll: measured on a real machine it
+    /// took 25.3 seconds and returned 46,181 lines, so the Codex monitor's
+    /// true cadence was about thirty seconds and a full descriptor scan ran
+    /// forever. With them it takes 0.16 seconds. The flags only affect how
+    /// NETWORK addresses are printed, never file paths, which is all this
+    /// reads: against a fixed set of pids both spellings produce identical
+    /// output.
     nonisolated static func codexPidsBySessionSuffix() -> [String: Int] {
         let sessionsRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions").path
-        guard let output = run("/usr/sbin/lsof", ["-F", "pn"]) else { return [:] }
+        guard let output = run("/usr/sbin/lsof", ["-n", "-P", "-F", "pn"]) else { return [:] }
         var result: [String: Int] = [:]
         var currentPid: Int?
         for line in output.split(separator: "\n") {

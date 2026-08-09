@@ -64,9 +64,13 @@ enum ProcessLiveness {
         // One lsof for every pid at once; -Fpn prints a p<pid> line then an
         // n<path> line per open file, so the current p line owns the paths
         // that follow it.
+        // -n and -P for the same reason as the Codex scan: this asks for
+        // every descriptor these pids hold, network sockets included, and
+        // resolving those names is what makes lsof slow. Neither flag
+        // changes how file paths print.
         guard let output = run(
             "/usr/sbin/lsof",
-            ["-a", "-p", pids.map(String.init).joined(separator: ","), "-Fpn"]
+            ["-n", "-P", "-a", "-p", pids.map(String.init).joined(separator: ","), "-Fpn"]
         ) else { return [:] }
 
         let prefix = directory.hasSuffix("/") ? directory : directory + "/"
@@ -128,7 +132,11 @@ enum ProcessLiveness {
     }
 
     private nonisolated static func cwds(pid: Int) -> [String] {
-        guard let output = run("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]) else {
+        // `-d cwd` already excludes sockets, so this one was never slow, but
+        // the flags are free and every lsof call here spells them the same.
+        guard let output = run(
+            "/usr/sbin/lsof", ["-n", "-P", "-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]
+        ) else {
             return []
         }
         return output.split(separator: "\n")

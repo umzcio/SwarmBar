@@ -16,9 +16,9 @@
 
 <p align="center">
   <strong>A macOS menu bar app that answers one question: do any of my agents need me right now?</strong><br/>
-  Watches Claude Code, Codex, Kimi Code, BearCode, OpenCode, and Grok Build across every concurrent
-  session, surfaces the ones waiting on you, and lets you approve, deny, or reply without leaving
-  the menu bar.<br/><br/>
+  Watches Claude Code, Codex, Kimi Code, BearCode, OpenCode, Grok Build, and Antigravity across
+  every concurrent session, surfaces the ones waiting on you, and lets you approve, deny, or reply
+  without leaving the menu bar.<br/><br/>
   <a href="#quick-start">Quick Start</a> · <a href="#how-it-works">How It Works</a> · <a href="#supported-agents">Supported Agents</a> · <a href="#features">Features</a> · <a href="#architecture">Architecture</a>
 </p>
 
@@ -26,7 +26,7 @@
 
 ## Why
 
-Running one coding agent is fine. Running six is a tab-hunting problem.
+Running one coding agent is fine. Running seven is a tab-hunting problem.
 
 Agents block on permission prompts, finish turns quietly, and ask clarifying questions into
 terminal windows you are not looking at. The cost is not the waiting, it is the discovery: cycling
@@ -71,6 +71,7 @@ Monitors are strictly read-only. Nothing is ever written to an agent's session o
 | BearCode | same as Kimi | on-screen selector | Rides the Kimi family layout |
 | OpenCode | in-process plugin | plugin respond endpoint | Prompts only where config has ask rules |
 | Grok Build | update stream | tty keystrokes | Its hook runner ignores deny responses |
+| Antigravity | presence lock + transcript | on-screen selector | Walked to with arrows, never a digit |
 
 Keystroke-answered tools currently require **iTerm2**. Elsewhere, Approve and Deny focus the
 terminal instead of answering for you.
@@ -181,7 +182,7 @@ approvals appear immediately.
 - Ship the first signed and notarized release
 - Terminal.app support for keystroke answers and inline reply
 - Remote sessions over SSH
-- User-defined agents beyond the six built in
+- More agents, added the way the seven built in were
 
 ---
 
