@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # GitHub Actions only, because it is the only thing here with
+  # dependencies. SwarmBar ships zero third-party packages: no SPM manifest,
+  # no Package.resolved, nothing vendored. The one link against libsqlite3
+  # is the SDK's own, which Dependabot neither tracks nor needs to.
+  #
+  # That leaves the actions pinned in ci.yml, which are the supply chain
+  # this repo actually has. An action runs with access to the workflow's
+  # token, so a stale one is worth updating for the same reasons a stale
+  # library would be.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      # Matches the sentence-case convention the rest of the history uses.
+      prefix: "Bump"
+    labels:
+      - dependencies
