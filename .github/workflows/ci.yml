@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    # macOS 26 is the deployment target and the project sets no availability
+    # fallbacks, so an older image cannot build this at all. macos-26 has
+    # been generally available since February 2026.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      # The .xcodeproj is generated, not committed, so this is not optional
+      # setup: without it there is nothing to build. It is also the step
+      # that catches a source file added without regenerating the project,
+      # which otherwise only shows up as a mystery "cannot find X in scope".
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the project
+        run: xcodegen generate
+
+      # No output formatter in the pipeline on purpose: piping xcodebuild
+      # moves the exit status onto the formatter, and a green tick on a
+      # failed build is worse than verbose logs.
+      - name: Test
+        run: |
+          xcodebuild test \
+            -project SwarmBar.xcodeproj \
+            -scheme SwarmBar \
+            -configuration Debug
+
+  copy:
+    name: Copy style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CLAUDE.md: no em dashes anywhere in UI copy or docs. It is a real
+      # rule that is otherwise enforced by remembering it, which is how the
+      # README ended up advertising six tools the day the seventh shipped.
+      # Scoped to compiled source and docs, so the superseded phase-1 sketch
+      # at the repo root is out of scope rather than excluded by name.
+      - name: No em dashes
+        run: |
+          if git ls-files '*.md' 'SwarmBar/**/*.swift' 'Tests/**/*.swift' \
+            | xargs grep -n '—' ; then
+            echo "::error::Em dash found. Use a comma, a colon, or a full stop."
+            exit 1
+          fi
+          echo "No em dashes."
