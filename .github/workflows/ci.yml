@@ -17,7 +17,7 @@ jobs:
     # been generally available since February 2026.
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The .xcodeproj is generated, not committed, so this is not optional
       # setup: without it there is nothing to build. It is also the step
@@ -43,7 +43,7 @@ jobs:
     name: Copy style
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # CLAUDE.md: no em dashes anywhere in UI copy or docs. It is a real
       # rule that is otherwise enforced by remembering it, which is how the
