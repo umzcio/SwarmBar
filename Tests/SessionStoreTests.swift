@@ -39,16 +39,16 @@ struct SessionStoreTests {
     @Test func recentCollapsesLaunchScopedToolTrails() {
         let store = SessionStore()
         let old = AgentSession(
-            tool: .grokBuild, projectName: "zach", status: .idle,
+            tool: .grokBuild, projectName: "demo", status: .idle,
             lastActivityAt: .now.addingTimeInterval(-30 * 60))
         let newer = AgentSession(
-            tool: .grokBuild, projectName: "zach", status: .idle,
+            tool: .grokBuild, projectName: "demo", status: .idle,
             lastActivityAt: .now)
         let claudeA = AgentSession(
-            tool: .claudeCode, projectName: "zach", status: .idle,
+            tool: .claudeCode, projectName: "demo", status: .idle,
             lastActivityAt: .now.addingTimeInterval(-30 * 60))
         let claudeB = AgentSession(
-            tool: .claudeCode, projectName: "zach", status: .idle,
+            tool: .claudeCode, projectName: "demo", status: .idle,
             lastActivityAt: .now)
         for s in [old, newer, claudeA, claudeB] { store.upsert(s) }
 

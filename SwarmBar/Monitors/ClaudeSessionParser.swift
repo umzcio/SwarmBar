@@ -54,7 +54,7 @@ enum ClaudeSessionParser {
         return nil
     }
 
-    /// "-Users-zach-GitHub-SwarmBar" is the cwd with "/" replaced by "-".
+    /// "-Users-you-GitHub-SwarmBar" is the cwd with "/" replaced by "-".
     /// Ambiguous when path components contain hyphens; the cwd field on
     /// JSONL lines is preferred and this is only a fallback.
     static func decodeProjectDir(_ name: String) -> String? {

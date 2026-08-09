@@ -19,7 +19,7 @@ struct ClaudeSessionParserTests {
         let parsed = try #require(ClaudeSessionParser.parse(
             tail: fixture("claude-running-tool"), now: now))
         #expect(parsed.status == .runningTool(activity: "Running swift build 2>&1 | tail -5"))
-        #expect(parsed.cwd == "/Users/zach/GitHub/demo")
+        #expect(parsed.cwd == "/Users/example/GitHub/demo")
     }
 
     @Test func waitingInputFromTrailingAssistantText() throws {
@@ -50,8 +50,8 @@ struct ClaudeSessionParserTests {
     }
 
     @Test func decodeProjectDirFallback() {
-        #expect(ClaudeSessionParser.decodeProjectDir("-Users-zach-GitHub-demo")
-                == "/Users/zach/GitHub/demo")
+        #expect(ClaudeSessionParser.decodeProjectDir("-Users-example-GitHub-demo")
+                == "/Users/example/GitHub/demo")
         #expect(ClaudeSessionParser.decodeProjectDir("not-escaped") == nil)
     }
 }
@@ -74,7 +74,7 @@ struct CodexSessionParserTests {
 
     @Test func metaFromHead() throws {
         let meta = CodexSessionParser.meta(head: try fixture("codex-running"))
-        #expect(meta.cwd == "/Users/zach/GitHub/demo")
+        #expect(meta.cwd == "/Users/example/GitHub/demo")
         #expect(meta.sessionId == "0198a6b9-1111-7abc-9def-0123456789ab")
     }
 
@@ -96,7 +96,7 @@ struct CodexSessionParserTests {
 
     @Test func sandboxedCallWithoutOutputIsNotAnApproval() {
         let tail = """
-        {"timestamp":"2026-08-01T10:04:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_plain","name":"exec","input":"const r = await tools.exec_command({\\"cmd\\":\\"ls\\",\\"workdir\\":\\"/Users/zach\\"});"}}
+        {"timestamp":"2026-08-01T10:04:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_plain","name":"exec","input":"const r = await tools.exec_command({\\"cmd\\":\\"ls\\",\\"workdir\\":\\"/Users/example\\"});"}}
         """
         #expect(CodexSessionParser.pendingApproval(tail: tail) == nil)
         #expect(CodexSessionParser.parse(tail: tail, now: now)
@@ -150,7 +150,7 @@ struct TuiPromptLayoutTests {
     let kimiShellPrompt = """
       ▶ Run this command?
 
-      cwd: /Users/zach
+      cwd: /Users/example
       $ ifconfig | grep -E "^(en|lo)" -A 5
 
       ▶ 1. Approve once
@@ -338,18 +338,18 @@ struct TuiPromptLayoutTests {
 /// there makes Reply, Approve and Open in Terminal all aim at nothing.
 @MainActor
 struct LsofParsingTests {
-    private let root = "/Users/zach/.codex/sessions"
+    private let root = "/Users/example/.codex/sessions"
 
     /// A p line owns the n lines that follow it, and lsof groups by
     /// process rather than repeating the pid.
     private var output: String {
         """
         p4242
-        n/Users/zach/.codex/sessions/2026/08/08/rollout-2026-08-08T10-00-00-\
+        n/Users/example/.codex/sessions/2026/08/08/rollout-2026-08-08T10-00-00-\
         aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl
-        n/Users/zach/somewhere/else.jsonl
+        n/Users/example/somewhere/else.jsonl
         p777
-        n/Users/zach/.codex/sessions/2026/08/07/rollout-2026-08-07T09-00-00-\
+        n/Users/example/.codex/sessions/2026/08/07/rollout-2026-08-07T09-00-00-\
         11111111-2222-3333-4444-555555555555.jsonl
         """
     }
@@ -397,27 +397,27 @@ struct LsofParsingTests {
     @Test func heldFilesMapPathsToTheirHolder() {
         let text = """
             p88837
-            n/Users/zach/.gemini/antigravity-cli/presence/abc-123.lock
-            n/Users/zach/elsewhere/other.lock
+            n/Users/example/.gemini/antigravity-cli/presence/abc-123.lock
+            n/Users/example/elsewhere/other.lock
             """
         let held = ProcessLiveness.heldFiles(
-            inLsofOutput: text, directory: "/Users/zach/.gemini/antigravity-cli/presence")
-        #expect(held == ["/Users/zach/.gemini/antigravity-cli/presence/abc-123.lock": 88837])
+            inLsofOutput: text, directory: "/Users/example/.gemini/antigravity-cli/presence")
+        #expect(held == ["/Users/example/.gemini/antigravity-cli/presence/abc-123.lock": 88837])
     }
 
     /// The directory is matched as a path prefix, so it must end at a
     /// boundary. Without that, "presence" would also match a sibling
     /// directory called "presence-old".
     @Test func aSiblingDirectoryWithASharedPrefixDoesNotMatch() {
-        let text = "p1\nn/Users/zach/state/presence-old/abc.lock"
+        let text = "p1\nn/Users/example/state/presence-old/abc.lock"
         #expect(ProcessLiveness.heldFiles(
-            inLsofOutput: text, directory: "/Users/zach/state/presence").isEmpty)
+            inLsofOutput: text, directory: "/Users/example/state/presence").isEmpty)
     }
 
     @Test func aTrailingSlashOnTheDirectoryIsAccepted() {
-        let text = "p1\nn/Users/zach/state/presence/abc.lock"
+        let text = "p1\nn/Users/example/state/presence/abc.lock"
         #expect(ProcessLiveness.heldFiles(
-            inLsofOutput: text, directory: "/Users/zach/state/presence/").count == 1)
+            inLsofOutput: text, directory: "/Users/example/state/presence/").count == 1)
     }
 
     @Test func emptyOutputIsNoProcesses() {

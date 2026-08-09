@@ -1060,7 +1060,7 @@ struct AntigravityPendingQuestionTests {
     /// same tool merely running, which is why the monitor corroborates
     /// this kind against the terminal.
     private let nativeGateMetadata = #"""
-        \#u{08}kuez57q6\#u{12}\#u{0d}write_to_file{"CodeContent":"hello","Description":"Writes a file that says hello","Overwrite":false,"TargetFile":"/Users/zach/GitHub/hello.txt","toolAction":"Writing file","toolSummary":"Write hello.txt"}
+        \#u{08}kuez57q6\#u{12}\#u{0d}write_to_file{"CodeContent":"hello","Description":"Writes a file that says hello","Overwrite":false,"TargetFile":"/Users/example/GitHub/hello.txt","toolAction":"Writing file","toolSummary":"Write hello.txt"}
         """#
 
     @Test func aGatedToolCallIsPendingWithNoQuestion() throws {

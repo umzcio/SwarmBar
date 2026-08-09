@@ -87,7 +87,7 @@ struct TomlHooksTransformTests {
 
         [[hooks]]
         event = "Stop"
-        command = "/Users/zach/GitHub/SwarmBar/scripts/swarmbar-kimi-hook.sh Stop"
+        command = "/Users/example/GitHub/SwarmBar/scripts/swarmbar-kimi-hook.sh Stop"
         timeout = 5
 
         [[hooks]]

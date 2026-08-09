@@ -1,4 +1,4 @@
-{"type":"user","message":{"role":"user","content":"Fix the failing build"},"timestamp":"2026-08-01T10:00:00.000Z","cwd":"/Users/zach/GitHub/demo"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking at the build error now."}]},"timestamp":"2026-08-01T10:00:05.000Z","cwd":"/Users/zach/GitHub/demo"}
+{"type":"user","message":{"role":"user","content":"Fix the failing build"},"timestamp":"2026-08-01T10:00:00.000Z","cwd":"/Users/example/GitHub/demo"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking at the build error now."}]},"timestamp":"2026-08-01T10:00:05.000Z","cwd":"/Users/example/GitHub/demo"}
 {"type":"last-prompt","leafUuid":"aaaa","sessionId":"bbbb"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"toolu_01","input":{"command":"swift build 2>&1 | tail -5"}}]},"timestamp":"2026-08-01T10:00:10.000Z","cwd":"/Users/zach/GitHub/demo"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"toolu_01","input":{"command":"swift build 2>&1 | tail -5"}}]},"timestamp":"2026-08-01T10:00:10.000Z","cwd":"/Users/example/GitHub/demo"}
