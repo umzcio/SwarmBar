@@ -390,46 +390,15 @@ final class SessionStore {
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
-            let executable = command.split(separator: " ").first.map(String.init) ?? command
-            update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
+            update(id: session.id) { $0.status = .runningTool(activity: running(command)) }
             return
         }
-        if session.tool == .grokBuild {
-            // Grok's hook runner ignores deny responses (verified), so the
-            // prompt is answered through its TUI selector. Layouts vary
-            // (3-option shell prompts, 4-option edit prompts), but reject
-            // is always last and plain approve-once second-from-last, so
-            // navigate: clamp to the bottom, step up once, submit.
-            guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: TuiAnswer.grokApprove)
-            return
-        }
-        if session.tool == .codex {
-            // Codex's approval modal has labeled hotkeys: y approves once,
-            // esc rejects (ExecApproval decision Abort). Semantic keys, not
-            // positional, so no arrow navigation needed. The rollout records
-            // the outcome as the call's output line.
-            answerTuiPrompt(session, keys: TuiAnswer.codexApprove)
-            return
-        }
-        if session.tool == .kimiCode || session.tool == .bearCode {
-            // The Kimi-family selector wraps, so navigation counts are
-            // unsafe; the option is read off the screen and answered by
-            // its own number. PermissionResult (hook) clears the row.
-            answerNumberedPrompt(session, choose: TuiPromptLayout.approveOnceOption(in:))
-            return
-        }
-        if session.tool == .antigravity {
-            // Antigravity's prompt offers arrows and enter, and says
-            // nothing about digits, so it is walked to rather than typed
-            // at. See answerByNavigation.
-            guard Self.antigravityKeystrokesEnabled else { openInTerminal(session); return }
-            answerByNavigation(session, choose: TuiPromptLayout.approveOnceOption(in:))
-            return
-        }
-        if session.projectPath != nil { openInTerminal(session); return }
-        let executable = command.split(separator: " ").first.map(String.init) ?? command
-        update(id: session.id) { $0.status = .runningTool(activity: "Running \(executable)") }
+        follow(
+            ApprovalRouter.route(tool: session.tool, allow: true, in: environment(for: session)),
+            for: session,
+            choose: TuiPromptLayout.approveOnceOption(in:),
+            mockStatus: .runningTool(activity: running(command))
+        )
     }
 
     func deny(_ session: AgentSession) {
@@ -438,29 +407,41 @@ final class SessionStore {
             update(id: session.id) { $0.status = .working(activity: "Rethinking after deny…") }
             return
         }
-        if session.tool == .grokBuild {
-            // Reject is the last option in every observed layout: clamp to
-            // the bottom and submit; the second newline submits the reject
-            // feedback field empty.
-            guard Self.grokKeystrokesEnabled else { openInTerminal(session); return }
-            answerTuiPrompt(session, keys: TuiAnswer.grokDeny)
-            return
+        follow(
+            ApprovalRouter.route(tool: session.tool, allow: false, in: environment(for: session)),
+            for: session,
+            choose: TuiPromptLayout.rejectOption(in:),
+            mockStatus: .working(activity: "Rethinking approach without that command…")
+        )
+    }
+
+    private func environment(for session: AgentSession) -> ApprovalRouter.Environment {
+        .init(
+            grokKeystrokes: Self.grokKeystrokesEnabled,
+            antigravityKeystrokes: Self.antigravityKeystrokesEnabled,
+            hasProjectPath: session.projectPath != nil
+        )
+    }
+
+    /// Carries out whatever the router chose. Which option a selector route
+    /// aims at is the caller's, since approve and deny differ only there.
+    private func follow(
+        _ route: ApprovalRoute,
+        for session: AgentSession,
+        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?,
+        mockStatus: SessionStatus
+    ) {
+        switch route {
+        case .keys(let keys):       answerTuiPrompt(session, keys: keys)
+        case .numberedSelector:     answerNumberedPrompt(session, choose: choose)
+        case .navigateSelector:     answerByNavigation(session, choose: choose)
+        case .focusTerminal:        openInTerminal(session)
+        case .mockTransition:       update(id: session.id) { $0.status = mockStatus }
         }
-        if session.tool == .codex {
-            answerTuiPrompt(session, keys: TuiAnswer.codexDeny)
-            return
-        }
-        if session.tool == .kimiCode || session.tool == .bearCode {
-            answerNumberedPrompt(session, choose: TuiPromptLayout.rejectOption(in:))
-            return
-        }
-        if session.tool == .antigravity {
-            guard Self.antigravityKeystrokesEnabled else { openInTerminal(session); return }
-            answerByNavigation(session, choose: TuiPromptLayout.rejectOption(in:))
-            return
-        }
-        if session.projectPath != nil { openInTerminal(session); return }
-        update(id: session.id) { $0.status = .working(activity: "Rethinking approach without that command…") }
+    }
+
+    private func running(_ command: String) -> String {
+        "Running \(command.split(separator: " ").first.map(String.init) ?? command)"
     }
 
     /// Reads the session's terminal, picks the option matching the intent,
