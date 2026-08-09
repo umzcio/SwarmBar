@@ -329,6 +329,141 @@ struct TuiPromptLayoutTests {
     }
 }
 
+/// `lsof -F pn` output, parsed into "who holds which file".
+///
+/// Both of these fail silently when they are wrong. The Codex map is
+/// looked up by "<uuid>.jsonl", so a suffix that does not match means
+/// every Codex session reads as dead with nothing logged. Antigravity's
+/// entire session-to-pid map comes through the other one, so a mistake
+/// there makes Reply, Approve and Open in Terminal all aim at nothing.
+@MainActor
+struct LsofParsingTests {
+    private let root = "/Users/zach/.codex/sessions"
+
+    /// A p line owns the n lines that follow it, and lsof groups by
+    /// process rather than repeating the pid.
+    private var output: String {
+        """
+        p4242
+        n/Users/zach/.codex/sessions/2026/08/08/rollout-2026-08-08T10-00-00-\
+        aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl
+        n/Users/zach/somewhere/else.jsonl
+        p777
+        n/Users/zach/.codex/sessions/2026/08/07/rollout-2026-08-07T09-00-00-\
+        11111111-2222-3333-4444-555555555555.jsonl
+        """
+    }
+
+    @Test func eachRolloutMapsToTheProcessHoldingIt() {
+        let pids = TerminalFocuser.codexPids(inLsofOutput: output, sessionsRoot: root)
+        #expect(pids["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"] == 4242)
+        #expect(pids["11111111-2222-3333-4444-555555555555.jsonl"] == 777)
+    }
+
+    /// The key must be exactly what CodexMonitor looks up, which is
+    /// "\(id.uuidString.lowercased()).jsonl" and nothing else. If this
+    /// drifts, every Codex row silently reads as dead.
+    @Test func theKeyIsTheLowercasedUUIDPlusExtensionAndNothingElse() {
+        let id = UUID()
+        let path = "\(root)/2026/08/08/rollout-2026-08-08T10-00-00-\(id.uuidString).jsonl"
+        let pids = TerminalFocuser.codexPids(
+            inLsofOutput: "p9\nn\(path)", sessionsRoot: root)
+        #expect(pids == ["\(id.uuidString.lowercased()).jsonl": 9])
+    }
+
+    @Test func filesOutsideTheSessionsRootAreIgnored() {
+        let pids = TerminalFocuser.codexPids(inLsofOutput: output, sessionsRoot: root)
+        #expect(pids.count == 2)
+    }
+
+    @Test func nonRolloutFilesAndShortNamesAreIgnored() {
+        let text = """
+            p1
+            n\(root)/2026/08/08/notes.jsonl
+            n\(root)/2026/08/08/rollout-short.jsonl
+            """
+        #expect(TerminalFocuser.codexPids(inLsofOutput: text, sessionsRoot: root).isEmpty)
+    }
+
+    /// A path with no p line before it belongs to no process, and must not
+    /// be attributed to whichever process happened to come later.
+    @Test func aPathBeforeAnyProcessLineIsDropped() {
+        let text = "n\(root)/2026/08/08/rollout-x-\(UUID().uuidString).jsonl\np5"
+        #expect(TerminalFocuser.codexPids(inLsofOutput: text, sessionsRoot: root).isEmpty)
+    }
+
+    // MARK: - Held files
+
+    @Test func heldFilesMapPathsToTheirHolder() {
+        let text = """
+            p88837
+            n/Users/zach/.gemini/antigravity-cli/presence/abc-123.lock
+            n/Users/zach/elsewhere/other.lock
+            """
+        let held = ProcessLiveness.heldFiles(
+            inLsofOutput: text, directory: "/Users/zach/.gemini/antigravity-cli/presence")
+        #expect(held == ["/Users/zach/.gemini/antigravity-cli/presence/abc-123.lock": 88837])
+    }
+
+    /// The directory is matched as a path prefix, so it must end at a
+    /// boundary. Without that, "presence" would also match a sibling
+    /// directory called "presence-old".
+    @Test func aSiblingDirectoryWithASharedPrefixDoesNotMatch() {
+        let text = "p1\nn/Users/zach/state/presence-old/abc.lock"
+        #expect(ProcessLiveness.heldFiles(
+            inLsofOutput: text, directory: "/Users/zach/state/presence").isEmpty)
+    }
+
+    @Test func aTrailingSlashOnTheDirectoryIsAccepted() {
+        let text = "p1\nn/Users/zach/state/presence/abc.lock"
+        #expect(ProcessLiveness.heldFiles(
+            inLsofOutput: text, directory: "/Users/zach/state/presence/").count == 1)
+    }
+
+    @Test func emptyOutputIsNoProcesses() {
+        #expect(TerminalFocuser.codexPids(inLsofOutput: "", sessionsRoot: root).isEmpty)
+        #expect(ProcessLiveness.heldFiles(inLsofOutput: "", directory: "/x").isEmpty)
+    }
+}
+
+/// Values interpolated into AppleScript source. Everything SwarmBar sends
+/// to a terminal is built by string interpolation, and the labels come off
+/// the terminal screen, which means the agent wrote them.
+@MainActor
+struct AppleScriptEscapingTests {
+    @Test func quotesAndBackslashesAreEscaped() {
+        #expect(AppleScriptLiteral.escape(#"say "hi""#) == #"say \"hi\""#)
+        #expect(AppleScriptLiteral.escape(#"C:\path\"#) == #"C:\\path\\"#)
+    }
+
+    /// The failure the old quote-stripping caused. A label carrying a
+    /// quote no longer matched the screen it was read from, so Approve
+    /// silently degraded to opening a terminal window.
+    @Test func anEscapedLabelStillMatchesTheScreenItCameFrom() {
+        let label = #"Approve "once""#
+        let escaped = AppleScriptLiteral.escape(label)
+        // What AppleScript sees after it parses the literal is the label.
+        #expect(escaped.replacingOccurrences(of: #"\""#, with: "\"") == label)
+        #expect(escaped != label.replacingOccurrences(of: "\"", with: ""))
+    }
+
+    /// The other half: an odd number of trailing backslashes used to
+    /// unbalance the string literal and break the whole script.
+    @Test func aTrailingBackslashCannotEndTheLiteral() {
+        let escaped = AppleScriptLiteral.escape(#"Approve \"#)
+        #expect(escaped.hasSuffix(#"\\"#))
+        // Every backslash in the result is part of a two-character escape,
+        // so none of them can escape the closing quote.
+        #expect(escaped.filter { $0 == "\\" }.count % 2 == 0)
+    }
+
+    @Test func multiLineTextIsJoinedWithLinefeed() {
+        #expect(AppleScriptLiteral.expression("a\nb") == "\"a\" & linefeed & \"b\"")
+        #expect(AppleScriptLiteral.expression("plain") == "\"plain\"")
+        #expect(AppleScriptLiteral.expression("") == "\"\"")
+    }
+}
+
 /// What the approval row's command slot says. It is the whole content of
 /// an approval request, so a tool whose description falls back to its own
 /// name tells the user nothing about what they are approving.

@@ -206,13 +206,21 @@ enum TerminalFocuser {
     ) -> AnswerOutcome {
         guard let tty = tty(forSession: sessionID, projectPath: projectPath),
               isRunning("iTerm2") else { return .noTerminal }
-        let needle = expectedLabel.replacingOccurrences(of: "\"", with: "")
+        // The label is read off the terminal, so it is whatever the agent
+        // printed. This used to delete quotes from it, which was the one
+        // interpolation site not using the escaper that exists for exactly
+        // this, and it was wrong twice over. A label carrying a quote no
+        // longer matched the screen it came from, so the answer always
+        // degraded to focusing the terminal. A label ending in a backslash
+        // unbalanced the string literal and broke the whole script. Both
+        // are silent: the button appears to do nothing but open a window.
+        let needle = AppleScriptLiteral.escape(expectedLabel)
         let script = """
         tell application "iTerm2"
           repeat with w in windows
             repeat with t in tabs of w
               repeat with s in sessions of t
-                if tty of s is "/dev/\(tty)" then
+                if tty of s is "/dev/\(AppleScriptLiteral.escape(tty))" then
                   set screenText to (text of s)
                   if screenText contains "\(needle)" then
                     tell s to write text "\(number)" newline NO
@@ -444,6 +452,24 @@ enum TerminalFocuser {
         let sessionsRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions").path
         guard let output = run("/usr/sbin/lsof", ["-n", "-P", "-F", "pn"]) else { return [:] }
+        return codexPids(inLsofOutput: output, sessionsRoot: sessionsRoot)
+    }
+
+    /// The parsing half, split out from the shell-out so it can be tested.
+    ///
+    /// It is worth testing precisely because it fails silently: the keys
+    /// here are looked up as "\(uuid.lowercased()).jsonl", so a suffix
+    /// length or case that does not match means every lookup misses and
+    /// every Codex session reads as dead, with nothing logged and no
+    /// visible error. That is a whole tool quietly showing wrong liveness.
+    ///
+    /// `-F pn` prints a p<pid> line then the n<path> lines belonging to it,
+    /// so the current p line owns the paths that follow.
+    nonisolated static func codexPids(
+        inLsofOutput output: String, sessionsRoot: String
+    ) -> [String: Int] {
+        /// <36-char-uuid>.jsonl
+        let suffixLength = 42
         var result: [String: Int] = [:]
         var currentPid: Int?
         for line in output.split(separator: "\n") {
@@ -454,14 +480,9 @@ enum TerminalFocuser {
                 guard path.hasPrefix(sessionsRoot),
                       path.hasSuffix(".jsonl"),
                       let name = path.split(separator: "/").last,
-                      name.hasPrefix("rollout-"), name.count >= 42
+                      name.hasPrefix("rollout-"), name.count >= suffixLength
                 else { continue }
-                // <36-char-uuid>.jsonl is 42 characters; this must match
-                // the "\(id.uuidString.lowercased()).jsonl" lookup key
-                // exactly, or every lookup misses and every Codex session
-                // reads as dead.
-                let suffix = String(name.suffix(42))
-                result[suffix.lowercased()] = pid
+                result[String(name.suffix(suffixLength)).lowercased()] = pid
             }
         }
         return result

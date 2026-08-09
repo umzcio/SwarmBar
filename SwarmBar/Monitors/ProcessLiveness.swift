@@ -72,7 +72,15 @@ enum ProcessLiveness {
             "/usr/sbin/lsof",
             ["-n", "-P", "-a", "-p", pids.map(String.init).joined(separator: ","), "-Fpn"]
         ) else { return [:] }
+        return heldFiles(inLsofOutput: output, directory: directory)
+    }
 
+    /// The parsing half, split out from the shell-out so it can be tested.
+    /// Antigravity's whole session-to-pid map comes through here, so a
+    /// mistake makes every remote action for that tool aim at nothing.
+    nonisolated static func heldFiles(
+        inLsofOutput output: String, directory: String
+    ) -> [String: Int] {
         let prefix = directory.hasSuffix("/") ? directory : directory + "/"
         var held: [String: Int] = [:]
         var current: Int?
