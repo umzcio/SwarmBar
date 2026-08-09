@@ -7,11 +7,13 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-pre--release-FF9F0A?style=flat-square" alt="pre-release" />
-  <img src="https://img.shields.io/badge/license-MIT-FF9F0A?style=flat-square" alt="MIT" />
+  <a href="https://github.com/umzcio/SwarmBar/releases/latest"><img src="https://img.shields.io/github/v/release/umzcio/SwarmBar?style=flat-square&color=FF9F0A&labelColor=0C0D14" alt="Latest release" /></a>
+  <a href="https://github.com/umzcio/SwarmBar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/umzcio/SwarmBar/ci.yml?branch=main&style=flat-square&label=tests&color=30D158&labelColor=0C0D14" alt="CI" /></a>
+  <img src="https://img.shields.io/badge/signed-notarized-30D158?style=flat-square&labelColor=0C0D14" alt="Signed and notarized" />
+  <img src="https://img.shields.io/badge/license-MIT-FF9F0A?style=flat-square&labelColor=0C0D14" alt="MIT" />
   <img src="https://img.shields.io/badge/stack-Swift%206%20%7C%20SwiftUI-0C0D14?style=flat-square" alt="Stack" />
-  <img src="https://img.shields.io/badge/platform-macOS%2026%2B-30D158?style=flat-square" alt="macOS 26+" />
-  <img src="https://img.shields.io/badge/dependencies-0-30D158?style=flat-square" alt="Zero dependencies" />
+  <img src="https://img.shields.io/badge/platform-macOS%2026%2B-30D158?style=flat-square&labelColor=0C0D14" alt="macOS 26+" />
+  <img src="https://img.shields.io/badge/dependencies-0-30D158?style=flat-square&labelColor=0C0D14" alt="Zero dependencies" />
 </p>
 
 <p align="center">
@@ -179,7 +181,6 @@ approvals appear immediately.
 
 ## Roadmap
 
-- Ship the first signed and notarized release
 - Terminal.app support for keystroke answers and inline reply
 - Remote sessions over SSH
 - More agents, added the way the seven built in were
