@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Load bearing for the signed build, and for nothing else.
+
+      Under the hardened runtime, which notarization requires, an app may
+      not send Apple events to another app without this. SwarmBar sends
+      them constantly: reading a terminal's screen to find a selector,
+      pressing the option that matches, pasting an inline reply, and
+      focusing the tab a session runs in. Every one of those is an Apple
+      event to iTerm2.
+
+      Without it the signed build would still launch, still show every
+      session, and silently fail at Approve, Deny, Reply and Open in
+      Terminal, while the unsigned development build kept working
+      perfectly. That is why this is here before the first release rather
+      than after the first bug report.
+
+      Nothing else is claimed. The app is deliberately unsandboxed (it
+      reads other tools' state directories), and no other hardened runtime
+      exception is needed: spawning pgrep, lsof and osascript is allowed
+      without one.
+    -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

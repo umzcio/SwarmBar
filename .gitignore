@@ -13,3 +13,6 @@ CLAUDE.md
 HANDOFF.md
 plans/
 docs/
+
+# Notarization credentials. The key itself lives outside the repo.
+scripts/.notary-config.local

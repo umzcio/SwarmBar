@@ -18,10 +18,17 @@ targets:
           - Resources
       - path: SwarmBar/Resources
         buildPhase: resources
-      - path: scripts
+      # Listed one by one rather than globbing scripts/, because these are
+      # the bridges IntegrationManager installs out of the bundle and
+      # nothing else belongs in there. Globbing the directory meant every
+      # new file beside them, including the release tooling, shipped inside
+      # the app.
+      - path: scripts/swarmbar-hook.sh
         buildPhase: resources
-        excludes:
-          - swarmbar-kimi-sample.sh
+      - path: scripts/swarmbar-kimi-hook.sh
+        buildPhase: resources
+      - path: scripts/swarmbar-opencode.js
+        buildPhase: resources
     info:
       path: SwarmBar/Info.plist
       properties:
@@ -34,11 +41,29 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.swarmbar.SwarmBar
+        # Off deliberately: the monitors read other tools' state
+        # directories under ~/.claude, ~/.codex, ~/.gemini and the rest,
+        # which a sandbox exists to prevent.
         ENABLE_APP_SANDBOX: NO
-        ENABLE_HARDENED_RUNTIME: NO
-        CODE_SIGN_STYLE: Automatic
-        CODE_SIGN_IDENTITY: "-"
         GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: SwarmBar/SwarmBar.entitlements
+      configs:
+        # Development and CI: ad-hoc signed, no hardened runtime, no team.
+        # A machine with no Developer ID can still build and test.
+        Debug:
+          ENABLE_HARDENED_RUNTIME: NO
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: "-"
+        # Distribution. The hardened runtime is what notarization requires,
+        # and it is also what makes the entitlements file load bearing:
+        # without it SwarmBar could not send an Apple event to iTerm2, so
+        # every approve, reply and focus would fail in the shipped build
+        # while working in Debug.
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Developer ID Application"
+          DEVELOPMENT_TEAM: 5JJ6G6A84S
   SwarmBarTests:
     type: bundle.unit-test
     platform: macOS
@@ -68,3 +93,7 @@ schemes:
       config: Debug
       targets:
         - SwarmBarTests
+    # scripts/build-app.sh archives before exporting a Developer ID app,
+    # which needs the scheme to have an archive action.
+    archive:
+      config: Release
