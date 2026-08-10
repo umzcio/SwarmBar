@@ -75,8 +75,11 @@ Monitors are strictly read-only. Nothing is ever written to an agent's session o
 | Grok Build | update stream | tty keystrokes | Its hook runner ignores deny responses |
 | Antigravity | presence lock + transcript | on-screen selector | Walked to with arrows, never a digit |
 
-Keystroke-answered tools currently require **iTerm2**. Elsewhere, Approve and Deny focus the
-terminal instead of answering for you.
+Keystroke-answered tools require **iTerm2**, and that is a design choice rather than a gap.
+iTerm2 can deliver a keystroke to one specific session, addressed by its tty, without touching
+what you are looking at. Other terminals only offer "type into whatever is frontmost", which
+would mean stealing your focus and racing you for it. Everywhere else, Approve and Deny focus
+the terminal instead of answering for you.
 
 ---
 
@@ -181,7 +184,6 @@ approvals appear immediately.
 
 ## Roadmap
 
-- Terminal.app support for keystroke answers and inline reply
 - Remote sessions over SSH
 - More agents, added the way the seven built in were
 
