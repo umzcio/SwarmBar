@@ -30,6 +30,7 @@ struct PopoverRootView: View {
     private var sessionList: some View {
         VStack(spacing: 0) {
             PopoverHeader()
+            NotificationsBlockedNotice()
 
             ScrollView {
                 VStack(spacing: 0) {
