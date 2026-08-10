@@ -17,7 +17,18 @@ enum AgentNotifier {
     /// ever appears.
     @MainActor private(set) static var authorization: Result<Bool, Error>?
 
+    /// What to do when the user clicks a banner. Set by the app to bring
+    /// the session's terminal forward. Without a delegate installed, macOS
+    /// has nowhere to deliver the click and a tap does nothing at all,
+    /// which is how this shipped.
+    @MainActor static var onClick: ((UUID) -> Void)?
+
+    @MainActor private static let delegate = ClickDelegate()
+
     static func prepare() {
+        Task { @MainActor in
+            UNUserNotificationCenter.current().delegate = delegate
+        }
         UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound]) { granted, error in
                 Task { @MainActor in
@@ -50,7 +61,7 @@ enum AgentNotifier {
         NSWorkspace.shared.open(url)
     }
 
-    static func post(title: String, body: String, sound: Bool) {
+    static func post(title: String, body: String, sound: Bool, sessionID: UUID? = nil) {
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             guard settings.authorizationStatus == .authorized
@@ -63,8 +74,40 @@ enum AgentNotifier {
             content.title = title
             content.body = body
             if sound { content.sound = .default }
+            // Which session this is about, so the click knows where to go.
+            if let sessionID { content.userInfo = ["sessionID": sessionID.uuidString] }
             center.add(UNNotificationRequest(
                 identifier: UUID().uuidString, content: content, trigger: nil))
         }
+    }
+}
+
+/// Receives banner clicks. Has to be an NSObject, and has to be installed
+/// before the app finishes launching, which is why prepare() sets it.
+///
+/// Not actor-isolated: the delegate methods are called by the system off
+/// the main actor, and the parameters are not Sendable, so the class stays
+/// nonisolated and hops only for the part that touches app state.
+private final class ClickDelegate: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let raw = response.notification.request.content.userInfo["sessionID"] as? String
+        completionHandler()
+        guard let raw, let id = UUID(uuidString: raw) else { return }
+        Task { @MainActor in AgentNotifier.onClick?(id) }
+    }
+
+    /// Show the banner even when SwarmBar is frontmost. It has no windows,
+    /// so "frontmost" tells the user nothing, and suppressing it would drop
+    /// the alert exactly when they are looking at the popover.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 }

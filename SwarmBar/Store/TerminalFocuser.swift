@@ -11,10 +11,17 @@ enum TerminalFocuser {
            focusRunningTerminal(device: "/dev/\(tty)") {
             return
         }
-        // `open -a Terminal` on a regular file hands the file to Terminal to
-        // run, so only ever pass a real directory. Project paths can come
+        // Nothing to focus: no live process for this session, so open the
+        // project directory in a new window instead.
+        //
+        // `open -a` on a regular file hands the file to the terminal to
+        // RUN, so only ever pass a real directory. Project paths can come
         // from a hook payload, which is not trusted input.
         guard let path = projectPath?.path, isDirectory(path) else { return }
+        // iTerm2 first, because it is the terminal every other path here
+        // targets and the one the app documents as required. Falling back
+        // to Terminal.app landed people somewhere they do not work.
+        if isRunning("iTerm2"), run("/usr/bin/open", ["-a", "iTerm", path]) != nil { return }
         _ = run("/usr/bin/open", ["-a", "Terminal", path])
     }
 

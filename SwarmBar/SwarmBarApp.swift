@@ -13,6 +13,14 @@ struct SwarmBarApp: App {
         store.approvalResponder = hookServer
         hookServer.start()
         AgentNotifier.prepare()
+        // Clicking a banner brings you to the session it is about. The
+        // popover cannot be opened programmatically without reaching into
+        // MenuBarExtra's private status item, and the terminal is where
+        // the agent is waiting anyway.
+        AgentNotifier.onClick = { [weak store] id in
+            guard let session = store?.sessions.first(where: { $0.id == id }) else { return }
+            store?.openInTerminal(session)
+        }
         store.attentionAlertHandler = { session in
             let defaults = UserDefaults.standard
             let wantsIt: Bool
@@ -34,7 +42,8 @@ struct SwarmBarApp: App {
             AgentNotifier.post(
                 title: title,
                 body: body,
-                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true
+                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true,
+                sessionID: session.id
             )
         }
         // Real monitors by default; --mock replays the prototype simulation
