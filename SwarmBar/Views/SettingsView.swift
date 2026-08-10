@@ -316,9 +316,38 @@ struct NotificationSettingsTab: View {
     @AppStorage("notifyApprovals") private var notifyApprovals = true
     @AppStorage("notifyWaiting") private var notifyWaiting = false
     @AppStorage("notifySound") private var notifySound = true
+    @State private var systemAllows: Bool?
 
     var body: some View {
         SettingsCardList {
+            // These three switches say what SwarmBar will send. macOS
+            // decides whether anything is sent at all, and when it says no
+            // it does so silently: the switches stay on, and nothing ever
+            // arrives. This app shipped in exactly that state, so the
+            // permission is stated here rather than left to be discovered.
+            if systemAllows == false {
+                SettingsCard {
+                    HStack(spacing: 11) {
+                        Image(systemName: "bell.slash")
+                            .foregroundStyle(.orange)
+                            .frame(width: 22)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("macOS is blocking notifications")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("The switches below have no effect until SwarmBar is allowed in System Settings.")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Open") { AgentNotifier.openSystemSettings() }
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 11)
+                }
+            }
+
             SettingsCard {
                 SettingsToggleRow(
                     symbol: "exclamationmark.circle",
@@ -350,6 +379,10 @@ struct NotificationSettingsTab: View {
                 .padding(.horizontal, 6)
                 .padding(.top, 10)
         }
+        // Asked every time the pane opens, not cached at launch: the user
+        // can grant or revoke this in System Settings while SwarmBar runs,
+        // and the whole point of the row is to be right.
+        .task { systemAllows = await AgentNotifier.isAllowed() }
     }
 }
 

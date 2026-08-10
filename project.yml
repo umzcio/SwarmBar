@@ -33,6 +33,11 @@ targets:
       path: SwarmBar/Info.plist
       properties:
         LSUIElement: true
+        # Without this the app has no icon anywhere. LSUIElement hides that
+        # for a long time, since there is no Dock tile to look wrong, but
+        # notifications, System Settings and Force Quit all fall back to a
+        # blank placeholder. Regenerate with scripts/make-icon.sh.
+        CFBundleIconFile: AppIcon
         CFBundleShortVersionString: "0.1.0"
         CFBundleVersion: "1"
         NSAppleEventsUsageDescription: SwarmBar focuses the terminal tab running a session when you use Reply or Open in Terminal.

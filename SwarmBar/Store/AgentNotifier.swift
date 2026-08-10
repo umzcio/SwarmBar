@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import UserNotifications
 
@@ -30,6 +31,23 @@ enum AgentNotifier {
                 // shown, so the request fails rather than pending.
                 NSLog("SwarmBar: notifications not authorized: \(String(describing: error))")
             }
+    }
+
+    /// Whether macOS will actually deliver anything right now. Asked fresh
+    /// rather than remembered, since permission can be revoked in System
+    /// Settings while the app runs.
+    static func isAllowed() async -> Bool {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return settings.authorizationStatus == .authorized
+            || settings.authorizationStatus == .provisional
+    }
+
+    @MainActor
+    static func openSystemSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+        else { return }
+        NSWorkspace.shared.open(url)
     }
 
     static func post(title: String, body: String, sound: Bool) {
