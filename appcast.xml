@@ -1,0 +1,14 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>SwarmBar</title>
+        <item>
+            <title>0.1.2</title>
+            <pubDate>Sun, 09 Aug 2026 21:20:53 -0600</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/umzcio/SwarmBar/releases/download/v0.1.2/SwarmBar-0.1.2.dmg" length="2505302" type="application/octet-stream" sparkle:edSignature="HPL7RIaEQ+FwhnhO7/qGAfzJVn+WKDvFT+lfeYV8XvENFsH+UKOn6XdB+lx9Rr2+/yM5dmXB2EYMeajdg09VDA=="/>
+        </item>
+    </channel>
+</rss>
