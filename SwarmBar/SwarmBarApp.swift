@@ -12,6 +12,7 @@ struct SwarmBarApp: App {
         self.hookServer = hookServer
         store.approvalResponder = hookServer
         hookServer.start()
+        AgentNotifier.prepare()
         store.attentionAlertHandler = { session in
             let defaults = UserDefaults.standard
             let wantsIt: Bool
