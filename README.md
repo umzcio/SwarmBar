@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/license-MIT-FF9F0A?style=flat-square&labelColor=0C0D14" alt="MIT" />
   <img src="https://img.shields.io/badge/stack-Swift%206%20%7C%20SwiftUI-0C0D14?style=flat-square" alt="Stack" />
   <img src="https://img.shields.io/badge/platform-macOS%2026%2B-30D158?style=flat-square&labelColor=0C0D14" alt="macOS 26+" />
-  <img src="https://img.shields.io/badge/dependencies-0-30D158?style=flat-square&labelColor=0C0D14" alt="Zero dependencies" />
+  <img src="https://img.shields.io/badge/dependencies-1_(Sparkle)-30D158?style=flat-square&labelColor=0C0D14" alt="One dependency" />
 </p>
 
 <p align="center">
@@ -113,8 +113,10 @@ the terminal instead of answering for you.
 - **SwiftUI** only, `MenuBarExtra` in window style, with AppKit used solely for the status item
 - **macOS 26+**, no availability fallbacks
 - **XcodeGen** so the project is defined by `project.yml` rather than a checked-in `.xcodeproj`
-- **Zero third-party dependencies.** The only linked library is the system `libsqlite3`, used to
-  read Codex's own state database
+- **One third-party dependency.** [Sparkle](https://github.com/sparkle-project/Sparkle), for
+  updates that install themselves. Self-updating replaces the running app with a file from the
+  network, and the signature check that makes that safe is the last thing worth hand-rolling.
+  Everything else is the system `libsqlite3`, used to read Codex's own state database
 
 ---
 
@@ -146,7 +148,8 @@ Signed and notarized builds are published to the
 `/Applications`, and launch it. There is no Dock icon by design: look for the hexagon in the menu
 bar.
 
-The first release is still in preparation. Until it lands, build from source below.
+SwarmBar updates itself from there: Settings has a Check for updates button, and it also checks
+quietly in the background.
 
 ### Build from source
 

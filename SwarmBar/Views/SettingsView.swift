@@ -31,7 +31,10 @@ struct GeneralSettingsTab: View {
     @AppStorage("compactRows") private var compactRows = false
     @AppStorage("popoverScale") private var popoverScale = PopoverScale.medium.rawValue
     @AppStorage("doubleClickOpensTerminal") private var doubleClickOpensTerminal = true
-    @State private var updates = UpdateChecker()
+    /// Sparkle owns checking, downloading, installing and relaunching.
+    /// The hand-rolled checker this replaces could only ever open a link,
+    /// which meant every update was a manual download.
+    @State private var updater = SwarmUpdater()
 
     var body: some View {
         SettingsCardList {
@@ -51,14 +54,9 @@ struct GeneralSettingsTab: View {
                             .foregroundStyle(versionStyle)
                     }
                     Spacer(minLength: 12)
-                    if case .available(_, let url) = updates.status {
-                        Button("View release") { NSWorkspace.shared.open(url) }
-                            .controlSize(.small)
-                    } else {
-                        Button("Check for updates") { updates.check() }
-                            .controlSize(.small)
-                            .disabled(updates.status == .checking)
-                    }
+                    Button("Check for updates") { updater.checkForUpdates() }
+                        .controlSize(.small)
+                        .disabled(!updater.canCheckForUpdates)
                 }
                 .padding(.horizontal, 13)
                 .padding(.vertical, 11)
@@ -117,20 +115,10 @@ struct GeneralSettingsTab: View {
     }
 
     private var versionLine: String {
-        let base = "Version \(UpdateChecker.currentVersion) (\(UpdateChecker.currentBuild))"
-        switch updates.status {
-        case .idle:                     return base
-        case .checking:                 return "Checking for updates…"
-        case .upToDate:                 return "\(base) · Up to date"
-        case .available(let v, _):      return "\(base) · \(v) available"
-        case .failed(let message):      return "\(base) · \(message)"
-        }
+        "Version \(SwarmUpdater.currentVersion) (\(SwarmUpdater.currentBuild))"
     }
 
-    private var versionStyle: AnyShapeStyle {
-        if case .available = updates.status { return AnyShapeStyle(.orange) }
-        return AnyShapeStyle(.secondary)
-    }
+    private var versionStyle: AnyShapeStyle { AnyShapeStyle(.secondary) }
 }
 
 // MARK: - Providers

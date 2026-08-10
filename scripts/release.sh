@@ -55,11 +55,26 @@ xcrun stapler validate "$APP_DIR"
 spctl --assess --type open --context context:primary-signature -v "$DMG"
 xcrun stapler validate "$DMG"
 
+echo "==> Generating the signed Sparkle appcast"
+# generate_appcast reads the EdDSA private key from the login keychain,
+# signs the dmg with it, and writes appcast.xml pointing at the GitHub
+# release asset. Without this the app can see nothing: SUFeedURL is the
+# appcast at the repo root, so a release that never reaches it is a
+# release nobody is offered.
+DIST="$ROOT/build/dist"
+GEN="$(find "$ROOT/build" ~/Library/Developer/Xcode/DerivedData \
+        -name generate_appcast -type f 2>/dev/null | head -1)"
+[ -n "$GEN" ] || { echo "error: generate_appcast not found; build once so SPM fetches Sparkle"; exit 1; }
+rm -rf "$DIST"; mkdir -p "$DIST"
+cp "$DMG" "$DIST/"
+"$GEN" "$DIST" --download-url-prefix "https://github.com/umzcio/SwarmBar/releases/download/v$VERSION/"
+cp "$DIST/appcast.xml" "$ROOT/appcast.xml"
+
 echo
-echo "  DMG: $DMG"
+echo "  DMG    : $DMG"
+echo "  appcast: $ROOT/appcast.xml"
 echo
 echo "  Next:"
-echo "    gh release create v$VERSION \"$DMG\" --title \"SwarmBar $VERSION\" --notes \"...\""
-echo
-echo "  The in-app update check reads the latest GitHub release for"
-echo "  UpdateChecker.repo, so it starts working as soon as that exists."
+echo "    1) gh release create v$VERSION \"$DMG\" --title \"SwarmBar $VERSION\" --notes \"...\""
+echo "    2) git add appcast.xml && git commit -m \"appcast: $VERSION\" && git push"
+echo "       The feed is read from main, so until it is pushed nobody is offered the update."

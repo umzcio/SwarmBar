@@ -1,7 +1,7 @@
 # Contributing to SwarmBar
 
 Thanks for considering a contribution. SwarmBar is a Swift 6 / SwiftUI macOS menu bar app with
-strict concurrency and zero third-party dependencies. This doc covers local setup, the conventions
+strict concurrency and one third-party dependency (Sparkle, for self-updating). This doc covers local setup, the conventions
 the codebase expects, and how to get a change merged.
 
 Two things are unusual about this project and worth reading before you start: the design spec is an

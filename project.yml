@@ -8,6 +8,15 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
+# The one third-party package. Self-updating is the place where
+# battle-tested beats hand-rolled: it downloads a file from the internet
+# and replaces the running app with it, and Sparkle exists because people
+# get the verification wrong. Same version fiddle and zMeet use.
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
+
 targets:
   SwarmBar:
     type: application
@@ -38,11 +47,21 @@ targets:
         # notifications, System Settings and Force Quit all fall back to a
         # blank placeholder. Regenerate with scripts/make-icon.sh.
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "0.1.2"
+        CFBundleVersion: "3"
+        # Sparkle. The feed is the appcast committed at the repo root, and
+        # the key is the PUBLIC half of the EdDSA pair in the login
+        # keychain; the private half never leaves this Mac and is what
+        # generate_appcast signs each build with. An update that is not
+        # signed by it is refused, which is the whole point: this is code
+        # that replaces the running app with a file from the internet.
+        SUFeedURL: https://raw.githubusercontent.com/umzcio/SwarmBar/main/appcast.xml
+        SUPublicEDKey: 7KQVNte/Z3ts81v6gETASf21YKulzZZTiqMpF8uv5G8=
+        SUEnableInstallerLauncherService: true
         NSAppleEventsUsageDescription: SwarmBar focuses the terminal tab running a session when you use Reply or Open in Terminal.
     dependencies:
       - sdk: libsqlite3.tbd
+      - package: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.swarmbar.SwarmBar
