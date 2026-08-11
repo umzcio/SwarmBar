@@ -248,12 +248,12 @@ final class SessionStore {
     /// the unchanged transcript every cycle, so pruning them here would let
     /// the next poll read as a fresh transition and alert again.
     private func pruneAlertRecords() {
-        let stillWaiting = Set(
-            sessions.filter { $0.status.needsAttention }.map(\.id)
-        )
-        alertedStatus = alertedStatus.filter {
-            stillWaiting.contains($0.key) || acknowledgedAt[$0.key] != nil
-        }
+        // Only sessions the store no longer holds at all. Dropping the
+        // record for a session that merely stopped waiting is what caused
+        // the repeat: it went idle for a cycle, forgot it had been
+        // announced, and announced itself again on the next one.
+        let known = Set(sessions.map(\.id))
+        alertedStatus = alertedStatus.filter { known.contains($0.key) }
     }
 
     // MARK: - Hook events
@@ -358,17 +358,31 @@ final class SessionStore {
     /// the app wires this to AgentNotifier, tests to a collector.
     @ObservationIgnored var attentionAlertHandler: ((AgentSession) -> Void)?
 
-    /// The attention status each session was last alerted for. Keyed by
-    /// session so a status that flickers mid-sync (the poller overwrites a
-    /// held approval before reapplyHookOverrides restores it) cannot look
-    /// like a fresh transition on the next pass.
-    @ObservationIgnored private var alertedStatus: [UUID: String] = [:]
+    /// What each session was last alerted for, and the activity it was
+    /// alerted at.
+    ///
+    /// The timestamp is what stops a loop. Keyed on the transition alone,
+    /// any session that oscillates between needing attention and not
+    /// re-alerts on every poll, because leaving the attention state forgot
+    /// that it had been announced. Closing a conversation does exactly
+    /// that, and the banner repeated until the session aged out. Requiring
+    /// newer activity than the last alert means a repeat is impossible
+    /// unless the agent has actually done something since.
+    @ObservationIgnored private var alertedStatus: [UUID: (label: String, at: Date)] = [:]
 
     private func noteAttentionTransitions() {
         for session in sessions where session.status.needsAttention {
             let label = session.status.label
-            guard alertedStatus[session.id] != label else { continue }
-            alertedStatus[session.id] = label
+            if let last = alertedStatus[session.id] {
+                // Newer activity is the only thing that earns a second
+                // alert. Not a label change: two approvals in a row on one
+                // session share the label "Approval" and both deserve
+                // announcing. Not a transition either, which is what
+                // looped, since a session re-derived from an unchanged
+                // transcript keeps the same lastActivityAt forever.
+                guard session.lastActivityAt > last.at else { continue }
+            }
+            alertedStatus[session.id] = (label, session.lastActivityAt)
             attentionAlertHandler?(session)
         }
     }

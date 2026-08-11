@@ -387,3 +387,36 @@ struct ToolVisibilityTests {
         for tool in AgentTool.allCases { #expect(store.isEnabled(tool)) }
     }
 }
+
+/// A session that stops needing attention and starts again, with no new
+/// activity behind it, must not announce itself twice.
+@MainActor
+struct AlertLoopTests {
+    @Test func aFlappingSessionAlertsOnlyOnce() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        var alerts = 0
+        store.attentionAlertHandler = { _ in alerts += 1 }
+
+        let at = Date.now
+        var waiting = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .waitingInput(prompt: "You're right to push back"),
+            lastActivityAt: at)
+
+        // Closing a conversation makes the poller oscillate: the same
+        // transcript reads as waiting, then idle, then waiting again.
+        for _ in 0..<5 {
+            store.sync(tool: .claudeCode, sessions: [waiting])
+            var settled = waiting
+            settled.status = .idle
+            store.sync(tool: .claudeCode, sessions: [settled])
+        }
+        #expect(alerts == 1, "an unchanged transcript alerted \(alerts) times")
+
+        // Genuine new activity earns a new alert.
+        waiting.lastActivityAt = at.addingTimeInterval(60)
+        store.sync(tool: .claudeCode, sessions: [waiting])
+        #expect(alerts == 2)
+    }
+}
