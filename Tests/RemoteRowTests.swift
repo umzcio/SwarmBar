@@ -40,4 +40,28 @@ struct RemoteRowTests {
         #expect(RemoteRowLabel.unreachableNote(
             host: nil, reachability: ["umzcaio": .unreachable("closed")]) == nil)
     }
+
+    // The compact row's badge is the only place a remote session's host
+    // reaches VoiceOver (see CompactSessionRow.swift): its accessibility
+    // label is `unreachableNote(...) ?? badge(...)`, composed from the two
+    // functions above rather than a third one. These tests pin that exact
+    // composition, in the same style as the five above.
+
+    @Test("the badge announcement carries the host and the unreachable reason")
+    func badgeAnnouncementCarriesUnreachableReason() {
+        let s = session(host: "umzcaio")
+        let announcement = RemoteRowLabel.unreachableNote(
+            host: s.host, reachability: ["umzcaio": .unreachable("closed")]
+        ) ?? RemoteRowLabel.badge(for: s)
+        #expect(announcement == "Cannot reach umzcaio")
+    }
+
+    @Test("the badge announcement is just the host when reachable")
+    func badgeAnnouncementIsHostWhenReachable() {
+        let s = session(host: "umzcaio")
+        let announcement = RemoteRowLabel.unreachableNote(
+            host: s.host, reachability: ["umzcaio": .reachable]
+        ) ?? RemoteRowLabel.badge(for: s)
+        #expect(announcement == "umzcaio")
+    }
 }

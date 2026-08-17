@@ -20,10 +20,25 @@ struct CompactSessionRow: View {
             if let badge = RemoteRowLabel.badge(for: session) {
                 Text(badge)
                     .swarmFont(.meta)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                    // Attached to the badge itself, a leaf, rather than the
+                    // row's outer HStack. That HStack also contains the
+                    // Approve/Deny/Reply/Dismiss MicroButtons; an
+                    // accessibilityLabel on a transparent container
+                    // collapses it into one opaque element with no
+                    // interactive trait, which would make those buttons
+                    // unreachable to VoiceOver on every compact row, local
+                    // and remote alike. A local row has no badge, so it
+                    // gets none of this and keeps SwiftUI's default
+                    // per-child exposure untouched.
+                    .accessibilityLabel(
+                        RemoteRowLabel.unreachableNote(
+                            host: session.host, reachability: store.remoteReachability
+                        ) ?? badge
+                    )
             }
 
             Group {
@@ -70,10 +85,6 @@ struct CompactSessionRow: View {
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
         .help(session.title ?? session.projectName)
-        .accessibilityLabel(
-            RemoteRowLabel.unreachableNote(host: session.host, reachability: store.remoteReachability)
-                ?? session.projectName
-        )
         .sessionRowInteractions(session, store: store)
     }
 }

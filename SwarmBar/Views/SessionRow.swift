@@ -18,7 +18,7 @@ struct SessionRow: View {
                     if let badge = RemoteRowLabel.badge(for: session) {
                         Text(badge)
                             .swarmFont(.meta)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.tertiary)
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
                             .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
