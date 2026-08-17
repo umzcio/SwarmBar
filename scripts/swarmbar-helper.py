@@ -94,7 +94,13 @@ def claude_roots(warnings):
 
 
 def tail_of(path, size):
-    """The trailing complete lines of a JSONL file."""
+    """The trailing complete lines of a JSONL file.
+
+    A session actively being worked on is normally mid-write, so the file
+    on disk commonly ends without a trailing newline. Trim that dangling
+    partial line so what is shipped is always whole records, never a
+    truncated fragment of the last one.
+    """
     try:
         with open(path, "rb") as handle:
             if size > TAIL_BYTES:
@@ -108,12 +114,15 @@ def tail_of(path, size):
                 data = handle.read()
     except OSError:
         return None
+    if data and not data.endswith(b"\n"):
+        last_newline = data.rfind(b"\n")
+        data = data[:last_newline + 1] if last_newline != -1 else b""
     return data.decode("utf-8", "replace")
 
 
-def claude_sessions(now, warnings):
+def claude_sessions(now, warnings, roots):
     sessions = []
-    for root in claude_roots(warnings):
+    for root in roots:
         try:
             project_dirs = sorted(os.listdir(root))
         except OSError:
@@ -214,7 +223,8 @@ def agent_processes(warnings):
 def snapshot():
     now = time.time()
     warnings = []
-    sessions = claude_sessions(now, warnings)
+    roots = claude_roots(warnings)
+    sessions = claude_sessions(now, warnings, roots)
     processes = agent_processes(warnings)
     payload = {
         "ok": True,
@@ -222,7 +232,7 @@ def snapshot():
         "hostname": platform.node(),
         "system": platform.system(),
         "now": now,
-        "roots": claude_roots([]),
+        "roots": roots,
         "sessions": sessions,
         "warnings": warnings,
     }
@@ -250,12 +260,20 @@ def main():
             sys.stdout.flush()
             continue
         command = request.get("cmd")
-        if command == "snapshot":
-            response = snapshot()
-        elif command == "ping":
-            response = {"ok": True, "protocol": PROTOCOL_VERSION}
-        else:
-            response = {"ok": False, "error": "unknown command: %s" % command}
+        try:
+            if command == "snapshot":
+                response = snapshot()
+            elif command == "ping":
+                response = {"ok": True, "protocol": PROTOCOL_VERSION}
+            else:
+                response = {"ok": False, "error": "unknown command: %s" % command}
+        except Exception as error:
+            # Every filesystem and process call above is individually
+            # defensive, but this is the backstop: no exception may skip
+            # a response line, or the one-JSON-object-per-line contract
+            # breaks for the rest of the stdin stream. Keep the message
+            # short; no traceback in the JSON.
+            response = {"ok": False, "error": "internal error: %s" % error}
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
 
