@@ -36,12 +36,28 @@ struct RemoteHostMonitor: SessionMonitor {
         while !Task.isCancelled {
             if !store.isPaused && host.isEnabled {
                 if !installed {
-                    installed = await Self.installHelper(alias: host.alias)
+                    let outcome = await Self.installHelper(alias: host.alias)
+                    installed = outcome.ok
+                    if !outcome.ok {
+                        // The snapshot below still runs: the helper may
+                        // already be installed from an earlier session, and
+                        // a successful poll overwrites this in the same
+                        // iteration. What this buys is a reason on the row
+                        // when the poll fails too.
+                        store.noteRemoteReachability(host: name, .unreachable(outcome.message))
+                    }
                 }
                 do {
                     let snapshot = try await channel.snapshot()
                     let now = Date.now
-                    let sessions = RemoteSnapshot.sessions(from: snapshot, host: name, now: now)
+                    // Off the main actor, exactly as ClaudeCodeMonitor.start
+                    // does with its own discovery. This splits every tail on
+                    // newlines and runs JSONSerialization over the trailing
+                    // lines, on the order of a megabyte of string work, and
+                    // the SessionMonitor protocol is @MainActor.
+                    let sessions = await Task.detached {
+                        RemoteSnapshot.sessions(from: snapshot, host: name, now: now)
+                    }.value
                     store.sync(tool: .claudeCode, host: name, sessions: sessions)
                     store.noteRemoteReachability(host: name, .reachable)
                     if snapshot.processesFailed {
@@ -82,38 +98,90 @@ struct RemoteHostMonitor: SessionMonitor {
     /// to the `@MainActor` `SessionMonitor` protocol, and `waitUntilExit()`
     /// blocks, so running this on the main actor would freeze the popover
     /// for the length of an ssh round trip.
-    nonisolated static func installHelper(alias: String) async -> Bool {
+    nonisolated static func installHelper(alias: String) async -> InstallOutcome {
         guard let source = Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"),
               let data = try? Data(contentsOf: source)
         else {
             NSLog("SwarmBar: swarmbar-helper.py missing from the app bundle")
-            return false
+            return InstallOutcome(ok: false, message: "helper missing from the app bundle")
         }
         return await Task.detached { install(data: data, alias: alias) }.value
     }
 
-    private nonisolated static func install(data: Data, alias: String) -> Bool {
+    /// Whether the install worked, and what went wrong if it did not. The
+    /// message carries ssh's own first stderr line, which is the only thing
+    /// that separates a missing NOPASSWD rule from an unauthorized key from
+    /// a host that is simply down.
+    struct InstallOutcome: Sendable {
+        let ok: Bool
+        let message: String
+    }
+
+    /// How long the install ssh gets, end to end. `waitUntilExit()` alone is
+    /// unbounded: a connection that goes half open AFTER the handshake
+    /// (laptop sleep, Tailscale dropping mid transfer) is not covered by
+    /// ConnectTimeout, and default TCP keepalive takes roughly two hours to
+    /// notice. This whole function then blocks the host's monitor loop
+    /// BEFORE its do/catch, so that host never polls, never updates
+    /// reachability, and its rows freeze with no note explaining why. It is
+    /// the one failure here that is silent rather than visible.
+    ///
+    /// 30 seconds: three times ConnectTimeout, and the transfer itself is
+    /// one ssh handshake plus a 9 KB write. The ServerAlive options below
+    /// would take 45 seconds to fire, so this deadline is the effective
+    /// bound; they are set anyway so ssh notices on its own if this path
+    /// ever stops being the one holding the stopwatch.
+    nonisolated static let installTimeout: TimeInterval = 30
+
+    private nonisolated static func install(data: Data, alias: String) -> InstallOutcome {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias]
-            + SSHChannel.installCommand(helperPath: "/usr/local/lib/swarmbar-helper")
-        let stdin = Pipe()
+        task.arguments = [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            alias,
+        ] + SSHChannel.installCommand(helperPath: "/usr/local/lib/swarmbar-helper")
+        let stdin = Pipe(), stderr = Pipe()
         task.standardInput = stdin
         task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
+        task.standardError = stderr
         do {
             try task.run()
             try stdin.fileHandleForWriting.write(contentsOf: data)
             try stdin.fileHandleForWriting.close()
-            task.waitUntilExit()
         } catch {
-            NSLog("SwarmBar: helper install failed on \(alias): \(error)")
-            return false
+            let hint = Self.stderrHint(stderr)
+            NSLog("SwarmBar: helper install failed on \(alias): \(error) \(hint)")
+            return InstallOutcome(ok: false, message: "helper install failed\(hint)")
+        }
+
+        let deadline = Date.now.addingTimeInterval(installTimeout)
+        while task.isRunning && Date.now < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if task.isRunning {
+            task.terminate()
+            NSLog("SwarmBar: helper install timed out after \(Int(installTimeout))s on \(alias)")
+            return InstallOutcome(
+                ok: false, message: "helper install timed out on \(alias)")
         }
         if task.terminationStatus != 0 {
-            NSLog("SwarmBar: helper install exited \(task.terminationStatus) on \(alias)")
-            return false
+            let hint = Self.stderrHint(stderr)
+            NSLog("SwarmBar: helper install exited \(task.terminationStatus) on \(alias)\(hint)")
+            return InstallOutcome(
+                ok: false,
+                message: "helper install exited \(task.terminationStatus)\(hint)")
         }
-        return true
+        return InstallOutcome(ok: true, message: "")
+    }
+
+    /// Reads what ssh has already said, without waiting for more. Never
+    /// blocks, so it is safe even when the spawn itself failed and nothing
+    /// will ever close the pipe.
+    private nonisolated static func stderrHint(_ pipe: Pipe) -> String {
+        let line = SSHChannel.firstLine(of: SSHChannel.readAvailable(pipe.fileHandleForReading))
+        return line.isEmpty ? "" : ": \(line)"
     }
 }

@@ -46,6 +46,37 @@ struct SSHChannelTests {
         #expect(SSHChannel.backoffSeconds(afterFailures: -5) == 1)
     }
 
+    @Test("the stderr hint is the first non-empty line, truncated")
+    func firstLineOfStderr() {
+        #expect(SSHChannel.firstLine(of: Data()) == "")
+        #expect(SSHChannel.firstLine(of: Data("\n\n".utf8)) == "")
+        // ssh leads with a blank line often enough that taking line zero
+        // blindly would produce an empty, useless hint.
+        #expect(SSHChannel.firstLine(of: Data("\nPermission denied (publickey).\nlost connection\n".utf8))
+                == "Permission denied (publickey).")
+        // A dump is not a diagnostic: the row has room for a sentence.
+        let long = String(repeating: "x", count: 500)
+        #expect(SSHChannel.firstLine(of: Data(long.utf8)).count == 200)
+        #expect(SSHChannel.firstLine(of: Data(long.utf8), limit: 20).count == 20)
+    }
+
+    @Test("reading a pipe returns what is there and never waits for more")
+    func readAvailableDoesNotBlock() {
+        let pipe = Pipe()
+        // Nothing written and the write end still open: availableData would
+        // park here forever. This must come straight back empty.
+        #expect(SSHChannel.readAvailable(pipe.fileHandleForReading).isEmpty)
+
+        try? pipe.fileHandleForWriting.write(contentsOf: Data("sudo: a password is required\n".utf8))
+        let hint = SSHChannel.firstLine(of: SSHChannel.readAvailable(pipe.fileHandleForReading))
+        #expect(hint == "sudo: a password is required")
+
+        // And still non-blocking once drained.
+        #expect(SSHChannel.readAvailable(pipe.fileHandleForReading).isEmpty)
+        try? pipe.fileHandleForWriting.close()
+        try? pipe.fileHandleForReading.close()
+    }
+
     @Test("a concurrent snapshot call is rejected while one is in flight, and the guard releases the channel afterward")
     func rejectsConcurrentSnapshotAndRecovers() async throws {
         // A hostname under .local that nothing answers for forces a real

@@ -23,6 +23,11 @@ actor SSHChannel {
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
+    /// ssh's own stderr. Without it a missing NOPASSWD rule, an unauthorized
+    /// key, a host key mismatch, a missing python3, a helper syntax error and
+    /// a genuinely down host all collapse into the same "connection closed"
+    /// and the row just says the host cannot be reached.
+    private var errorOutput: FileHandle?
     private var buffer = Data()
     private var failures = 0
     /// Guards snapshot() against actor reentrancy. Two overlapping calls
@@ -94,7 +99,42 @@ actor SSHChannel {
         process = nil
         input = nil
         output = nil
+        errorOutput = nil
         buffer = Data()
+    }
+
+    /// Whatever a pipe already holds, without ever waiting for more.
+    ///
+    /// `availableData` is the obvious call and it is wrong here: it blocks
+    /// until bytes or EOF, so a child that is alive and quiet hangs the
+    /// caller, and when the spawn itself failed the parent still holds the
+    /// write end so EOF never comes at all. Switching the descriptor to
+    /// non-blocking for one read has neither problem.
+    nonisolated static func readAvailable(_ handle: FileHandle, limit: Int = 4096) -> Data {
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags != -1, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            return Data()
+        }
+        defer { _ = fcntl(descriptor, F_SETFL, flags) }
+        var buffer = [UInt8](repeating: 0, count: limit)
+        let count = buffer.withUnsafeMutableBytes { raw in
+            read(descriptor, raw.baseAddress, limit)
+        }
+        return count > 0 ? Data(buffer.prefix(count)) : Data()
+    }
+
+    /// The first non-empty line of a child's stderr, short enough to sit in
+    /// an error payload. A diagnostic, not a dump: ssh is happy to print a
+    /// dozen lines of host key warning and the row only has space to say
+    /// which kind of failure this was.
+    nonisolated static func firstLine(of data: Data, limit: Int = 200) -> String {
+        let text = String(decoding: data, as: UTF8.self)
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return String(trimmed.prefix(limit)) }
+        }
+        return ""
     }
 
     func noteFailure(_ message: String) {
@@ -119,10 +159,10 @@ actor SSHChannel {
             alias,
             "sudo", "-n", helperPath,
         ]
-        let stdin = Pipe(), stdout = Pipe()
+        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         task.standardInput = stdin
         task.standardOutput = stdout
-        task.standardError = FileHandle.nullDevice
+        task.standardError = stderr
         do {
             try task.run()
         } catch {
@@ -131,6 +171,7 @@ actor SSHChannel {
         process = task
         input = stdin.fileHandleForWriting
         output = stdout.fileHandleForReading
+        errorOutput = stderr.fileHandleForReading
         buffer = Data()
     }
 
@@ -139,8 +180,22 @@ actor SSHChannel {
         do {
             try input.write(contentsOf: Data(text.utf8))
         } catch {
-            throw SSHChannelError.closed(error.localizedDescription)
+            throw SSHChannelError.closed(failureMessage(error.localizedDescription))
         }
+    }
+
+    /// Appends whatever ssh said to a failure message, so the row's reason
+    /// separates a missing NOPASSWD rule from an unauthorized key from a
+    /// host key mismatch from a host that is simply down.
+    private func failureMessage(_ reason: String) -> String {
+        guard let errorOutput else { return reason }
+        let hint = Self.firstLine(of: Self.readAvailable(errorOutput))
+        guard !hint.isEmpty else {
+            NSLog("SwarmBar: \(alias) failed with no stderr: \(reason)")
+            return reason
+        }
+        NSLog("SwarmBar: \(alias) ssh said: \(hint)")
+        return "\(reason): \(hint)"
     }
 
     /// `availableData` blocks. Inside an actor that would occupy a
@@ -154,7 +209,8 @@ actor SSHChannel {
             if let line = Self.takeLine(from: &buffer) { return line }
             let chunk = await Task.detached { output.availableData }.value
             if chunk.isEmpty {
-                throw SSHChannelError.closed("connection closed by \(alias)")
+                throw SSHChannelError.closed(
+                    failureMessage("connection closed by \(alias)"))
             }
             buffer.append(chunk)
         }
