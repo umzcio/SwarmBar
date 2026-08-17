@@ -15,7 +15,10 @@ struct RemoteSnapshotTests {
         let snapshot = try RemoteSnapshot.decode(fixture())
         #expect(snapshot.ok)
         #expect(snapshot.system == "Linux")
-        #expect(!snapshot.sessions.isEmpty)
+        #expect(snapshot.sessions.count == 4)
+
+        let sessions = RemoteSnapshot.sessions(from: snapshot, host: "umzcaio", now: .now)
+        #expect(sessions.count == 4)
     }
 
     @Test("no backup root survives into the snapshot")
@@ -63,8 +66,14 @@ struct RemoteSnapshotTests {
         #expect(sessions[0].processAlive)
     }
 
-    @Test("liveness is never claimed when ps itself failed")
+    @Test("liveness is never claimed when ps itself failed, even with a matching cwd present")
     func noLivenessWhenPsFailed() throws {
+        // The helper's wire protocol always sends an empty `processes` array
+        // alongside `processes_failed: true`, but the decoder must not rely
+        // on that invariant holding. This payload deliberately violates it,
+        // shipping a "claude" process whose cwd exactly matches the
+        // session's cwd, so that only the processesFailed gate (not an
+        // incidentally empty processes list) can keep processAlive false.
         let json = """
         {"ok":true,"protocol":1,"hostname":"h","system":"Darwin","now":0,
          "roots":[],
@@ -72,7 +81,8 @@ struct RemoteSnapshotTests {
         22222222-2222-2222-2222-222222222222.jsonl","root":"/Users/z/.claude/projects",
          "project_dir":"-p","mtime":0,"size":10,
          "tail":"{\\"type\\":\\"user\\",\\"cwd\\":\\"/p\\"}"}],
-         "processes":[],"processes_failed":true,"warnings":["ps exited 1"]}
+         "processes":[{"pid":1,"user":"z","comm":"claude","cwd":"/p"}],
+         "processes_failed":true,"warnings":["ps exited 1"]}
         """
         let snapshot = try RemoteSnapshot.decode(Data(json.utf8))
         let sessions = RemoteSnapshot.sessions(from: snapshot, host: "h", now: .now)
