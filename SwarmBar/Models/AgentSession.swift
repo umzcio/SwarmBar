@@ -20,6 +20,11 @@ struct AgentSession: Identifiable, Equatable, Sendable {
     /// Whether the tool's process still runs. A live session that just
     /// finished a turn belongs in Active, not buried in Recent history.
     var processAlive: Bool
+    /// Which host this session runs on. Nil means this Mac. Remote and
+    /// local rows of the same tool must never delete each other during
+    /// sync, and two hosts can legitimately hold the same session id if a
+    /// home directory is copied between them.
+    var host: String?
 
     init(
         id: UUID = UUID(),
@@ -32,7 +37,8 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         pid: pid_t? = nil,
         accountLabel: String? = nil,
         title: String? = nil,
-        processAlive: Bool = false
+        processAlive: Bool = false,
+        host: String? = nil
     ) {
         self.id = id
         self.tool = tool
@@ -45,6 +51,7 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         self.accountLabel = accountLabel
         self.title = title
         self.processAlive = processAlive
+        self.host = host
     }
 
     /// What the row's elapsed timer should measure: run length while

@@ -187,10 +187,10 @@ final class SessionStore {
     /// overrides win over transcript-derived status: sticky ones (pending
     /// approvals) until resolved, others for a grace window that covers
     /// polling lag.
-    func sync(tool: AgentTool, sessions incoming: [AgentSession]) {
+    func sync(tool: AgentTool, host: String? = nil, sessions incoming: [AgentSession]) {
         guard isEnabled(tool) else {
-            if sessions.contains(where: { $0.tool == tool }) {
-                sessions.removeAll { $0.tool == tool }
+            if sessions.contains(where: { $0.tool == tool && $0.host == host }) {
+                sessions.removeAll { $0.tool == tool && $0.host == host }
                 refreshIconTicker()
             }
             return
@@ -198,7 +198,8 @@ final class SessionStore {
         let incomingIds = Set(incoming.map(\.id))
         for session in incoming { upsert(session) }
         sessions.removeAll {
-            $0.tool == tool && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
+            $0.tool == tool && $0.host == host
+                && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
         }
         for id in incomingIds {
             guard let endedAt = endedSessions[id] else { continue }
