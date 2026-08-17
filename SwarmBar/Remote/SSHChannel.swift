@@ -10,6 +10,7 @@ enum SSHChannelError: Error, Equatable {
     case notRunning
     case closed(String)
     case badResponse(String)
+    case busy
 }
 
 /// One long-lived ssh connection per host, with the helper as the remote
@@ -24,6 +25,13 @@ actor SSHChannel {
     private var output: FileHandle?
     private var buffer = Data()
     private var failures = 0
+    /// Guards snapshot() against actor reentrancy. Two overlapping calls
+    /// would both write to the same stdin and each suspend on its own
+    /// detached read of the same pipe, racing over which call's bytes land
+    /// in whose buffer. The single monitor loop never calls in twice, so a
+    /// concurrent call means a bug in a future caller; it should be loud
+    /// (an error) rather than silently serialized or interleaved.
+    private var requestInFlight = false
 
     private(set) var reachability: RemoteReachability = .connecting
 
@@ -39,7 +47,7 @@ actor SSHChannel {
     }
 
     nonisolated static func backoffSeconds(afterFailures failures: Int) -> Int {
-        min(60, 1 << min(failures, 6))
+        min(60, 1 << min(max(failures, 0), 6))
     }
 
     /// Splits one newline-terminated frame off the buffer. Returns nil when
@@ -53,16 +61,31 @@ actor SSHChannel {
     }
 
     func snapshot() async throws -> RemoteSnapshot {
-        try start()
-        try write(#"{"cmd":"snapshot"}"# + "\n")
-        let line = try await readLine()
+        guard !requestInFlight else { throw SSHChannelError.busy }
+        requestInFlight = true
+        defer { requestInFlight = false }
+
         do {
-            let decoded = try RemoteSnapshot.decode(line)
+            try start()
+            try write(#"{"cmd":"snapshot"}"# + "\n")
+            let line = try await readLine()
+            let decoded: RemoteSnapshot
+            do {
+                decoded = try RemoteSnapshot.decode(line)
+            } catch {
+                throw SSHChannelError.badResponse(String(decoding: line.prefix(200), as: UTF8.self))
+            }
             failures = 0
             reachability = .reachable
             return decoded
         } catch {
-            throw SSHChannelError.badResponse(String(decoding: line.prefix(200), as: UTF8.self))
+            // snapshot() owns its own failure bookkeeping so reachability
+            // cannot lag behind a caller that forgets to report a failure
+            // separately. Callers must not also call noteFailure for this
+            // same error, or `failures` double-counts; the monitor loop
+            // only reads currentBackoff after a catch.
+            noteFailure(String(describing: error))
+            throw error
         }
     }
 
