@@ -32,6 +32,11 @@ struct RemoteHostMonitor: SessionMonitor {
         let channel = SSHChannel(alias: host.alias)
         let name = host.displayName
         var installed = false
+        // The warning set from the previous successful snapshot for this
+        // host, so a warning that persists across polls (the common case:
+        // a backup-looking root or an unreadable transcript does not fix
+        // itself) is logged once rather than every ten seconds.
+        var lastWarnings: [String] = []
 
         while !Task.isCancelled {
             if !store.isPaused && host.isEnabled {
@@ -65,7 +70,18 @@ struct RemoteHostMonitor: SessionMonitor {
                         // "no agents running". BSD ps rejecting a GNU flag
                         // produces exactly that.
                         NSLog("SwarmBar: \(name) could not list processes: \(snapshot.warnings)")
+                    } else if !snapshot.warnings.isEmpty && snapshot.warnings != lastWarnings {
+                        // Warnings unrelated to ps: a backup-looking root
+                        // the helper skipped, an unreadable transcript, or a
+                        // record beyond the 4 MB ceiling omitted rather than
+                        // shipped empty. None of those set processesFailed,
+                        // so without this branch they were silent on the
+                        // Mac. Logged only when the set changes from the
+                        // previous snapshot for this host, not on every
+                        // poll while the same condition persists.
+                        NSLog("SwarmBar: \(name) reported warnings: \(snapshot.warnings)")
                     }
+                    lastWarnings = snapshot.warnings
                 } catch {
                     // Deliberately does NOT clear this host's sessions. The
                     // work is still running on the far side and SwarmBar has

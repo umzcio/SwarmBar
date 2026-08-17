@@ -82,6 +82,18 @@ actor SSHChannel {
             }
             failures = 0
             reachability = .reachable
+            // Drained here too, not only on failure. Before the stderr pipe
+            // replaced /dev/null, nothing could ever back up; now a
+            // long-lived connection accumulates whatever ssh and the remote
+            // command write there, and past roughly 64 KB the pipe fills
+            // and ssh stalls with no timeout on readLine to notice. The
+            // helper writes nothing to stderr in normal operation, so this
+            // is usually a no-op, but it is the only thing keeping the
+            // buffer from ever filling on a connection that stays healthy
+            // for a long time.
+            if let errorOutput {
+                _ = Self.readAvailable(errorOutput)
+            }
             return decoded
         } catch {
             // snapshot() owns its own failure bookkeeping so reachability

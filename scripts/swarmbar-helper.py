@@ -180,11 +180,15 @@ def created_time(stat):
     """Session start, as close as this platform will give it.
 
     st_birthtime is the real thing and Darwin has it. Linux does not expose
-    it through os.stat before python 3.12, so there st_ctime stands in. That
-    is inode CHANGE time, which a write updates too, so on Linux this
-    tracks mtime for a file being actively appended to and the elapsed
-    timer on such a row still understates. It is never later than the last
-    write, so it never invents an older session than there is.
+    it through os.stat before python 3.12, so there st_ctime stands in.
+    POSIX requires write() to update both mtime and ctime, so ctime tracks
+    every write and usually equals mtime for a transcript that is actively
+    being appended to. It is not, however, bounded by the last write: a
+    metadata-only change (chmod, chown, rename, a hardlink) bumps ctime
+    without touching mtime, so ctime can land AFTER mtime. That is reachable
+    here, and when it happens the Mac side clamps the visible elapsed time
+    at zero rather than showing a negative duration (see ElapsedTimeText and
+    RemoteSnapshot.swift).
     """
     birth = getattr(stat, "st_birthtime", None)
     if birth:

@@ -75,6 +75,18 @@ struct RemoteSnapshot: Decodable, Sendable {
             // monitor uses the file's creation date for exactly this
             // reason. A helper too old to send one falls back to mtime,
             // which is the previous behaviour rather than a wrong date.
+            //
+            // `created` is st_birthtime where the remote has one (Darwin);
+            // elsewhere (Linux before Python 3.12) the helper falls back to
+            // st_ctime, which every write refreshes and so usually equals
+            // mtime for a transcript being actively appended to. It is not
+            // bounded by mtime, though: a metadata-only change (chmod,
+            // chown, rename, a hardlink) bumps ctime without a write, so
+            // `created > mtime` is reachable on that fallback. When it
+            // happens, startedAt lands after lastActivityAt and the row's
+            // elapsed time goes negative; ElapsedTimeText clamps at zero, so
+            // the visible effect is a row reading "0s", not a negative
+            // duration.
             let started = record.created.map { Date(timeIntervalSince1970: $0) } ?? modified
             result.append(AgentSession(
                 id: StableID.uuid(for: "\(host):\(record.path)"),
