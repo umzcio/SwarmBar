@@ -38,6 +38,8 @@ targets:
         buildPhase: resources
       - path: scripts/swarmbar-opencode.js
         buildPhase: resources
+      - path: scripts/swarmbar-helper.py
+        buildPhase: resources
     info:
       path: SwarmBar/Info.plist
       properties:

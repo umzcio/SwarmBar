@@ -7,6 +7,17 @@ import Observation
 @Observable
 final class SessionStore {
     private(set) var sessions: [AgentSession] = []
+
+    /// Per-host reachability, keyed by display name. A host going away is a
+    /// routinely exercised path rather than an error case, so rows keep
+    /// their last known status and say the host cannot be reached.
+    private(set) var remoteReachability: [String: RemoteReachability] = [:]
+
+    func noteRemoteReachability(host: String, _ state: RemoteReachability) {
+        guard remoteReachability[host] != state else { return }
+        remoteReachability[host] = state
+    }
+
     var isPaused = false
 
     /// Tools the user has switched off in Settings. A tool that is off is

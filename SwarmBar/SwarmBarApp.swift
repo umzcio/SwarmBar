@@ -58,6 +58,9 @@ struct SwarmBarApp: App {
             Task { await OpenCodeMonitor().start(into: store) }
             Task { await GrokBuildMonitor().start(into: store) }
             Task { await AntigravityMonitor().start(into: store) }
+            for host in RemoteHostStore.load(from: .standard) where host.isEnabled {
+                Task { await RemoteHostMonitor(host: host).start(into: store) }
+            }
         }
     }
 
