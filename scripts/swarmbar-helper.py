@@ -28,6 +28,28 @@ DISCOVERY_WINDOW_SECONDS = 8 * 60 * 60
 
 TAIL_BYTES = 64 * 1024
 
+# Ceiling for the growing tail read, matching ClaudeCodeMonitor.maxTailBytes
+# on the Mac. A single record larger than this is pathological; giving up
+# keeps a runaway file from being read whole on every poll.
+MAX_TAIL_BYTES = 4 * 1024 * 1024
+
+
+class _Sentinel(object):
+    """Distinguishable non-string results from tail_of."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+
+# The window grew to the ceiling and still held no complete record.
+OVERSIZED = _Sentinel("OVERSIZED")
+# The file holds no complete record at all: one partial line, still being
+# written, with no newline anywhere in it.
+INCOMPLETE = _Sentinel("INCOMPLETE")
+
 # A backup directory is shape-identical to a live root: it is prefixed
 # .claude and it contains projects/. On umzcaio,
 # /root/.claude-cio.pre-symlink-backup/projects holds 344 transcripts.
@@ -93,31 +115,63 @@ def claude_roots(warnings):
     return roots
 
 
-def tail_of(path, size):
-    """The trailing complete lines of a JSONL file.
+def whole_lines(data):
+    """Drops a dangling final line.
 
     A session actively being worked on is normally mid-write, so the file
-    on disk commonly ends without a trailing newline. Trim that dangling
-    partial line so what is shipped is always whole records, never a
-    truncated fragment of the last one.
+    on disk commonly ends without a trailing newline. Trimming that partial
+    line means what is shipped is always whole records, never a truncated
+    fragment of the last one.
     """
-    try:
-        with open(path, "rb") as handle:
-            if size > TAIL_BYTES:
-                handle.seek(size - TAIL_BYTES)
-                data = handle.read()
-                newline = data.find(b"\n")
-                if newline == -1:
-                    return ""
-                data = data[newline + 1:]
-            else:
-                data = handle.read()
-    except OSError:
-        return None
     if data and not data.endswith(b"\n"):
         last_newline = data.rfind(b"\n")
         data = data[:last_newline + 1] if last_newline != -1 else b""
-    return data.decode("utf-8", "replace")
+    return data
+
+
+def tail_of(path, size):
+    """The trailing complete lines of a JSONL file.
+
+    Starts at TAIL_BYTES and doubles until the window holds at least one
+    complete record, mirroring ClaudeCodeMonitor.tail(of:) on the Mac. A
+    single record larger than the window would otherwise leave nothing
+    complete behind it, and shipping the empty string that results is far
+    worse here than locally: the Mac's parser returns nil for it, the record
+    never reaches `incomingIds`, and SessionStore.sync DELETES the row. The
+    session is on screen one poll and gone the next, with no warning on
+    either side, and the window is open exactly when a session is busiest.
+    Reading from offset 0 always counts as complete.
+
+    Returns the tail as text, or None if the file cannot be read, or the
+    OVERSIZED / INCOMPLETE sentinels when no complete record could be
+    obtained. The caller must omit those records rather than ship an empty
+    tail.
+    """
+    try:
+        with open(path, "rb") as handle:
+            window = TAIL_BYTES
+            while True:
+                offset = size - window if size > window else 0
+                handle.seek(offset)
+                data = handle.read()
+                if offset == 0:
+                    data = whole_lines(data)
+                    if not data:
+                        return INCOMPLETE
+                    return data.decode("utf-8", "replace")
+                # The window's first newline ends the partial first record.
+                # Anything after it is whole; nothing after it means one
+                # oversized record fills the window and it has to grow.
+                newline = data.find(b"\n")
+                if newline != -1:
+                    remainder = whole_lines(data[newline + 1:])
+                    if remainder:
+                        return remainder.decode("utf-8", "replace")
+                if window >= MAX_TAIL_BYTES:
+                    return OVERSIZED
+                window = min(window * 2, MAX_TAIL_BYTES)
+    except OSError:
+        return None
 
 
 def claude_sessions(now, warnings, roots):
@@ -148,6 +202,17 @@ def claude_sessions(now, warnings, roots):
                 tail = tail_of(path, stat.st_size)
                 if tail is None:
                     warnings.append("unreadable: %s" % path)
+                    continue
+                # Omitting the record says nothing about the session, which
+                # is recoverable on the next poll. Shipping an empty tail
+                # would delete its row on the Mac, which is not.
+                if tail is OVERSIZED:
+                    warnings.append(
+                        "no complete record within %d bytes, omitted: %s"
+                        % (MAX_TAIL_BYTES, path))
+                    continue
+                if tail is INCOMPLETE:
+                    warnings.append("no complete record yet, omitted: %s" % path)
                     continue
                 sessions.append({
                     "tool": "claudeCode",
