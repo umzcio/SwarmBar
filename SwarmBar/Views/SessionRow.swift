@@ -15,6 +15,14 @@ struct SessionRow: View {
                     Text(session.projectName)
                         .swarmFont(.rowTitleStrong)
                         .lineLimit(1)
+                    if let badge = RemoteRowLabel.badge(for: session) {
+                        Text(badge)
+                            .swarmFont(.meta)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                    }
                     Spacer()
                     ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
                 }
@@ -36,6 +44,13 @@ struct SessionRow: View {
                     Spacer(minLength: 0)
                 }
                 .doubleClickOpensTerminal(session, store: store)
+
+                if let note = RemoteRowLabel.unreachableNote(
+                    host: session.host, reachability: store.remoteReachability) {
+                    Text(note)
+                        .swarmFont(.meta)
+                        .foregroundStyle(.secondary)
+                }
 
                 switch session.status {
                 case .waitingApproval(let command):

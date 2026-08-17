@@ -17,6 +17,14 @@ struct CompactSessionRow: View {
                 .lineLimit(1)
                 .frame(maxWidth: 118 * scale, alignment: .leading)
                 .doubleClickOpensTerminal(session, store: store)
+            if let badge = RemoteRowLabel.badge(for: session) {
+                Text(badge)
+                    .swarmFont(.meta)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+            }
 
             Group {
                 switch session.status {
@@ -62,6 +70,10 @@ struct CompactSessionRow: View {
         .contentShape(.rect(cornerRadius: 9))
         .hoverHighlight()
         .help(session.title ?? session.projectName)
+        .accessibilityLabel(
+            RemoteRowLabel.unreachableNote(host: session.host, reachability: store.remoteReachability)
+                ?? session.projectName
+        )
         .sessionRowInteractions(session, store: store)
     }
 }
