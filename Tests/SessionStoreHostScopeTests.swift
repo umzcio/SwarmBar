@@ -47,4 +47,28 @@ struct SessionStoreHostScopeTests {
         #expect(!store.sessions.contains { $0.id == gone })
         #expect(store.sessions.contains { $0.id == kept })
     }
+
+    // MARK: - openInTerminal gating (R1)
+    //
+    // TerminalFocuser.focus drives real AppleScript and pgrep calls, so its
+    // side effect cannot be observed here. What can be tested, and is the
+    // whole point of the fix, is the decision openInTerminal consults before
+    // ever reaching TerminalFocuser: SessionStore.canOpenInTerminal. This is
+    // the same rule the row views already apply to Open in Terminal and the
+    // double click, now also enforced inside the store so a caller that is
+    // not a view (the notification click handler in SwarmBarApp) cannot
+    // bypass it and focus a terminal on this Mac for a session that is
+    // actually running on another host.
+
+    @Test("a remote session is not eligible to open a local terminal")
+    func remoteSessionCannotOpenTerminal() {
+        let remote = session(id: UUID(), host: "umzcaio")
+        #expect(!SessionStore.canOpenInTerminal(remote))
+    }
+
+    @Test("a local session is still eligible to open a local terminal")
+    func localSessionCanOpenTerminal() {
+        let local = session(id: UUID(), host: nil)
+        #expect(SessionStore.canOpenInTerminal(local))
+    }
 }

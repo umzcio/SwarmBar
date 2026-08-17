@@ -626,7 +626,30 @@ final class SessionStore {
         }
     }
 
+    /// The decision half of `openInTerminal`, pulled out so it is testable
+    /// without driving TerminalFocuser's real AppleScript and pgrep calls.
+    /// Delegates to `SessionRowInteraction.allowsLocalTerminalActions`,
+    /// which the views already consult for the same gate, so there is one
+    /// rule rather than two that could drift apart.
+    static func canOpenInTerminal(_ session: AgentSession) -> Bool {
+        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    }
+
+    /// Gated on `session.host` even though every row-level call site already
+    /// checks `SessionRowInteraction.allowsLocalTerminalActions` before
+    /// reaching here. That gate lives in the views, and this method has
+    /// another caller that is not a view: the notification click handler in
+    /// SwarmBarApp, which resolves a session by id and calls straight in.
+    /// Every channel TerminalFocuser has (open -a iTerm, cwd matching,
+    /// AppleScript) targets THIS Mac, so acting on a remote session focuses
+    /// the wrong machine, silently and convincingly, rather than doing
+    /// nothing. Checking here too makes the guarantee structural instead of
+    /// depending on every present and future call site remembering it.
+    /// Phase 2 replaces this with a remote channel; until then, doing
+    /// nothing for a remote session is strictly better than focusing a
+    /// same-named local directory and implying it is the session in question.
     func openInTerminal(_ session: AgentSession) {
+        guard Self.canOpenInTerminal(session) else { return }
         let id = session.id
         let path = session.projectPath
         Task.detached {
