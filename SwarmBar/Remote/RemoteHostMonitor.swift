@@ -14,6 +14,20 @@ struct RemoteHostMonitor: SessionMonitor {
     /// Tailscale and a snapshot is one round trip for the whole host.
     static let pollSeconds: TimeInterval = 10
 
+    /// Whether a failed poll should force a helper reinstall on the next
+    /// attempt. A transient failure is almost never a missing helper, so
+    /// reinstalling on it just doubles the connection attempts: installHelper
+    /// spawns its own ssh, and the snapshot retry that follows spawns a
+    /// second one, each with its own ConnectTimeout, against a host that may
+    /// be down precisely because it is flaky or access-controlled. A host
+    /// that has failed long enough to saturate the backoff is the case where
+    /// "the helper is broken" becomes plausible, and at the cap a reinstall
+    /// costs one extra connection per minute rather than one per cycle. That
+    /// keeps self-healing without the doubling.
+    nonisolated static func shouldReinstall(afterBackoff backoff: Int) -> Bool {
+        backoff >= 60
+    }
+
     func start(into store: SessionStore) async {
         let channel = SSHChannel(alias: host.alias)
         let name = host.displayName
@@ -48,8 +62,10 @@ struct RemoteHostMonitor: SessionMonitor {
                     // backoff on every failure. This block only mirrors the
                     // state into the store for the UI.
                     store.noteRemoteReachability(host: name, .unreachable("\(error)"))
-                    installed = false
                     let backoff = await channel.currentBackoff
+                    if Self.shouldReinstall(afterBackoff: backoff) {
+                        installed = false
+                    }
                     try? await Task.sleep(for: .seconds(backoff))
                     continue
                 }
