@@ -9,11 +9,15 @@ struct RemoteSessionRecord: Decodable, Sendable {
     let root: String
     let projectDir: String
     let mtime: TimeInterval
+    /// Protocol 2 and later. Optional so a host still running an older
+    /// helper decodes rather than failing the whole snapshot, which would
+    /// take every session on that host with it.
+    let created: TimeInterval?
     let size: Int
     let tail: String
 
     enum CodingKeys: String, CodingKey {
-        case tool, path, root, mtime, size, tail
+        case tool, path, root, mtime, created, size, tail
         case projectDir = "project_dir"
     }
 }
@@ -64,13 +68,21 @@ struct RemoteSnapshot: Decodable, Sendable {
             let cwd = parsed.cwd ?? ClaudeSessionParser.decodeProjectDir(record.projectDir)
             let projectPath = cwd.map { URL(fileURLWithPath: $0) }
             let modified = Date(timeIntervalSince1970: record.mtime)
+            // startedAt is what AgentSession.elapsedAnchor reads while a
+            // session is active, so anchoring it on mtime like
+            // lastActivityAt made an actively working row show its time
+            // since the last write, which is always seconds. The local
+            // monitor uses the file's creation date for exactly this
+            // reason. A helper too old to send one falls back to mtime,
+            // which is the previous behaviour rather than a wrong date.
+            let started = record.created.map { Date(timeIntervalSince1970: $0) } ?? modified
             result.append(AgentSession(
                 id: StableID.uuid(for: "\(host):\(record.path)"),
                 tool: .claudeCode,
                 projectName: projectPath?.lastPathComponent ?? record.projectDir,
                 projectPath: projectPath,
                 status: parsed.status,
-                startedAt: modified,
+                startedAt: started,
                 lastActivityAt: modified,
                 processAlive: cwd.map { liveCwds.contains($0) } ?? false,
                 host: host

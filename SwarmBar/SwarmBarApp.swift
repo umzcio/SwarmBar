@@ -6,6 +6,15 @@ struct SwarmBarApp: App {
     private let hookServer: HookServer
 
     init() {
+        // A write to a pipe whose reader has already gone raises SIGPIPE,
+        // and the default disposition kills the whole menu bar app. Every
+        // child SwarmBar writes to can be gone by the time the write lands:
+        // the remote helper install runs ssh and immediately pushes 9 KB
+        // into its stdin, so a fast failure closes the read end first. With
+        // the signal ignored the same case surfaces as EPIPE through the
+        // throwing write, which every call site already handles.
+        signal(SIGPIPE, SIG_IGN)
+
         let store = SessionStore()
         _store = State(initialValue: store)
         let hookServer = HookServer(store: store)

@@ -155,6 +155,16 @@ class SessionRecordTests(unittest.TestCase):
         self.assertEqual(sessions[0]["tail"], record('{"type":"user"}'))
         self.assertEqual(warnings, [])
 
+    def test_a_session_carries_a_creation_timestamp(self):
+        self.add("a.jsonl", record('{"type":"user"}'))
+        warnings = []
+        sessions = helper.claude_sessions(time.time(), warnings, [self.root])
+        created = sessions[0]["created"]
+        self.assertGreater(created, 0)
+        # Never later than the last write: startedAt has to precede
+        # lastActivityAt or the Mac's elapsed timer runs backwards.
+        self.assertLessEqual(created, sessions[0]["mtime"] + 1)
+
     def test_an_over_ceiling_record_is_omitted_with_a_warning(self):
         self.add("good.jsonl", record('{"type":"user"}'))
         original = helper.MAX_TAIL_BYTES

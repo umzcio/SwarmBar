@@ -48,6 +48,43 @@ struct RemoteSnapshotTests {
         #expect(Set(a.map(\.id)).isDisjoint(with: Set(b.map(\.id))))
     }
 
+    @Test("an active session's elapsed anchor is its creation time, not its last write")
+    func startedAtComesFromCreation() throws {
+        let snapshot = try RemoteSnapshot.decode(fixture())
+        let sessions = RemoteSnapshot.sessions(from: snapshot, host: "umzcaio", now: .now)
+        #expect(!sessions.isEmpty)
+        for session in sessions {
+            let record = try #require(snapshot.sessions.first {
+                StableID.uuid(for: "umzcaio:" + $0.path) == session.id
+            })
+            let created = try #require(record.created)
+            #expect(session.startedAt == Date(timeIntervalSince1970: created))
+            #expect(session.lastActivityAt == Date(timeIntervalSince1970: record.mtime))
+            // The bug this replaces: both anchored on mtime, so a session
+            // that had been running for days read as seconds old.
+            #expect(session.startedAt < session.lastActivityAt)
+        }
+    }
+
+    @Test("a helper too old to send a creation time still decodes, falling back to mtime")
+    func toleratesMissingCreated() throws {
+        let json = """
+        {"ok":true,"protocol":1,"hostname":"h","system":"Linux","now":0,
+         "roots":["/root/.claude/projects"],
+         "sessions":[{"tool":"claudeCode","path":"/root/.claude/projects/-projects-AIF/\
+        11111111-1111-1111-1111-111111111111.jsonl","root":"/root/.claude/projects",
+         "project_dir":"-projects-AIF","mtime":1786926580,"size":10,
+         "tail":"{\\"type\\":\\"user\\",\\"cwd\\":\\"/projects/AIF\\"}"}],
+         "processes":[],"processes_failed":false,"warnings":[]}
+        """
+        let snapshot = try RemoteSnapshot.decode(Data(json.utf8))
+        #expect(snapshot.sessions[0].created == nil)
+        let sessions = RemoteSnapshot.sessions(from: snapshot, host: "h", now: .now)
+        #expect(sessions.count == 1)
+        #expect(sessions[0].startedAt == Date(timeIntervalSince1970: 1786926580))
+        #expect(sessions[0].startedAt == sessions[0].lastActivityAt)
+    }
+
     @Test("a session whose cwd matches a live agent process is marked alive")
     func livenessFromCwd() throws {
         let json = """

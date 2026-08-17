@@ -193,8 +193,11 @@ final class SessionStore {
         refreshIconTicker()
     }
 
-    /// Replaces one tool's sessions with a freshly discovered set: upserts
-    /// each and drops that tool's sessions that no longer exist. Hook
+    /// Replaces one tool's sessions ON ONE HOST with a freshly discovered
+    /// set: upserts each and drops that tool and host's sessions that no
+    /// longer exist. `host` is nil for this Mac, so a monitor that omits it
+    /// claims the local rows and DELETES them; every remote monitor must
+    /// pass its own host. Hook
     /// overrides win over transcript-derived status: sticky ones (pending
     /// approvals) until resolved, others for a grace window that covers
     /// polling lag.

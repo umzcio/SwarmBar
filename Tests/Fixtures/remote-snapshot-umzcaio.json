@@ -1,6 +1,6 @@
 {
  "ok": true,
- "protocol": 1,
+ "protocol": 2,
  "hostname": "umzcaio",
  "system": "Linux",
  "now": 1786928340.129051,
@@ -17,6 +17,7 @@
    "root": "/root/.claude/projects",
    "project_dir": "-projects-demo1",
    "mtime": 1786926580.9150755,
+   "created": 1786580980.915076,
    "size": 372,
    "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo1\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo1\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
   },
@@ -26,6 +27,7 @@
    "root": "/root/.claude/projects",
    "project_dir": "-projects-demo2",
    "mtime": 1786925379.9781497,
+   "created": 1786914579.97815,
    "size": 372,
    "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo2\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo2\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
   },
@@ -35,6 +37,7 @@
    "root": "/root/.claude/projects",
    "project_dir": "-projects-demo3",
    "mtime": 1786927855.5545132,
+   "created": 1786834255.554513,
    "size": 372,
    "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo3\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo3\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
   },
@@ -44,6 +47,7 @@
    "root": "/root/.claude/projects",
    "project_dir": "-projects-demo4",
    "mtime": 1786925455.069,
+   "created": 1786924555.069,
    "size": 372,
    "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo4\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo4\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
   }

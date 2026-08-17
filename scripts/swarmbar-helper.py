@@ -20,7 +20,9 @@ import subprocess
 import sys
 import time
 
-PROTOCOL_VERSION = 1
+# 2 added "created" to every session record. Additive: an older Mac
+# ignores the field and an older helper simply omits it.
+PROTOCOL_VERSION = 2
 
 # Only files touched inside this window are worth shipping. Matches
 # ClaudeCodeMonitor.discoveryWindow on the Mac.
@@ -174,6 +176,22 @@ def tail_of(path, size):
         return None
 
 
+def created_time(stat):
+    """Session start, as close as this platform will give it.
+
+    st_birthtime is the real thing and Darwin has it. Linux does not expose
+    it through os.stat before python 3.12, so there st_ctime stands in. That
+    is inode CHANGE time, which a write updates too, so on Linux this
+    tracks mtime for a file being actively appended to and the elapsed
+    timer on such a row still understates. It is never later than the last
+    write, so it never invents an older session than there is.
+    """
+    birth = getattr(stat, "st_birthtime", None)
+    if birth:
+        return birth
+    return stat.st_ctime
+
+
 def claude_sessions(now, warnings, roots):
     sessions = []
     for root in roots:
@@ -220,6 +238,7 @@ def claude_sessions(now, warnings, roots):
                     "root": root,
                     "project_dir": project_dir,
                     "mtime": stat.st_mtime,
+                    "created": created_time(stat),
                     "size": stat.st_size,
                     "tail": tail,
                 })
