@@ -3,12 +3,12 @@
     <channel>
         <title>SwarmBar</title>
         <item>
-            <title>0.1.4</title>
-            <pubDate>Mon, 10 Aug 2026 19:52:02 -0600</pubDate>
-            <sparkle:version>5</sparkle:version>
-            <sparkle:shortVersionString>0.1.4</sparkle:shortVersionString>
+            <title>0.1.5</title>
+            <pubDate>Sun, 06 Sep 2026 20:24:43 -0600</pubDate>
+            <sparkle:version>6</sparkle:version>
+            <sparkle:shortVersionString>0.1.5</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/umzcio/SwarmBar/releases/download/v0.1.4/SwarmBar-0.1.4.dmg" length="2512396" type="application/octet-stream" sparkle:edSignature="aa/g0zIUoas9AqtkLKXp3kxICdIUGHfITECNXFUVQvqt66qWX31cPuupo/XiyNSFicxHRGpdv2FbfYubmIE5Bg=="/>
+            <enclosure url="https://github.com/umzcio/SwarmBar/releases/download/v0.1.5/SwarmBar-0.1.5.dmg" length="2607967" type="application/octet-stream" sparkle:edSignature="NFlBihVB2OtH74r71Bm+FjtdPUSifPxy8BFw6u2SA8+1HU1LEJHRNrKTMwQv4K52CTCfjTJ+et/V2KvSD5QXBQ=="/>
         </item>
     </channel>
 </rss>
