@@ -15,9 +15,10 @@ import Foundation
 enum CodexSessionParser {
     static let staleAfter: TimeInterval = 30 * 60
 
-    static func parse(tail: String, now: Date = .now) -> SessionStatus? {
-        if let pending = pendingApproval(tail: tail) {
-            return .waitingApproval(command: pending)
+    static func parseDetails(tail: String, now: Date = .now) -> ParsedStatus? {
+        if let pending = pendingRequest(tail: tail) {
+            return ParsedStatus(status: .waitingApproval(command: pending.command),
+                cwd: nil, attentionEventID: "call:\(pending.id)")
         }
         for raw in tail.split(separator: "\n").reversed() {
             guard let data = raw.data(using: .utf8),
@@ -30,17 +31,27 @@ enum CodexSessionParser {
                 .map { now.timeIntervalSince($0) }
             let stale = (age ?? 0) > staleAfter
 
+            func result(_ status: SessionStatus) -> ParsedStatus {
+                ParsedStatus(status: status, cwd: nil,
+                    attentionEventID: status.needsAttention
+                        ? "turn:" + ((payload["turn_id"] as? String)
+                            ?? StableID.uuid(for: String(raw)).uuidString)
+                        : nil)
+            }
+
             switch type {
             case "event_msg":
                 switch payload["type"] as? String {
                 case "task_complete":
-                    let summary = (payload["last_agent_message"] as? String)
-                        .map { String($0.prefix(90)) } ?? "Task complete"
-                    return .done(summary: summary)
+                    guard let message = payload["last_agent_message"] as? String else {
+                        return result(.done(summary: "Task complete"))
+                    }
+                    let status = SessionStatus.finishedTurn(fullText: message, preview: String(message.prefix(90)))
+                    return result(stale && status.needsAttention ? .idle : status)
                 case "turn_aborted":
-                    return .idle
+                    return result(.idle)
                 case "task_started", "user_message":
-                    return stale ? .idle : .working(activity: "Working…")
+                    return result(stale ? .idle : .working(activity: "Working…"))
                 default:
                     continue
                 }
@@ -48,9 +59,9 @@ enum CodexSessionParser {
                 switch payload["type"] as? String {
                 case "function_call", "custom_tool_call":
                     let name = payload["name"] as? String ?? "tool"
-                    return stale ? .idle : .runningTool(activity: "Running \(name)")
+                    return result(stale ? .idle : .runningTool(activity: "Running \(name)"))
                 case "function_call_output", "custom_tool_call_output":
-                    return stale ? .idle : .working(activity: "Working through tool results…")
+                    return result(stale ? .idle : .working(activity: "Working through tool results…"))
                 default:
                     continue
                 }
@@ -61,10 +72,18 @@ enum CodexSessionParser {
         return nil
     }
 
+    static func parse(tail: String, now: Date = .now) -> SessionStatus? {
+        parseDetails(tail: tail, now: now)?.status
+    }
+
     /// The command of the newest escalated call that has no output line
     /// yet, meaning its permission prompt is on screen. Answered calls end
     /// the search: everything older is settled.
     static func pendingApproval(tail: String) -> String? {
+        pendingRequest(tail: tail)?.command
+    }
+
+    private static func pendingRequest(tail: String) -> (command: String, id: String)? {
         var answered = Set<String>()
         var lines: [[String: Any]] = []
         for raw in tail.split(separator: "\n") {
@@ -86,7 +105,7 @@ enum CodexSessionParser {
               !answered.contains(callId),
               input.contains("require_escalated") || input.contains("\"with_escalated_permissions\":true")
         else { return nil }
-        return field("cmd", in: input) ?? field("justification", in: input) ?? "escalated command"
+        return (field("cmd", in: input) ?? field("justification", in: input) ?? "escalated command", callId)
     }
 
     /// Pulls a string field out of the call input, which is JS source for

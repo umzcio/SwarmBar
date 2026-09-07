@@ -97,7 +97,8 @@ struct RemoteSnapshot: Decodable, Sendable {
                 startedAt: started,
                 lastActivityAt: modified,
                 processAlive: cwd.map { liveCwds.contains($0) } ?? false,
-                host: host
+                host: host,
+                attentionEventID: parsed.attentionEventID
             ))
         }
         return result.sorted { $0.startedAt > $1.startedAt }

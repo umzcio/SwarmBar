@@ -25,6 +25,9 @@ struct AgentSession: Identifiable, Equatable, Sendable {
     /// sync, and two hosts can legitimately hold the same session id if a
     /// home directory is copied between them.
     var host: String?
+    /// Identity of the request itself, independent of transcript mtime.
+    /// Nil for providers that only expose a status snapshot.
+    var attentionEventID: String?
 
     init(
         id: UUID = UUID(),
@@ -38,7 +41,8 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         accountLabel: String? = nil,
         title: String? = nil,
         processAlive: Bool = false,
-        host: String? = nil
+        host: String? = nil,
+        attentionEventID: String? = nil
     ) {
         self.id = id
         self.tool = tool
@@ -52,6 +56,7 @@ struct AgentSession: Identifiable, Equatable, Sendable {
         self.title = title
         self.processAlive = processAlive
         self.host = host
+        self.attentionEventID = attentionEventID
     }
 
     /// What the row's elapsed timer should measure: run length while

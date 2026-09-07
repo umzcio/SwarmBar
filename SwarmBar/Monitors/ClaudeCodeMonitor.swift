@@ -84,7 +84,8 @@ struct ClaudeCodeMonitor: SessionMonitor {
                         status: parsed.status,
                         startedAt: values.creationDate ?? mtime,
                         lastActivityAt: mtime,
-                        processAlive: livePids[id.uuidString.lowercased()] != nil
+                        processAlive: livePids[id.uuidString.lowercased()] != nil,
+                        attentionEventID: parsed.attentionEventID
                     ))
                 }
             }

@@ -209,6 +209,14 @@ final class SessionStore {
             }
             return
         }
+        // Upserts and overrides are intermediate states. Publish attention
+        // only after the entire snapshot, dismissals and hooks have settled.
+        isSyncing = true
+        defer {
+            isSyncing = false
+            noteAttentionTransitions()
+            refreshIconTicker()
+        }
         let incomingIds = Set(incoming.map(\.id))
         for session in incoming { upsert(session) }
         sessions.removeAll {
@@ -226,13 +234,13 @@ final class SessionStore {
                 update(id: id) { $0.status = .idle }
             }
         }
-        for (id, ackTime) in acknowledgedAt {
+        for (id, acknowledged) in acknowledgedAt {
             guard let session = sessions.first(where: { $0.id == id }) else { continue }
-            if session.lastActivityAt > ackTime {
-                // The dismissal is over: genuinely new activity. Re-arm the
-                // alert so the next question is announced.
+            if (session.status.isActive && session.lastActivityAt > acknowledged.at)
+                || (session.status.needsAttention && !acknowledged.matches(session)) {
+                // The dismissal is over. Keep alert history: a hook may
+                // already have announced the new request before this poll.
                 acknowledgedAt.removeValue(forKey: id)
-                alertedStatus.removeValue(forKey: id)
             } else if case .waitingInput(let prompt) = session.status {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
@@ -240,8 +248,6 @@ final class SessionStore {
         pruneSessionRecords()
         reapplyHookOverrides()
         pruneAlertRecords()
-        noteAttentionTransitions()
-        refreshIconTicker()
     }
 
     /// Forgets bookkeeping for sessions the store no longer holds, so a
@@ -279,6 +285,7 @@ final class SessionStore {
         var status: SessionStatus
         var at: Date
         var sticky: Bool
+        var attentionEventID: String? = nil
     }
 
     @ObservationIgnored private(set) var hookOverrides: [UUID: HookOverride] = [:]
@@ -301,11 +308,11 @@ final class SessionStore {
     /// A waiting row the user dismissed reads as done until the session
     /// produces new activity; the poller would otherwise re-derive the
     /// waiting verdict from the unchanged transcript on the next sync.
-    @ObservationIgnored private var acknowledgedAt: [UUID: Date] = [:]
+    @ObservationIgnored private var acknowledgedAt: [UUID: AlertRecord] = [:]
 
     func acknowledge(_ session: AgentSession) {
         guard case .waitingInput(let prompt) = session.status else { return }
-        acknowledgedAt[session.id] = session.lastActivityAt
+        acknowledgedAt[session.id] = AlertRecord(session)
         clearHookOverride(sessionID: session.id)
         update(id: session.id) { $0.status = .done(summary: prompt) }
     }
@@ -322,10 +329,13 @@ final class SessionStore {
         // Hooks arrive independently of polling, so a disabled tool would
         // otherwise reappear the moment one of its agents did anything.
         guard isEnabled(tool) else { return }
-        hookOverrides[sessionID] = HookOverride(status: status, at: .now, sticky: sticky)
+        let eventID = status.needsAttention ? UUID().uuidString : nil
+        hookOverrides[sessionID] = HookOverride(
+            status: status, at: .now, sticky: sticky, attentionEventID: eventID)
         if sessions.contains(where: { $0.id == sessionID }) {
             update(id: sessionID) { session in
                 session.status = status
+                session.attentionEventID = eventID
                 session.lastActivityAt = .now
                 if let accountLabel { session.accountLabel = accountLabel }
                 // Only overwrite with a real value: a later hook that
@@ -341,7 +351,8 @@ final class SessionStore {
                 projectName: path?.lastPathComponent ?? "session",
                 projectPath: path,
                 status: status,
-                accountLabel: accountLabel
+                accountLabel: accountLabel,
+                attentionEventID: eventID
             ))
         }
     }
@@ -356,7 +367,10 @@ final class SessionStore {
                 hookOverrides.removeValue(forKey: id)
                 continue
             }
-            update(id: id) { $0.status = override.status }
+            update(id: id) {
+                $0.status = override.status
+                $0.attentionEventID = override.attentionEventID
+            }
         }
     }
 
@@ -373,31 +387,52 @@ final class SessionStore {
     /// the app wires this to AgentNotifier, tests to a collector.
     @ObservationIgnored var attentionAlertHandler: ((AgentSession) -> Void)?
 
-    /// What each session was last alerted for, and the activity it was
-    /// alerted at.
-    ///
-    /// The timestamp is what stops a loop. Keyed on the transition alone,
-    /// any session that oscillates between needing attention and not
-    /// re-alerts on every poll, because leaving the attention state forgot
-    /// that it had been announced. Closing a conversation does exactly
-    /// that, and the banner repeated until the session aged out. Requiring
-    /// newer activity than the last alert means a repeat is impossible
-    /// unless the agent has actually done something since.
-    @ObservationIgnored private var alertedStatus: [UUID: (label: String, at: Date)] = [:]
+    @ObservationIgnored private var isSyncing = false
+
+    private struct AlertRecord {
+        var status: SessionStatus
+        var at: Date
+        var eventID: String?
+        var recentEventIDs: [String]
+
+        init(_ session: AgentSession, previousEventIDs: [String] = []) {
+            status = session.status
+            at = session.lastActivityAt
+            eventID = session.attentionEventID
+            // Keep a bounded history across hook/poll handoffs. A delayed
+            // snapshot can replay a question older than the latest alert.
+            recentEventIDs = Array((previousEventIDs + [session.attentionEventID].compactMap { $0 }).suffix(32))
+        }
+
+        func matches(_ session: AgentSession) -> Bool {
+            if let eventID, let incoming = session.attentionEventID {
+                return eventID == incoming
+            }
+            return status == session.status && session.lastActivityAt <= at
+        }
+    }
+
+    /// Identified requests survive metadata writes and idle flicker.
+    /// Providers without event identity retain timestamp-based alerts:
+    /// their snapshots cannot distinguish identical successive requests
+    /// from bookkeeping, so status-only deduplication would lose requests.
+    @ObservationIgnored private var alertedStatus: [UUID: AlertRecord] = [:]
 
     private func noteAttentionTransitions() {
+        guard !isSyncing else { return }
         for session in sessions where session.status.needsAttention {
-            let label = session.status.label
             if let last = alertedStatus[session.id] {
-                // Newer activity is the only thing that earns a second
-                // alert. Not a label change: two approvals in a row on one
-                // session share the label "Approval" and both deserve
-                // announcing. Not a transition either, which is what
-                // looped, since a session re-derived from an unchanged
-                // transcript keeps the same lastActivityAt forever.
-                guard session.lastActivityAt > last.at else { continue }
+                if let eventID = session.attentionEventID,
+                   last.recentEventIDs.contains(eventID) { continue }
+                // With a provider event id, even identical wording in two
+                // turns is distinct, and an old polled event stays old.
+                let identified = last.eventID != nil && session.attentionEventID != nil
+                if !identified {
+                    guard session.lastActivityAt > last.at else { continue }
+                }
             }
-            alertedStatus[session.id] = (label, session.lastActivityAt)
+            alertedStatus[session.id] = AlertRecord(session,
+                previousEventIDs: alertedStatus[session.id]?.recentEventIDs ?? [])
             attentionAlertHandler?(session)
         }
     }
