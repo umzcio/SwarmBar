@@ -122,14 +122,40 @@ struct TypographyTests {
 struct SessionRowInteractionTests {
     @Test func theGestureIsAttachedOnlyWhenItCouldFire() {
         #expect(SessionRowInteraction.attachesDoubleClick(
-            enabled: true, hasProjectPath: true))
+            enabled: true, hasProjectPath: true, host: nil))
         // Setting off: no recognizer, so single clicks keep their speed.
         #expect(!SessionRowInteraction.attachesDoubleClick(
-            enabled: false, hasProjectPath: true))
+            enabled: false, hasProjectPath: true, host: nil))
         // Nothing to open: attaching would cost the delay for no action.
         #expect(!SessionRowInteraction.attachesDoubleClick(
-            enabled: true, hasProjectPath: false))
+            enabled: true, hasProjectPath: false, host: nil))
         #expect(!SessionRowInteraction.attachesDoubleClick(
-            enabled: false, hasProjectPath: false))
+            enabled: false, hasProjectPath: false, host: nil))
+    }
+
+    @Test func aRemoteRowNeverOpensALocalTerminal() {
+        // The path exists on the far host, and on the fleet's macOS host it
+        // has the same /Users/zach/... shape as this Mac's, so opening it
+        // here could land in a real local directory and imply it is the
+        // session that was asked for.
+        #expect(!SessionRowInteraction.attachesDoubleClick(
+            enabled: true, hasProjectPath: true, host: "umzcaio"))
+    }
+}
+
+@Suite("Row actions that reach a local terminal")
+struct LocalTerminalActionTests {
+    @Test("a local session keeps Reply, Approve, Deny and Open in Terminal")
+    func localAllows() {
+        #expect(SessionRowInteraction.allowsLocalTerminalActions(host: nil))
+    }
+
+    @Test("a remote session offers none of them")
+    func remoteDenies() {
+        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "umzcaio"))
+        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "umzmac"))
+        // Even an empty host string is a host: a row that carries one at
+        // all came from a remote snapshot.
+        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: ""))
     }
 }

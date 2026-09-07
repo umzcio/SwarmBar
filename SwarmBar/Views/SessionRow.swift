@@ -6,6 +6,12 @@ struct SessionRow: View {
     @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
+    /// Reply, Approve and Deny all reach into a terminal on this Mac. See
+    /// SessionRowInteraction.allowsLocalTerminalActions.
+    private var isLocal: Bool {
+        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             ToolChip(tool: session.tool, size: 26 * scale)
@@ -15,6 +21,14 @@ struct SessionRow: View {
                     Text(session.projectName)
                         .swarmFont(.rowTitleStrong)
                         .lineLimit(1)
+                    if let badge = RemoteRowLabel.badge(for: session) {
+                        Text(badge)
+                            .swarmFont(.meta)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                    }
                     Spacer()
                     ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
                 }
@@ -37,10 +51,22 @@ struct SessionRow: View {
                 }
                 .doubleClickOpensTerminal(session, store: store)
 
+                if let note = RemoteRowLabel.unreachableNote(
+                    host: session.host, reachability: store.remoteReachability) {
+                    Text(note)
+                        .swarmFont(.meta)
+                        .foregroundStyle(.secondary)
+                }
+
                 switch session.status {
                 case .waitingApproval(let command):
                     CommandPreview(command: command)
-                    ApprovalActions(session: session)
+                    // The command is still worth showing on a remote row;
+                    // answering it from here is not, and would answer on
+                    // this Mac.
+                    if isLocal {
+                        ApprovalActions(session: session)
+                    }
                 case .waitingInput(let prompt):
                     if !prompt.isEmpty {
                         Text("\u{201C}\(prompt)\u{201D}")
@@ -48,9 +74,11 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 6) {
-                        Button("Reply…") { store.replyingTo = session.id }
-                            .buttonStyle(ActionPill.reply)
-                            .accessibilityLabel("Reply")
+                        if isLocal {
+                            Button("Reply…") { store.replyingTo = session.id }
+                                .buttonStyle(ActionPill.reply)
+                                .accessibilityLabel("Reply")
+                        }
                         Button("Dismiss") { store.acknowledge(session) }
                             .buttonStyle(ActionPill.deny)
                             .accessibilityLabel("Dismiss")
@@ -66,7 +94,7 @@ struct SessionRow: View {
                         .foregroundStyle(.secondary)
                     // A finished turn is still steerable: its composer is
                     // idle, so a reply can start the next turn.
-                    if session.processAlive {
+                    if session.processAlive && isLocal {
                         Button("Reply…") { store.replyingTo = session.id }
                             .buttonStyle(ActionPill.reply)
                             .accessibilityLabel("Reply")
@@ -122,12 +150,30 @@ extension View {
 /// hitTest cannot tell a button click from a row click, so no in-process
 /// test can observe which one wins. Do not add a test that claims to.
 enum SessionRowInteraction {
+    /// Whether a row may offer the actions that reach into a terminal on
+    /// THIS Mac: Reply, Approve, Deny, Open in Terminal and the double
+    /// click behind it.
+    ///
+    /// A remote session's terminal is on another host, and the failure is
+    /// not merely that nothing happens. TerminalFocuser matches a local
+    /// process by cwd, and the fleet includes a macOS host whose paths are
+    /// /Users/zach/... , the same shape as this Mac's, so a same-named
+    /// directory here is enough for `open -a iTerm` to take you somewhere
+    /// and imply it is the session you asked for. Phase 1a is status only
+    /// for remote rows; gating Approve and Deny too keeps phase 3 from
+    /// inheriting this.
+    ///
+    /// Dismiss is not gated: it only writes SwarmBar's own store.
+    static func allowsLocalTerminalActions(host: String?) -> Bool {
+        host == nil
+    }
+
     /// A double-click recognizer is attached only when it could actually
     /// fire. Attaching it always and returning early inside the handler
     /// looks equivalent and is not: the recognizer still makes every
     /// single click wait to see whether a second one follows.
-    static func attachesDoubleClick(enabled: Bool, hasProjectPath: Bool) -> Bool {
-        enabled && hasProjectPath
+    static func attachesDoubleClick(enabled: Bool, hasProjectPath: Bool, host: String?) -> Bool {
+        enabled && hasProjectPath && allowsLocalTerminalActions(host: host)
     }
 }
 
@@ -136,11 +182,19 @@ private struct SessionRowInteractions: ViewModifier {
     let store: SessionStore
 
     private var canOpen: Bool { session.projectPath != nil }
+    /// Hidden rather than disabled on a remote row: a disabled item invites
+    /// the reading that it will work once something changes, and it will
+    /// not. Copy project path stays, since the path is still worth having.
+    private var isLocal: Bool {
+        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    }
 
     func body(content: Content) -> some View {
         content.contextMenu {
-            Button("Open in Terminal") { store.openInTerminal(session) }
-                .disabled(!canOpen)
+            if isLocal {
+                Button("Open in Terminal") { store.openInTerminal(session) }
+                    .disabled(!canOpen)
+            }
             Button("Copy project path") { store.copyProjectPath(session) }
                 .disabled(!canOpen)
         }
@@ -154,7 +208,8 @@ private struct DoubleClickToOpen: ViewModifier {
 
     func body(content: Content) -> some View {
         if SessionRowInteraction.attachesDoubleClick(
-            enabled: enabled, hasProjectPath: session.projectPath != nil) {
+            enabled: enabled, hasProjectPath: session.projectPath != nil,
+            host: session.host) {
             // Attached only when it could fire. A recognizer that will
             // never fire still makes every single click here wait to see
             // whether a second one follows.

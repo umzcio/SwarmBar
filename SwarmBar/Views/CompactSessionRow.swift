@@ -6,6 +6,10 @@ struct CompactSessionRow: View {
     @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
+    private var isLocal: Bool {
+        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             StatusDot(status: session.status)
@@ -17,6 +21,29 @@ struct CompactSessionRow: View {
                 .lineLimit(1)
                 .frame(maxWidth: 118 * scale, alignment: .leading)
                 .doubleClickOpensTerminal(session, store: store)
+            if let badge = RemoteRowLabel.badge(for: session) {
+                Text(badge)
+                    .swarmFont(.meta)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                    // Attached to the badge itself, a leaf, rather than the
+                    // row's outer HStack. That HStack also contains the
+                    // Approve/Deny/Reply/Dismiss MicroButtons; an
+                    // accessibilityLabel on a transparent container
+                    // collapses it into one opaque element with no
+                    // interactive trait, which would make those buttons
+                    // unreachable to VoiceOver on every compact row, local
+                    // and remote alike. A local row has no badge, so it
+                    // gets none of this and keeps SwiftUI's default
+                    // per-child exposure untouched.
+                    .accessibilityLabel(
+                        RemoteRowLabel.unreachableNote(
+                            host: session.host, reachability: store.remoteReachability
+                        ) ?? badge
+                    )
+            }
 
             Group {
                 switch session.status {
@@ -42,16 +69,22 @@ struct CompactSessionRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .doubleClickOpensTerminal(session, store: store)
 
-            if case .waitingApproval = session.status {
+            // Approve, Deny and Reply all answer through a terminal on THIS
+            // Mac, so a remote row does not offer them. Dismiss does not:
+            // it only writes SwarmBar's own store. See
+            // SessionRowInteraction.allowsLocalTerminalActions.
+            if case .waitingApproval = session.status, isLocal {
                 MicroButton(.approve, help: "Approve") { store.approve(session) }
                 MicroButton(.deny, help: "Deny") { store.deny(session) }
             }
             if case .waitingInput = session.status {
-                MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
+                if isLocal {
+                    MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
+                }
                 MicroButton(.dismiss, help: "Dismiss") { store.acknowledge(session) }
             }
             // A finished turn whose process is still up can be steered.
-            if case .done = session.status, session.processAlive {
+            if case .done = session.status, session.processAlive, isLocal {
                 MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
             }
 

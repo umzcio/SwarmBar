@@ -65,7 +65,7 @@ struct CodexMonitor: SessionMonitor {
             guard let cachedTail = tailCache.value(
                     for: file, size: size, modified: mtime,
                     compute: { ClaudeCodeMonitor.tail(of: file) }),
-                  let status = CodexSessionParser.parse(tail: cachedTail, now: now)
+                  let parsed = CodexSessionParser.parseDetails(tail: cachedTail, now: now)
             else { continue }
 
             let meta = headCache.value(
@@ -90,10 +90,11 @@ struct CodexMonitor: SessionMonitor {
                 tool: .codex,
                 projectName: projectPath?.lastPathComponent ?? "codex session",
                 projectPath: projectPath,
-                status: status,
+                status: parsed.status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                processAlive: livePids["\(id.uuidString.lowercased()).jsonl"] != nil
+                processAlive: livePids["\(id.uuidString.lowercased()).jsonl"] != nil,
+                attentionEventID: parsed.attentionEventID
             ))
         }
         tailCache.retain(paths: seenPaths)

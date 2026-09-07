@@ -3,6 +3,7 @@ import Foundation
 struct ParsedStatus: Equatable, Sendable {
     var status: SessionStatus
     var cwd: String?
+    var attentionEventID: String? = nil
 }
 
 /// Maps the tail of a Claude Code session JSONL to a SessionStatus.
@@ -37,7 +38,9 @@ enum ClaudeSessionParser {
                 if let age, age > staleAfter { return ParsedStatus(status: .idle, cwd: cwd) }
                 return ParsedStatus(
                     status: .finishedTurn(fullText: text, preview: prompt(from: text)),
-                    cwd: cwd
+                    cwd: cwd,
+                    attentionEventID: (line["uuid"] as? String)
+                        ?? StableID.uuid(for: String(raw)).uuidString
                 )
             case "user":
                 if let age, age > staleAfter { return ParsedStatus(status: .idle, cwd: cwd) }

@@ -1,0 +1,97 @@
+{
+ "ok": true,
+ "protocol": 2,
+ "hostname": "umzcaio",
+ "system": "Linux",
+ "now": 1786928340.129051,
+ "roots": [
+  "/root/.claude/projects",
+  "/root/.claude-acct1/projects",
+  "/root/.claude-acct2/projects",
+  "/root/.claude-acct3/projects"
+ ],
+ "sessions": [
+  {
+   "tool": "claudeCode",
+   "path": "/root/.claude/projects/-projects-demo1/11111111-1111-1111-1111-111111111111.jsonl",
+   "root": "/root/.claude/projects",
+   "project_dir": "-projects-demo1",
+   "mtime": 1786926580.9150755,
+   "created": 1786580980.915076,
+   "size": 372,
+   "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo1\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo1\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
+  },
+  {
+   "tool": "claudeCode",
+   "path": "/root/.claude/projects/-projects-demo2/22222222-2222-2222-2222-222222222222.jsonl",
+   "root": "/root/.claude/projects",
+   "project_dir": "-projects-demo2",
+   "mtime": 1786925379.9781497,
+   "created": 1786914579.97815,
+   "size": 372,
+   "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo2\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo2\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
+  },
+  {
+   "tool": "claudeCode",
+   "path": "/root/.claude/projects/-projects-demo3/33333333-3333-3333-3333-333333333333.jsonl",
+   "root": "/root/.claude/projects",
+   "project_dir": "-projects-demo3",
+   "mtime": 1786927855.5545132,
+   "created": 1786834255.554513,
+   "size": 372,
+   "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo3\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo3\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
+  },
+  {
+   "tool": "claudeCode",
+   "path": "/root/.claude/projects/-projects-demo4/44444444-4444-4444-4444-444444444444.jsonl",
+   "root": "/root/.claude/projects",
+   "project_dir": "-projects-demo4",
+   "mtime": 1786925455.069,
+   "created": 1786924555.069,
+   "size": 372,
+   "tail": "{\"type\": \"user\", \"cwd\": \"/projects/demo4\", \"timestamp\": \"2026-08-16T20:00:00.000Z\", \"message\": {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted for the fixture.\"}]}}\n{\"type\": \"assistant\", \"cwd\": \"/projects/demo4\", \"timestamp\": \"2026-08-16T20:00:05.000Z\", \"message\": {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"Redacted assistant reply.\"}]}}\n"
+  }
+ ],
+ "warnings": [
+  "skipped backup-looking root: /root/.claude-acct9.pre-symlink-backup"
+ ],
+ "processes": [
+  {
+   "pid": 34261,
+   "user": "root",
+   "comm": "claude",
+   "cwd": "/projects/demo1"
+  },
+  {
+   "pid": 34265,
+   "user": "root",
+   "comm": "claude",
+   "cwd": "/projects/demo2"
+  },
+  {
+   "pid": 34268,
+   "user": "root",
+   "comm": "claude",
+   "cwd": "/projects/demo3"
+  },
+  {
+   "pid": 433062,
+   "user": "root",
+   "comm": "grok",
+   "cwd": "/projects/demo4"
+  },
+  {
+   "pid": 752958,
+   "user": "root",
+   "comm": "kimi",
+   "cwd": "/projects/demo5"
+  },
+  {
+   "pid": 1945042,
+   "user": "root",
+   "comm": "kimi-code",
+   "cwd": "/projects/demo6"
+  }
+ ],
+ "processes_failed": false
+}

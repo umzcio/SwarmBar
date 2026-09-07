@@ -215,7 +215,7 @@ final class HookServer: ApprovalResponding {
 
     // MARK: - Routing
 
-    private func route(_ request: Request, connection: NWConnection) {
+    func route(_ request: Request, connection: NWConnection) {
         // Only bridges this app installed may change what the popover shows.
         // A wrong or missing token gets the same empty answer a non-session
         // event gets, so a misconfigured bridge fails open rather than hanging.
@@ -310,11 +310,10 @@ final class HookServer: ApprovalResponding {
 
         case "Stop", "SubagentStop":
             if event == "Stop" {
-                store.applyHookEvent(
-                    sessionID: sessionID, tool: tool,
-                    status: .waitingInput(prompt: ""),
-                    sticky: false, cwd: cwd, accountLabel: request.accountLabel, title: sessionTitle
-                )
+                // Stop only says the turn ended. Let the transcript decide
+                // whether it ended with a question or a completed report.
+                // Release the working override so the next poll can do so.
+                store.clearHookOverride(sessionID: sessionID)
             }
             finishEmpty()
 
