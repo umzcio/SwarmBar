@@ -12,6 +12,12 @@ struct KimiMonitor: SessionMonitor {
     nonisolated static let activeAfter: TimeInterval = 2 * 60
     nonisolated static let staleAfter: TimeInterval = 30 * 60
 
+    /// Kimi Code's process name, old and new. 2.0.0 runs as `kimi-code`;
+    /// earlier builds ran as `kimi`. Matching only the old name made every
+    /// live 2.0 session read as closed, and left Approve unable to find the
+    /// terminal to read its selector.
+    nonisolated static let processNames = ["kimi", "kimi-code"]
+
     func start(into store: SessionStore) async {
         while !Task.isCancelled {
             if !store.isPaused {
@@ -20,7 +26,7 @@ struct KimiMonitor: SessionMonitor {
                 let sessions = await Task.detached {
                     Self.discover(
                         root: root,
-                        liveCounts: ProcessLiveness.directoryCounts(processName: "kimi"),
+                        liveCounts: ProcessLiveness.directoryCounts(processNames: Self.processNames),
                         now: now
                     )
                 }.value

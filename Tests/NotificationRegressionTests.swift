@@ -389,3 +389,41 @@ struct IdleTurnReminderTests {
         #expect(count == 0)
     }
 }
+
+/// Codex 0.157 writes bulk record types the parser does not read
+/// (token_count, item_completed, reasoning, token_usage_record). When the
+/// last 64KB held only those, the tail parsed to nothing and discovery
+/// dropped the session, deleting its row and its alert history. Replayed
+/// against a real 48MB rollout that happened on about one poll in ten.
+struct CodexTailWindowTests {
+    private func rollout(_ lines: [String]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    @Test func aTailOfOnlyUnreadRecordsStillFindsTheTurn() throws {
+        let stamp = ISO8601DateFormatter().string(from: .now)
+        let done = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Shipped the fix."}}"#
+        let noise = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"token_count","info":{"pad":"\#(String(repeating: "x", count: 900))"}}}"#
+        let file = try rollout([done] + Array(repeating: noise, count: 90))
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let tail = try #require(ClaudeCodeMonitor.tail(of: file))
+        #expect(CodexSessionParser.parseDetails(tail: tail, now: .now) == nil,
+                "the fixture must reproduce the drop: nothing readable in 64KB")
+
+        let parsed = try #require(CodexMonitor.parsedStatus(of: file, tail: tail, now: .now))
+        #expect(parsed.status == .done(summary: "Shipped the fix."))
+    }
+
+    @Test func anOrdinaryTailDoesNotReadFurther() throws {
+        let stamp = ISO8601DateFormatter().string(from: .now)
+        let done = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Done."}}"#
+        let file = try rollout([done])
+        defer { try? FileManager.default.removeItem(at: file) }
+        let tail = try #require(ClaudeCodeMonitor.tail(of: file))
+        #expect(CodexMonitor.parsedStatus(of: file, tail: tail, now: .now)?.status == .done(summary: "Done."))
+    }
+}
