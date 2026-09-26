@@ -283,3 +283,109 @@ struct NotificationRegressionTests {
     }
 
 }
+
+/// A finished turn whose process is still open is an agent waiting on the
+/// user. Six of seven tools classify that as "done" unless the last message
+/// contains a question mark, which caught about a quarter of real turn
+/// endings, so the reminder is keyed on the state every monitor reports,
+/// not on any one provider's signal.
+@MainActor
+struct IdleTurnReminderTests {
+    private func store() -> SessionStore {
+        let s = SessionStore(defaults: UserDefaults(suiteName: "IdleTurn.\(UUID())")!)
+        s.launchedAt = .distantPast
+        return s
+    }
+
+    private func finished(_ tool: AgentTool, endedAt: Date, alive: Bool = true,
+                          id: UUID = UUID(), host: String? = nil) -> AgentSession {
+        AgentSession(id: id, tool: tool, projectName: "proj",
+                     status: .done(summary: "Here is the plan."),
+                     lastActivityAt: endedAt, processAlive: alive, host: host)
+    }
+
+    @Test func remindsOnceAfterTheDelayForEveryProvider() {
+        let now = Date.now
+        for tool in AgentTool.allCases {
+            let store = store()
+            var reminded: [AgentSession] = []
+            store.idleTurnHandler = { reminded.append($0) }
+            store.upsert(finished(tool, endedAt: now.addingTimeInterval(-30)))
+            store.noteIdleTurns(now: now)
+            #expect(reminded.isEmpty, "\(tool) reminded before the delay")
+            store.noteIdleTurns(now: now.addingTimeInterval(31))
+            #expect(reminded.count == 1, "\(tool) did not remind after the delay")
+            store.noteIdleTurns(now: now.addingTimeInterval(120))
+            #expect(reminded.count == 1, "\(tool) reminded twice for one turn")
+        }
+    }
+
+    @Test func remoteSessionsAreRemindedToo() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(finished(.claudeCode, endedAt: now.addingTimeInterval(-90), host: "umzcaio"))
+        store.noteIdleTurns(now: now)
+        #expect(count == 1)
+    }
+
+    @Test func aNewTurnEarnsANewReminder() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let id = UUID(), now = Date.now
+        store.upsert(finished(.codex, endedAt: now.addingTimeInterval(-90), id: id))
+        store.noteIdleTurns(now: now)
+        store.upsert(finished(.codex, endedAt: now.addingTimeInterval(10), id: id))
+        store.noteIdleTurns(now: now.addingTimeInterval(80))
+        #expect(count == 2)
+    }
+
+    @Test func turnsThatEndedBeforeLaunchAreNotAnnounced() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.launchedAt = now.addingTimeInterval(-10)
+        store.upsert(finished(.kimiCode, endedAt: now.addingTimeInterval(-3600)))
+        store.noteIdleTurns(now: now.addingTimeInterval(600))
+        #expect(count == 0)
+    }
+
+    @Test func aClosedProcessIsNotWaiting() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(finished(.openCode, endedAt: now.addingTimeInterval(-90), alive: false))
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+
+    @Test func aTurnAnnouncedByTheQuestionRuleIsNotRemindedAgain() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(AgentSession(tool: .claudeCode, projectName: "p",
+                                  status: .waitingInput(prompt: "Which region?"),
+                                  lastActivityAt: now.addingTimeInterval(-90), processAlive: true))
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+
+    @Test func aDismissedTurnIsNotRemindedAgain() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        let waiting = AgentSession(tool: .claudeCode, projectName: "p",
+                                   status: .waitingInput(prompt: "Which region?"),
+                                   lastActivityAt: now.addingTimeInterval(-90), processAlive: true)
+        store.upsert(waiting)
+        store.acknowledge(waiting)
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+}

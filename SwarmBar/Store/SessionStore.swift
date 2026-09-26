@@ -221,6 +221,7 @@ final class SessionStore {
         defer {
             isSyncing = false
             noteAttentionTransitions()
+            noteIdleTurns()
             refreshIconTicker()
         }
         let incomingIds = Set(incoming.map(\.id))
@@ -263,6 +264,7 @@ final class SessionStore {
         let known = Set(sessions.map(\.id))
         endedSessions = endedSessions.filter { known.contains($0.key) }
         acknowledgedAt = acknowledgedAt.filter { known.contains($0.key) }
+        remindedTurn = remindedTurn.filter { known.contains($0.key) }
     }
 
     /// Drops alert records for sessions that are settled: no longer needing
@@ -440,6 +442,48 @@ final class SessionStore {
             alertedStatus[session.id] = AlertRecord(session,
                 previousEventIDs: alertedStatus[session.id]?.recentEventIDs ?? [])
             attentionAlertHandler?(session)
+        }
+    }
+
+    // MARK: - Idle turn reminders
+
+    /// When this store started. A turn that ended before launch was never
+    /// seen ending, so it is not announced: opening the app must not fire a
+    /// banner for every agent that was already sitting idle.
+    @ObservationIgnored var launchedAt = Date.now
+
+    /// How long a finished turn waits, process still open, before it counts
+    /// as waiting on the user. Matches Claude Code's own idle_prompt, and
+    /// means no banner when the user is already at the terminal.
+    static let idleReminderDelay: TimeInterval = 60
+
+    /// Wired by the app to post "waiting on you". Separate from
+    /// attentionAlertHandler because the row's status does not change: the
+    /// turn is still Done in Active, it has just been sitting there.
+    @ObservationIgnored var idleTurnHandler: ((AgentSession) -> Void)?
+
+    /// The turn (its end time) each session was last reminded about, so a
+    /// turn is announced once and the next turn earns its own reminder.
+    @ObservationIgnored private var remindedTurn: [UUID: Date] = [:]
+
+    /// A finished turn whose process is still open is an agent waiting on
+    /// the user, for every tool. Six of seven tools only call that
+    /// "waiting" when the last message holds a question mark, which caught
+    /// about a quarter of real turn endings, so this keys on the state every
+    /// monitor reports instead of on any one provider's signal. A turn
+    /// already announced by the question rule is not .done, and a dismissed
+    /// one carries an acknowledgement, so neither is announced twice.
+    func noteIdleTurns(now: Date = .now) {
+        for session in sessions {
+            guard case .done = session.status, session.processAlive else { continue }
+            let endedAt = session.lastActivityAt
+            guard endedAt > launchedAt,
+                  now.timeIntervalSince(endedAt) >= Self.idleReminderDelay,
+                  remindedTurn[session.id] != endedAt,
+                  acknowledgedAt[session.id] == nil
+            else { continue }
+            remindedTurn[session.id] = endedAt
+            idleTurnHandler?(session)
         }
     }
 
