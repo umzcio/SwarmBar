@@ -150,6 +150,12 @@ final class SessionStore {
     var visibleCount: Int { attention.count + active.count + recent.count }
 
     var anyActive: Bool { !active.isEmpty }
+
+    /// Whether any agent is actually doing work right now. Deliberately NOT
+    /// the Active section: that section also holds finished turns whose
+    /// process is still open, and keying the icon off it kept the fill cycle
+    /// running whenever any agent was merely sitting in a terminal.
+    var anyWorking: Bool { sessions.contains { $0.status.isActive } }
     var attentionCount: Int { attention.count }
 
     /// Pending approvals only. The icon's flash is reserved for these;
@@ -168,7 +174,7 @@ final class SessionStore {
     /// paused, and nothing otherwise.
     var iconNeedsAnimation: Bool {
         if approvalCount > 0 { return true }
-        return anyActive && !isPaused
+        return anyWorking && !isPaused
     }
 
     // Called by monitors.

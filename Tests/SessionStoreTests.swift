@@ -204,6 +204,24 @@ struct SessionStoreTests {
         #expect(!store.iconNeedsAnimation)
     }
 
+    /// The Active section includes finished turns whose process is still
+    /// open, so a session idling in a terminal belongs there. The icon must
+    /// not follow the section: it animates only while an agent is actually
+    /// working, or it cycles forever whenever any agent is merely open.
+    @Test func anOpenButFinishedSessionDoesNotAnimate() {
+        let store = SessionStore()
+        store.upsert(AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            status: .done(summary: "Shipped."), processAlive: true))
+        #expect(store.anyActive)
+        #expect(!store.iconNeedsAnimation)
+
+        store.upsert(AgentSession(
+            tool: .codex, projectName: "proj2",
+            status: .runningTool(activity: "Running tests")))
+        #expect(store.iconNeedsAnimation)
+    }
+
     @Test func theIconPhaseAdvancesWhileActive() async throws {
         let store = SessionStore()
         store.upsert(AgentSession(
