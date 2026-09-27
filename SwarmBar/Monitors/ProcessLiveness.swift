@@ -16,6 +16,20 @@ enum ProcessLiveness {
         counts(pgrepArgs: ["-x", processName])
     }
 
+    /// Any of several process names, merged with `max` like the name plus
+    /// command-line variant below. Kimi Code 2.0 renamed its process from
+    /// `kimi` to `kimi-code`, and an exact match on the old name alone found
+    /// no live session at all, so every open Kimi session read as closed.
+    nonisolated static func directoryCounts(processNames: [String]) -> [String: Int] {
+        var merged: [String: Int] = [:]
+        for name in processNames {
+            for (path, count) in directoryCounts(processName: name) {
+                merged[path] = max(merged[path] ?? 0, count)
+            }
+        }
+        return merged
+    }
+
     /// For tools launched through interpreters (BearCode runs as
     /// `node .../main.mjs`), match the command line instead of the name.
     nonisolated static func directoryCounts(commandPattern: String) -> [String: Int] {
@@ -111,6 +125,14 @@ enum ProcessLiveness {
     /// no pid registry.
     nonisolated static func pid(processName: String, cwd: String) -> Int? {
         pid(pgrepArgs: ["-x", processName], cwd: cwd)
+    }
+
+    /// The first of several process names with a process in `cwd`.
+    nonisolated static func pid(processNames: [String], cwd: String) -> Int? {
+        for name in processNames {
+            if let pid = pid(processName: name, cwd: cwd) { return pid }
+        }
+        return nil
     }
 
     nonisolated static func pid(commandPattern: String, cwd: String) -> Int? {

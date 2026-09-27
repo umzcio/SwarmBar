@@ -39,6 +39,25 @@ struct CodexMonitor: SessionMonitor {
         }
     }
 
+    /// The session's status from its tail, reading further back when the
+    /// usual window holds nothing the parser reads. Codex 0.157 writes bulk
+    /// records the parser ignores (token_count, item_completed, reasoning,
+    /// token_usage_record), and when the last 64KB were only those the
+    /// session parsed to nothing and was dropped, deleting its row and its
+    /// alert history. Replayed against a real 48MB rollout, that was about
+    /// one poll in ten. Those records never change status, so the newest
+    /// readable line further back is still the session's current state.
+    nonisolated static func parsedStatus(of file: URL, tail: String, now: Date) -> ParsedStatus? {
+        if let parsed = CodexSessionParser.parseDetails(tail: tail, now: now) { return parsed }
+        for start in [1 << 20, ClaudeCodeMonitor.maxTailBytes] {
+            guard let wider = ClaudeCodeMonitor.tail(of: file, startingAt: start),
+                  let parsed = CodexSessionParser.parseDetails(tail: wider, now: now)
+            else { continue }
+            return parsed
+        }
+        return nil
+    }
+
     nonisolated static func discover(now: Date) -> [AgentSession] {
         let fm = FileManager.default
         let root = fm.homeDirectoryForCurrentUser
@@ -65,7 +84,7 @@ struct CodexMonitor: SessionMonitor {
             guard let cachedTail = tailCache.value(
                     for: file, size: size, modified: mtime,
                     compute: { ClaudeCodeMonitor.tail(of: file) }),
-                  let parsed = CodexSessionParser.parseDetails(tail: cachedTail, now: now)
+                  let parsed = parsedStatus(of: file, tail: cachedTail, now: now)
             else { continue }
 
             let meta = headCache.value(

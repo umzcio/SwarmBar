@@ -283,3 +283,147 @@ struct NotificationRegressionTests {
     }
 
 }
+
+/// A finished turn whose process is still open is an agent waiting on the
+/// user. Six of seven tools classify that as "done" unless the last message
+/// contains a question mark, which caught about a quarter of real turn
+/// endings, so the reminder is keyed on the state every monitor reports,
+/// not on any one provider's signal.
+@MainActor
+struct IdleTurnReminderTests {
+    private func store() -> SessionStore {
+        let s = SessionStore(defaults: UserDefaults(suiteName: "IdleTurn.\(UUID())")!)
+        s.launchedAt = .distantPast
+        return s
+    }
+
+    private func finished(_ tool: AgentTool, endedAt: Date, alive: Bool = true,
+                          id: UUID = UUID(), host: String? = nil) -> AgentSession {
+        AgentSession(id: id, tool: tool, projectName: "proj",
+                     status: .done(summary: "Here is the plan."),
+                     lastActivityAt: endedAt, processAlive: alive, host: host)
+    }
+
+    @Test func remindsOnceAfterTheDelayForEveryProvider() {
+        let now = Date.now
+        for tool in AgentTool.allCases {
+            let store = store()
+            var reminded: [AgentSession] = []
+            store.idleTurnHandler = { reminded.append($0) }
+            store.upsert(finished(tool, endedAt: now.addingTimeInterval(-30)))
+            store.noteIdleTurns(now: now)
+            #expect(reminded.isEmpty, "\(tool) reminded before the delay")
+            store.noteIdleTurns(now: now.addingTimeInterval(31))
+            #expect(reminded.count == 1, "\(tool) did not remind after the delay")
+            store.noteIdleTurns(now: now.addingTimeInterval(120))
+            #expect(reminded.count == 1, "\(tool) reminded twice for one turn")
+        }
+    }
+
+    @Test func remoteSessionsAreRemindedToo() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(finished(.claudeCode, endedAt: now.addingTimeInterval(-90), host: "umzcaio"))
+        store.noteIdleTurns(now: now)
+        #expect(count == 1)
+    }
+
+    @Test func aNewTurnEarnsANewReminder() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let id = UUID(), now = Date.now
+        store.upsert(finished(.codex, endedAt: now.addingTimeInterval(-90), id: id))
+        store.noteIdleTurns(now: now)
+        store.upsert(finished(.codex, endedAt: now.addingTimeInterval(10), id: id))
+        store.noteIdleTurns(now: now.addingTimeInterval(80))
+        #expect(count == 2)
+    }
+
+    @Test func turnsThatEndedBeforeLaunchAreNotAnnounced() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.launchedAt = now.addingTimeInterval(-10)
+        store.upsert(finished(.kimiCode, endedAt: now.addingTimeInterval(-3600)))
+        store.noteIdleTurns(now: now.addingTimeInterval(600))
+        #expect(count == 0)
+    }
+
+    @Test func aClosedProcessIsNotWaiting() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(finished(.openCode, endedAt: now.addingTimeInterval(-90), alive: false))
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+
+    @Test func aTurnAnnouncedByTheQuestionRuleIsNotRemindedAgain() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        store.upsert(AgentSession(tool: .claudeCode, projectName: "p",
+                                  status: .waitingInput(prompt: "Which region?"),
+                                  lastActivityAt: now.addingTimeInterval(-90), processAlive: true))
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+
+    @Test func aDismissedTurnIsNotRemindedAgain() {
+        let store = store()
+        var count = 0
+        store.idleTurnHandler = { _ in count += 1 }
+        let now = Date.now
+        let waiting = AgentSession(tool: .claudeCode, projectName: "p",
+                                   status: .waitingInput(prompt: "Which region?"),
+                                   lastActivityAt: now.addingTimeInterval(-90), processAlive: true)
+        store.upsert(waiting)
+        store.acknowledge(waiting)
+        store.noteIdleTurns(now: now)
+        #expect(count == 0)
+    }
+}
+
+/// Codex 0.157 writes bulk record types the parser does not read
+/// (token_count, item_completed, reasoning, token_usage_record). When the
+/// last 64KB held only those, the tail parsed to nothing and discovery
+/// dropped the session, deleting its row and its alert history. Replayed
+/// against a real 48MB rollout that happened on about one poll in ten.
+struct CodexTailWindowTests {
+    private func rollout(_ lines: [String]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    @Test func aTailOfOnlyUnreadRecordsStillFindsTheTurn() throws {
+        let stamp = ISO8601DateFormatter().string(from: .now)
+        let done = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Shipped the fix."}}"#
+        let noise = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"token_count","info":{"pad":"\#(String(repeating: "x", count: 900))"}}}"#
+        let file = try rollout([done] + Array(repeating: noise, count: 90))
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let tail = try #require(ClaudeCodeMonitor.tail(of: file))
+        #expect(CodexSessionParser.parseDetails(tail: tail, now: .now) == nil,
+                "the fixture must reproduce the drop: nothing readable in 64KB")
+
+        let parsed = try #require(CodexMonitor.parsedStatus(of: file, tail: tail, now: .now))
+        #expect(parsed.status == .done(summary: "Shipped the fix."))
+    }
+
+    @Test func anOrdinaryTailDoesNotReadFurther() throws {
+        let stamp = ISO8601DateFormatter().string(from: .now)
+        let done = #"{"timestamp":"\#(stamp)","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Done."}}"#
+        let file = try rollout([done])
+        defer { try? FileManager.default.removeItem(at: file) }
+        let tail = try #require(ClaudeCodeMonitor.tail(of: file))
+        #expect(CodexMonitor.parsedStatus(of: file, tail: tail, now: .now)?.status == .done(summary: "Done."))
+    }
+}

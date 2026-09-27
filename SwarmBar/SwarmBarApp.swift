@@ -36,7 +36,9 @@ struct SwarmBarApp: App {
             let title: String
             if case .waitingApproval = session.status {
                 wantsIt = (defaults.object(forKey: "notifyApprovals") as? Bool) ?? true
-                title = "\(session.projectName) wants to run a command"
+                // Not "wants to run a command": AskUserQuestion also arrives
+                // through the permission hook, with the question as the body.
+                title = "\(session.projectName) needs your approval"
             } else {
                 wantsIt = (defaults.object(forKey: "notifyWaiting") as? Bool) ?? false
                 title = "\(session.projectName) is waiting on you"
@@ -51,6 +53,17 @@ struct SwarmBarApp: App {
             AgentNotifier.post(
                 title: title,
                 body: body,
+                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true,
+                sessionID: session.id
+            )
+        }
+        store.idleTurnHandler = { session in
+            let defaults = UserDefaults.standard
+            guard (defaults.object(forKey: "notifyWaiting") as? Bool) ?? false,
+                  case .done(let summary) = session.status else { return }
+            AgentNotifier.post(
+                title: "\(session.projectName) is waiting on you",
+                body: summary.isEmpty ? session.tool.label : summary,
                 sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true,
                 sessionID: session.id
             )

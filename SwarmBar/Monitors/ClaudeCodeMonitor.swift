@@ -99,12 +99,15 @@ struct ClaudeCodeMonitor: SessionMonitor {
     /// single record larger than the window would otherwise yield only a
     /// fragment and drop the session from discovery entirely. Reading from
     /// offset 0 always counts as complete.
-    nonisolated static func tail(of file: URL) -> String? {
+    ///
+    /// `start` lets a caller that found nothing readable in the default
+    /// window ask for a bigger one; the ceiling is the same either way.
+    nonisolated static func tail(of file: URL, startingAt start: Int = tailBytes) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd() else { return nil }
 
-        var window = UInt64(tailBytes)
+        var window = UInt64(min(start, maxTailBytes))
         while true {
             let offset = size > window ? size - window : 0
             try? handle.seek(toOffset: offset)
