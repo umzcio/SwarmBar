@@ -148,3 +148,32 @@ struct OpenCodeConfigTransformTests {
         }
     }
 }
+
+/// Kimi and BearCode print a UserPromptSubmit hook's stdout into the
+/// transcript (and hand it to the model as context), so the bridge's echoed
+/// "{}" showed up under every prompt. The fixed script only reaches users if
+/// the copy already installed in Application Support is refreshed.
+struct BridgeScriptRefreshTests {
+    @Test func anOutdatedInstalledScriptIsReplaced() {
+        #expect(IntegrationManager.refreshedScript(installed: "old", bundled: "new") == "new")
+    }
+
+    @Test func aCurrentScriptIsLeftAlone() {
+        #expect(IntegrationManager.refreshedScript(installed: "same", bundled: "same") == nil)
+    }
+
+    /// Never install on the user's behalf: no copy means the bridge was
+    /// never switched on, and creating one would be an opt-in they did not make.
+    @Test func aMissingScriptIsNotCreated() {
+        #expect(IntegrationManager.refreshedScript(installed: nil, bundled: "new") == nil)
+    }
+
+    /// The Kimi family never needs SwarmBar's reply: every event is
+    /// fire-and-forget and approvals go through the terminal.
+    @Test func theKimiBridgePrintsNothing() throws {
+        let url = try #require(Bundle.main.url(forResource: "swarmbar-kimi-hook", withExtension: "sh"))
+        let script = try String(contentsOf: url, encoding: .utf8)
+        let curl = try #require(script.components(separatedBy: "curl ").last)
+        #expect(curl.contains(">/dev/null") || curl.contains("> /dev/null"))
+    }
+}
