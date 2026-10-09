@@ -49,8 +49,8 @@ targets:
         # notifications, System Settings and Force Quit all fall back to a
         # blank placeholder. Regenerate with scripts/make-icon.sh.
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.1.7"
-        CFBundleVersion: "8"
+        CFBundleShortVersionString: "0.1.8"
+        CFBundleVersion: "9"
         # Sparkle. The feed is the appcast committed at the repo root, and
         # the key is the PUBLIC half of the EdDSA pair in the login
         # keychain; the private half never leaves this Mac and is what
