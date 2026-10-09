@@ -13,8 +13,12 @@ EVENT="$1"
 TOKEN_FILE="$HOME/Library/Application Support/SwarmBar/hook-token"
 TOKEN=""
 [ -r "$TOKEN_FILE" ] && TOKEN="$(cat "$TOKEN_FILE")"
+# SwarmBar's reply is discarded, never printed. Nothing in the Kimi family
+# needs it, and Kimi and BearCode show a UserPromptSubmit hook's stdout in
+# the transcript and pass it to the model as context, so an echoed "{}"
+# appeared under every prompt.
 curl -s --connect-timeout 1 -m 5 \
   -H "X-SwarmBar-Token: ${TOKEN}" \
   -X POST --data-binary @- \
-  "http://127.0.0.1:48620/hook/${EVENT}" 2>/dev/null || true
+  "http://127.0.0.1:48620/hook/${EVENT}" >/dev/null 2>&1 || true
 exit 0

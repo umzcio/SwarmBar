@@ -186,6 +186,44 @@ final class IntegrationManager {
     /// Copies a bundled script into Application Support and returns its
     /// installed location, so configs never point into the app bundle
     /// (which moves on every update).
+    /// The bridge scripts a toggle copies into Application Support.
+    nonisolated static let bridgeScripts = ["swarmbar-hook.sh", "swarmbar-kimi-hook.sh"]
+
+    /// The bundled script when an installed copy exists and differs from
+    /// it, otherwise nil. A missing copy stays missing: it means the bridge
+    /// was never switched on, and creating one would opt the user in.
+    nonisolated static func refreshedScript(installed: String?, bundled: String) -> String? {
+        guard let installed, installed != bundled else { return nil }
+        return bundled
+    }
+
+    /// Brings already-installed bridge scripts up to the bundled version at
+    /// launch. Only SwarmBar's own script files are touched, never an
+    /// agent's config: the toggle is the only thing that writes those, and
+    /// re-toggling would rewrite Kimi's config.toml, where one unrecognized
+    /// event name drops the whole hooks section. Without this, a fixed
+    /// script only reached users who happened to flip the toggle again.
+    nonisolated static func refreshInstalledScripts() {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SwarmBar")
+        for name in bridgeScripts {
+            let destination = dir.appendingPathComponent(name)
+            guard let source = Bundle.main.url(forResource: name, withExtension: nil),
+                  let bundled = try? String(contentsOf: source, encoding: .utf8),
+                  let updated = refreshedScript(
+                    installed: try? String(contentsOf: destination, encoding: .utf8),
+                    bundled: bundled)
+            else { continue }
+            do {
+                try updated.write(to: destination, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
+            } catch {
+                NSLog("SwarmBar: could not refresh \(name): \(error)")
+            }
+        }
+    }
+
     private func installScript(named name: String) throws -> URL {
         try fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
         let destination = appSupport.appendingPathComponent(name)

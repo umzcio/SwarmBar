@@ -22,6 +22,8 @@ struct SwarmBarApp: App {
         store.approvalResponder = hookServer
         hookServer.start()
         AgentNotifier.prepare()
+        // Off the main thread: it reads and may rewrite two small files.
+        Task.detached { IntegrationManager.refreshInstalledScripts() }
         // Clicking a banner brings you to the session it is about. The
         // popover cannot be opened programmatically without reaching into
         // MenuBarExtra's private status item, and the terminal is where
