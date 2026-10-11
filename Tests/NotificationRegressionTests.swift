@@ -427,3 +427,36 @@ struct CodexTailWindowTests {
         #expect(CodexMonitor.parsedStatus(of: file, tail: tail, now: .now)?.status == .done(summary: "Done."))
     }
 }
+
+/// A banner for a session the user is already looking at is noise. It is
+/// skipped only when that exact session is visible and the user is present;
+/// every doubt falls back to notifying.
+struct VisibleSessionSuppressionTests {
+    private func decide(tty: String? = "ttys004", front: Bool = true,
+                        visible: [String] = ["/dev/ttys004"], idle: TimeInterval = 5,
+                        locked: Bool = false) -> Bool {
+        TerminalFocuser.shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: front,
+            visibleTTYs: visible, secondsSinceInput: idle, screenLocked: locked)
+    }
+
+    @Test func theSessionOnScreenIsSkipped() { #expect(decide()) }
+
+    @Test func aSplitPaneInTheSameTabCountsAsVisible() {
+        #expect(decide(visible: ["/dev/ttys002", "/dev/ttys004"]))
+    }
+
+    @Test func aSessionInAnotherTabStillNotifies() {
+        #expect(!decide(visible: ["/dev/ttys002"]))
+    }
+
+    @Test func iTermNotInFrontStillNotifies() { #expect(!decide(front: false)) }
+
+    /// iTerm2 left in front while the user walked away must not swallow it.
+    @Test func anIdleUserStillGetsTheBanner() { #expect(!decide(idle: 61)) }
+
+    @Test func aLockedScreenStillGetsTheBanner() { #expect(!decide(locked: true)) }
+
+    /// No tty means the terminal could not be identified (or the session is
+    /// remote), so there is no evidence the user is looking at it.
+    @Test func anUnknownTerminalStillNotifies() { #expect(!decide(tty: nil)) }
+}

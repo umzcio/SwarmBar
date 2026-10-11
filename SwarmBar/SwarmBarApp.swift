@@ -52,23 +52,18 @@ struct SwarmBarApp: App {
             case .waitingInput(let prompt): body = prompt.isEmpty ? session.tool.label : prompt
             default: return
             }
-            AgentNotifier.post(
-                title: title,
-                body: body,
-                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true,
-                sessionID: session.id
-            )
+            let sound = (defaults.object(forKey: "notifySound") as? Bool) ?? true
+            Self.postUnlessOnScreen(session, title: title, body: body, sound: sound)
         }
         store.idleTurnHandler = { session in
             let defaults = UserDefaults.standard
             guard (defaults.object(forKey: "notifyWaiting") as? Bool) ?? false,
                   case .done(let summary) = session.status else { return }
-            AgentNotifier.post(
+            Self.postUnlessOnScreen(
+                session,
                 title: "\(session.projectName) is waiting on you",
                 body: summary.isEmpty ? session.tool.label : summary,
-                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true,
-                sessionID: session.id
-            )
+                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true)
         }
         // Real monitors by default; --mock replays the prototype simulation
         // so the demo mode survives.
@@ -101,6 +96,21 @@ struct SwarmBarApp: App {
         Settings {
             SettingsView()
                 .environment(store)
+        }
+    }
+}
+
+extension SwarmBarApp {
+    /// Posts a banner unless the user is already looking at that session's
+    /// terminal. Off the main thread: finding the tty and asking iTerm2 for
+    /// its current tab are both process launches.
+    nonisolated static func postUnlessOnScreen(
+        _ session: AgentSession, title: String, body: String, sound: Bool
+    ) {
+        let id = session.id, path = session.projectPath, isLocal = session.host == nil
+        Task.detached {
+            if isLocal, TerminalFocuser.isSessionOnScreen(sessionID: id, projectPath: path) { return }
+            AgentNotifier.post(title: title, body: body, sound: sound, sessionID: id)
         }
     }
 }

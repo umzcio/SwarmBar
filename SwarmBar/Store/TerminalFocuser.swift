@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Focuses the terminal tab actually hosting a Claude Code session:
@@ -308,9 +309,56 @@ enum TerminalFocuser {
         }
     }
 
+    // MARK: - Is the user already looking at it
+
+    /// Whether a banner for this session would only repeat what is on
+    /// screen. True only when the session's own terminal sits in the current
+    /// tab of the frontmost iTerm2 window (a split pane in that tab counts),
+    /// and the user is evidently there: input within the last minute and the
+    /// screen unlocked. Every doubt falls back to notifying, since a missed
+    /// prompt costs more than a redundant banner.
+    nonisolated static func shouldSkipBanner(
+        sessionTTY: String?, frontmostIsITerm: Bool, visibleTTYs: [String],
+        secondsSinceInput: TimeInterval, screenLocked: Bool
+    ) -> Bool {
+        guard let sessionTTY, frontmostIsITerm, !screenLocked,
+              secondsSinceInput <= 60 else { return false }
+        return visibleTTYs.contains("/dev/\(sessionTTY)")
+    }
+
+    /// Live inputs for shouldSkipBanner. Local sessions only: a remote
+    /// session's terminal cannot be matched to a tab on this Mac.
+    nonisolated static func isSessionOnScreen(sessionID: UUID, projectPath: URL?) -> Bool {
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.googlecode.iterm2"
+        guard front, let tty = tty(forSession: sessionID, projectPath: projectPath) else { return false }
+        let locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        let anyInput = CGEventType(rawValue: UInt32.max)!
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
+        return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: front,
+            visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
+    }
+
+    /// The ttys of every pane in the current tab of the frontmost window.
+    private nonisolated static func visibleTTYs() -> [String] {
+        guard isRunning("iTerm2") else { return [] }
+        let script = """
+        tell application "iTerm2"
+          if (count of windows) is 0 then return ""
+          set out to ""
+          repeat with s in sessions of current tab of current window
+            set out to out & (tty of s) & linefeed
+          end repeat
+          return out
+        end tell
+        """
+        return (run("/usr/bin/osascript", ["-e", script]) ?? "")
+            .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     // MARK: - Session -> tty
 
-    private nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
+    nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
         let pid = claudePid(forSession: id)
             ?? grokPid(forSession: id)
             ?? codexPid(forSession: id)
