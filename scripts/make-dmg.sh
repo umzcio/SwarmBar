@@ -41,7 +41,15 @@ rm -rf "$STAGE"
 #
 # This invalidates any notarization ticket already stapled to the dmg, so
 # it must happen before notarizing, never after.
-IDENTITY="${CODESIGN_IDENTITY:-Developer ID Application}"
+#
+# Sign with the same team project.yml signs the app with. The bare name
+# "Developer ID Application" is ambiguous as soon as the keychain holds a
+# second Developer ID certificate, and codesign then refuses to pick one, so
+# the identity is chosen by team id. CODESIGN_IDENTITY still overrides.
+TEAM="$(awk '/DEVELOPMENT_TEAM:/ { print $2; exit }' "$ROOT/project.yml")"
+IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning \
+    | awk -v team="($TEAM)\"" '/Developer ID Application/ && index($0, team) { print $2; exit }')}"
+[ -n "$IDENTITY" ] || { echo "error: no Developer ID Application identity for team $TEAM"; exit 1; }
 echo "==> Signing the disk image"
 codesign --sign "$IDENTITY" --timestamp "$DMG"
 codesign --verify --strict "$DMG"
