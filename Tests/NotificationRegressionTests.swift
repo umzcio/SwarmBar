@@ -460,3 +460,100 @@ struct VisibleSessionSuppressionTests {
     /// remote), so there is no evidence the user is looking at it.
     @Test func anUnknownTerminalStillNotifies() { #expect(!decide(tty: nil)) }
 }
+
+/// Ghostty exposes no tty, only each terminal's working directory and id,
+/// so a session is matched to its terminal by directory.
+struct GhosttyTerminalTests {
+    private let terminals: [TerminalFocuser.GhosttyTerminal] = [
+        .init(id: "A", directory: "/Users/z/GitHub/zMail"),
+        .init(id: "B", directory: "/Users/z/GitHub/HIEM-CRM"),
+        .init(id: "C", directory: "/Users/z/GitHub/HIEM-CRM/"),
+    ]
+
+    @Test func matchesTheSessionsDirectory() {
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil,
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/zMail"), in: terminals)?.id == "A")
+    }
+
+    @Test func aTrailingSlashDoesNotMatter() {
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil,
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/zMail/"), in: terminals)?.id == "A")
+    }
+
+    /// Two terminals in one project: either is the right project, so focus
+    /// the first rather than refusing. Nothing is typed into it.
+    @Test func severalInOneDirectoryPicksTheFirst() {
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil,
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/HIEM-CRM"), in: terminals)?.id == "B")
+    }
+
+    @Test func noMatchIsNil() {
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil,
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/Other"), in: terminals) == nil)
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil, projectPath: nil, in: terminals) == nil)
+    }
+
+    /// Terminal.app only when neither iTerm2 nor Ghostty is installed.
+    /// Falling back to it sent Ghostty users somewhere they do not work.
+    @Test func fallbackNeverPicksTerminalWhenAnotherIsInstalled() {
+        typealias F = TerminalFocuser
+        #expect(F.preferredTerminal(iTermRunning: true, ghosttyInstalled: true) == .iTerm)
+        #expect(F.preferredTerminal(iTermRunning: false, ghosttyInstalled: true) == .ghostty)
+        #expect(F.preferredTerminal(iTermRunning: false, ghosttyInstalled: false) == .terminal)
+    }
+
+    @Test func theGhosttyTabOnScreenIsSkipped() {
+        let zMail = TerminalFocuser.GhosttyTerminal(id: "A", directory: "/Users/z/GitHub/zMail/")
+        let crm = TerminalFocuser.GhosttyTerminal(id: "B", directory: "/Users/z/GitHub/HIEM-CRM")
+        func skip(_ dir: String?, _ visible: [TerminalFocuser.GhosttyTerminal], idle: TimeInterval = 5) -> Bool {
+            TerminalFocuser.shouldSkipBanner(sessionTTY: nil, sessionDirectory: dir, frontmostIsGhostty: true,
+                visible: visible, secondsSinceInput: idle, screenLocked: false)
+        }
+        #expect(skip("/Users/z/GitHub/zMail", [zMail]))
+        #expect(!skip("/Users/z/GitHub/zMail", [crm]))
+        #expect(!skip("/Users/z/GitHub/zMail", [zMail], idle: 90))
+        #expect(!skip(nil, [zMail]))
+    }
+
+    // Ghostty 1.4 adds a tty property (ghostty-org/ghostty#11922). Where it
+    // is present it identifies the exact terminal, which a directory cannot
+    // when two terminals share a project; on 1.3 it is absent and the
+    // directory is used as before.
+
+    @Test func aTTYPicksTheExactTerminalInASharedDirectory() {
+        let both: [TerminalFocuser.GhosttyTerminal] = [
+            .init(id: "B", directory: "/p/crm", tty: "/dev/ttys003"),
+            .init(id: "C", directory: "/p/crm", tty: "/dev/ttys008"),
+        ]
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: "ttys008",
+            projectPath: URL(fileURLWithPath: "/p/crm"), in: both)?.id == "C")
+    }
+
+    @Test func withoutATTYTheDirectoryIsUsed() {
+        let old: [TerminalFocuser.GhosttyTerminal] = [.init(id: "A", directory: "/p/mail")]
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: "ttys008",
+            projectPath: URL(fileURLWithPath: "/p/mail"), in: old)?.id == "A")
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: nil,
+            projectPath: URL(fileURLWithPath: "/p/mail"), in: old)?.id == "A")
+    }
+
+    /// When Ghostty does report ttys, a tty that matches none of them means
+    /// the session is not in Ghostty at all, so a same-named directory must
+    /// not stand in for it.
+    @Test func aKnownTTYThatMatchesNothingDoesNotFallBackToTheDirectory() {
+        let new: [TerminalFocuser.GhosttyTerminal] = [.init(id: "A", directory: "/p/mail", tty: "/dev/ttys001")]
+        #expect(TerminalFocuser.ghosttyTarget(sessionTTY: "ttys009",
+            projectPath: URL(fileURLWithPath: "/p/mail"), in: new) == nil)
+    }
+
+    @Test func onScreenUsesTheTTYWhenGhosttyReportsOne() {
+        let other = TerminalFocuser.GhosttyTerminal(id: "B", directory: "/p/crm", tty: "/dev/ttys003")
+        let mine = TerminalFocuser.GhosttyTerminal(id: "C", directory: "/p/crm", tty: "/dev/ttys008")
+        func skip(_ visible: [TerminalFocuser.GhosttyTerminal]) -> Bool {
+            TerminalFocuser.shouldSkipBanner(sessionTTY: "ttys008", sessionDirectory: "/p/crm",
+                frontmostIsGhostty: true, visible: visible, secondsSinceInput: 5, screenLocked: false)
+        }
+        #expect(skip([mine]))
+        #expect(!skip([other]), "same directory, different terminal: still notify")
+    }
+}
