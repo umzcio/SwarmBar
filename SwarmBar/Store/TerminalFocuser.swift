@@ -18,12 +18,133 @@ enum TerminalFocuser {
         // `open -a` on a regular file hands the file to the terminal to
         // RUN, so only ever pass a real directory. Project paths can come
         // from a hook payload, which is not trusted input.
+        // Ghostty exposes no tty, so its terminal is found by the session's
+        // working directory instead.
+        if ghosttyRunning(),
+           let target = ghosttyTarget(projectPath: projectPath, in: ghosttyTerminals()),
+           runScript(ghosttyFocusScript(id: target.id)) == "FOCUSED" {
+            return
+        }
         guard let path = projectPath?.path, isDirectory(path) else { return }
-        // iTerm2 first, because it is the terminal every other path here
-        // targets and the one the app documents as required. Falling back
-        // to Terminal.app landed people somewhere they do not work.
-        if isRunning("iTerm2"), run("/usr/bin/open", ["-a", "iTerm", path]) != nil { return }
-        _ = run("/usr/bin/open", ["-a", "Terminal", path])
+        // The terminal the user actually works in. Terminal.app only when
+        // neither iTerm2 nor Ghostty is installed: falling back to it sent
+        // people somewhere they do not work.
+        switch preferredTerminal(iTermRunning: isRunning("iTerm2"), ghosttyInstalled: ghosttyInstalled()) {
+        case .iTerm:    _ = run("/usr/bin/open", ["-a", "iTerm", path])
+        case .ghostty:  _ = runScript(ghosttyNewWindowScript(path: path))
+        case .terminal: _ = run("/usr/bin/open", ["-a", "Terminal", path])
+        }
+    }
+
+    // MARK: - Ghostty
+
+    enum PreferredTerminal: Equatable, Sendable { case iTerm, ghostty, terminal }
+
+    struct GhosttyTerminal: Equatable, Sendable {
+        let id: String
+        let directory: String
+    }
+
+    nonisolated static let ghosttyBundleID = "com.mitchellh.ghostty"
+
+    nonisolated static func preferredTerminal(iTermRunning: Bool, ghosttyInstalled: Bool) -> PreferredTerminal {
+        if iTermRunning { return .iTerm }
+        return ghosttyInstalled ? .ghostty : .terminal
+    }
+
+    /// Trailing slashes and symlinks do not make two directories different.
+    nonisolated static func normalizedDirectory(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// The Ghostty terminal whose working directory is the session's
+    /// project. Several in one project are all the right project, so the
+    /// first is focused rather than none; nothing is ever typed into it.
+    nonisolated static func ghosttyTarget(projectPath: URL?, in terminals: [GhosttyTerminal]) -> GhosttyTerminal? {
+        guard let projectPath else { return nil }
+        let want = normalizedDirectory(projectPath.path)
+        return terminals.first { normalizedDirectory($0.directory) == want }
+    }
+
+    /// By bundle id rather than pgrep, which does not reliably match
+    /// Ghostty's process name.
+    nonisolated static func ghosttyRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: ghosttyBundleID).isEmpty
+    }
+
+    nonisolated static func ghosttyInstalled() -> Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: ghosttyBundleID) != nil
+    }
+
+    private nonisolated static func ghosttyTerminals() -> [GhosttyTerminal] {
+        // `character id 9` rather than `tab`, which inside this tell block
+        // means Ghostty's tab class, not the tab character.
+        let script = """
+        tell application "Ghostty"
+          set out to ""
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in terminals of t
+                set out to out & (id of s) & (character id 9) & (working directory of s) & linefeed
+              end repeat
+            end repeat
+          end repeat
+          return out
+        end tell
+        """
+        return (run("/usr/bin/osascript", ["-e", script]) ?? "")
+            .split(separator: "\n").compactMap { line in
+                let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+                guard parts.count == 2, !parts[1].isEmpty else { return nil }
+                return GhosttyTerminal(id: parts[0], directory: parts[1])
+            }
+    }
+
+    nonisolated static func ghosttyFocusScript(id: String) -> String {
+        """
+        tell application "Ghostty"
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in terminals of t
+                if (id of s) is "\(AppleScriptLiteral.escape(id))" then
+                  focus s
+                  activate
+                  return "FOCUSED"
+                end if
+              end repeat
+            end repeat
+          end repeat
+          return "MISS"
+        end tell
+        """
+    }
+
+    nonisolated static func ghosttyNewWindowScript(path: String) -> String {
+        """
+        tell application "Ghostty"
+          set cfg to new surface configuration
+          set initial working directory of cfg to "\(AppleScriptLiteral.escape(path))"
+          new window with configuration cfg
+          activate
+        end tell
+        """
+    }
+
+    /// Working directories of every split in the frontmost window's
+    /// selected tab.
+    private nonisolated static func ghosttyVisibleDirectories() -> [String] {
+        let script = """
+        tell application "Ghostty"
+          if (count of windows) is 0 then return ""
+          set out to ""
+          repeat with s in terminals of (selected tab of front window)
+            set out to out & (working directory of s) & linefeed
+          end repeat
+          return out
+        end tell
+        """
+        return (run("/usr/bin/osascript", ["-e", script]) ?? "")
+            .split(separator: "\n").map(String.init).filter { !$0.isEmpty }
     }
 
     nonisolated static func isDirectory(_ path: String) -> Bool {
@@ -321,21 +442,49 @@ enum TerminalFocuser {
         sessionTTY: String?, frontmostIsITerm: Bool, visibleTTYs: [String],
         secondsSinceInput: TimeInterval, screenLocked: Bool
     ) -> Bool {
-        guard let sessionTTY, frontmostIsITerm, !screenLocked,
-              secondsSinceInput <= 60 else { return false }
+        guard let sessionTTY, frontmostIsITerm,
+              userIsPresent(secondsSinceInput: secondsSinceInput, screenLocked: screenLocked)
+        else { return false }
         return visibleTTYs.contains("/dev/\(sessionTTY)")
+    }
+
+    /// The Ghostty form, matched by working directory since Ghostty exposes
+    /// no tty. Same presence rules as the iTerm2 form.
+    nonisolated static func shouldSkipBanner(
+        sessionDirectory: String?, frontmostIsGhostty: Bool, visibleDirectories: [String],
+        secondsSinceInput: TimeInterval, screenLocked: Bool
+    ) -> Bool {
+        guard let sessionDirectory, frontmostIsGhostty,
+              userIsPresent(secondsSinceInput: secondsSinceInput, screenLocked: screenLocked)
+        else { return false }
+        let want = normalizedDirectory(sessionDirectory)
+        return visibleDirectories.contains { normalizedDirectory($0) == want }
+    }
+
+    /// Input within the last minute and the screen unlocked. A terminal
+    /// left in front while the user walked away must not swallow a banner.
+    nonisolated static func userIsPresent(secondsSinceInput: TimeInterval, screenLocked: Bool) -> Bool {
+        !screenLocked && secondsSinceInput <= 60
     }
 
     /// Live inputs for shouldSkipBanner. Local sessions only: a remote
     /// session's terminal cannot be matched to a tab on this Mac.
     nonisolated static func isSessionOnScreen(sessionID: UUID, projectPath: URL?) -> Bool {
-        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.googlecode.iterm2"
-        guard front, let tty = tty(forSession: sessionID, projectPath: projectPath) else { return false }
+        let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
         let anyInput = CGEventType(rawValue: UInt32.max)!
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
-        return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: front,
-            visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
+        switch frontmost {
+        case "com.googlecode.iterm2":
+            guard let tty = tty(forSession: sessionID, projectPath: projectPath) else { return false }
+            return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: true,
+                visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
+        case ghosttyBundleID:
+            return shouldSkipBanner(sessionDirectory: projectPath?.path, frontmostIsGhostty: true,
+                visibleDirectories: ghosttyVisibleDirectories(), secondsSinceInput: idle, screenLocked: locked)
+        default:
+            return false
+        }
     }
 
     /// The ttys of every pane in the current tab of the frontmost window.

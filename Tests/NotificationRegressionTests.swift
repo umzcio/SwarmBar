@@ -460,3 +460,60 @@ struct VisibleSessionSuppressionTests {
     /// remote), so there is no evidence the user is looking at it.
     @Test func anUnknownTerminalStillNotifies() { #expect(!decide(tty: nil)) }
 }
+
+/// Ghostty exposes no tty, only each terminal's working directory and id,
+/// so a session is matched to its terminal by directory.
+struct GhosttyTerminalTests {
+    private let terminals: [TerminalFocuser.GhosttyTerminal] = [
+        .init(id: "A", directory: "/Users/z/GitHub/zMail"),
+        .init(id: "B", directory: "/Users/z/GitHub/HIEM-CRM"),
+        .init(id: "C", directory: "/Users/z/GitHub/HIEM-CRM/"),
+    ]
+
+    @Test func matchesTheSessionsDirectory() {
+        #expect(TerminalFocuser.ghosttyTarget(
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/zMail"), in: terminals)?.id == "A")
+    }
+
+    @Test func aTrailingSlashDoesNotMatter() {
+        #expect(TerminalFocuser.ghosttyTarget(
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/zMail/"), in: terminals)?.id == "A")
+    }
+
+    /// Two terminals in one project: either is the right project, so focus
+    /// the first rather than refusing. Nothing is typed into it.
+    @Test func severalInOneDirectoryPicksTheFirst() {
+        #expect(TerminalFocuser.ghosttyTarget(
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/HIEM-CRM"), in: terminals)?.id == "B")
+    }
+
+    @Test func noMatchIsNil() {
+        #expect(TerminalFocuser.ghosttyTarget(
+            projectPath: URL(fileURLWithPath: "/Users/z/GitHub/Other"), in: terminals) == nil)
+        #expect(TerminalFocuser.ghosttyTarget(projectPath: nil, in: terminals) == nil)
+    }
+
+    /// Terminal.app only when neither iTerm2 nor Ghostty is installed.
+    /// Falling back to it sent Ghostty users somewhere they do not work.
+    @Test func fallbackNeverPicksTerminalWhenAnotherIsInstalled() {
+        typealias F = TerminalFocuser
+        #expect(F.preferredTerminal(iTermRunning: true, ghosttyInstalled: true) == .iTerm)
+        #expect(F.preferredTerminal(iTermRunning: false, ghosttyInstalled: true) == .ghostty)
+        #expect(F.preferredTerminal(iTermRunning: false, ghosttyInstalled: false) == .terminal)
+    }
+
+    @Test func theGhosttyTabOnScreenIsSkipped() {
+        #expect(TerminalFocuser.shouldSkipBanner(
+            sessionDirectory: "/Users/z/GitHub/zMail", frontmostIsGhostty: true,
+            visibleDirectories: ["/Users/z/GitHub/zMail/"], secondsSinceInput: 5, screenLocked: false))
+        #expect(!TerminalFocuser.shouldSkipBanner(
+            sessionDirectory: "/Users/z/GitHub/zMail", frontmostIsGhostty: true,
+            visibleDirectories: ["/Users/z/GitHub/HIEM-CRM"], secondsSinceInput: 5, screenLocked: false))
+        #expect(!TerminalFocuser.shouldSkipBanner(
+            sessionDirectory: "/Users/z/GitHub/zMail", frontmostIsGhostty: true,
+            visibleDirectories: ["/Users/z/GitHub/zMail"], secondsSinceInput: 90, screenLocked: false))
+        #expect(!TerminalFocuser.shouldSkipBanner(
+            sessionDirectory: nil, frontmostIsGhostty: true,
+            visibleDirectories: ["/"], secondsSinceInput: 5, screenLocked: false))
+    }
+}
