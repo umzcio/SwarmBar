@@ -8,8 +8,8 @@ import Foundation
 /// the project directory in a new Terminal window.
 enum TerminalFocuser {
     nonisolated static func focus(sessionID: UUID, projectPath: URL?) {
-        if let tty = tty(forSession: sessionID, projectPath: projectPath),
-           focusRunningTerminal(device: "/dev/\(tty)") {
+        let sessionTTY = tty(forSession: sessionID, projectPath: projectPath)
+        if let sessionTTY, focusRunningTerminal(device: "/dev/\(sessionTTY)") {
             return
         }
         // Nothing to focus: no live process for this session, so open the
@@ -18,10 +18,11 @@ enum TerminalFocuser {
         // `open -a` on a regular file hands the file to the terminal to
         // RUN, so only ever pass a real directory. Project paths can come
         // from a hook payload, which is not trusted input.
-        // Ghostty exposes no tty, so its terminal is found by the session's
-        // working directory instead.
+        // Ghostty: by tty where it reports one (1.4+), otherwise by the
+        // session's working directory.
         if ghosttyRunning(),
-           let target = ghosttyTarget(projectPath: projectPath, in: ghosttyTerminals()),
+           let target = ghosttyTarget(sessionTTY: sessionTTY, projectPath: projectPath,
+                                      in: ghosttyTerminals()),
            runScript(ghosttyFocusScript(id: target.id)) == "FOCUSED" {
             return
         }
@@ -43,6 +44,15 @@ enum TerminalFocuser {
     struct GhosttyTerminal: Equatable, Sendable {
         let id: String
         let directory: String
+        /// "/dev/ttysNNN" on Ghostty 1.4 and later, which added the property
+        /// (ghostty-org/ghostty#11922); nil on 1.3.
+        let tty: String?
+
+        init(id: String, directory: String, tty: String? = nil) {
+            self.id = id
+            self.directory = directory
+            self.tty = tty
+        }
     }
 
     nonisolated static let ghosttyBundleID = "com.mitchellh.ghostty"
@@ -57,10 +67,18 @@ enum TerminalFocuser {
         URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    /// The Ghostty terminal whose working directory is the session's
-    /// project. Several in one project are all the right project, so the
-    /// first is focused rather than none; nothing is ever typed into it.
-    nonisolated static func ghosttyTarget(projectPath: URL?, in terminals: [GhosttyTerminal]) -> GhosttyTerminal? {
+    /// The session's Ghostty terminal. By tty when Ghostty reports ttys
+    /// (1.4+): exact, even with several terminals in one project, and a tty
+    /// that matches none means the session is not in Ghostty at all, so a
+    /// same-named directory does not stand in. Otherwise by working
+    /// directory, where several in one project are all the right project and
+    /// the first is focused; nothing is ever typed into it.
+    nonisolated static func ghosttyTarget(
+        sessionTTY: String?, projectPath: URL?, in terminals: [GhosttyTerminal]
+    ) -> GhosttyTerminal? {
+        if let sessionTTY, terminals.contains(where: { $0.tty != nil }) {
+            return terminals.first { $0.tty == "/dev/\(sessionTTY)" }
+        }
         guard let projectPath else { return nil }
         let want = normalizedDirectory(projectPath.path)
         return terminals.first { normalizedDirectory($0.directory) == want }
@@ -85,7 +103,13 @@ enum TerminalFocuser {
           repeat with w in windows
             repeat with t in tabs of w
               repeat with s in terminals of t
-                set out to out & (id of s) & (character id 9) & (working directory of s) & linefeed
+                -- tty exists from Ghostty 1.4; on 1.3 the lookup fails
+                -- inside try and stays empty.
+                set tt to ""
+                try
+                  set tt to (tty of s)
+                end try
+                set out to out & (id of s) & (character id 9) & tt & (character id 9) & (working directory of s) & linefeed
               end repeat
             end repeat
           end repeat
@@ -94,9 +118,11 @@ enum TerminalFocuser {
         """
         return (run("/usr/bin/osascript", ["-e", script]) ?? "")
             .split(separator: "\n").compactMap { line in
-                let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
-                guard parts.count == 2, !parts[1].isEmpty else { return nil }
-                return GhosttyTerminal(id: parts[0], directory: parts[1])
+                let parts = line.split(separator: "\t", maxSplits: 2,
+                                       omittingEmptySubsequences: false).map(String.init)
+                guard parts.count == 3, !parts[2].isEmpty else { return nil }
+                return GhosttyTerminal(id: parts[0], directory: parts[2],
+                                       tty: parts[1].isEmpty ? nil : parts[1])
             }
     }
 
@@ -130,21 +156,29 @@ enum TerminalFocuser {
         """
     }
 
-    /// Working directories of every split in the frontmost window's
-    /// selected tab.
-    private nonisolated static func ghosttyVisibleDirectories() -> [String] {
+    /// Every split in the frontmost window's selected tab.
+    private nonisolated static func ghosttyVisibleTerminals() -> [GhosttyTerminal] {
         let script = """
         tell application "Ghostty"
           if (count of windows) is 0 then return ""
           set out to ""
           repeat with s in terminals of (selected tab of front window)
-            set out to out & (working directory of s) & linefeed
+            set tt to ""
+            try
+              set tt to (tty of s)
+            end try
+            set out to out & tt & (character id 9) & (working directory of s) & linefeed
           end repeat
           return out
         end tell
         """
         return (run("/usr/bin/osascript", ["-e", script]) ?? "")
-            .split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+            .split(separator: "\n").compactMap { line in
+                let parts = line.split(separator: "\t", maxSplits: 1,
+                                       omittingEmptySubsequences: false).map(String.init)
+                guard parts.count == 2, !parts[1].isEmpty else { return nil }
+                return GhosttyTerminal(id: "", directory: parts[1], tty: parts[0].isEmpty ? nil : parts[0])
+            }
     }
 
     nonisolated static func isDirectory(_ path: String) -> Bool {
@@ -448,17 +482,18 @@ enum TerminalFocuser {
         return visibleTTYs.contains("/dev/\(sessionTTY)")
     }
 
-    /// The Ghostty form, matched by working directory since Ghostty exposes
-    /// no tty. Same presence rules as the iTerm2 form.
+    /// The Ghostty form: by tty when Ghostty reports ttys (1.4+), otherwise
+    /// by working directory. Same presence rules as the iTerm2 form.
     nonisolated static func shouldSkipBanner(
-        sessionDirectory: String?, frontmostIsGhostty: Bool, visibleDirectories: [String],
-        secondsSinceInput: TimeInterval, screenLocked: Bool
+        sessionTTY: String?, sessionDirectory: String?, frontmostIsGhostty: Bool,
+        visible: [GhosttyTerminal], secondsSinceInput: TimeInterval, screenLocked: Bool
     ) -> Bool {
-        guard let sessionDirectory, frontmostIsGhostty,
+        guard frontmostIsGhostty,
               userIsPresent(secondsSinceInput: secondsSinceInput, screenLocked: screenLocked)
         else { return false }
-        let want = normalizedDirectory(sessionDirectory)
-        return visibleDirectories.contains { normalizedDirectory($0) == want }
+        return ghosttyTarget(sessionTTY: sessionTTY,
+                             projectPath: sessionDirectory.map { URL(fileURLWithPath: $0) },
+                             in: visible) != nil
     }
 
     /// Input within the last minute and the screen unlocked. A terminal
@@ -480,8 +515,10 @@ enum TerminalFocuser {
             return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: true,
                 visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
         case ghosttyBundleID:
-            return shouldSkipBanner(sessionDirectory: projectPath?.path, frontmostIsGhostty: true,
-                visibleDirectories: ghosttyVisibleDirectories(), secondsSinceInput: idle, screenLocked: locked)
+            return shouldSkipBanner(
+                sessionTTY: tty(forSession: sessionID, projectPath: projectPath),
+                sessionDirectory: projectPath?.path, frontmostIsGhostty: true,
+                visible: ghosttyVisibleTerminals(), secondsSinceInput: idle, screenLocked: locked)
         default:
             return false
         }
