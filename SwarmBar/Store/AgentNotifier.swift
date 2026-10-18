@@ -96,6 +96,7 @@ private final class ClickDelegate: NSObject, UNUserNotificationCenterDelegate, @
     ) {
         let raw = response.notification.request.content.userInfo["sessionID"] as? String
         completionHandler()
+        FocusLog.log.notice("click received, sessionID=\(raw ?? "none", privacy: .public)")
         guard let raw, let id = UUID(uuidString: raw) else { return }
         Task { @MainActor in AgentNotifier.onClick?(id) }
     }

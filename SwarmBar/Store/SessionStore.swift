@@ -734,7 +734,10 @@ final class SessionStore {
     /// nothing for a remote session is strictly better than focusing a
     /// same-named local directory and implying it is the session in question.
     func openInTerminal(_ session: AgentSession) {
-        guard Self.canOpenInTerminal(session) else { return }
+        guard Self.canOpenInTerminal(session) else {
+            FocusLog.log.notice("open: skipped, remote session on \(session.host ?? "?", privacy: .public)")
+            return
+        }
         let id = session.id
         let path = session.projectPath
         Task.detached {
