@@ -6,10 +6,21 @@ import Foundation
 /// pid -> tty via ps, tty -> tab by scripting iTerm2 or Terminal (only
 /// when already running, so nothing gets launched). Falls back to opening
 /// the project directory in a new Terminal window.
+import os
+
+/// Each step of a banner click, so a click that seems to do nothing can be
+/// traced: `log show --predicate 'subsystem == "app.swarmbar.SwarmBar"'`.
+enum FocusLog {
+    nonisolated static let log = Logger(subsystem: "app.swarmbar.SwarmBar", category: "focus")
+}
+
 enum TerminalFocuser {
     nonisolated static func focus(sessionID: UUID, projectPath: URL?) {
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         let sessionTTY = tty(forSession: sessionID, projectPath: projectPath)
+        FocusLog.log.notice("focus: path=\(projectPath?.path ?? "none", privacy: .public) tty=\(sessionTTY ?? "none", privacy: .public) frontmost=\(front, privacy: .public)")
         if let sessionTTY, focusRunningTerminal(device: "/dev/\(sessionTTY)") {
+            FocusLog.log.notice("focus: done via iTerm2/Terminal tty match")
             return
         }
         // Nothing to focus: no live process for this session, so open the
@@ -20,11 +31,20 @@ enum TerminalFocuser {
         // from a hook payload, which is not trusted input.
         // Ghostty: by tty where it reports one (1.4+), otherwise by the
         // session's working directory.
-        if ghosttyRunning(),
-           let target = ghosttyTarget(sessionTTY: sessionTTY, projectPath: projectPath,
-                                      in: ghosttyTerminals()),
-           runScript(ghosttyFocusScript(id: target.id)) == "FOCUSED" {
-            return
+        if ghosttyRunning() {
+            let terminals = ghosttyTerminals()
+            let target = ghosttyTarget(sessionTTY: sessionTTY, projectPath: projectPath, in: terminals)
+            FocusLog.log.notice("focus: ghostty terminals=\(terminals.count) target=\(target?.id ?? "none", privacy: .public)")
+            if let target {
+                let result = runScript(ghosttyFocusScript(id: target.id)) ?? "nil (script failed)"
+                FocusLog.log.notice("focus: ghostty script returned \(result, privacy: .public)")
+                if result == "FOCUSED" {
+                    bringForward(bundleID: ghosttyBundleID)
+                    return
+                }
+            }
+        } else {
+            FocusLog.log.notice("focus: ghostty not running")
         }
         guard let path = projectPath?.path, isDirectory(path) else { return }
         // The terminal the user actually works in. Terminal.app only when
@@ -32,9 +52,28 @@ enum TerminalFocuser {
         // people somewhere they do not work.
         switch preferredTerminal(iTermRunning: isRunning("iTerm2"), ghosttyInstalled: ghosttyInstalled()) {
         case .iTerm:    _ = run("/usr/bin/open", ["-a", "iTerm", path])
-        case .ghostty:  _ = runScript(ghosttyNewWindowScript(path: path))
+        case .ghostty:
+            _ = runScript(ghosttyNewWindowScript(path: path))
+            bringForward(bundleID: ghosttyBundleID)
         case .terminal: _ = run("/usr/bin/open", ["-a", "Terminal", path])
         }
+    }
+
+    /// Brings a terminal to the front through LaunchServices, after its own
+    /// script has already selected the right window, tab and split.
+    ///
+    /// The scripts end in AppleScript `activate`, which macOS 27 refuses when
+    /// the request comes from a background app: SwarmBar is a menu bar app,
+    /// so clicking a banner left the terminal selected but behind whatever
+    /// the user was in, and the click looked like it did nothing. A
+    /// LaunchServices open is honored from the same position, verified live
+    /// from a background job with Ghostty behind Finder. It raises the app's
+    /// key window, which is the one the script just selected.
+    private nonisolated static func bringForward(bundleID: String) {
+        _ = run("/usr/bin/open", ["-b", bundleID])
+        Thread.sleep(forTimeInterval: 0.5)
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+        FocusLog.log.notice("focus: brought \(bundleID, privacy: .public) forward, frontmost now \(front, privacy: .public)")
     }
 
     // MARK: - Ghostty
@@ -733,9 +772,11 @@ enum TerminalFocuser {
 
     private nonisolated static func focusRunningTerminal(device: String) -> Bool {
         if isRunning("iTerm2"), runScript(iTermScript(device: device)) == "FOCUSED" {
+            bringForward(bundleID: "com.googlecode.iterm2")
             return true
         }
         if isRunning("Terminal"), runScript(terminalScript(device: device)) == "FOCUSED" {
+            bringForward(bundleID: "com.apple.Terminal")
             return true
         }
         return false

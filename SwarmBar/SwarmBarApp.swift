@@ -29,7 +29,10 @@ struct SwarmBarApp: App {
         // MenuBarExtra's private status item, and the terminal is where
         // the agent is waiting anyway.
         AgentNotifier.onClick = { [weak store] id in
-            guard let session = store?.sessions.first(where: { $0.id == id }) else { return }
+            guard let session = store?.sessions.first(where: { $0.id == id }) else {
+                FocusLog.log.notice("click: session \(id.uuidString, privacy: .public) is no longer in the store")
+                return
+            }
             store?.openInTerminal(session)
         }
         store.attentionAlertHandler = { session in
