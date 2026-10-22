@@ -101,7 +101,10 @@ struct GeneralSettingsTab: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
-                    .frame(width: 168)
+                    // The control's own width (188pt on macOS 27). A fixed
+                    // frame narrower than that does not shrink it, it lets it
+                    // spill past the card's edge.
+                    .fixedSize()
                 }
                 SettingsDivider()
                 SettingsToggleRow(
