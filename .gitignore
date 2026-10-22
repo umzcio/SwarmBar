@@ -16,3 +16,6 @@ docs/
 
 # Notarization credentials. The key itself lives outside the repo.
 scripts/.notary-config.local
+
+# Brainstorm mockups and agent scratch (hold real host names)
+.superpowers/
