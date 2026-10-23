@@ -325,7 +325,7 @@ struct IdleTurnReminderTests {
         var count = 0
         store.idleTurnHandler = { _ in count += 1 }
         let now = Date.now
-        store.upsert(finished(.claudeCode, endedAt: now.addingTimeInterval(-90), host: "umzcaio"))
+        store.upsert(finished(.claudeCode, endedAt: now.addingTimeInterval(-90), host: "devbox"))
         store.noteIdleTurns(now: now)
         #expect(count == 1)
     }

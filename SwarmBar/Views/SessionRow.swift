@@ -168,7 +168,7 @@ enum SessionRowInteraction {
     /// A remote session's terminal is on another host, and the failure is
     /// not merely that nothing happens. TerminalFocuser matches a local
     /// process by cwd, and the fleet includes a macOS host whose paths are
-    /// /Users/zach/... , the same shape as this Mac's, so a same-named
+    /// /Users/u/... , the same shape as this Mac's, so a same-named
     /// directory here is enough for `open -a iTerm` to take you somewhere
     /// and imply it is the session you asked for. Phase 1a is status only
     /// for remote rows; gating Approve and Deny too keeps phase 3 from

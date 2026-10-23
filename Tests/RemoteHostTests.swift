@@ -14,8 +14,8 @@ struct RemoteHostTests {
     func roundTrips() throws {
         let defaults = try scratchDefaults(#function)
         let hosts = [
-            RemoteHost(alias: "umzcaio.ts", displayName: "umzcaio"),
-            RemoteHost(alias: "umzflash.ts", displayName: "umzflash", isEnabled: false),
+            RemoteHost(alias: "devbox.ts", displayName: "devbox"),
+            RemoteHost(alias: "alpha.ts", displayName: "alpha", isEnabled: false),
         ]
         RemoteHostStore.save(hosts, to: defaults)
         #expect(RemoteHostStore.load(from: defaults) == hosts)
@@ -36,7 +36,7 @@ struct RemoteHostTests {
 
     @Test("display name defaults to the alias with its .ts suffix removed")
     func displayNameDefault() {
-        #expect(RemoteHost(alias: "umzcaio.ts").displayName == "umzcaio")
-        #expect(RemoteHost(alias: "umzcaio").displayName == "umzcaio")
+        #expect(RemoteHost(alias: "devbox.ts").displayName == "devbox")
+        #expect(RemoteHost(alias: "devbox").displayName == "devbox")
     }
 }

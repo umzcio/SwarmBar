@@ -783,10 +783,10 @@ class ProtocolTests(unittest.TestCase):
 
 PS_SAMPLE = (
     "    1     0 0 root     ?        systemd         /sbin/init splash\n"
-    "  500     1 1000 zach     pts/1    tmux: server    tmux new -s work\n"
-    "  610   500 1000 zach     pts/2    bash            -bash\n"
-    "  700   610 1000 zach     pts/2    claude          claude --resume abc --model x\n"
-    "  800     1 1000 zach     ?        node            node /home/z/bearcode-cli/apps/kimi-code/dist/main.mjs --yolo\n"
+    "  500     1 1000 u        pts/1    tmux: server    tmux new -s work\n"
+    "  610   500 1000 u        pts/2    bash            -bash\n"
+    "  700   610 1000 u        pts/2    claude          claude --resume abc --model x\n"
+    "  800     1 1000 u        ?        node            node /home/z/bearcode-cli/apps/kimi-code/dist/main.mjs --yolo\n"
 )
 
 
@@ -848,7 +848,7 @@ class ProcessTableTests(unittest.TestCase):
         self.assertEqual([r for r in rows if r["pid"] == 1][0]["tty"], "")
 
     def test_parse_ps_takes_basename_of_a_path_comm(self):
-        rows = helper.parse_ps("  9  1 1000 zach ttys001 /opt/bin/codex codex exec go\n")
+        rows = helper.parse_ps("  9  1 1000 u ttys001 /opt/bin/codex codex exec go\n")
         self.assertEqual(rows[0]["comm"], "codex")
         self.assertEqual(rows[0]["args"], "codex exec go")
 
@@ -979,9 +979,9 @@ class ProcessTableTests(unittest.TestCase):
         self.assertTrue(table[0]["open_failed"])
 
     def test_darwin_truncated_comm_resolved_from_argv0(self):
-        ps = ("  30  1 1000 zach ttys001 /Users/zach/.loc /Users/zach/.local/bin/claude --resume\n"
-              "  31  1 1000 zach ttys002 /Users/zach/.cod /Users/zach/.codex/bin/codex exec\n"
-              "  32  1 1000 zach ttys003 /Users/zach/.loc /Users/zach/.local/bin/other --x\n")
+        ps = ("  30  1 1000 u ttys001 /Users/u/.local/ /Users/u/.local/bin/claude --resume\n"
+              "  31  1 1000 u ttys002 /Users/u/.codex/ /Users/u/.codex/bin/codex exec\n"
+              "  32  1 1000 u ttys003 /Users/u/.local/ /Users/u/.local/bin/other --x\n")
         table, _ = self.run_table(FakeRunner(ps=ps))
         self.assertEqual(sorted((p["pid"], p["comm"]) for p in table),
                          [(30, "claude"), (31, "codex")])

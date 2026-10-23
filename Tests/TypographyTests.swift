@@ -135,11 +135,11 @@ struct SessionRowInteractionTests {
 
     @Test func aRemoteRowNeverOpensALocalTerminal() {
         // The path exists on the far host, and on the fleet's macOS host it
-        // has the same /Users/zach/... shape as this Mac's, so opening it
+        // has the same /Users/u/... shape as this Mac's, so opening it
         // here could land in a real local directory and imply it is the
         // session that was asked for.
         #expect(!SessionRowInteraction.attachesDoubleClick(
-            enabled: true, hasProjectPath: true, host: "umzcaio"))
+            enabled: true, hasProjectPath: true, host: "devbox"))
     }
 }
 
@@ -152,8 +152,8 @@ struct LocalTerminalActionTests {
 
     @Test("a remote session offers none of them")
     func remoteDenies() {
-        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "umzcaio"))
-        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "umzmac"))
+        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "devbox"))
+        #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: "beta"))
         // Even an empty host string is a host: a row that carries one at
         // all came from a remote snapshot.
         #expect(!SessionRowInteraction.allowsLocalTerminalActions(host: ""))

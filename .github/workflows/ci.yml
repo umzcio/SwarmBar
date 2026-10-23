@@ -60,10 +60,13 @@ jobs:
       # rule that is otherwise enforced by remembering it, which is how the
       # README ended up advertising six tools the day the seventh shipped.
       # Scoped to compiled source and docs, so the superseded phase-1 sketch
-      # at the repo root is out of scope rather than excluded by name.
+      # at the repo root is out of scope rather than excluded by name. The
+      # :(glob) magic is what makes ** match any depth, the top level
+      # included; without it a pathspec's * already crosses slashes and **/
+      # demands one more directory, so it matched no test file at all.
       - name: No em dashes
         run: |
-          if git ls-files '*.md' 'SwarmBar/**/*.swift' 'Tests/**/*.swift' \
+          if git ls-files '*.md' ':(glob)SwarmBar/**/*.swift' ':(glob)Tests/**/*.swift' \
             | xargs grep -n '—' ; then
             echo "::error::Em dash found. Use a comma, a colon, or a full stop."
             exit 1
