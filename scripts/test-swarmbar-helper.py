@@ -24,6 +24,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1601,11 +1602,11 @@ class HookRelayTests(unittest.TestCase):
         self.assertIsNotNone(event)
         return client, event
 
-    def test_forked_setup_serves_and_follows(self):
-        # Root forks each home step and drops to the owner. Run as an
-        # ordinary user here, the drop is to this same uid, but the fork and
-        # the descriptors passed back are the real thing.
-        with mock.patch.object(helper, "HOOK_FORK", True):
+    def test_step_child_setup_serves_and_follows(self):
+        # As root each home step runs in a child started as the owner. Run
+        # as an ordinary user here the child keeps this uid, but the child
+        # and the descriptors passed back are the real thing.
+        with mock.patch.object(helper, "STEP_CHILD", True):
             owner, owner_sink = self.relay()
             follower, follower_sink = self.relay()
             self.assertEqual(self.hub(owner).role, "owner")
@@ -1620,7 +1621,55 @@ class HookRelayTests(unittest.TestCase):
 
     def test_source_never_changes_ownership(self):
         with open(helper.__file__) as handle:
-            self.assertNotRegex(handle.read(), r"chown\s*\(")
+            source = handle.read()
+        self.assertNotRegex(source, r"chown\s*\(")
+        # A fork of a threaded process can deadlock in the child, and python
+        # 3.12 warns about it on stderr, which the Mac reads as the failure.
+        self.assertNotRegex(source, r"os\.fork\s*\(")
+
+    def test_step_children_print_nothing(self):
+        # The real script, twice, as owner and follower, with the step
+        # children switched on as they are under root.
+        env = dict(os.environ, SWARMBAR_HELPER_HOMES=self.home, SWARMBAR_HELPER_STEP_CHILD="1")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        procs, sinks, readers = [], [], []
+        try:
+            for _ in range(2):
+                proc = subprocess.Popen(
+                    [sys.executable, script], env=env, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                sink = EventSink()
+                reader = threading.Thread(
+                    target=lambda p=proc, k=sink: [k.write(line.decode()) for line in p.stdout])
+                reader.start()
+                procs.append(proc)
+                sinks.append(sink)
+                readers.append(reader)
+                self.assertTrue(wait_until(lambda: os.path.exists(self.sock_path)))
+            # Posts until the follower, connected through its own step
+            # child, has relayed one.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not sinks[1].matching(is_hook("/hook/Stop")):
+                self.assertEqual(read_response(self.post("Stop", {}))[2], {})
+                time.sleep(0.05)
+            for sink in sinks:
+                self.assertTrue(sink.matching(is_hook("/hook/Stop")))
+            errors = []
+            for proc in procs:
+                proc.stdin.close()
+                errors.append(proc.stderr.read())
+                proc.wait(10)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            for reader in readers:
+                reader.join(5)
+            for proc in procs:
+                proc.stdout.close()
+                proc.stderr.close()
+        self.assertEqual(errors, [b"", b""])
 
     def test_hardlinked_lock_is_refused_and_never_chowned(self):
         target = os.path.join(self.home, "someone-elses-file")
@@ -1628,8 +1677,8 @@ class HookRelayTests(unittest.TestCase):
             handle.write("keep")
         os.link(target, os.path.join(self.bridge_dir, "hook.lock"))
         refuse = mock.Mock(side_effect=AssertionError("ownership changed"))
-        for fork in (False, True):
-            with mock.patch.object(helper, "HOOK_FORK", fork), \
+        for child in (False, True):
+            with mock.patch.object(helper, "STEP_CHILD", child), \
                     mock.patch.object(os, "chown", refuse), \
                     mock.patch.object(os, "fchown", refuse), \
                     mock.patch.object(os, "lchown", refuse):
@@ -1731,6 +1780,30 @@ class HookRelayTests(unittest.TestCase):
         client, event = self.hold_one(relay, sink, {"session_id": "claude-1"})
         relay.handle_reply({"rid": event["rid"], "body": self.DECISION})
         self.assertEqual(read_response(client)[2], self.DECISION)
+
+    def test_unseen_hold_is_answered_at_once(self):
+        # This helper's Mac cannot take the event and nobody follows, so no
+        # one can answer: waiting out the hold would only stall the agent.
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        blocked = EventSink()
+        blocked.gate = gate
+        with mock.patch.object(helper, "EMIT_QUEUE_SIZE", 1):
+            relay, _ = self.relay(blocked)
+        read_response(self.post("Stop", {"n": 1}))
+        self.assertTrue(wait_until(lambda: relay.queue.qsize() == 0))
+        read_response(self.post("Stop", {"n": 2}))
+        self.assertTrue(wait_until(lambda: relay.queue.qsize() == 1))
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        self.assertEqual(read_response(client, timeout=2)[2], {})
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_session_named_by_any_grok_session_entry_is_never_held(self):
+        path = os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-file")
+        os.makedirs(os.path.dirname(path))
+        open(path, "w").close()
+        relay, sink = self.relay()
+        self.assert_answered_at_once(relay, sink, {"session_id": "g-file"})
 
     def test_session_with_a_grok_session_dir_is_never_held(self):
         os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))

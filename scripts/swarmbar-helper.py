@@ -1273,8 +1273,8 @@ def handle_tmux(request):
 # exits.
 #
 # Running as root, the helper never creates, binds or changes anything in a
-# user's home itself. Each of those steps runs in a forked child that has
-# become the home's owner, and the child hands back only file descriptors.
+# user's home itself. Each of those steps runs in a child process started as
+# the home's owner, and the child hands back only file descriptors.
 # Done as root, a user could hardlink a root-owned file in as hook.lock for
 # root to hand over, or swap ~/.swarmbar for a link between a check and a
 # bind.
@@ -1299,10 +1299,142 @@ def handle_tmux(request):
 # request for a decision, so a Mac shows Approve only when an answer can
 # still land, and false when it was already answered {} (not holdable, a
 # Grok refusal, unreadable Grok state, the hold cap). Replays carry true.
-HOOK_DIR = ".swarmbar"
+
+# The steps that act inside a home, as python source. Run as root, they run
+# in a child started with `python3 -I -S -c STEP_SOURCE <step> <dir> <fd>`
+# that is already the home's owner (uid, gid and its groups, umask 177), and
+# hand back descriptors over the socketpair whose number is <fd>. Run as
+# the owner, the same text is exec'd once into _STEPS and called
+# in-process. Inline source, because under root the helper file is root's,
+# mode 700, and the child cannot read it. exec, not fork, because a fork of
+# this threaded process can deadlock in the child on any lock another
+# thread held, and python 3.12 says so on stderr.
+STEP_SOURCE = r'''
+import os
+import socket
+import stat
+import sys
+
 HOOK_SOCKET = "hook.sock"
 BROKER_SOCKET = "broker.sock"
 HOOK_LOCK = "hook.lock"
+
+
+class StepError(Exception):
+    """A home whose sockets cannot be set up, with the reason."""
+
+
+def step_prepare(directory, umask_lock):
+    """~/.swarmbar (700, this user's own, never through a link) and its
+    lock file. Returns [directory fd, lock fd]."""
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
+    try:
+        info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise StepError(".swarmbar is not a directory")
+        if info.st_uid != os.geteuid():
+            raise StepError(".swarmbar has another owner")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(dir_fd, 0o700)
+        lock_fd = os.open(HOOK_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+                          dir_fd=dir_fd)
+        lock = os.fstat(lock_fd)
+        # A second link is someone else's file wearing this name.
+        if not stat.S_ISREG(lock.st_mode) or lock.st_uid != os.geteuid() \
+                or lock.st_nlink != 1:
+            os.close(lock_fd)
+            raise StepError("%s is not this user's own file" % HOOK_LOCK)
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return [dir_fd, lock_fd]
+
+
+def step_bind(directory, umask_lock):
+    """Removes whatever a crashed owner left and binds both sockets, 600 by
+    umask: the child's was set when it started, and in-process it is set
+    here under the lock, since a umask is process-wide. Returns
+    [hook fd, broker fd], listening."""
+    fds = []
+    try:
+        for name in (HOOK_SOCKET, BROKER_SOCKET):
+            path = os.path.join(directory, name)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                if umask_lock is None:
+                    sock.bind(path)
+                else:
+                    with umask_lock:
+                        previous = os.umask(0o177)
+                        try:
+                            sock.bind(path)
+                        finally:
+                            os.umask(previous)
+                sock.listen(16)
+            except BaseException:
+                sock.close()
+                raise
+            fds.append(sock.detach())
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+    return fds
+
+
+def step_connect(directory, umask_lock):
+    """A connection to the owner's broker. Returns [fd]."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(os.path.join(directory, BROKER_SOCKET))
+    except BaseException:
+        sock.close()
+        raise
+    return [sock.detach()]
+
+
+BY_KIND = {"prepare": step_prepare, "bind": step_bind, "connect": step_connect}
+
+
+def run_child(argv):
+    """The child's whole life: one step, its descriptors or its error back
+    to the parent, and nothing on any standard stream."""
+    channel = socket.socket(fileno=int(argv[3]))
+    try:
+        step = BY_KIND.get(argv[1])
+        if step is None:
+            raise StepError("unknown step")
+        socket.send_fds(channel, [b"ok"], step(argv[2], None))
+    except Exception as error:
+        text = getattr(error, "strerror", None) or str(error)
+        try:
+            channel.sendall(("error:" + text).encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+
+if __name__ == "__main__" and len(sys.argv) == 4:
+    run_child(sys.argv)
+'''
+
+_STEPS = {"__name__": "swarmbar_steps"}
+exec(compile(STEP_SOURCE, "<swarmbar-steps>", "exec"), _STEPS)
+STEP_BY_KIND = _STEPS["BY_KIND"]
+StepError = _STEPS["StepError"]
+
+
+HOOK_DIR = ".swarmbar"
+HOOK_SOCKET = _STEPS["HOOK_SOCKET"]
+BROKER_SOCKET = _STEPS["BROKER_SOCKET"]
+HOOK_LOCK = _STEPS["HOOK_LOCK"]
 
 # A home with any of these installed is a hook home and gets a socket.
 HOOK_MARKERS = (
@@ -1348,10 +1480,11 @@ MAX_BROKER_LINE = 8 * 1024 * 1024
 EMIT_QUEUE_SIZE = 256
 # sun_path is 104 bytes on Darwin and 108 on Linux, NUL included.
 MAX_SOCKET_PATH = 103
-# None forks a child for each home step exactly when running as root. Tests
-# set True to run the forked path as an ordinary user.
-HOOK_FORK = None
-# A forked step that has not answered by then is killed.
+# None runs each home step in a child exactly when running as root. True runs
+# the child path as an ordinary user, for tests; SWARMBAR_HELPER_STEP_CHILD=1
+# sets it for a whole helper process.
+STEP_CHILD = True if os.environ.get("SWARMBAR_HELPER_STEP_CHILD") == "1" else None
+# A step child that has not answered by then is killed.
 USER_STEP_SECONDS = 5
 GROK_INDEX_MAX_BYTES = 4 * 1024 * 1024
 
@@ -1359,9 +1492,8 @@ HOOK_PATH = re.compile(r"^/hook/([A-Za-z0-9_]+)$")
 GROK_SESSION_KEYS = ("id", "session_id", "sessionId", "sessionID")
 
 # os.umask is process-wide. Binding under a tight umask creates each socket
-# 600 from the start, with no chmod by path afterwards. A forked child is
-# single-threaded and sets it without this lock, which another thread may
-# have held at the fork.
+# 600 from the start, with no chmod by path afterwards. A step child starts
+# with that umask and needs no lock.
 _UMASK_LOCK = threading.Lock()
 
 
@@ -1447,7 +1579,10 @@ def grok_session(home, session_id):
         return False
     except OSError:
         return True
-    return any(os.path.isdir(os.path.join(sessions, name, session_id)) for name in directories)
+    # lexists, like the Swift fileExists: any entry by that name counts,
+    # even a dangling link.
+    return any(os.path.lexists(os.path.join(sessions, name, session_id))
+               for name in directories)
 
 
 def peer_pid(sock):
@@ -1569,8 +1704,8 @@ def error_text(error):
 
 
 def supplementary_groups(user, gid):
-    """The owner's groups, computed before any fork: NSS lookups are not
-    safe in the child of a threaded process."""
+    """The owner's groups, always passed to the child: left out, it would
+    keep root's."""
     try:
         groups = os.getgrouplist(user, gid)
     except (OSError, KeyError, TypeError):
@@ -1582,148 +1717,61 @@ def supplementary_groups(user, gid):
     return groups[:max(limit, 1)]
 
 
-def run_as_user(owner, step):
-    """Runs step(in_child) as the home's owner and returns the descriptors it
-    produced.
+def run_as_user(owner, kind, directory):
+    """Runs one step ("prepare", "bind" or "connect") as the home's owner
+    and returns the descriptors it produced.
 
-    As root, or when HOOK_FORK is set, the step runs in a forked child that
-    drops to the owner (groups, then gid, then uid, the only order that
-    works) and passes the descriptors back over a socketpair. Otherwise the
-    helper already is the owner, or the home is not its to serve.
+    As root, or when STEP_CHILD is set, the step runs in a child python
+    started as the owner, which passes the descriptors back over a
+    socketpair. Otherwise the helper already is the owner and runs the same
+    step in-process, or the home is not its to serve.
     """
     user, uid, gid = owner
-    fork = HOOK_FORK if HOOK_FORK is not None else os.geteuid() == 0
-    if not fork:
-        if os.geteuid() != uid:
-            raise HookHomeError("home has another owner")
-        return step(False)
-    groups = supplementary_groups(user, gid)
+    root = os.geteuid() == 0
+    child_path = STEP_CHILD if STEP_CHILD is not None else root
+    if not root and os.geteuid() != uid:
+        raise HookHomeError("home has another owner")
+    if not child_path:
+        try:
+            return STEP_BY_KIND[kind](directory, _UMASK_LOCK)
+        except StepError as error:
+            raise HookHomeError(str(error))
+    ids = {}
+    if root:
+        ids = {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    pid = os.fork()
-    if pid == 0:
-        # Only system calls from here: no imports, no locks another thread
-        # might have held at the fork, and no exit handlers.
-        try:
-            parent.close()
-            if os.geteuid() == 0:
-                os.setgroups(groups)
-                os.setgid(gid)
-                os.setuid(uid)
-            if os.geteuid() != uid or os.getuid() != uid:
-                raise HookHomeError("cannot act as the home's owner")
-            fds = step(True)
-            socket.send_fds(child, [b"ok"], fds)
-        except BaseException as error:
-            try:
-                child.sendall(("error:" + error_text(error)).encode("utf-8", "replace"))
-            except BaseException:
-                pass
-        finally:
-            os._exit(0)
-    child.close()
     try:
-        parent.settimeout(USER_STEP_SECONDS)
         try:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", STEP_SOURCE, kind, directory,
+                 str(child.fileno())],
+                umask=0o177, cwd="/", env={"PATH": "/usr/bin:/bin"},
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, pass_fds=(child.fileno(),), close_fds=True,
+                **ids)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise HookHomeError("cannot start a step as the owner: %s" % error_text(error))
+        finally:
+            child.close()
+        try:
+            parent.settimeout(USER_STEP_SECONDS)
             data, fds, _, _ = socket.recv_fds(parent, 4096, 8)
-        except socket.timeout:
-            os.kill(pid, 9)
-            raise HookHomeError("setup did not finish")
+        except (socket.timeout, OSError) as error:
+            proc.kill()
+            proc.wait()
+            raise HookHomeError("step did not finish: %s" % error_text(error))
     finally:
         parent.close()
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
+    try:
+        proc.wait(USER_STEP_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
     if data != b"ok":
         for fd in fds:
             os.close(fd)
-        raise HookHomeError(data.decode("utf-8", "replace")[len("error:"):] or "setup failed")
+        raise HookHomeError(data.decode("utf-8", "replace")[len("error:"):] or "step failed")
     return fds
-
-
-def step_prepare(directory):
-    """~/.swarmbar (700, this user's own, never through a link) and its
-    lock file. Returns [directory fd, lock fd]."""
-    def step(in_child):
-        try:
-            os.mkdir(directory, 0o700)
-        except FileExistsError:
-            pass
-        dir_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
-        try:
-            info = os.fstat(dir_fd)
-            if not stat_module.S_ISDIR(info.st_mode):
-                raise HookHomeError("%s is not a directory" % HOOK_DIR)
-            if info.st_uid != os.geteuid():
-                raise HookHomeError("%s has another owner" % HOOK_DIR)
-            if stat_module.S_IMODE(info.st_mode) != 0o700:
-                os.fchmod(dir_fd, 0o700)
-            lock_fd = os.open(HOOK_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
-                              dir_fd=dir_fd)
-            lock = os.fstat(lock_fd)
-            # A second link is someone else's file wearing this name.
-            if not stat_module.S_ISREG(lock.st_mode) or lock.st_uid != os.geteuid() \
-                    or lock.st_nlink != 1:
-                os.close(lock_fd)
-                raise HookHomeError("%s is not this user's own file" % HOOK_LOCK)
-        except BaseException:
-            os.close(dir_fd)
-            raise
-        return [dir_fd, lock_fd]
-    return step
-
-
-def step_bind(directory):
-    """Removes whatever a crashed owner left and binds both sockets, 600 by
-    umask. Returns [hook fd, broker fd], listening."""
-    def step(in_child):
-        fds = []
-        try:
-            for name in (HOOK_SOCKET, BROKER_SOCKET):
-                path = os.path.join(directory, name)
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    if in_child:
-                        previous = os.umask(0o177)
-                        try:
-                            sock.bind(path)
-                        finally:
-                            os.umask(previous)
-                    else:
-                        with _UMASK_LOCK:
-                            previous = os.umask(0o177)
-                            try:
-                                sock.bind(path)
-                            finally:
-                                os.umask(previous)
-                    sock.listen(16)
-                except BaseException:
-                    sock.close()
-                    raise
-                fds.append(sock.detach())
-        except BaseException:
-            for fd in fds:
-                os.close(fd)
-            raise
-        return fds
-    return step
-
-
-def step_connect(directory):
-    """A connection to the owner's broker. Returns [fd]."""
-    def step(in_child):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.connect(os.path.join(directory, BROKER_SOCKET))
-        except BaseException:
-            sock.close()
-            raise
-        return [sock.detach()]
-    return step
 
 
 def read_lines(sock, stopping):
@@ -1939,7 +1987,7 @@ class HookHome(object):
         if self.uid is None:
             raise HookHomeError("cannot examine home")
         try:
-            self.dir_fd, self.lock_fd = run_as_user(self.owner(), step_prepare(self.directory))
+            self.dir_fd, self.lock_fd = run_as_user(self.owner(), "prepare", self.directory)
         except (OSError, HookHomeError) as error:
             raise HookHomeError(error_text(error))
         with self.transition:
@@ -1968,7 +2016,7 @@ class HookHome(object):
         The caller holds `transition`."""
         if self.closing:
             return
-        fds = run_as_user(self.owner(), step_bind(self.directory))
+        fds = run_as_user(self.owner(), "bind", self.directory)
         servers = []
         for fd, name, handler in zip(fds, (HOOK_SOCKET, BROKER_SOCKET),
                                      (HookHandler, BrokerHandler)):
@@ -2031,7 +2079,7 @@ class HookHome(object):
 
     def connect_broker(self):
         try:
-            (fd,) = run_as_user(self.owner(), step_connect(self.directory))
+            (fd,) = run_as_user(self.owner(), "connect", self.directory)
         except (OSError, HookHomeError, ValueError):
             return None
         conn = socket.socket(fileno=fd)
@@ -2129,11 +2177,13 @@ class HookHome(object):
             return len(self.followers)
 
     def broadcast(self, messages):
-        """Sends messages to every follower in one write each. One that
-        cannot take it in BROKER_SEND_TIMEOUT is dropped, and reconnects."""
+        """Sends messages to every follower in one write each, and returns
+        how many took them. One that cannot take them in BROKER_SEND_TIMEOUT
+        is dropped, and reconnects."""
         data = encode_lines(messages)
         with self.lock:
             followers = list(self.followers.items())
+        delivered = 0
         for conn, send_lock in followers:
             failed = False
             with send_lock:
@@ -2144,12 +2194,17 @@ class HookHome(object):
             if failed:
                 drop_connection(conn)
                 self.remove_follower(conn)
+            else:
+                delivered += 1
+        return delivered
 
     def publish(self, message, held=False):
         """To every follower first, then queued for this helper's Mac, so a
-        Mac that is not reading delays nobody."""
-        self.broadcast(([{"type": "held", "rid": message["rid"]}] if held else []) + [message])
-        self.relay.emit(message)
+        Mac that is not reading delays nobody. Returns whether any Mac will
+        see it."""
+        delivered = self.broadcast(
+            ([{"type": "held", "rid": message["rid"]}] if held else []) + [message])
+        return self.relay.emit(message) or delivered > 0
 
     def resolve(self, rid, body):
         """Answers a held request with the first reply to reach it. True
@@ -2229,7 +2284,10 @@ class HookHome(object):
             handler.answer({})
             self.publish(message)
             return
-        self.publish(message, held=True)
+        if not self.publish(message, held=True):
+            # No Mac will ever see this request, so none can answer it, and
+            # waiting out the hold would only stall the agent.
+            self.resolve(rid, {})
         gone = False
         while not held.done.is_set():
             remaining = deadline - time.monotonic()
@@ -2323,11 +2381,14 @@ class HookRelay(object):
         writer.start()
 
     def emit(self, message):
+        """Queues an event for this helper's Mac. False when it was dropped."""
         try:
             self.queue.put_nowait(message)
+            return True
         except queue.Full:
             with self.lock:
                 self.dropped += 1
+            return False
 
     def drain(self):
         while True:
