@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum AgentTool: String, CaseIterable, Identifiable, Sendable {
+enum AgentTool: String, CaseIterable, Identifiable, Codable, Sendable {
     case claudeCode, codex, kimiCode, bearCode, openCode, grokBuild, antigravity
     var id: String { rawValue }
 
