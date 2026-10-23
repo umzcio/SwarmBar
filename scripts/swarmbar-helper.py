@@ -772,8 +772,25 @@ def parse_ps(text):
     return rows
 
 
-def is_agent(row):
-    return row["comm"] in AGENT_COMMANDS or BEARCODE_ARGS in row["args"]
+def agent_name(row):
+    """The agent a ps row is, or None.
+
+    On Darwin `comm` is a full path truncated to 16 characters
+    (/Users/zach/.loc), so its basename can be garbage and an agent started by
+    absolute path would silently vanish from the table. When comm's basename
+    is not an agent, argv[0] (the first token of args) is tried instead.
+    BearCode is a bare node process and is recognised by its script path.
+    """
+    if row["comm"] in AGENT_COMMANDS:
+        return row["comm"]
+    if BEARCODE_ARGS in row["args"]:
+        return "bearcode"
+    tokens = row["args"].split(None, 1)
+    if tokens:
+        name = tokens[0].split("/")[-1]
+        if name in AGENT_COMMANDS:
+            return name
+    return None
 
 
 def tmux_sockets():
@@ -846,12 +863,13 @@ def pane_for(pid, parents, panes):
 
 
 def proc_fd_links(pid):
+    """Link targets of a pid's fds, or None when the directory is unreadable."""
     links = []
     base = "/proc/%d/fd" % pid
     try:
         names = os.listdir(base)
     except OSError:
-        return links
+        return None
     for name in names:
         try:
             links.append(os.readlink(os.path.join(base, name)))
@@ -861,7 +879,11 @@ def proc_fd_links(pid):
 
 
 def held_files(comm, pid):
-    """Files a codex or agy process holds open, which name its session."""
+    """(paths, ok) for files a codex or agy process holds open.
+
+    ok is False when the read itself failed, so a failure never reads as
+    "holds nothing".
+    """
     if comm == "codex":
         def wanted(path):
             return path.endswith(".jsonl") and "/.codex/sessions/" in path
@@ -869,17 +891,21 @@ def held_files(comm, pid):
         def wanted(path):
             return path.endswith(".lock") and "/presence/" in path
     else:
-        return []
+        return [], True
     if platform.system() == "Darwin":
         try:
             out = run_command(["lsof", "-n", "-P", "-a", "-p", str(pid), "-Fn"])
         except (OSError, subprocess.SubprocessError):
-            return []
+            return [], False
+        if out.returncode != 0 and not out.stdout.strip():
+            return [], False
         text = out.stdout.decode("utf-8", "replace")
         links = [line[1:] for line in text.splitlines() if line.startswith("n")]
     else:
         links = proc_fd_links(pid)
-    return [path for path in links if wanted(path)]
+        if links is None:
+            return [], False
+    return [path for path in links if wanted(path)], True
 
 
 def pane_screen(pane):
@@ -911,8 +937,19 @@ def agent_processes(warnings):
         ))
         return None
 
-    rows = parse_ps(completed.stdout.decode("utf-8", "replace"))
-    agents = [row for row in rows if is_agent(row)]
+    text = completed.stdout.decode("utf-8", "replace")
+    rows = parse_ps(text)
+    if not rows and text.strip():
+        # A real ps always lists at least itself. Output nothing parses is a
+        # failure, not "no agents".
+        warnings.append("ps output could not be parsed")
+        return None
+    agents = []
+    for row in rows:
+        name = agent_name(row)
+        if name:
+            row["comm"] = name
+            agents.append(row)
     panes = tmux_panes() if agents else {}
     parents = dict((row["pid"], row["ppid"]) for row in rows)
     processes = []
@@ -920,10 +957,14 @@ def agent_processes(warnings):
         pid = row["pid"]
         pane = pane_for(pid, parents, panes)
         entry = dict(row)
+        paths, ok = held_files(row["comm"], pid)
+        if not ok:
+            warnings.append("cannot read open files of pid %d" % pid)
+            entry["open_failed"] = True
         entry.update({
             "cwd": process_cwd(pid),
             "pane": pane,
-            "open": held_files(row["comm"], pid),
+            "open": paths,
             "screen": pane_screen(pane) if pane and row["comm"] == "agy" else None,
         })
         processes.append(entry)

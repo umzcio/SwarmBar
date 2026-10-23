@@ -778,7 +778,7 @@ class ProcessTableTests(unittest.TestCase):
         pids = sorted(p["pid"] for p in table)
         self.assertEqual(pids, [700, 800])
         bear = [p for p in table if p["pid"] == 800][0]
-        self.assertEqual(bear["comm"], "node")
+        self.assertEqual(bear["comm"], "bearcode")
         self.assertIn("bearcode-cli/apps/kimi-code/dist/main.mjs", bear["args"])
 
     def test_pane_found_through_ancestry(self):
@@ -854,6 +854,44 @@ class ProcessTableTests(unittest.TestCase):
                 mock.patch.object(helper, "proc_fd_links", return_value=links):
             table, _ = self.run_table(FakeRunner(ps=ps))
         self.assertEqual(table[0]["open"], ["/h/.codex/sessions/r.jsonl"])
+        self.assertFalse(table[0].get("open_failed", False))
+
+    def test_unreadable_fd_dir_is_flagged_not_empty(self):
+        ps = "  10  1 z pts/1 codex codex\n"
+        with mock.patch.object(helper.platform, "system", return_value="Linux"), \
+                mock.patch.object(helper, "proc_fd_links", return_value=None):
+            table, warnings = self.run_table(FakeRunner(ps=ps))
+        self.assertTrue(table[0]["open_failed"])
+        self.assertTrue([w for w in warnings if "10" in w])
+
+    def test_lsof_failure_is_flagged(self):
+        ps = "  10  1 z ttys1 codex codex\n"
+        def runner(argv, timeout=5):
+            if argv[0] == "lsof":
+                raise OSError("gone")
+            return FakeRunner(ps=ps)(argv, timeout)
+        with mock.patch.object(helper.platform, "system", return_value="Darwin"):
+            table, _ = self.run_table(runner)
+        self.assertTrue(table[0]["open_failed"])
+
+    def test_darwin_truncated_comm_resolved_from_argv0(self):
+        ps = ("  30  1 zach ttys001 /Users/zach/.loc /Users/zach/.local/bin/claude --resume\n"
+              "  31  1 zach ttys002 /Users/zach/.cod /Users/zach/.codex/bin/codex exec\n"
+              "  32  1 zach ttys003 /Users/zach/.loc /Users/zach/.local/bin/other --x\n")
+        table, _ = self.run_table(FakeRunner(ps=ps))
+        self.assertEqual(sorted((p["pid"], p["comm"]) for p in table),
+                         [(30, "claude"), (31, "codex")])
+
+    def test_unparseable_ps_output_is_a_failure(self):
+        table, warnings = self.run_table(FakeRunner(ps="complete nonsense\n"))
+        self.assertIsNone(table)
+        self.assertTrue(warnings)
+
+    def test_agent_that_is_the_pane_pid_gets_the_pane(self):
+        runner = FakeRunner(ps="  700  1 z pts/1 claude claude\n",
+                            panes={"/tmp/tmux-1000/default": "%9 700\n"})
+        table, _ = self.run_table(runner)
+        self.assertEqual(table[0]["pane"]["id"], "%9")
 
     def test_screen_only_for_agy_with_a_pane_and_last_60_lines(self):
         ps = ("  10  1 z pts/1 agy agy\n  11  1 z pts/2 claude claude\n"
