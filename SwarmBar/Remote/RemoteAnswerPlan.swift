@@ -1,0 +1,102 @@
+import Foundation
+
+/// What to press in a remote session's tmux pane, and what must still be
+/// on its screen when the helper presses it. The helper re-reads the pane
+/// immediately before sending and sends nothing if any `expect` string is
+/// missing, which is the remote form of the local path's one-script read
+/// and press.
+struct RemoteKeyCommand: Equatable, Sendable {
+    var keys: [String]
+    var expect: [String]
+}
+
+/// Turns the route `ApprovalRouter` chose into a key command, from a screen
+/// the helper captured. Pure, so the one table that decides which keys land
+/// in somebody's live session on a server is assertable without one.
+///
+/// Every rule here is the local path's, unchanged: the same router, the same
+/// selector reader, the same fixed sequences and the same strings
+/// re-confirmed before pressing. A remote session gets no answer the local
+/// one would not, so nothing settled by a live round is re-derived.
+enum RemoteAnswerPlan {
+    /// Nil whenever nothing can be pressed safely, which leaves the row as
+    /// it is rather than guessing at a prompt nobody read.
+    static func command(
+        route: ApprovalRoute, screen: String?,
+        choose: (String) -> TuiPromptLayout.Option?
+    ) -> RemoteKeyCommand? {
+        switch route {
+        case .keys(let keys):
+            // Fixed sequences are positional or hotkeys, verified live as
+            // they are and sent unconfirmed exactly as the local path sends
+            // them to a tty.
+            return RemoteKeyCommand(keys: keys, expect: [])
+
+        case .numberedSelector:
+            // The digit is read off the screen, never assumed, and its label
+            // is what the helper re-confirms, as TerminalFocuser.answerNumbered
+            // does locally.
+            guard let screen, let option = choose(screen) else { return nil }
+            return RemoteKeyCommand(keys: ["\(option.number)"], expect: [option.label])
+
+        case .navigateSelector:
+            // Walked by label from the marked line, only ever the distance
+            // within the list, so a wrapping selector cannot come into it.
+            // The marked line is confirmed as well as the label, since the
+            // label is on screen wherever the cursor happens to be, as in
+            // TerminalFocuser.answerByNavigation.
+            guard let screen, let option = choose(screen) else { return nil }
+            let selector = TuiPromptLayout.selector(in: screen)
+            guard let cursor = selector.cursor,
+                  let cursorLine = selector.cursorLine,
+                  let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
+            else { return nil }
+            return RemoteKeyCommand(
+                keys: Array(repeating: move.key, count: move.presses) + ["\n"],
+                expect: [option.label, cursorLine])
+
+        case .focusTerminal, .mockTransition:
+            return nil
+        }
+    }
+
+    /// Whether the route chooses its keys from the screen, and so needs a
+    /// capture first. A fixed sequence is pressed without one, as locally.
+    static func needsScreen(_ route: ApprovalRoute) -> Bool {
+        switch route {
+        case .numberedSelector, .navigateSelector: true
+        case .keys, .focusTerminal, .mockTransition: false
+        }
+    }
+
+    /// The visible screen from a `capture` reply, or nil for an error reply
+    /// or anything unreadable. Success replies carry no `ok` field, so an
+    /// explicit `ok: false` is the error and the text is the success.
+    static func screen(fromCapture data: Data) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["ok"] as? Bool != false
+        else { return nil }
+        return object["text"] as? String
+    }
+
+    enum KeysOutcome: Equatable {
+        case sent
+        /// The helper's reason, or the error it returned instead.
+        case notSent(String)
+    }
+
+    /// Only an explicit `sent: true` counts. Anything else, including a
+    /// reply that does not parse, is treated as nothing pressed, because
+    /// moving the row on for keys that never landed would hide a prompt
+    /// that is still waiting.
+    static func keysOutcome(from data: Data) -> KeysOutcome {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .notSent("unreadable reply")
+        }
+        if object["ok"] as? Bool == false {
+            return .notSent(object["error"] as? String ?? "error")
+        }
+        if object["sent"] as? Bool == true { return .sent }
+        return .notSent(object["reason"] as? String ?? "not sent")
+    }
+}

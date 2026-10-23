@@ -59,7 +59,16 @@ final class HookServer: ApprovalResponding {
         /// and the host it came from.
         let remote: (rid: String, hostID: UUID)?
     }
-    private var pendingApprovals: [UUID: PendingApproval] = [:]
+    private var pendingApprovals: [UUID: PendingApproval] = [:] {
+        didSet {
+            // A remote row's buttons depend on whether its request is held,
+            // which no view can observe here, so the store carries a signal
+            // that moves when the set of relayed holds does.
+            let before = Set(oldValue.filter { $0.value.remote != nil }.keys)
+            let after = Set(pendingApprovals.filter { $0.value.remote != nil }.keys)
+            if before != after { store.remoteHoldRevision &+= 1 }
+        }
+    }
 
     /// How long a relayed request stays answerable. Just past the helper's
     /// own 345 s hold, so a row never offers Approve for a request the

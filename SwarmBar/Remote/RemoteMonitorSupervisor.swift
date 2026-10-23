@@ -19,12 +19,23 @@ final class RemoteMonitorSupervisor {
         let relay: Task<Void, Never>?
     }
 
-    private let store: SessionStore
-    private let registry: RemoteHostRegistry
+    let store: SessionStore
+    let registry: RemoteHostRegistry
     private let factory: Factory
     /// Where relayed hook events go. Nil in tests that only watch the
     /// supervisor's bookkeeping, which then start no relay.
-    private let hookServer: HookServer?
+    let hookServer: HookServer?
+    /// What a host's helper commands go through when answering. The
+    /// connection's own channel, or a recorder in tests.
+    var requester: @MainActor (RemoteHostConnection) -> any RemoteRequesting = { $0.channel }
+    /// The Grok and Antigravity keystroke switches, which apply to remote
+    /// sessions exactly as to local ones. Injectable so tests never read
+    /// the real defaults.
+    var keystrokeToggles: @MainActor () -> (grok: Bool, antigravity: Bool) = {
+        (SessionStore.grokKeystrokesEnabled, SessionStore.antigravityKeystrokesEnabled)
+    }
+    /// Sessions with an answer in flight. See `performAnswer`.
+    var answering: Set<UUID> = []
     private var running: [UUID: Running] = [:]
     /// A stopped monitor until it has actually finished, and its mirror is
     /// deleted where that was asked for. Cancel is only a request: a poll in

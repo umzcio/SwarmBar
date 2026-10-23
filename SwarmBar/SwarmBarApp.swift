@@ -95,6 +95,7 @@ struct SwarmBarApp: App {
             let supervisor = RemoteMonitorSupervisor(
                 store: store, registry: registry, hookServer: hookServer)
             registry.onChange = { [supervisor] in supervisor.reconcile() }
+            store.remoteActions = supervisor
             supervisor.reconcile()
             remoteRegistry = registry
             remoteSupervisor = supervisor

@@ -323,6 +323,24 @@ final class SessionStore {
     /// driven this Mac's terminal without ever driving it.
     @ObservationIgnored var localAnswerObserver: ((AgentSession, ApprovalRoute) -> Void)?
 
+    /// Answers rows that have a host. Weak because the app owns it.
+    @ObservationIgnored weak var remoteActions: RemoteActing?
+
+    /// Moves whenever a relayed hold starts or ends. Whether a remote row
+    /// can be answered depends on HookServer's holds, which nothing
+    /// observes, and a hold that ends at its timeout changes no row: the
+    /// row keeps its prompt. Reading this from a view is what makes that
+    /// row swap its buttons for the terminal note.
+    var remoteHoldRevision = 0
+
+    /// How a remote row's prompt can be answered, for the view. Reads
+    /// `remoteHoldRevision` so a view that asks is redrawn when a hold
+    /// comes or goes.
+    func remoteAnswerability(for session: AgentSession) -> RemoteAnswerability {
+        _ = remoteHoldRevision
+        return remoteActions?.answerability(for: session) ?? .terminalOnly
+    }
+
     /// Sessions whose tool reported the session over (Claude and Grok's
     /// SessionEnd hook fires on /exit), and when. The transcript keeps
     /// looking fresh for a while, so without this an exited session reads
@@ -532,13 +550,16 @@ final class SessionStore {
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
-            update(id: session.id) { $0.status = .runningTool(activity: running(command)) }
+            noteAnswered(session.id, command: command, allow: true)
             return
         }
         // Every route below reaches into a terminal on THIS Mac, which a
-        // remote session is not in. Nothing is sent until the remote
-        // keystroke path exists.
-        guard session.host == nil else { return }
+        // remote session is not in. Its keys go to its own tmux pane on its
+        // host instead, or nowhere.
+        guard session.host == nil else {
+            remoteActions?.answer(session, allow: true)
+            return
+        }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: true, in: environment(for: session)),
             for: session,
@@ -548,12 +569,15 @@ final class SessionStore {
     }
 
     func deny(_ session: AgentSession) {
-        guard case .waitingApproval = session.status else { return }
+        guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: false) == true {
-            update(id: session.id) { $0.status = .working(activity: "Rethinking after deny…") }
+            noteAnswered(session.id, command: command, allow: false)
             return
         }
-        guard session.host == nil else { return }
+        guard session.host == nil else {
+            remoteActions?.answer(session, allow: false)
+            return
+        }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: false, in: environment(for: session)),
             for: session,
@@ -589,6 +613,26 @@ final class SessionStore {
         case .focusTerminal:        openInTerminal(session)
         case .mockTransition:       update(id: session.id) { $0.status = mockStatus }
         }
+    }
+
+    /// The row after an answer was delivered, by a held reply or by keys
+    /// a helper confirmed it pressed.
+    private func noteAnswered(_ id: UUID, command: String, allow: Bool) {
+        update(id: id) {
+            $0.status = allow
+                ? .runningTool(activity: running(command))
+                : .working(activity: "Rethinking after deny…")
+        }
+    }
+
+    /// A remote answer's keys landed. The answer took a round trip, so the
+    /// row is moved on only if it is still asking: a poll that has already
+    /// seen the prompt settle knows better than this does.
+    func noteRemoteAnswerSent(_ session: AgentSession, allow: Bool) {
+        guard let current = sessions.first(where: { $0.id == session.id }),
+              case .waitingApproval(let command) = current.status
+        else { return }
+        noteAnswered(session.id, command: command, allow: allow)
     }
 
     private func running(_ command: String) -> String {

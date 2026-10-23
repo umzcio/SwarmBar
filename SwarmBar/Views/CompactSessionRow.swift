@@ -10,6 +10,14 @@ struct CompactSessionRow: View {
         SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
     }
 
+    /// Set for a remote prompt nothing here can answer.
+    private var terminalOnlyNote: String? {
+        guard let host = session.host,
+              store.remoteAnswerability(for: session) == .terminalOnly
+        else { return nil }
+        return RemoteRowLabel.terminalOnlyNote(host: host)
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             StatusDot(status: session.status)
@@ -69,13 +77,21 @@ struct CompactSessionRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .doubleClickOpensTerminal(session, store: store)
 
-            // Approve, Deny and Reply all answer through a terminal on THIS
-            // Mac, so a remote row does not offer them. Dismiss does not:
-            // it only writes SwarmBar's own store. See
-            // SessionRowInteraction.allowsLocalTerminalActions.
-            if case .waitingApproval = session.status, isLocal {
-                MicroButton(.approve, help: "Approve") { store.approve(session) }
-                MicroButton(.deny, help: "Deny") { store.deny(session) }
+            // Reply answers through a terminal on THIS Mac, so a remote row
+            // does not offer it. Dismiss only writes SwarmBar's own store.
+            // See SessionRowInteraction.allowsLocalTerminalActions. A remote
+            // prompt is answered by its held request or its tmux pane, and
+            // when neither can reach it the row says where to go instead.
+            if case .waitingApproval = session.status {
+                if let note = terminalOnlyNote {
+                    Text(note)
+                        .swarmFont(.meta)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    MicroButton(.approve, help: "Approve") { store.approve(session) }
+                    MicroButton(.deny, help: "Deny") { store.deny(session) }
+                }
             }
             if case .waitingInput = session.status {
                 if isLocal {
