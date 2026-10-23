@@ -34,7 +34,14 @@ struct WizardSetupStep: View {
                         .wizardMuted()
                 }
             }
-            watchSection(alias, row)
+            if model.unfinishedRun {
+                unfinished(row)
+            }
+            // An undo takes out what is there, however the host is watched,
+            // so there is nothing to choose.
+            if model.mode == .setUp {
+                watchSection(alias, row)
+            }
             if let warning = model.everyUserWarning(for: alias) {
                 WizardNotice(text: warning)
             }
@@ -64,6 +71,31 @@ struct WizardSetupStep: View {
             Button("Skip this host") { model.skipHost() }
                 .disabled(model.isWorking)
             primary(alias, plan: plan)
+        }
+    }
+
+    // MARK: After a run
+
+    /// The last run's outcomes, kept reachable while the fresh plan below
+    /// waits for a tap.
+    private func unfinished(_ row: RemoteWizardModel.Row) -> some View {
+        let key = "\(row.id)\u{0}happened"
+        return VStack(alignment: .leading, spacing: 6) {
+            WizardNotice(text: "The last run didn't finish everything. The plan below is from a fresh look at the host.")
+            DisclosureGroup(isExpanded: Binding(
+                get: { expanded.contains(key) },
+                set: { if $0 { expanded.insert(key) } else { expanded.remove(key) } })
+            ) {
+                SettingsCard {
+                    WizardOutcomeList(changes: model.appliedPlan?.changes ?? [], progress: model.progress,
+                                      isWorking: false, hostName: row.displayName)
+                        .padding(.vertical, 6)
+                }
+                .padding(.top, 4)
+            } label: {
+                Text("Show what happened")
+                    .swarmFont(.body)
+            }
         }
     }
 
@@ -192,8 +224,9 @@ struct WizardSetupStep: View {
         }
         let omitted = model.pasteOmissions(for: alias)
         if !omitted.isEmpty {
-            WizardNotice(text: "Left out of the prompt, so make these with Let SwarmBar do it or the command:\n"
-                + omitted.map { "• \($0)" }.joined(separator: "\n"))
+            let command = if case .success = model.command(for: alias) { true } else { false }
+            WizardNotice(text: WizardCopy.omissionsLead(letSwarmBar: model.canLetSwarmBarDoIt(alias), command: command)
+                + "\n" + omitted.map { "• \($0)" }.joined(separator: "\n"))
         }
         disclosure(alias, "paste", model.changeGroups(for: alias))
     }
@@ -256,14 +289,15 @@ struct WizardSetupStep: View {
     // MARK: Footer
 
     @ViewBuilder private func primary(_ alias: String, plan: SetupPlan?) -> some View {
-        if plan == nil {
-            // No plan: the user still has to pick, or something stopped the
-            // plan, which a fresh look may clear.
-            Button(model.watchAs[alias] == nil ? "Make these changes" : "Check again") {
-                Task { await model.confirmPastedOrRan() }
-            }
-            .keyboardShortcut(.defaultAction)
-            .disabled(model.watchAs[alias] == nil || model.isBusy)
+        if plan == nil && model.watchAs[alias] == nil {
+            // Nothing to make until the user picks, so no button says so.
+            Text("Pick how SwarmBar should watch this host.")
+                .wizardMuted()
+        } else if plan == nil {
+            // Something stopped the plan, which a fresh look may clear.
+            Button("Check again") { Task { await model.confirmPastedOrRan() } }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.isBusy)
         } else {
             switch model.path[alias] ?? .swarmBar {
             case .swarmBar:

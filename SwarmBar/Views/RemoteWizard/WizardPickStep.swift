@@ -97,9 +97,11 @@ struct WizardPickStep: View {
         .swarmFont(.body)
     }
 
+    /// The typed name stays put when the add can't run yet, so nothing the
+    /// user typed is lost to a check still in flight.
     private func add() {
         let alias = newAlias
-        guard !alias.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard !alias.trimmingCharacters(in: .whitespaces).isEmpty, !model.isBusy, model.step == .pick else { return }
         adding = false
         newAlias = ""
         Task { await model.addHost(alias: alias) }

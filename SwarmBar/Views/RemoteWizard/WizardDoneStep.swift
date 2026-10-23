@@ -9,7 +9,7 @@ struct WizardDoneStep: View {
     var body: some View {
         let rows = model.watchedRows
         WizardScaffold {
-            Text(verbatim: title(rows.count))
+            Text(verbatim: title(rows))
                 .swarmFont(.title)
             if !rows.isEmpty {
                 SettingsCard {
@@ -19,7 +19,7 @@ struct WizardDoneStep: View {
                     }
                 }
             }
-            Text(rows.isEmpty
+            Text(rows.isEmpty || model.mode == .undo
                  ? "Manage hosts in Settings › Hosts."
                  : "Their sessions are in the menu bar now. Manage hosts in Settings › Hosts.")
                 .wizardMuted()
@@ -30,9 +30,11 @@ struct WizardDoneStep: View {
         }
     }
 
-    private func title(_ count: Int) -> String {
-        if model.mode == .undo { return "Done" }
-        return count == 0 ? "No hosts added" : "Watching \(WizardCopy.hosts(count))"
+    private func title(_ rows: [RemoteWizardModel.Row]) -> String {
+        if model.mode == .undo, rows.count == 1, let row = rows.first {
+            return WizardCopy.undoTitle(name: model.watchedName(row.id), undone: model.isUndone(row.id))
+        }
+        return rows.isEmpty ? "No hosts added" : "Watching \(WizardCopy.hosts(rows.count))"
     }
 }
 
@@ -43,7 +45,7 @@ private struct WizardDoneRow: View {
 
     var body: some View {
         let name = model.watchedName(row.id)
-        let pill = model.pill(for: row)
+        let pill = model.donePill(for: row)
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(verbatim: name)
                 .swarmFont(.rowTitle)
@@ -94,6 +96,7 @@ private struct WizardDoneRow: View {
 
     private var status: String {
         if let problem = row.problem { return problem }
+        if model.isUndone(row.id) { return "changes removed" }
         switch row.assessment?.status {
         case .ready?: return "approvals on"
         case .needsSetup(let reasons)?: return reasons.first ?? "Needs setup"

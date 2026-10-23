@@ -54,6 +54,8 @@ final class FakeWizardServices: RemoteWizardServices {
     var applyOutcomes: [String: SetupApplier.StepOutcome] = [:]
     /// Runs after the first change is reported, while the apply is still going.
     var duringApply: (@MainActor () -> Void)?
+    /// When set, the apply waits here after its first change is reported.
+    var applyGate: Gate?
     private(set) var applied: [(alias: String, plan: SetupPlan)] = []
     let helperVersion = "0.2.0"
     var helperSHA256: String? = String(repeating: "ab", count: 32)
@@ -131,7 +133,10 @@ final class FakeWizardServices: RemoteWizardServices {
             }
             outcomes.append(outcome)
             progress(outcomes.count - 1, outcome)
-            if outcomes.count == 1 { duringApply?() }
+            if outcomes.count == 1 {
+                duringApply?()
+                if let applyGate { await applyGate.wait() }
+            }
             await Task.yield()
         }
     }
@@ -350,7 +355,8 @@ struct RemoteWizardModelTests {
         #expect(services.probeCalls == ["alpha", "alpha"])
         let status = try #require(try row(model, "alpha").assessment?.status)
         #expect(status != .ready)
-        #expect(model.step == .applying(hostIndex: 0))
+        #expect(model.step == .setup(hostIndex: 0))
+        #expect(model.unfinishedRun)
         #expect(model.currentAlias == "alpha")
     }
 
@@ -715,11 +721,14 @@ struct RemoteWizardModelTests {
         let (model, registry) = model()
         await model.lookForHosts()
         await model.continueFromPick()
+        services.applyOutcomes = [Self.settings: .changed]
         services.duringApply = { model.back() }
         await model.makeChanges()
-        #expect(model.step == .applying(hostIndex: 0))
+        // Back mid-apply did nothing; the unfinished run came back to step 3.
+        #expect(model.step == .setup(hostIndex: 0))
         model.back()
         #expect(model.step == .pick)
+        #expect(model.appliedPlan == nil)
         #expect(model.setupAliases.isEmpty)
         #expect(model.progress.isEmpty)
         // Already watched, and going back does not undo that.
@@ -964,21 +973,27 @@ struct RemoteWizardModelTests {
         let (model, _) = model()
         await model.lookForHosts()
         await model.continueFromPick()
-        var reopened: RemoteWizardModel.Step?
-        services.duringApply = {
-            Task { @MainActor in
-                await model.open(.fresh)
-                reopened = model.step
-            }
-        }
-        await model.makeChanges()
-        await Task.yield()
-        #expect(reopened == .applying(hostIndex: 0))
+        let gate = Gate()
+        services.applyGate = gate
+        let run = Task { await model.makeChanges() }
+        await gate.held()
+        await model.open(.fresh)
+        #expect(model.step == .applying(hostIndex: 0))
+        #expect(model.isWorking)
+        gate.open()
+        await run.value
     }
 
     @Test func progressReadsAgainstThePlanThatWasApplied() async throws {
+        let script = SetupPlanner.claudeScript(home: "/home/u")
+        // After the run the hook script is in place, so the fresh plan has
+        // only the settings file left: a different plan from the one applied.
+        let after = Self.probe(
+            "alpha", processes: [Self.process("claude")], tools: ["claude"],
+            configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, "{}\n")]],
+            bridges: ["/home/u": [.init(path: script, sha256: SetupPlannerTests.sha(SetupPlannerTests.bridges.claudeHook))]])
         services.aliases = ["alpha"]
-        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha"), (after, nil, nil)]]
         services.applyOutcomes = [Self.settings: .changed]
         let (model, _) = model()
         await model.lookForHosts()
@@ -986,11 +1001,56 @@ struct RemoteWizardModelTests {
         let applied = try #require(model.plan(for: "alpha"))
         #expect(model.appliedPlan == nil)
         await model.makeChanges()
-        #expect(model.step == .applying(hostIndex: 0))
+        let fresh = try #require(model.plan(for: "alpha"))
+        #expect(fresh.changes.count < applied.changes.count)
         #expect(model.appliedPlan == applied)
-        #expect(model.progress.count == applied.changes.count)
+        #expect(model.progress.keys.sorted() == Array(applied.changes.indices))
+        let changed = try #require(applied.changes.firstIndex { $0.path == Self.settings })
+        #expect(model.progress[changed] == .changed)
         model.back()
         #expect(model.appliedPlan == nil)
+    }
+
+    @Test func anUnfinishedRunLandsOnStepThreeWithTheFreshPlan() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        services.applyOutcomes = [Self.settings: .failed("disk full")]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        #expect(!model.unfinishedRun)
+        let calls = services.planCalls.count
+        await model.makeChanges()
+        #expect(model.step == .setup(hostIndex: 0))
+        #expect(model.unfinishedRun)
+        #expect(services.planCalls.count > calls)
+        #expect(model.plan(for: "alpha") != nil)
+        #expect(model.path["alpha"] == .swarmBar)
+        // Nothing more was sent: the fresh plan waits for another tap.
+        #expect(services.applied.count == 1)
+    }
+
+    @Test func noWriteIsReachableWhileApplying() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        let gate = Gate()
+        services.applyGate = gate
+        let run = Task { await model.makeChanges() }
+        await gate.held()
+        #expect(model.step == .applying(hostIndex: 0))
+        let probes = services.probeCalls.count
+        await model.makeChanges()
+        await model.confirmPastedOrRan()
+        model.back()
+        model.skipHost()
+        #expect(services.applied.count == 1)
+        #expect(services.probeCalls.count == probes)
+        #expect(model.step == .applying(hostIndex: 0))
+        gate.open()
+        await run.value
     }
 
     @Test func changesAreGroupedByToolWithKeystrokeToolsSaid() async throws {
@@ -1105,6 +1165,54 @@ struct RemoteWizardModelTests {
         ])
     }
 
+    @Test func tmuxIsUnknownWhenProcessesCouldNotBeListed() async throws {
+        var failed = Self.probe("alpha", tools: ["claude"])
+        failed.processesFailed = true
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [(failed, nil, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        #expect(model.notInTmuxLines(for: "alpha") == [RemoteWizardModel.tmuxUnknown])
+    }
+
+    @Test func anUndoneHostSaysSoWithANeutralPill() async throws {
+        let (model, registry) = model()
+        registry.upsert(RemoteHost(alias: "beta", watchAs: .loginUser))
+        let script = SetupPlanner.claudeScript(home: "/home/u")
+        let wired = try ClaudeHookTransform.install("{}\n", scriptPath: script, family: .remote)
+        let before = Self.probe(
+            "beta", processes: [Self.process("claude")], tools: ["claude"], installed: ["claude"],
+            configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, wired)]],
+            bridges: ["/home/u": [.init(path: script, sha256: String(repeating: "e", count: 64))]])
+        let after = Self.probe(
+            "beta", processes: [Self.process("claude")], tools: ["claude"],
+            configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, "{}\n")]],
+            bridges: ["/home/u": []])
+        services.outcomes = ["beta": [(before, nil, nil), (after, nil, nil)]]
+        await model.startUndo(alias: "beta")
+        #expect(!model.isUndone("beta"))
+        await model.makeChanges()
+        #expect(model.step == .done)
+        let undone = try row(model, "beta")
+        // The host now needs setup again, which is the point of an undo.
+        #expect(model.pill(for: undone) == .needsSetup)
+        #expect(model.isUndone("beta"))
+        #expect(model.donePill(for: undone) == .undone)
+        #expect(WizardCopy.undoTitle(name: "beta", undone: true) == "SwarmBar's changes were removed from beta.")
+        #expect(WizardCopy.undoTitle(name: "beta", undone: false) == "SwarmBar's changes are still on beta.")
+    }
+
+    @Test func omissionsNameOnlyThePathsThatAreThere() {
+        #expect(WizardCopy.omissionsLead(letSwarmBar: true, command: true)
+            == "Left out of the prompt. Use Let SwarmBar do it or the command for these:")
+        #expect(WizardCopy.omissionsLead(letSwarmBar: false, command: true)
+            == "Left out of the prompt. Use the command for these:")
+        #expect(WizardCopy.omissionsLead(letSwarmBar: true, command: false)
+            == "Left out of the prompt. Use Let SwarmBar do it for these:")
+        #expect(WizardCopy.omissionsLead(letSwarmBar: false, command: false)
+            == "Left out of the prompt. Neither other way is available here, so these can't be made from this window:")
+    }
+
     @Test func pillsFollowTheAssessment() async throws {
         services.aliases = ["alpha", "beta", "devbox", "gamma"]
         let partial = Self.probe("gamma", processes: [Self.process("claude"), Self.process("codex", user: "root")],
@@ -1145,23 +1253,28 @@ struct RemoteWizardModelTests {
         #expect(model.helperVersion == "0.2.0")
     }
 
-    @Test func theLauncherBuildsOneModelLateAndHandsEachRequestOnce() async throws {
+    @Test func theLauncherBuildsOneModelOnTheFirstAskAndHandsEachRequestOnce() async throws {
         var built = 0
         let launcher = RemoteWizardLauncher {
             built += 1
             return RemoteWizardModel(services: services, registry: RemoteHostRegistry(defaults: defaults))
         }
+        #expect(launcher.model == nil)
         #expect(built == 0)
         #expect(launcher.takeRequest() == nil)
         launcher.ask(.fresh)
+        #expect(built == 1)
         #expect(launcher.takeRequest() == .fresh)
         #expect(launcher.takeRequest() == nil)
+        let model = try #require(launcher.model)
         launcher.ask(.undo(alias: "beta"))
         #expect(launcher.takeRequest() == .undo(alias: "beta"))
-        let model = try #require(launcher.model)
         #expect(launcher.model === model)
         #expect(built == 1)
-        #expect(RemoteWizardLauncher(makeModel: nil).model == nil)
+        let demo = RemoteWizardLauncher(makeModel: nil)
+        demo.ask(.fresh)
+        #expect(demo.model == nil && demo.isDemo)
+        #expect(!launcher.isDemo)
     }
 }
 

@@ -93,7 +93,7 @@ final class RemoteWizardModel {
     }
 
     /// The pill a row shows on the pick and on done.
-    enum Pill: Equatable { case ready, partial, needsSetup, cantConnect, cantContinue }
+    enum Pill: Equatable { case ready, partial, needsSetup, cantConnect, cantContinue, undone }
 
     /// One tool's lines in "Let SwarmBar do it" and "Show what it will
     /// change".
@@ -134,6 +134,8 @@ final class RemoteWizardModel {
     static let notChecked = "Not checked"
 
     static let nothingToInstall = "Nothing to install. Answers are keystrokes in tmux."
+    /// ps failed, so which sessions are in tmux is unknown, not none.
+    static let tmuxUnknown = "SwarmBar couldn't list the processes on this host, so it can't tell which sessions are in tmux."
     static let sudoersPath = "/etc/sudoers.d/swarmbar"
     /// Answered with keystrokes or walked by label, so nothing is installed
     /// for them.
@@ -194,6 +196,13 @@ final class RemoteWizardModel {
     /// which the check after applying replaces, so the progress list never
     /// reads one plan's outcomes against another plan's changes.
     private(set) var appliedPlan: SetupPlan?
+    /// A run of "Let SwarmBar do it" ended without the host being done, and
+    /// step 3 is showing the fresh plan the check after it made. The run's
+    /// outcomes stay in `appliedPlan` and `progress` until the next run.
+    var unfinishedRun: Bool {
+        guard appliedPlan != nil, case .setup = step else { return false }
+        return true
+    }
     /// Opened at step 3 from Settings, where there is no pick to go back
     /// to, so the view's Back closes the window instead.
     private(set) var openedAtSetup = false
@@ -358,14 +367,18 @@ final class RemoteWizardModel {
     /// Back from the pick to the intro, stopping any probe, or from step 3
     /// to the pick while nothing is being applied. Hosts already registered
     /// stay registered. Opened from Settings there is no pick to return to,
-    /// so the view closes the window instead.
+    /// so the view closes the window instead. From a finished run, back is
+    /// that host's step 3, never the pick.
     func back() {
         switch step {
+        case .applying(let index):
+            guard !isWorking else { return }
+            step = .setup(hostIndex: index)
         case .checking, .pick:
             guard !openedAtSetup, !isWorking else { return }
             stopProbing()
             step = .intro
-        case .setup, .applying:
+        case .setup:
             guard !openedAtSetup, !isWorking else { return }
             cancelRootChecks()
             progress = [:]
@@ -544,9 +557,11 @@ final class RemoteWizardModel {
     }
 
     /// One line per tool whose sessions here are outside tmux, where a
-    /// remote keystroke can't reach them.
+    /// remote keystroke can't reach them. A process list that failed says
+    /// so, since "could not look" must not read as "all in tmux".
     func notInTmuxLines(for alias: String) -> [String] {
-        guard let (probe, only) = watchedView(alias), !probe.processesFailed else { return [] }
+        guard let (probe, only) = watchedView(alias) else { return [] }
+        if probe.processesFailed { return [Self.tmuxUnknown] }
         var counts: [AgentTool: Int] = [:]
         for process in probe.processes where process.pane == nil && (only == nil || process.user == only) {
             if let tool = ProbeResult.tool(forProcess: process.comm), Self.toolsNeedingTmux.contains(tool) {
@@ -571,6 +586,17 @@ final class RemoteWizardModel {
         case .needsSetup: return .needsSetup
         case .ready: return (row.assessment?.hiddenSessions ?? 0) > 0 ? .partial : .ready
         }
+    }
+
+    /// Undoing finished for this host: a fresh look left nothing to remove.
+    func isUndone(_ alias: String) -> Bool {
+        mode == .undo && isFinished(alias)
+    }
+
+    /// The done step's pill. An undone host needs setup again, which is the
+    /// point, so it gets a neutral pill rather than a warning.
+    func donePill(for row: Row) -> Pill? {
+        isUndone(row.id) ? .undone : pill(for: row)
     }
 
     /// The hosts this run put in the registry, for the done step.
@@ -609,6 +635,9 @@ final class RemoteWizardModel {
     /// "Make these changes": applies the current host's plan, checks the
     /// host again, and moves on only if it is really done. Never while a
     /// root view is still being taken, since the plan is about to change.
+    /// A run that leaves the host not done returns to its step 3, which
+    /// shows the fresh plan with all three paths: nothing is written that
+    /// the screen did not list first.
     func makeChanges() async {
         guard !isBusy, let index = currentIndex, let alias = currentAlias, let plan = plans[alias],
               canLetSwarmBarDoIt(alias)
@@ -622,6 +651,7 @@ final class RemoteWizardModel {
             self?.progress[change] = outcome
         }
         await recheck(alias, index: index)
+        if step == .applying(hostIndex: index) { step = .setup(hostIndex: index) }
     }
 
     /// "I've pasted it, check now", "I've run it, check now", and "Check

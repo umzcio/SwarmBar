@@ -39,4 +39,19 @@ enum WizardCopy {
             ? "1 session runs as \(users) and isn't shown"
             : "\(count) sessions run as \(users) and aren't shown"
     }
+
+    /// The done step's title for an undo.
+    static func undoTitle(name: String, undone: Bool) -> String {
+        undone ? "SwarmBar's changes were removed from \(name)." : "SwarmBar's changes are still on \(name)."
+    }
+
+    /// The lead for changes the paste prompt leaves out, naming only the
+    /// ways that can make them here.
+    static func omissionsLead(letSwarmBar: Bool, command: Bool) -> String {
+        let ways = (letSwarmBar ? ["Let SwarmBar do it"] : []) + (command ? ["the command"] : [])
+        guard !ways.isEmpty else {
+            return "Left out of the prompt. Neither other way is available here, so these can't be made from this window:"
+        }
+        return "Left out of the prompt. Use \(ways.joined(separator: " or ")) for these:"
+    }
 }

@@ -4,8 +4,9 @@ import SwiftUI
 // MARK: - Opening the window
 
 /// Holds the wizard's one model for the life of the app, and the latest
-/// request to open it. The model is built on first use, so a user who never
-/// opens the wizard never reads the bundled helper or builds the services.
+/// request to open it. The model is built by the first request, outside any
+/// view update, so a user who never opens the wizard never reads the
+/// bundled helper or builds the services.
 @MainActor @Observable
 final class RemoteWizardLauncher {
     static let windowID = "remote-hosts-wizard"
@@ -20,7 +21,7 @@ final class RemoteWizardLauncher {
     /// it handled instead.
     private(set) var request: Request?
     @ObservationIgnored private var handled: UUID?
-    @ObservationIgnored private var built: RemoteWizardModel?
+    private(set) var model: RemoteWizardModel?
     @ObservationIgnored private let makeModel: (@MainActor () -> RemoteWizardModel)?
 
     /// nil `makeModel` is demo mode, which has no remote hosts.
@@ -28,12 +29,11 @@ final class RemoteWizardLauncher {
         self.makeModel = makeModel
     }
 
-    var model: RemoteWizardModel? {
-        if built == nil { built = makeModel?() }
-        return built
-    }
+    /// Demo mode has no remote hosts, so no model.
+    var isDemo: Bool { makeModel == nil }
 
     func ask(_ entry: RemoteWizardModel.Entry) {
+        if model == nil { model = makeModel?() }
         request = Request(entry: entry)
     }
 
@@ -95,7 +95,7 @@ struct RemoteWizardWindow: View {
                     await model.open(entry)
                 }
                 .onDisappear { model.cancel() }
-        } else {
+        } else if launcher.isDemo {
             Text("Remote hosts aren't available in demo mode.")
                 .swarmFont(.body)
                 .foregroundStyle(.secondary)
@@ -199,8 +199,8 @@ extension View {
     }
 }
 
-/// Ready, Partial, Needs setup, Can't connect or Can't continue. On the
-/// done step Ready is a check mark, as in the mockup.
+/// Ready, Partial, Needs setup, Can't connect, Can't continue, or a
+/// neutral Undone. On the done step Ready is a check mark, as in the mockup.
 struct WizardPill: View {
     let pill: RemoteWizardModel.Pill
     var checkForReady = false
@@ -230,6 +230,7 @@ struct WizardPill: View {
         case .needsSetup: "Needs setup"
         case .cantConnect: "Can't connect"
         case .cantContinue: "Can't continue"
+        case .undone: "Undone"
         }
     }
 
@@ -239,6 +240,7 @@ struct WizardPill: View {
         case .partial: .blue
         case .needsSetup: .orange
         case .cantConnect, .cantContinue: .red
+        case .undone: .gray
         }
     }
 }

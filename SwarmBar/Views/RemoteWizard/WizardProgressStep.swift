@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Step 3 while SwarmBar makes the changes, and after, when the host is not
-/// Ready yet: each change with its outcome, then the check that decides.
+/// Step 3 while SwarmBar makes the changes: each change with its outcome,
+/// then the check that decides. A run that leaves the host not done goes
+/// back to step 3, so this screen offers no write of its own.
 struct WizardProgressStep: View {
     let model: RemoteWizardModel
     let index: Int
@@ -14,26 +15,15 @@ struct WizardProgressStep: View {
     }
 
     private func content(_ alias: String, _ row: RemoteWizardModel.Row) -> some View {
-        // The plan that was applied, which outlives the replan the check
-        // after it makes, so outcomes line up with their changes.
-        let changes = (model.appliedPlan ?? model.plan(for: alias))?.changes ?? []
-        let firstPending = changes.indices.first { model.progress[$0] == nil }
-        return WizardScaffold {
+        WizardScaffold {
             WizardHeading(
                 title: model.mode == .undo ? "Undoing changes on \(row.displayName)" : "Setting up \(row.displayName)",
                 crumbs: "\(index + 1) of \(WizardCopy.hosts(model.setupAliases.count))")
             SettingsCard {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(changes.enumerated()), id: \.offset) { offset, change in
-                        line(change.description, model.progress[offset],
-                             running: model.isWorking && offset == firstPending)
-                    }
-                    checkLine(row, allReported: firstPending == nil)
-                }
-                .padding(.vertical, 6)
-            }
-            if !model.isWorking {
-                after(row)
+                WizardOutcomeList(
+                    changes: (model.appliedPlan ?? model.plan(for: alias))?.changes ?? [],
+                    progress: model.progress, isWorking: model.isWorking, hostName: row.displayName)
+                    .padding(.vertical, 6)
             }
             Text("**If a file changed since SwarmBar read it**, that file is left alone and listed here with \"Changed on the host since it was checked. Check again to retry.\" Files already done stay done.")
                 .swarmFont(.body)
@@ -42,18 +32,34 @@ struct WizardProgressStep: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 8))
         } footer: {
-            Button("Back", action: back)
-                .disabled(model.isWorking)
+            if !model.isWorking {
+                Button("Back", action: back)
+            }
             Spacer()
             Button("Skip this host") { model.skipHost() }
                 .disabled(model.isWorking)
             Button("Check again") { Task { await model.confirmPastedOrRan() } }
-                .disabled(model.isBusy)
-            // The check after a run already planned again from what is on
-            // the host now, so trying again sends fresh hashes.
-            Button("Make these changes") { Task { await model.makeChanges() } }
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.isBusy || !model.canLetSwarmBarDoIt(alias))
+                .disabled(model.isBusy)
+        }
+    }
+}
+
+/// A run's changes with their outcomes, and the check after it. Used while
+/// the run goes, and under "Show what happened" on step 3 after it.
+struct WizardOutcomeList: View {
+    let changes: [PlannedChange]
+    let progress: [Int: SetupApplier.StepOutcome]
+    let isWorking: Bool
+    let hostName: String
+
+    var body: some View {
+        let firstPending = changes.indices.first { progress[$0] == nil }
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(changes.enumerated()), id: \.offset) { offset, change in
+                line(change.description, progress[offset], running: isWorking && offset == firstPending)
+            }
+            checkLine(allReported: firstPending == nil)
         }
     }
 
@@ -80,9 +86,9 @@ struct WizardProgressStep: View {
     }
 
     /// The last line: the host checked again, which is what says Ready.
-    private func checkLine(_ row: RemoteWizardModel.Row, allReported: Bool) -> some View {
-        let running = model.isWorking && allReported
-        let finished = !model.isWorking && allReported
+    private func checkLine(allReported: Bool) -> some View {
+        let running = isWorking && allReported
+        let finished = !isWorking && allReported
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Group {
                 if running {
@@ -95,10 +101,10 @@ struct WizardProgressStep: View {
             }
             .frame(width: 16)
             .accessibilityHidden(true)
-            Text(verbatim: "Check \(row.displayName) again")
+            Text(verbatim: "Check \(hostName) again")
                 .swarmFont(.body)
                 .foregroundStyle(running || finished ? .primary : .secondary)
-                .accessibilityLabel("Check \(row.displayName) again, \(running ? "running" : finished ? "done" : "waiting")")
+                .accessibilityLabel("Check \(hostName) again, \(running ? "running" : finished ? "done" : "waiting")")
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 5)
@@ -143,23 +149,6 @@ struct WizardProgressStep: View {
         case .byHand?: "by hand"
         case .skipped?: "skipped"
         case nil: running ? "running" : "waiting"
-        }
-    }
-
-    /// Once the run and its check are over and the host is still here, the
-    /// check's own verdict says what is left.
-    @ViewBuilder private func after(_ row: RemoteWizardModel.Row) -> some View {
-        if let problem = row.problem {
-            WizardNotice(text: problem, tint: .red, symbol: "xmark.octagon.fill")
-        } else {
-            switch row.assessment?.status {
-            case .needsSetup(let reasons)?:
-                WizardNotice(text: reasons.joined(separator: "\n"))
-            case .cantConnect(let problem)?:
-                WizardNotice(text: problem.message, tint: .red, symbol: "xmark.octagon.fill")
-            case .ready?, nil:
-                EmptyView()
-            }
         }
     }
 }
