@@ -140,7 +140,7 @@ def owned_home(path):
         import pwd
         real = os.path.realpath(path)
         info = os.stat(real)
-        if not stat_module.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+        if not stat_module.S_ISDIR(info.st_mode) or not only_owner_can_write(info):
             return False
         return os.path.realpath(pwd.getpwuid(info.st_uid).pw_dir) == real
     except (ImportError, KeyError, OSError):
@@ -1261,15 +1261,16 @@ def owner_only_path(home, resolved, uid):
             info = os.lstat(current)
         except OSError:
             return False
-        if info.st_uid != uid or info.st_mode & 0o022 or stat_module.S_ISLNK(info.st_mode):
+        if info.st_uid != uid or not only_owner_can_write(info) \
+                or stat_module.S_ISLNK(info.st_mode):
             return False
     return True
 
 
-def read_owned(path, uid, limit=None):
-    """file_digest for a file that must be `uid`'s own regular file, checked
-    on the descriptor actually read, so a swap after the path was checked
-    is caught. None when it is not, or cannot be read."""
+def read_owned_bytes(path, uid, size=-1):
+    """Up to `size` bytes of a file that must be `uid`'s own regular file,
+    checked on the descriptor actually read, so a swap after the path was
+    checked is caught. None when it is not, or cannot be read."""
     def opener(name, flags):
         return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -1277,8 +1278,15 @@ def read_owned(path, uid, limit=None):
             info = os.fstat(handle.fileno())
             if not stat_module.S_ISREG(info.st_mode) or info.st_uid != uid:
                 return None
-            data = handle.read()
+            return handle.read(size)
     except OSError:
+        return None
+
+
+def read_owned(path, uid, limit=None):
+    """file_digest through read_owned_bytes."""
+    data = read_owned_bytes(path, uid)
+    if data is None:
         return None
     kept = data if limit is None or len(data) <= limit else None
     return hashlib.sha256(data).hexdigest(), kept
@@ -1326,15 +1334,20 @@ def home_configs(home, warnings):
     return configs
 
 
-def mentions_bridge(path):
-    """True or False, or None when the file is there but cannot be read."""
-    try:
-        with open(path, "rb") as handle:
-            return BRIDGE_MARK in handle.read(WHOLE_MAX_BYTES)
-    except OSError as error:
-        if error.errno in (errno.ENOENT, errno.ENOTDIR):
-            return False
+def mentions_bridge(home, path, uid):
+    """True or False, or None when the file is there but cannot be read, or
+    is not the home owner's own all the way down (owner_only_path). Like
+    the config reads, it refuses rather than reads: one bit is still a
+    read of a file someone else planted."""
+    resolved = os.path.realpath(path)
+    if not os.path.lexists(resolved):
+        return False
+    if not owner_only_path(home, resolved, uid):
         return None
+    data = read_owned_bytes(resolved, uid, WHOLE_MAX_BYTES)
+    if data is None:
+        return None
+    return BRIDGE_MARK in data
 
 
 def home_tools(home):
@@ -1356,15 +1369,17 @@ def home_installed(home, warnings):
     Claude counts only when every config dir it is used from names the
     bridge, so a second profile without hooks still reads as not set up."""
     installed, unknown = set(), set()
+    uid = home_owner(home)[1]
     for tool, bridge in BRIDGE_FILES:
         if not os.path.isfile(os.path.join(home, bridge)):
             continue
         if tool == "claude":
             used = [d for d in claude_config_dirs(home)
                     if os.path.isdir(os.path.join(d, "projects"))]
-            found = [mentions_bridge(os.path.join(d, "settings.json")) for d in used]
+            found = [mentions_bridge(home, os.path.join(d, "settings.json"), uid)
+                     for d in used]
         else:
-            found = [mentions_bridge(os.path.join(home, pattern))
+            found = [mentions_bridge(home, os.path.join(home, pattern), uid)
                      for name, pattern in CONFIG_TOOLS if name == tool]
             # One OpenCode config naming the bridge is enough.
             if True in found:
@@ -1373,8 +1388,8 @@ def home_installed(home, warnings):
             continue
         if None in found:
             unknown.add(tool)
-            warnings.append("cannot tell whether %s is set up in %s: a config cannot be read"
-                            % (tool, home))
+            warnings.append("cannot tell whether %s is set up in %s: a config cannot be read "
+                            "or is not the home owner's own" % (tool, home))
         else:
             installed.add(tool)
     return ([tool for tool in TOOL_ORDER if tool in installed],
@@ -1914,12 +1929,41 @@ class Refused(Exception):
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
 
 
+def only_owner_can_write(info):
+    """Whether nobody but the owner of `info` can write it. The one rule for
+    the home check, the write walk and the probe's reads.
+
+    Other-writable never passes. Group-writable passes only through a
+    user-private group: Ubuntu's umask 002 makes a user's own directories
+    775 under a group named for them, and refusing those would refuse the
+    login user's own config. The group must be the owner's primary group,
+    have no member but the owner, and be no one else's primary group.
+    """
+    mode = info.st_mode
+    if mode & 0o002:
+        return False
+    if not mode & 0o020:
+        return True
+    try:
+        import grp
+        import pwd
+        owner = pwd.getpwuid(info.st_uid)
+        if info.st_gid != owner.pw_gid:
+            return False
+        if any(member != owner.pw_name for member in grp.getgrgid(info.st_gid).gr_mem):
+            return False
+        return not any(entry.pw_gid == info.st_gid and entry.pw_name != owner.pw_name
+                       for entry in pwd.getpwall())
+    except (ImportError, KeyError, OSError):
+        return False
+
+
 def checked_directory(fd):
     """A directory this user owns and nobody else can write, or Refused.
     Anything less and someone else decides what its names point at."""
     info = os.fstat(fd)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() \
-            or info.st_mode & 0o022:
+            or not only_owner_can_write(info):
         os.close(fd)
         raise Refused("not allowed")
     return fd
@@ -2193,6 +2237,7 @@ _STEPS = {"__name__": "swarmbar_steps"}
 exec(compile(STEP_SOURCE, "<swarmbar-steps>", "exec"), _STEPS)
 STEP_BY_KIND = _STEPS["BY_KIND"]
 StepError = _STEPS["StepError"]
+only_owner_can_write = _STEPS["only_owner_can_write"]
 
 
 HOOK_DIR = ".swarmbar"
@@ -2796,7 +2841,7 @@ def root_only_path(path):
             info = os.lstat(current)
         except OSError:
             return False
-        if info.st_uid != 0 or info.st_mode & 0o022:
+        if info.st_uid != 0 or not only_owner_can_write(info):
             return False
         parent = os.path.dirname(current)
         if parent == current:
@@ -2848,8 +2893,16 @@ def kimi_events(request):
             # nothing else, so there is nothing in it to keep private.
             os.chmod(temp, 0o755)
             os.chmod(config, 0o644)
-        env = {"PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin",
-               "HOME": os.path.realpath(home), "KIMI_CODE_HOME": temp}
+        real_home = os.path.realpath(home)
+        if ids:
+            # Never root's PATH for another user: the system's, then the
+            # owner's own, where kimi and bun-installed builds live.
+            search = ":".join(["/usr/local/bin", "/usr/bin", "/bin",
+                               os.path.join(real_home, ".local", "bin"),
+                               os.path.join(real_home, ".bun", "bin")])
+        else:
+            search = os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+        env = {"PATH": search, "HOME": real_home, "KIMI_CODE_HOME": temp}
         if os.environ.get("LANG"):
             env["LANG"] = os.environ["LANG"]
         try:
@@ -3657,7 +3710,7 @@ def install_helper(request, source=None):
         if os.geteuid() == 0:
             os.makedirs(directory, 0o755, exist_ok=True)
             info = os.stat(directory)
-            if info.st_uid != 0 or info.st_mode & 0o022:
+            if info.st_uid != 0 or not only_owner_can_write(info):
                 return {"ok": False, "error": "%s is writable by another user" % directory}
         else:
             try:

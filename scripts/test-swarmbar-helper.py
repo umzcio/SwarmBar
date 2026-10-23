@@ -2446,6 +2446,27 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(sum("refusing" in w for w in result["warnings"]), 3, result["warnings"])
         self.assertNotIn("PLANTED", json.dumps(result["configs"]))
 
+    def test_bridge_check_refuses_a_config_that_is_not_the_owners_own(self):
+        self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n")
+        outside = os.path.join(self.root, "planted.toml")
+        with open(outside, "w") as handle:
+            handle.write('command = "swarmbar-remote-kimi-hook.sh"\n')
+        os.makedirs(os.path.join(self.home, ".kimi-code"))
+        os.symlink(outside, os.path.join(self.home, ".kimi-code", "config.toml"))
+        real_open = open
+        opened = []
+
+        def watching(name, *args, **kwargs):
+            opened.append(os.path.realpath(name) if isinstance(name, str) else name)
+            return real_open(name, *args, **kwargs)
+        with mock.patch("builtins.open", side_effect=watching):
+            result = self.probe()
+        self.assertNotIn(os.path.realpath(outside), opened)
+        self.assertEqual(result["installed"][self.home], [])
+        self.assertEqual(result["installed_unknown"][self.home], ["kimi"])
+        self.assertTrue(any("cannot tell whether kimi" in w for w in result["warnings"]),
+                        result["warnings"])
+
     def test_allowed_patterns(self):
         self.assertEqual(helper.ALLOWED, (
             ".claude*/settings.json",
@@ -2477,6 +2498,79 @@ def apply_blob(operations, raw=False):
     else:
         packed = zlib.compress(data)
     return base64.b64encode(packed).decode("ascii")
+
+
+class OwnerWritableTests(unittest.TestCase):
+    """only_owner_can_write: group write is the owner's own only through a
+    user-private group, and other write never is."""
+
+    UID, GID = 4100, 4100
+
+    def info(self, mode, gid=None):
+        values = [stat.S_IFDIR | mode, 1, 1, 2, self.UID, self.GID if gid is None else gid,
+                  0, 0, 0, 0]
+        return os.stat_result(values)
+
+    def users(self, members=(), others=()):
+        owner = mock.Mock(pw_name="u", pw_uid=self.UID, pw_gid=self.GID)
+        group = mock.Mock(gr_mem=list(members))
+        everyone = [owner] + [mock.Mock(pw_name=name, pw_uid=uid, pw_gid=gid)
+                              for name, uid, gid in others]
+        return (mock.patch("pwd.getpwuid", return_value=owner),
+                mock.patch("pwd.getpwall", return_value=everyone),
+                mock.patch("grp.getgrgid", return_value=group))
+
+    def check(self, info, **users):
+        patches = self.users(**users)
+        with patches[0], patches[1], patches[2]:
+            return helper.only_owner_can_write(info)
+
+    def test_user_private_group_775_passes(self):
+        self.assertTrue(self.check(self.info(0o775)))
+        self.assertTrue(self.check(self.info(0o775), members=["u"]))
+        self.assertTrue(self.check(self.info(0o755), members=["v"]))
+
+    def test_group_with_another_member_is_refused(self):
+        self.assertFalse(self.check(self.info(0o775), members=["u", "v"]))
+
+    def test_another_users_primary_group_is_refused(self):
+        self.assertFalse(self.check(self.info(0o775), others=[("v", 4200, self.GID)]))
+        # Nor a group that is not the owner's primary one at all.
+        self.assertFalse(self.check(self.info(0o775, gid=4300)))
+
+    def test_other_writable_is_always_refused(self):
+        self.assertFalse(self.check(self.info(0o1777)))
+        self.assertFalse(self.check(self.info(0o757)))
+
+    def test_upg_directories_pass_everywhere_the_rule_applies(self):
+        # A real 775 tree under this user's own group, as Ubuntu's umask
+        # 002 makes it: home rule, write walk and probe read all accept it
+        # once the group reads as private, and refuse it when it does not.
+        root = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbu-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        home = os.path.join(root, "u")
+        config = os.path.join(home, ".kimi-code", "config.toml")
+        os.makedirs(os.path.dirname(config))
+        with open(config, "w") as handle:
+            handle.write("old\n")
+        for directory in (home, os.path.dirname(config)):
+            os.chmod(directory, 0o775)
+        info = os.stat(home)
+        owner = mock.Mock(pw_name="u", pw_uid=info.st_uid, pw_gid=info.st_gid, pw_dir=home)
+        for members, ok in (([], True), (["someone"], False)):
+            with mock.patch("pwd.getpwuid", return_value=owner), \
+                    mock.patch("pwd.getpwall", return_value=[owner]), \
+                    mock.patch("grp.getgrgid", return_value=mock.Mock(gr_mem=members)), \
+                    mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": home}):
+                self.assertEqual(helper.owned_home(home), ok)
+                warnings = []
+                configs = helper.home_configs(home, warnings)
+                self.assertEqual(configs[0]["sha256"] is not None, ok, warnings)
+                result = helper.write_file({"path": config, "content_b64": encoded("new\n"),
+                                            "expect_sha256": sha("old\n"), "mode": 0o644})
+                self.assertEqual(result["ok"], ok, result)
+        with open(config) as handle:
+            self.assertEqual(handle.read(), "new\n")
 
 
 class SetupWriteTests(unittest.TestCase):
@@ -2920,6 +3014,10 @@ class KimiEventsTests(unittest.TestCase):
             self.assertIsNotNone(self.events()["events"])
         self.assertEqual(seen["options"]["user"], os.stat(self.home).st_uid)
         self.assertEqual(seen["options"]["group"], helper.home_owner(self.home)[2])
+        # Never root's PATH: the system's, then the owner's own bin dirs.
+        self.assertEqual(seen["options"]["env"]["PATH"], ":".join([
+            "/usr/local/bin", "/usr/bin", "/bin",
+            os.path.join(self.home, ".local", "bin"), os.path.join(self.home, ".bun", "bin")]))
 
     def test_root_home_runs_only_a_build_only_root_can_change(self):
         runner = mock.Mock(side_effect=AssertionError("ran"))
