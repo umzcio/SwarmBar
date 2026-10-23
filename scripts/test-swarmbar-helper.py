@@ -11,6 +11,7 @@ bigger than the read window) is only reproducible against a real file.
 python 3.9 compatible, like the helper itself.
 """
 
+import base64
 import hashlib
 import importlib.util
 import io
@@ -135,65 +136,286 @@ class TailOfTests(unittest.TestCase):
         self.assertTrue(result.endswith(record('{"i":19999}')))
 
 
-class SessionRecordTests(unittest.TestCase):
+def decode_chunks(entry):
+    """[(offset, bytes)] for one manifest entry."""
+    return [(offset, base64.b64decode(data)) for offset, data in entry["chunks"]]
+
+
+class ManifestTests(unittest.TestCase):
+    """The protocol 3 snapshot, against a temporary home.
+
+    Every file here is synthetic and lives under a temp dir that
+    SWARMBAR_HELPER_HOMES points at, so no real agent state is read.
+    """
+
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="swarmbar-helper-sessions-")
-        self.root = os.path.join(self.dir, ".claude", "projects")
-        self.project = os.path.join(self.root, "-projects-demo")
-        os.makedirs(self.project)
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-manifest-"))
+        self.env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home})
+        self.env.start()
+        # ps and lsof are not what these tests are about, and on a machine
+        # with live agents they make every snapshot slow.
+        self.ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        self.ps.start()
+        helper.SHIPPED.clear()
 
     def tearDown(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
+        self.ps.stop()
+        self.env.stop()
+        helper.SHIPPED.clear()
+        shutil.rmtree(self.home, ignore_errors=True)
 
-    def add(self, name, text):
-        path = os.path.join(self.project, name)
-        with open(path, "wb") as handle:
-            handle.write(text.encode("utf-8"))
+    def put(self, relative, data, mode="wb"):
+        path = os.path.join(self.home, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with open(path, mode) as handle:
+            handle.write(data)
         return path
 
-    def test_a_normal_session_is_shipped_whole(self):
-        self.add("a.jsonl", record('{"type":"user"}'))
-        warnings = []
-        sessions = helper.claude_sessions(time.time(), warnings, [self.root])
-        self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0]["tail"], record('{"type":"user"}'))
-        self.assertEqual(warnings, [])
+    def read(self, path):
+        with open(path, "rb") as handle:
+            return handle.read()
 
-    def test_a_session_carries_a_creation_timestamp(self):
-        self.add("a.jsonl", record('{"type":"user"}'))
-        warnings = []
-        sessions = helper.claude_sessions(time.time(), warnings, [self.root])
-        created = sessions[0]["created"]
-        self.assertGreater(created, 0)
-        # Never later than the last write: startedAt has to precede
-        # lastActivityAt or the Mac's elapsed timer runs backwards.
-        self.assertLessEqual(created, sessions[0]["mtime"] + 1)
+    def entry(self, snap, path):
+        for item in snap["files"]:
+            if item["path"] == path:
+                return item
+        return None
 
-    def test_an_over_ceiling_record_is_omitted_with_a_warning(self):
-        self.add("good.jsonl", record('{"type":"user"}'))
+    def many_records(self, count, partial=""):
+        return "".join(record('{"i":%d,"pad":"%s"}' % (i, "y" * 40))
+                       for i in range(count)) + partial
+
+    EVENTS = ".grok/sessions/s1/abc/events.jsonl"
+
+    def test_first_snapshot_ships_tail_chunk_at_true_offset(self):
+        # Well past TAIL_BYTES, and mid-write: the last line is partial.
+        path = self.put(self.EVENTS, self.many_records(4000, partial='{"i":"half'))
+        content = self.read(path)
+        snap = helper.snapshot()
+        self.assertEqual(snap["protocol"], 3)
+        self.assertEqual(snap["stream"], helper.STREAM_ID)
+        item = self.entry(snap, path)
+        self.assertIsNotNone(item)
+        self.assertTrue(item["reset"])
+        self.assertEqual(item["size"], len(content))
+        chunks = decode_chunks(item)
+        self.assertEqual(len(chunks), 1)
+        offset, data = chunks[0]
+        self.assertGreater(offset, 0)
+        # The bytes are the file's own bytes at that offset, through the
+        # size the manifest reports, so the next growth chunk lines up.
+        self.assertEqual(data, content[offset:])
+        self.assertEqual(offset + len(data), item["size"])
+        self.assertLessEqual(len(data), helper.TAIL_BYTES)
+
+    def test_second_snapshot_ships_nothing_for_unchanged_file(self):
+        path = self.put(self.EVENTS, self.many_records(10))
+        helper.snapshot()
+        item = self.entry(helper.snapshot(), path)
+        # Still listed: the manifest names every in-scope file every time.
+        self.assertIsNotNone(item)
+        self.assertEqual(item["chunks"], [])
+        self.assertFalse(item["reset"])
+
+    def test_append_ships_only_growth(self):
+        path = self.put(self.EVENTS, self.many_records(10))
+        old_size = os.stat(path).st_size
+        helper.snapshot()
+        appended = record('{"added":true}') + '{"half'
+        self.put(self.EVENTS, appended, mode="ab")
+        item = self.entry(helper.snapshot(), path)
+        self.assertFalse(item["reset"])
+        self.assertEqual(decode_chunks(item), [(old_size, appended.encode("utf-8"))])
+
+    def test_shrink_resets(self):
+        path = self.put(self.EVENTS, self.many_records(50))
+        helper.snapshot()
+        replacement = record('{"fresh":1}')
+        self.put(self.EVENTS, replacement)
+        item = self.entry(helper.snapshot(), path)
+        self.assertTrue(item["reset"])
+        self.assertEqual(decode_chunks(item), [(0, replacement.encode("utf-8"))])
+
+    def test_growth_past_the_ceiling_resets_with_a_fresh_tail(self):
+        path = self.put(self.EVENTS, self.many_records(10))
+        helper.snapshot()
         original = helper.MAX_TAIL_BYTES
         helper.MAX_TAIL_BYTES = helper.TAIL_BYTES * 2
         try:
-            self.add("bad.jsonl", big_record("huge", helper.TAIL_BYTES * 4))
-            warnings = []
-            sessions = helper.claude_sessions(
-                time.time(), warnings, [self.root])
+            self.put(self.EVENTS, self.many_records(4000), mode="ab")
+            item = self.entry(helper.snapshot(), path)
         finally:
             helper.MAX_TAIL_BYTES = original
-        paths = [s["path"] for s in sessions]
-        self.assertTrue(any(p.endswith("good.jsonl") for p in paths))
-        self.assertFalse(any(p.endswith("bad.jsonl") for p in paths))
-        self.assertTrue(any("bad.jsonl" in w for w in warnings), warnings)
-        # Never the empty tail that silently deletes the row.
-        self.assertFalse(any(s["tail"] == "" for s in sessions))
+        content = self.read(path)
+        self.assertTrue(item["reset"])
+        ((offset, data),) = decode_chunks(item)
+        self.assertEqual(data, content[offset:])
+        self.assertLessEqual(len(data), helper.TAIL_BYTES)
 
-    def test_a_session_still_being_written_is_omitted_with_a_warning(self):
-        self.add("fresh.jsonl", '{"type":"user"')
-        warnings = []
-        sessions = helper.claude_sessions(
-            time.time(), warnings, [self.root])
-        self.assertEqual(sessions, [])
-        self.assertTrue(any("fresh.jsonl" in w for w in warnings), warnings)
+    def test_head_tail_ships_first_line_at_zero(self):
+        first = record('{"type":"session_meta","cwd":"/home/u/demo"}')
+        path = self.put(".claude/projects/-home-u-demo/a.jsonl",
+                        first + self.many_records(4000))
+        content = self.read(path)
+        item = self.entry(helper.snapshot(), path)
+        chunks = decode_chunks(item)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0], (0, first.encode("utf-8")))
+        offset, data = chunks[1]
+        self.assertEqual(data, content[offset:])
+
+    def test_codex_head_grows_past_a_large_first_line(self):
+        first = record('{"type":"session_meta","base":"%s"}' % ("z" * 40000))
+        path = self.put(".codex/sessions/2026/10/22/rollout-demo.jsonl",
+                        first + self.many_records(10))
+        item = self.entry(helper.snapshot(), path)
+        self.assertEqual(decode_chunks(item)[0], (0, first.encode("utf-8")))
+
+    def test_whole_file_reships_on_change(self):
+        path = self.put(".grok/active_sessions.json", '{"sessions":[]}')
+        first = self.entry(helper.snapshot(), path)
+        self.assertTrue(first["reset"])
+        self.assertEqual(decode_chunks(first), [(0, b'{"sessions":[]}')])
+        self.assertEqual(self.entry(helper.snapshot(), path)["chunks"], [])
+        self.put(".grok/active_sessions.json", '{"sessions":[1]}')
+        later = os.stat(path).st_mtime + 5
+        os.utime(path, (later, later))
+        changed = self.entry(helper.snapshot(), path)
+        self.assertTrue(changed["reset"])
+        self.assertEqual(decode_chunks(changed), [(0, b'{"sessions":[1]}')])
+
+    def test_old_file_outside_window_is_not_listed(self):
+        path = self.put(self.EVENTS, self.many_records(5))
+        old = time.time() - helper.DISCOVERY_WINDOW_SECONDS - 60
+        os.utime(path, (old, old))
+        snap = helper.snapshot()
+        self.assertIsNone(self.entry(snap, path))
+        # An unwindowed spec keeps an equally old file.
+        history = self.put(".gemini/antigravity-cli/history.jsonl", record('{"p":1}'))
+        os.utime(history, (old, old))
+        self.assertIsNotNone(self.entry(helper.snapshot(), history))
+
+    def test_file_that_leaves_and_returns_ships_fresh(self):
+        path = self.put(self.EVENTS, self.many_records(5))
+        helper.snapshot()
+        os.remove(path)
+        self.assertIsNone(self.entry(helper.snapshot(), path))
+        self.assertNotIn(path, helper.SHIPPED)
+        self.put(self.EVENTS, self.many_records(5))
+        item = self.entry(helper.snapshot(), path)
+        self.assertTrue(item["reset"])
+        self.assertEqual(decode_chunks(item)[0][0], 0)
+
+    def test_backup_named_claude_root_is_skipped_with_warning(self):
+        live = self.put(".claude/projects/-p/a.jsonl", record('{"type":"user"}'))
+        backup = self.put(".claude.pre-move-backup/projects/-p/b.jsonl",
+                          record('{"type":"user"}'))
+        # A second name for the live root must not list its files twice.
+        os.symlink(os.path.join(self.home, ".claude"),
+                   os.path.join(self.home, ".claude-alias"))
+        snap = helper.snapshot()
+        paths = [f["path"] for f in snap["files"]]
+        self.assertIn(live, paths)
+        self.assertNotIn(backup, paths)
+        self.assertEqual(sum(p.endswith("/a.jsonl") for p in paths), 1)
+        self.assertTrue(any(".claude.pre-move-backup" in w for w in snap["warnings"]),
+                        snap["warnings"])
+
+    def test_conversation_db_only_with_presence_lock(self):
+        base = ".gemini/antigravity-cli/"
+        lock = self.put(base + "presence/conv-a.lock", "")
+        live = self.put(base + "conversations/conv-a.db", b"SQLite synthetic a")
+        wal = self.put(base + "conversations/conv-a.db-wal", b"wal a")
+        ended = self.put(base + "conversations/conv-b.db", b"SQLite synthetic b")
+        snap = helper.snapshot()
+        self.assertIsNotNone(self.entry(snap, live))
+        self.assertIsNotNone(self.entry(snap, wal))
+        self.assertIsNone(self.entry(snap, ended))
+        # A presence lock is listed for its existence and times, never read.
+        lock_item = self.entry(snap, lock)
+        self.assertIsNotNone(lock_item)
+        self.assertEqual(lock_item["chunks"], [])
+
+    def test_oversized_whole_file_is_omitted_not_empty(self):
+        original = helper.WHOLE_MAX_BYTES
+        helper.WHOLE_MAX_BYTES = 16
+        try:
+            path = self.put(".local/share/opencode/opencode.db", b"x" * 64)
+            snap = helper.snapshot()
+        finally:
+            helper.WHOLE_MAX_BYTES = original
+        self.assertIsNone(self.entry(snap, path))
+        self.assertIn({"path": path, "reason": "too large"}, snap["omitted"])
+
+    def test_tail_with_no_complete_record_is_omitted_not_empty(self):
+        path = self.put(self.EVENTS, '{"i":"still being written')
+        snap = helper.snapshot()
+        self.assertIsNone(self.entry(snap, path))
+        self.assertEqual([o["path"] for o in snap["omitted"]], [path])
+        self.assertNotIn(path, helper.SHIPPED)
+
+    def test_tail_over_the_ceiling_is_omitted_not_empty(self):
+        original = helper.MAX_TAIL_BYTES
+        helper.MAX_TAIL_BYTES = helper.TAIL_BYTES * 2
+        try:
+            path = self.put(self.EVENTS, record('{"first":1}')
+                            + big_record("huge", helper.TAIL_BYTES * 4))
+            snap = helper.snapshot()
+        finally:
+            helper.MAX_TAIL_BYTES = original
+        self.assertIsNone(self.entry(snap, path))
+        (omitted,) = snap["omitted"]
+        self.assertEqual(omitted["path"], path)
+        self.assertIn("no complete record", omitted["reason"])
+
+    def test_ancestor_dirs_are_listed(self):
+        session = ".kimi-code/sessions/wd_demo_0a1b/session_1234"
+        self.put(session + "/state.json", '{"status":"idle"}')
+        self.put(session + "/agents/main/wire.jsonl", record('{"t":1}'))
+        os.makedirs(os.path.join(self.home, ".grok/sessions/s1/abc/subagents/sub-1"))
+        snap = helper.snapshot()
+        dirs = [d["path"] for d in snap["dirs"]]
+        for relative in (".kimi-code", ".kimi-code/sessions",
+                         ".kimi-code/sessions/wd_demo_0a1b", session,
+                         session + "/agents", session + "/agents/main",
+                         ".grok/sessions/s1/abc/subagents/sub-1"):
+            self.assertIn(os.path.join(self.home, relative), dirs)
+        self.assertNotIn(self.home, dirs)
+        self.assertEqual(len(dirs), len(set(dirs)))
+        for item in snap["dirs"]:
+            self.assertIn("mtime", item)
+            self.assertIn("created", item)
+
+    def test_homes_and_shape(self):
+        snap = helper.snapshot()
+        self.assertEqual([h["path"] for h in snap["homes"]], [self.home])
+        self.assertTrue(snap["homes"][0]["user"])
+        self.assertNotIn("sessions", snap)
+        self.assertEqual(snap["processes"], [])
+        self.assertFalse(snap["processes_failed"])
+
+
+class ShipDecisionTests(unittest.TestCase):
+    def test_first_sight_is_fresh(self):
+        self.assertEqual(helper.ship_decision(None, None, 10, 1.0), "fresh")
+
+    def test_unchanged_is_nothing(self):
+        self.assertEqual(helper.ship_decision(10, 1.0, 10, 1.0), "none")
+
+    def test_growth(self):
+        self.assertEqual(helper.ship_decision(10, 1.0, 20, 2.0), "growth")
+
+    def test_growth_past_the_ceiling_is_fresh(self):
+        self.assertEqual(helper.ship_decision(
+            10, 1.0, 11 + helper.MAX_TAIL_BYTES, 2.0), "fresh")
+
+    def test_shrink_is_fresh(self):
+        self.assertEqual(helper.ship_decision(20, 1.0, 10, 2.0), "fresh")
+
+    def test_same_size_rewritten_is_fresh(self):
+        self.assertEqual(helper.ship_decision(10, 1.0, 10, 2.0), "fresh")
 
 
 class ProtocolTests(unittest.TestCase):
