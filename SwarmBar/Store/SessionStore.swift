@@ -16,6 +16,10 @@ final class SessionStore {
     /// One outage can change its reason between polls (a timeout, then a
     /// refused connection), so only reaching the host again ends it.
     private(set) var remoteUnreachableSince: [String: Date] = [:]
+    /// Called with a host's display name when it becomes reachable, so a
+    /// check that could not connect earlier is not left contradicting a
+    /// live connection. Set by the remote monitor supervisor.
+    @ObservationIgnored var remoteReachableHandler: ((String) -> Void)?
 
     func noteRemoteReachability(host: String, _ state: RemoteReachability, now: Date = .now) {
         if case .unreachable = state {
@@ -25,6 +29,7 @@ final class SessionStore {
         }
         guard remoteReachability[host] != state else { return }
         remoteReachability[host] = state
+        if state == .reachable { remoteReachableHandler?(host) }
     }
 
     /// Forgets everything about one remote host: its rows, its reachability

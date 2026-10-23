@@ -100,9 +100,13 @@ struct RemoteHostHintTests {
         let host = RemoteHost(alias: "alpha")
         #expect(HostRowText.status(host: host, reachability: .needsSetup("Run the setup command."),
                                    sessions: 2, assessment: nil) == "Run the setup command.")
-        #expect(HostRowText.status(host: host, reachability: .reachable, sessions: 2,
+        // A failed check speaks only while nothing live contradicts it.
+        #expect(HostRowText.status(host: host, reachability: .connecting, sessions: 2,
                                    assessment: Self.assessment(.cantConnect(.timedOut)))
             == HostProblem.timedOut.message)
+        #expect(HostRowText.status(host: host, reachability: .reachable, sessions: 2,
+                                   assessment: Self.assessment(.cantConnect(.timedOut)))
+            == "2 sessions · every user · connected")
         // A disabled host has no monitor, so "connecting" would never end.
         #expect(HostRowText.status(host: RemoteHost(alias: "beta", isEnabled: false), reachability: nil,
                                    sessions: 0, assessment: nil) == "Not being watched")
@@ -122,8 +126,16 @@ struct RemoteHostHintTests {
                                  assessment: Self.assessment()) == .needsSetup)
         #expect(HostRowText.pill(host: every, reachability: .unreachable("down"),
                                  assessment: Self.assessment()) == .offline)
-        #expect(HostRowText.pill(host: every, reachability: .reachable,
+        #expect(HostRowText.pill(host: every, reachability: .connecting,
                                  assessment: Self.assessment(.cantConnect(.keyRejected))) == .offline)
+        // Connected now, so the failed check is set aside, not shown as Offline.
+        #expect(HostRowText.pill(host: every, reachability: .reachable,
+                                 assessment: Self.assessment(.cantConnect(.keyRejected))) == .notChecked)
+        // Nothing watches a disabled host, so it gets no verdict at all.
+        let off = RemoteHost(alias: "beta", isEnabled: false)
+        #expect(HostRowText.pill(host: off, reachability: nil, assessment: Self.assessment()) == nil)
+        #expect(HostRowText.pill(host: off, reachability: .reachable,
+                                 assessment: Self.assessment(hidden: 2)) == nil)
         #expect(HostRowText.Pill.ready.label == "Ready")
         #expect(HostRowText.Pill.needsSetup.label == "Needs setup")
         #expect(HostRowText.Pill.offline.label == "Offline")
@@ -267,7 +279,89 @@ struct RemoteHostHintTests {
         #expect(rig.supervisor.assessments[host.id] == nil)
 
         await rig.supervisor.checkAgain(hostID: host.id)
+        var renamed = rig.registry.host(id: host.id)!
+        renamed.alias = "devbox2"
+        rig.registry.upsert(renamed)
+        #expect(rig.supervisor.assessments[host.id] == nil)
+
+        await rig.supervisor.checkAgain(hostID: host.id)
         rig.registry.remove(id: host.id)
+        #expect(rig.supervisor.assessments[host.id] == nil)
+    }
+
+    @Test func failedCheckIsDroppedWhenTheHostAnswersAgain() async {
+        let rig = Rig()
+        let host = RemoteHost(alias: "alpha")
+        rig.registry.upsert(host)
+        rig.supervisor.prober = { _ in (nil, nil, .timedOut) }
+        await rig.supervisor.checkAgain(hostID: host.id)
+        #expect(rig.supervisor.assessments[host.id]?.status == .cantConnect(.timedOut))
+
+        rig.store.noteRemoteReachability(host: host.displayName, .unreachable("down"))
+        #expect(rig.supervisor.assessments[host.id] != nil)
+        rig.store.noteRemoteReachability(host: host.displayName, .reachable)
+        #expect(rig.supervisor.assessments[host.id] == nil)
+
+        // A check that did connect is kept when the host answers.
+        rig.supervisor.prober = { _ in (Self.probe(), nil, nil) }
+        await rig.supervisor.checkAgain(hostID: host.id)
+        rig.store.noteRemoteReachability(host: host.displayName, .unreachable("down"))
+        rig.store.noteRemoteReachability(host: host.displayName, .reachable)
+        #expect(rig.supervisor.assessments[host.id] != nil)
+    }
+
+    /// Holds a probe open until the test lets it finish.
+    @MainActor private final class Gate {
+        var waiting: CheckedContinuation<Void, Never>?
+        func open() { waiting?.resume(); waiting = nil }
+    }
+
+    private func settle(until condition: () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !condition() && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    @Test func probeForARemovedHostPublishesNothing() async {
+        let rig = Rig()
+        let host = RemoteHost(alias: "devbox")
+        rig.registry.upsert(host)
+        let gate = Gate()
+        rig.supervisor.prober = { _ in
+            await withCheckedContinuation { gate.waiting = $0 }
+            return (Self.probe(), nil, nil)
+        }
+        let check = Task { await rig.supervisor.checkAgain(hostID: host.id) }
+        await settle { gate.waiting != nil }
+
+        rig.registry.remove(id: host.id)
+        gate.open()
+        await check.value
+
+        #expect(rig.supervisor.assessments[host.id] == nil)
+        #expect(rig.supervisor.checking.isEmpty)
+    }
+
+    @Test func probeForAReAliasedHostPublishesNothing() async {
+        let rig = Rig()
+        let host = RemoteHost(alias: "devbox")
+        rig.registry.upsert(host)
+        let gate = Gate()
+        rig.supervisor.prober = { _ in
+            await withCheckedContinuation { gate.waiting = $0 }
+            return (Self.probe(), nil, nil)
+        }
+        let check = Task { await rig.supervisor.checkAgain(hostID: host.id) }
+        await settle { gate.waiting != nil }
+
+        var moved = host
+        moved.alias = "devbox2"
+        rig.registry.upsert(moved)
+        gate.open()
+        await check.value
+
+        // The answer was about the old alias, so it says nothing about this one.
         #expect(rig.supervisor.assessments[host.id] == nil)
     }
 
@@ -288,5 +382,28 @@ struct RemoteHostHintTests {
         #expect(peak == ProbeRunner.maxConcurrent)
         #expect(rig.supervisor.assessments.count == 9)
         #expect(rig.supervisor.assessments.values.allSatisfy { $0.status == .cantConnect(.timedOut) })
+    }
+
+    @Test func secondCheckAllWhileOneRunsDoesNothing() async {
+        let rig = Rig()
+        for n in 0..<9 { rig.registry.upsert(RemoteHost(alias: "host\(n)")) }
+        var inFlight = 0, peak = 0, calls = 0
+        rig.supervisor.prober = { _ in
+            calls += 1
+            inFlight += 1
+            peak = max(peak, inFlight)
+            try? await Task.sleep(for: .milliseconds(20))
+            inFlight -= 1
+            return (nil, nil, .timedOut)
+        }
+
+        let first = Task { await rig.supervisor.checkAllAgain() }
+        let second = Task { await rig.supervisor.checkAllAgain() }
+        await first.value
+        await second.value
+
+        #expect(peak == ProbeRunner.maxConcurrent)
+        #expect(calls == 9)
+        #expect(rig.supervisor.checkingAll == false)
     }
 }

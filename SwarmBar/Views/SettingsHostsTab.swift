@@ -41,6 +41,7 @@ enum HostRowText {
         case .reachable?, .connecting?, nil:
             break
         }
+        let assessment = live(assessment, reachability)
         if case .cantConnect(let problem)? = assessment?.status { return problem.message }
 
         let count = sessions == 0 ? "No sessions" : WizardCopy.sessions(sessions)
@@ -57,13 +58,16 @@ enum HostRowText {
 
     /// Reachability says Offline and Needs setup on its own. Ready and
     /// Partial need a check, and until there is one the host is not
-    /// checked yet rather than assumed fine.
-    static func pill(host: RemoteHost, reachability: RemoteReachability?, assessment: HostAssessment?) -> Pill {
+    /// checked yet rather than assumed fine. A disabled host has no pill:
+    /// nothing is watching it, so no verdict about it is current.
+    static func pill(host: RemoteHost, reachability: RemoteReachability?, assessment: HostAssessment?) -> Pill? {
+        guard host.isEnabled else { return nil }
         switch reachability {
         case .unreachable?: return .offline
         case .needsSetup?: return .needsSetup
         case .reachable?, .connecting?, nil: break
         }
+        let assessment = live(assessment, reachability)
         switch assessment?.status {
         case nil: return .notChecked
         case .cantConnect?: return .offline
@@ -102,6 +106,13 @@ enum HostRowText {
         guard let check else { return "No agents seen on this host yet. Check all again to look." }
         if check.loginUser == nil { return "SwarmBar couldn't look at this host. Check all again to try." }
         return "No agents found on this host."
+    }
+
+    /// A check that could not connect is wrong about a host the monitor is
+    /// connected to right now, so it is set aside rather than shown.
+    static func live(_ assessment: HostAssessment?, _ reachability: RemoteReachability?) -> HostAssessment? {
+        if reachability == .reachable, case .cantConnect? = assessment?.status { return nil }
+        return assessment
     }
 
     private static func hiddenPhrase(_ count: Int, users: [String]) -> String {
@@ -188,7 +199,7 @@ struct HostsSettingsTab: View {
             .buttonStyle(.plain)
             .font(.system(size: 12))
             .foregroundStyle(.orange)
-            .disabled(!supervisor.checking.isEmpty)
+            .disabled(supervisor.checkingAll || !supervisor.checking.isEmpty)
         }
         .padding(.top, 10)
     }
@@ -223,9 +234,11 @@ private struct HostSettingsRow: View {
     @State private var confirmingRemove = false
 
     var body: some View {
-        let check = supervisor.checks[host.id]
-        let sessions = store.sessions.filter { $0.host == host.displayName }
         let reachability = store.remoteReachability[host.displayName]
+        let check = supervisor.checks[host.id].flatMap {
+            HostRowText.live($0.assessment, reachability) == nil ? nil : $0
+        }
+        let sessions = store.sessions.filter { $0.host == host.displayName }
         VStack(alignment: .leading, spacing: 0) {
             Button(action: toggleExpanded) {
                 HStack(spacing: 10) {
@@ -237,8 +250,10 @@ private struct HostSettingsRow: View {
                     Text(verbatim: host.displayName)
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
-                        .frame(minWidth: 84, alignment: .leading)
-                        .fixedSize()
+                        .truncationMode(.tail)
+                        .frame(minWidth: 84, maxWidth: 140, alignment: .leading)
+                        .layoutPriority(1)
+                        .help(host.displayName)
                     Text(verbatim: HostRowText.status(
                         host: host, reachability: reachability, sessions: sessions.count,
                         assessment: check?.assessment, loginUser: check?.loginUser,
@@ -251,9 +266,9 @@ private struct HostSettingsRow: View {
                     if supervisor.checking.contains(host.id) {
                         ProgressView()
                             .controlSize(.mini)
-                    } else {
-                        HostPill(pill: HostRowText.pill(
-                            host: host, reachability: reachability, assessment: check?.assessment))
+                    } else if let pill = HostRowText.pill(
+                        host: host, reachability: reachability, assessment: check?.assessment) {
+                        HostPill(pill: pill)
                     }
                 }
                 .padding(.horizontal, 13)
@@ -261,6 +276,7 @@ private struct HostSettingsRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
 
             if isExpanded {
                 details(check: check, sessions: sessions)

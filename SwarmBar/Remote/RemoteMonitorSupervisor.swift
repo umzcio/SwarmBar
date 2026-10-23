@@ -27,7 +27,9 @@ final class RemoteMonitorSupervisor {
     /// assessment, plus what the row needs to say it in words.
     struct HostCheck: Equatable, Sendable {
         var assessment: HostAssessment
-        /// The pick it was judged for. A different pick makes it stale.
+        /// The alias and pick it was judged for. A change to either makes
+        /// it describe some other host.
+        var alias: String
         var watchAs: WatchAs
         /// Who the probe logged in as, for "Just dev". nil when it never
         /// connected.
@@ -69,6 +71,9 @@ final class RemoteMonitorSupervisor {
     private(set) var checks: [UUID: HostCheck] = [:]
     /// Hosts being checked right now.
     private(set) var checking: Set<UUID> = []
+    /// "Check all again" is running. Set before its first await, so a
+    /// second press cannot start a second batch beside it.
+    private(set) var checkingAll = false
     /// Probes a host by alias. Injectable so tests never start ssh.
     @ObservationIgnored var prober: @MainActor (String) async -> ProbeRunner.Outcome = { alias in
         guard let runner = RemoteMonitorSupervisor.bundledProbeRunner else {
@@ -93,6 +98,8 @@ final class RemoteMonitorSupervisor {
         self.registry = registry
         self.factory = factory
         self.hookServer = hookServer
+        // A host that answers again proves a "can't connect" check wrong.
+        store.remoteReachableHandler = { [weak self] name in self?.dropFailedCheck(hostName: name) }
     }
 
     /// One ssh helper per host, and a mirror in Caches keyed by the host's
@@ -145,7 +152,9 @@ final class RemoteMonitorSupervisor {
         }
         // A check is about one host as it was picked. Gone, or picked the
         // other way since, it no longer says anything true.
-        let staleChecks = checks.filter { id, check in wanted[id]?.watchAs != check.watchAs }
+        let staleChecks = checks.filter { id, check in
+            wanted[id].map { $0.alias != check.alias || $0.watchAs != check.watchAs } ?? true
+        }
         for id in staleChecks.keys { checks.removeValue(forKey: id) }
         // Hosts gone from the registry never start again, so nothing will
         // wait on their stopping tasks. Dropping the reference does not
@@ -187,11 +196,14 @@ final class RemoteMonitorSupervisor {
         let outcome = await prober(host.alias)
         // Removed, or pointed somewhere else, while the probe ran.
         guard let current = registry.host(id: id), current.alias == host.alias else { return }
-        checks[id] = Self.check(outcome, watchAs: current.watchAs)
+        checks[id] = Self.check(outcome, alias: current.alias, watchAs: current.watchAs)
     }
 
     /// Every host, at most as many at once as the wizard probes.
     func checkAllAgain() async {
+        guard !checkingAll else { return }
+        checkingAll = true
+        defer { checkingAll = false }
         let ids = registry.hosts.map(\.id)
         await withTaskGroup(of: Void.self) { group in
             var pending = ids[...]
@@ -213,12 +225,20 @@ final class RemoteMonitorSupervisor {
         if checks[id] != nil { checks.removeValue(forKey: id) }
     }
 
+    /// The live connection outranks a check that could not make one.
+    private func dropFailedCheck(hostName: String) {
+        guard let host = registry.hosts.first(where: { $0.displayName == hostName }),
+              case .cantConnect? = checks[host.id]?.assessment.status else { return }
+        checks.removeValue(forKey: host.id)
+    }
+
     /// Pure: the assessment for this pick, and what the row says about it.
-    static func check(_ outcome: ProbeRunner.Outcome, watchAs: WatchAs) -> HostCheck {
+    static func check(_ outcome: ProbeRunner.Outcome, alias: String, watchAs: WatchAs) -> HostCheck {
         let assessment = HostAssessment.assess(
             user: outcome.user, root: outcome.root, failure: outcome.failure, watchAs: watchAs)
         guard let user = outcome.user else {
-            return HostCheck(assessment: assessment, watchAs: watchAs, loginUser: nil, hiddenUsers: [], tools: [])
+            return HostCheck(assessment: assessment, alias: alias, watchAs: watchAs, loginUser: nil,
+                             hiddenUsers: [], tools: [])
         }
         let agents = user.processesFailed ? [] : user.processes.filter {
             ProbeResult.tool(forProcess: $0.comm) != nil
@@ -234,7 +254,7 @@ final class RemoteMonitorSupervisor {
                 if let tool = ProbeResult.tool(forProcess: process.comm) { tools.insert(tool) }
             }
         }
-        return HostCheck(assessment: assessment, watchAs: watchAs, loginUser: user.user,
+        return HostCheck(assessment: assessment, alias: alias, watchAs: watchAs, loginUser: user.user,
                          hiddenUsers: hidden, tools: tools)
     }
 
