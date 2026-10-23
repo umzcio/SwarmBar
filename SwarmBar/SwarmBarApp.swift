@@ -7,6 +7,9 @@ struct SwarmBarApp: App {
     /// Held for the life of the app. Nil under --mock, which has no remote hosts.
     private let remoteRegistry: RemoteHostRegistry?
     private let remoteSupervisor: RemoteMonitorSupervisor?
+    /// The remote hosts wizard's one model, built with the registry above
+    /// the first time the wizard opens.
+    @State private var remoteWizard: RemoteWizardLauncher
 
     init() {
         // A write to a pipe whose reader has already gone raises SIGPIPE,
@@ -76,6 +79,7 @@ struct SwarmBarApp: App {
         if CommandLine.arguments.contains("--mock") {
             remoteRegistry = nil
             remoteSupervisor = nil
+            _remoteWizard = State(initialValue: RemoteWizardLauncher(makeModel: nil))
             Task { await MockSessionMonitor().start(into: store) }
         } else {
             // Every mirror from the previous run is meaningless now: each
@@ -99,6 +103,9 @@ struct SwarmBarApp: App {
             supervisor.reconcile()
             remoteRegistry = registry
             remoteSupervisor = supervisor
+            _remoteWizard = State(initialValue: RemoteWizardLauncher {
+                RemoteWizardModel(services: LiveRemoteWizardServices(), registry: registry)
+            })
         }
     }
 
@@ -106,6 +113,7 @@ struct SwarmBarApp: App {
         MenuBarExtra {
             PopoverRootView()
                 .environment(store)
+                .remoteWizardLauncher(remoteWizard)
         } label: {
             MenuBarLabel()
                 .environment(store)
@@ -115,7 +123,19 @@ struct SwarmBarApp: App {
         Settings {
             SettingsView()
                 .environment(store)
+                .remoteWizardLauncher(remoteWizard)
         }
+
+        // Opened only through `openRemoteWizard`, from Settings or the
+        // popover: never at launch and never restored, since the wizard
+        // must not open by itself.
+        Window("Add remote hosts", id: RemoteWizardLauncher.windowID) {
+            RemoteWizardWindow(launcher: remoteWizard)
+                .environment(store)
+        }
+        .defaultSize(width: 520, height: 560)
+        .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.suppressed)
     }
 }
 

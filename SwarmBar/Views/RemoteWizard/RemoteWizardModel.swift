@@ -84,6 +84,38 @@ final class RemoteWizardModel {
     /// the same steps and offer the same three paths.
     enum Mode: Equatable { case setUp, undo }
 
+    /// How the window was asked to open: at the intro, or at step 3 for one
+    /// registered host from Settings.
+    enum Entry: Equatable, Sendable {
+        case fresh
+        case setUp(alias: String)
+        case undo(alias: String)
+    }
+
+    /// The pill a row shows on the pick and on done.
+    enum Pill: Equatable { case ready, partial, needsSetup, cantConnect, cantContinue }
+
+    /// One tool's lines in "Let SwarmBar do it" and "Show what it will
+    /// change".
+    struct ChangeGroup: Equatable, Identifiable {
+        var title: String
+        var lines: [String]
+        var id: String { title }
+    }
+
+    /// Who runs the agents on a host, from the login user's own view, for
+    /// the watch-as choice.
+    struct WatchContext: Equatable {
+        var loginUser: String
+        var sudoOK: Bool
+        /// Agents other accounts run, which only watching every user shows.
+        /// nil when the process list could not be read.
+        var otherSessions: Int?
+        var otherUsers: [String]
+        /// "2 Codex, 1 Grok Build".
+        var otherSummary: String
+    }
+
     struct Row: Identifiable, Equatable {
         /// The ssh alias, as ssh config spells it.
         let id: String
@@ -100,6 +132,20 @@ final class RemoteWizardModel {
     static let unusableAlias = "This host name can't be used."
     /// A row whose probe was stopped before it answered.
     static let notChecked = "Not checked"
+
+    static let nothingToInstall = "Nothing to install. Answers are keystrokes in tmux."
+    static let sudoersPath = "/etc/sudoers.d/swarmbar"
+    /// Answered with keystrokes or walked by label, so nothing is installed
+    /// for them.
+    static let keystrokeTools: [AgentTool] = [.codex, .grokBuild, .antigravity]
+    /// Answered with keystrokes or screen reads into a tmux pane on a remote
+    /// host. Claude Code and OpenCode answer over their hooks instead.
+    static let toolsNeedingTmux: [AgentTool] = [.codex, .kimiCode, .bearCode, .grokBuild, .antigravity]
+
+    /// The rule the helper writes for the narrow sudo setup, as it writes it.
+    static func sudoersLine(user: String) -> String {
+        "\(user) ALL=(root) NOPASSWD: \(HelperLaunch.rootHelperPath)"
+    }
 
     static func noHomeMessage(user: String) -> String {
         "Couldn't find a home folder for \(user) on this host."
@@ -144,6 +190,13 @@ final class RemoteWizardModel {
     private(set) var isWorking = false
     /// True while hosts are being looked for or checked again.
     private(set) var isProbing = false
+    /// The plan `progress` is reported against. Kept apart from `plans`,
+    /// which the check after applying replaces, so the progress list never
+    /// reads one plan's outcomes against another plan's changes.
+    private(set) var appliedPlan: SetupPlan?
+    /// Opened at step 3 from Settings, where there is no pick to go back
+    /// to, so the view's Back closes the window instead.
+    private(set) var openedAtSetup = false
     /// Root's view being taken in the background after a pick.
     private var rootChecks: [UUID: Task<Void, Never>] = [:]
 
@@ -164,8 +217,6 @@ final class RemoteWizardModel {
     /// Bumped by every fresh start, so work left over from an earlier run
     /// never lands in this one.
     @ObservationIgnored private var generation = 0
-    /// Opened at step 3 from Settings, where there is no pick to go back to.
-    @ObservationIgnored private var openedAtSetup = false
 
     private struct Artifacts {
         var command: Result<String, SetupCommand.Unavailable>
@@ -180,6 +231,28 @@ final class RemoteWizardModel {
     /// Something is in flight, so actions wait.
     var isBusy: Bool { isWorking || isProbing || !rootChecks.isEmpty }
 
+    /// The release the setup command downloads the helper from.
+    var helperVersion: String { services.helperVersion }
+
+    // MARK: Opening
+
+    /// What the window does when it is asked to open. A fresh open shows
+    /// the intro and reaches out to nothing. Changes being made are never
+    /// interrupted, so a fresh open while they run shows them instead.
+    func open(_ entry: Entry) async {
+        guard !isWorking else { return }
+        cancel()
+        switch entry {
+        case .fresh:
+            reset()
+            step = .intro
+        case .setUp(let alias):
+            await startSetUp(alias: alias)
+        case .undo(let alias):
+            await startUndo(alias: alias)
+        }
+    }
+
     var skippedLine: String? {
         skippedGitHosts.isEmpty ? nil : "Skipped: \(skippedGitHosts.joined(separator: ", ")) (git hosts)."
     }
@@ -190,6 +263,7 @@ final class RemoteWizardModel {
     func lookForHosts() async {
         guard !isBusy else { return }
         reset()
+        let run = generation
         step = .checking
         await probing { [self] in
             let found = await services.candidates()
@@ -202,6 +276,9 @@ final class RemoteWizardModel {
             }
             await probe(found.aliases, setDefaultCheck: Set(found.aliases))
         }
+        // A look that was stopped and replaced by a newer one returns late,
+        // and must not move the newer one on while it is still checking.
+        guard generation == run else { return }
         if step == .checking { step = .pick }
         collapseRows()
     }
@@ -269,6 +346,7 @@ final class RemoteWizardModel {
         }
         setupAliases = queue
         progress = [:]
+        appliedPlan = nil
         if queue.isEmpty {
             step = .done
         } else {
@@ -291,7 +369,9 @@ final class RemoteWizardModel {
             guard !openedAtSetup, !isWorking else { return }
             cancelRootChecks()
             progress = [:]
+            appliedPlan = nil
             setupAliases = []
+            clearPlanningProblems()
             step = .pick
         case .intro, .done:
             break
@@ -387,10 +467,122 @@ final class RemoteWizardModel {
         plans[alias]?.changes.filter(\.isSent) ?? []
     }
 
-    /// "Edit by hand" items: changes that are never sent, each with its
-    /// description, which says what to do and why SwarmBar can't.
+    /// "Edit by hand" items, each with its description, which says what to
+    /// do and why SwarmBar can't. A skipped change is not one: nothing is
+    /// needed there, so it stays in its tool's group.
     func handEdits(for alias: String) -> [String] {
-        plans[alias]?.changes.filter { !$0.isSent }.map(\.description) ?? []
+        plans[alias]?.changes.filter { $0.action == .byHand }.map(\.description) ?? []
+    }
+
+    /// Every change but the hand edits, grouped by tool in AgentTool order,
+    /// with a line for each keystroke tool the host has, since those need
+    /// nothing installed. The command also installs the helper and the sudo
+    /// rule, which no PlannedChange stands for, so its list says so too.
+    func changeGroups(for alias: String, forCommand: Bool = false) -> [ChangeGroup] {
+        guard let plan = plans[alias] else { return [] }
+        let present = presentTools(alias)
+        var groups: [ChangeGroup] = []
+        for tool in AgentTool.allCases {
+            var lines = plan.changes.filter { $0.tool == tool && $0.action != .byHand }.map(\.description)
+            if Self.keystrokeTools.contains(tool) && present.contains(tool) {
+                lines.append(Self.nothingToInstall)
+            }
+            if !lines.isEmpty { groups.append(ChangeGroup(title: tool.label, lines: lines)) }
+        }
+        var shared = plan.changes.filter { $0.tool == nil && $0.action != .byHand }.map(\.description)
+        if forCommand {
+            if plan.installHelper { shared.append("Install SwarmBar's helper at \(plan.helperDestination)") }
+            if let user = plan.sudoersUser {
+                shared.append("Let \(user) run SwarmBar's helper as root, in \(Self.sudoersPath)")
+            }
+        }
+        if !shared.isEmpty { groups.append(ChangeGroup(title: "Shared", lines: shared)) }
+        return groups
+    }
+
+    /// The probe a host is judged on as it is watched, and the account
+    /// whose homes and agents that means. nil before the host answers.
+    private func watchedView(_ alias: String) -> (probe: ProbeResult, only: String?)? {
+        guard let input = inputs[alias], let user = input.user else { return nil }
+        if watchAs[alias] == .everyUser { return (input.root ?? user, nil) }
+        return (user, user.user)
+    }
+
+    /// Tools with state or a running agent in the homes the host is watched
+    /// for.
+    private func presentTools(_ alias: String) -> Set<AgentTool> {
+        guard let (probe, only) = watchedView(alias) else { return [] }
+        var found = Set<AgentTool>()
+        for home in probe.homes where only == nil || home.user == only {
+            for name in probe.tools[home.path] ?? [] {
+                if let tool = ProbeResult.tool(named: name) { found.insert(tool) }
+            }
+        }
+        for process in probe.processes where only == nil || process.user == only {
+            if let tool = ProbeResult.tool(forProcess: process.comm) { found.insert(tool) }
+        }
+        return found
+    }
+
+    func watchContext(for alias: String) -> WatchContext? {
+        guard let user = inputs[alias]?.user else { return nil }
+        guard !user.processesFailed else {
+            return WatchContext(loginUser: user.user, sudoOK: user.sudoOK, otherSessions: nil,
+                                otherUsers: [], otherSummary: "")
+        }
+        let others = user.processes.filter {
+            $0.user != user.user && ProbeResult.tool(forProcess: $0.comm) != nil
+        }
+        var counts: [AgentTool: Int] = [:]
+        for process in others {
+            if let tool = ProbeResult.tool(forProcess: process.comm) { counts[tool, default: 0] += 1 }
+        }
+        let summary = AgentTool.allCases.compactMap { tool in counts[tool].map { "\($0) \(tool.label)" } }
+        return WatchContext(
+            loginUser: user.user, sudoOK: user.sudoOK, otherSessions: others.count,
+            otherUsers: Set(others.map(\.user)).sorted(), otherSummary: summary.joined(separator: ", "))
+    }
+
+    /// One line per tool whose sessions here are outside tmux, where a
+    /// remote keystroke can't reach them.
+    func notInTmuxLines(for alias: String) -> [String] {
+        guard let (probe, only) = watchedView(alias), !probe.processesFailed else { return [] }
+        var counts: [AgentTool: Int] = [:]
+        for process in probe.processes where process.pane == nil && (only == nil || process.user == only) {
+            if let tool = ProbeResult.tool(forProcess: process.comm), Self.toolsNeedingTmux.contains(tool) {
+                counts[tool, default: 0] += 1
+            }
+        }
+        return AgentTool.allCases.compactMap { tool in
+            counts[tool].map { count in
+                count == 1
+                    ? "1 \(tool.label) session isn't in tmux: answer it in its terminal"
+                    : "\(count) \(tool.label) sessions aren't in tmux: answer them in their terminals"
+            }
+        }
+    }
+
+    func pill(for row: Row) -> Pill? {
+        if row.isChecking || row.problem == Self.notChecked { return nil }
+        if row.problem != nil { return .cantContinue }
+        switch row.assessment?.status {
+        case nil: return nil
+        case .cantConnect: return .cantConnect
+        case .needsSetup: return .needsSetup
+        case .ready: return (row.assessment?.hiddenSessions ?? 0) > 0 ? .partial : .ready
+        }
+    }
+
+    /// The hosts this run put in the registry, for the done step.
+    var watchedRows: [Row] {
+        rows.filter { registered.contains($0.id) }
+    }
+
+    /// The name the registry gave the host, which is the one its sessions
+    /// carry, or the row's own before it is registered.
+    func watchedName(_ alias: String) -> String {
+        registry.hosts.first { $0.alias == alias }?.displayName
+            ?? rows.first { $0.id == alias }?.displayName ?? alias
     }
 
     /// The narrow sudo rule is root for that account, which the view says
@@ -425,6 +617,7 @@ final class RemoteWizardModel {
         defer { isWorking = false }
         step = .applying(hostIndex: index)
         progress = [:]
+        appliedPlan = plan
         await services.apply(plan, alias: alias) { [weak self] change, outcome in
             self?.progress[change] = outcome
         }
@@ -524,6 +717,7 @@ final class RemoteWizardModel {
         path = [:]
         defaultPaths = [:]
         progress = [:]
+        appliedPlan = nil
         setupAliases = []
         registered = []
         skippedGitHosts = []
@@ -532,14 +726,26 @@ final class RemoteWizardModel {
         openedAtSetup = false
     }
 
+    /// A problem from planning belongs to step 3. Back on the pick it would
+    /// leave a good host unable to be ticked, so only what the pick itself
+    /// found stays: a name that can't be used, or a host never checked.
+    private func clearPlanningProblems() {
+        for index in rows.indices {
+            guard let problem = rows[index].problem, problem != Self.unusableAlias, problem != Self.notChecked
+            else { continue }
+            rows[index].problem = nil
+        }
+    }
+
     private func seed(_ body: () -> Void) {
         seeding = true
         body()
         seeding = false
     }
 
-    /// A cantConnect row can't be ticked, nor can one with a problem.
-    private static func canCheck(_ row: Row) -> Bool {
+    /// A cantConnect row can't be ticked, nor can one with a problem. The
+    /// pick's check boxes are disabled by the same rule.
+    static func canCheck(_ row: Row) -> Bool {
         guard row.problem == nil, let assessment = row.assessment else { return false }
         if case .cantConnect = assessment.status { return false }
         return true
@@ -555,9 +761,11 @@ final class RemoteWizardModel {
     /// and it lands exactly as a pick would, short of a second probe.
     private func record(_ alias: String, _ outcome: HostAssessmentInput, setDefaultCheck: Bool) {
         inputs[alias] = outcome
+        // A fresh answer replaces whatever the last one led to. Only an
+        // unusable name outlives it; step 3 plans again and says anew.
         setRow(alias) { row in
             row.isChecking = false
-            if row.problem == Self.notChecked { row.problem = nil }
+            if row.problem != Self.unusableAlias { row.problem = nil }
         }
         let suggested = watchAs[alias] != nil ? nil : HostAssessment.assess(
             user: outcome.user, root: outcome.root, failure: outcome.failure, watchAs: nil
@@ -728,6 +936,7 @@ final class RemoteWizardModel {
 
     private func advance(from index: Int) {
         progress = [:]
+        appliedPlan = nil
         let next = index + 1
         guard setupAliases.indices.contains(next) else {
             step = .done
@@ -743,7 +952,7 @@ final class RemoteWizardModel {
 final class LiveRemoteWizardServices: RemoteWizardServices {
     /// `ssh -G` runs at once, at most this many.
     static let maxResolves = 8
-    static let helperMissing = HostProblem.other("SwarmBar's helper is missing from the app.")
+    static let helperMissing = HostProblem.other(SetupCommand.Unavailable.helperMissing.reason)
 
     private let runner: ProbeRunner?
     private let bundled: BundledBridges?

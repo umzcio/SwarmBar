@@ -379,6 +379,10 @@ struct NotificationSettingsTab: View {
 
 // MARK: - Shared pieces
 
+// The card, its group label, divider and toggle row are internal because the
+// remote hosts wizard is built from them too, so the two windows read as one
+// app.
+
 private struct SettingsCardList<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -391,7 +395,7 @@ private struct SettingsCardList<Content: View>: View {
     }
 }
 
-private struct SettingsCard<Content: View>: View {
+struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -404,7 +408,7 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct SettingsGroupLabel: View {
+struct SettingsGroupLabel: View {
     let title: String
     init(_ title: String) { self.title = title }
 
@@ -418,7 +422,7 @@ private struct SettingsGroupLabel: View {
     }
 }
 
-private struct SettingsDivider: View {
+struct SettingsDivider: View {
     var body: some View {
         Divider()
             .overlay(.white.opacity(0.06))
@@ -457,7 +461,7 @@ private struct SettingsPickerRow<Control: View>: View {
     }
 }
 
-private struct SettingsToggleRow: View {
+struct SettingsToggleRow: View {
     let symbol: String
     var symbolTint: Color = .secondary
     let title: String

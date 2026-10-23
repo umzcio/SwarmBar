@@ -872,6 +872,297 @@ struct RemoteWizardModelTests {
         #expect(model.currentAlias == "alpha")
         #expect(try row(model, "alpha").problem == "SwarmBar's bridge scripts are missing from the app.")
     }
+
+    // MARK: The windows (Task 21)
+
+    @Test func anEarlierLookThatEndsLateLeavesTheNewOneChecking() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let gate = Gate()
+        services.probeGate = gate
+        let (model, _) = model()
+        let first = Task { await model.lookForHosts() }
+        await gate.held()
+        model.back()
+        let second = Task { await model.lookForHosts() }
+        await gate.held(count: 2)
+        // The first look's probe was stopped, so it returns now, while the
+        // second is still checking. It must not flip the second to the pick.
+        await first.value
+        #expect(model.step == .checking)
+        #expect(model.isProbing)
+        gate.open()
+        await second.value
+        #expect(model.step == .pick)
+        #expect(try row(model, "alpha").assessment != nil)
+    }
+
+    @Test func backFromSetupClearsPlanningProblems() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        services.planError = RemoteWizardError.bridgesMissing
+        await model.continueFromPick()
+        #expect(try row(model, "alpha").problem == "SwarmBar's bridge scripts are missing from the app.")
+        model.back()
+        #expect(model.step == .pick)
+        #expect(try row(model, "alpha").problem == nil)
+        // Checkable again, since nothing is wrong with the host itself.
+        model.setChecked("alpha", false)
+        model.setChecked("alpha", true)
+        #expect(try row(model, "alpha").isChecked)
+    }
+
+    @Test func backFromSetupKeepsAnUnusableAlias() async throws {
+        services.aliases = ["-x", "alpha"]
+        services.outcomes = ["-x": [Self.needsSetup("devbox")], "alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        model.back()
+        #expect(try row(model, "-x").problem == RemoteWizardModel.unusableAlias)
+    }
+
+    @Test func backClosesTheWindowOnlyWhenOpenedFromSettings() async throws {
+        let (model, registry) = model()
+        registry.upsert(RemoteHost(alias: "beta", watchAs: .loginUser))
+        services.aliases = ["beta"]
+        services.outcomes = ["beta": [Self.needsSetup("beta")]]
+        #expect(!model.openedAtSetup)
+        await model.startSetUp(alias: "beta")
+        #expect(model.openedAtSetup)
+        await model.lookForHosts()
+        #expect(!model.openedAtSetup)
+        await model.startUndo(alias: "beta")
+        #expect(model.openedAtSetup)
+        await model.open(.fresh)
+        #expect(!model.openedAtSetup)
+    }
+
+    @Test func openingDispatchesToTheEntryPoint() async throws {
+        let (model, registry) = model()
+        registry.upsert(RemoteHost(alias: "beta", watchAs: .loginUser))
+        services.aliases = ["beta"]
+        services.outcomes = ["beta": [Self.needsSetup("beta")]]
+        await model.open(.setUp(alias: "beta"))
+        #expect(model.step == .setup(hostIndex: 0))
+        #expect(model.mode == .setUp)
+        await model.open(.undo(alias: "beta"))
+        #expect(model.mode == .undo)
+        await model.open(.fresh)
+        #expect(model.step == .intro)
+        #expect(model.rows.isEmpty)
+        #expect(model.mode == .setUp)
+        // Opening never reaches out by itself: only the entry points probe.
+        #expect(services.candidateCalls == 0)
+    }
+
+    @Test func openingFreshLeavesChangesBeingMadeOnShow() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        var reopened: RemoteWizardModel.Step?
+        services.duringApply = {
+            Task { @MainActor in
+                await model.open(.fresh)
+                reopened = model.step
+            }
+        }
+        await model.makeChanges()
+        await Task.yield()
+        #expect(reopened == .applying(hostIndex: 0))
+    }
+
+    @Test func progressReadsAgainstThePlanThatWasApplied() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        services.applyOutcomes = [Self.settings: .changed]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        let applied = try #require(model.plan(for: "alpha"))
+        #expect(model.appliedPlan == nil)
+        await model.makeChanges()
+        #expect(model.step == .applying(hostIndex: 0))
+        #expect(model.appliedPlan == applied)
+        #expect(model.progress.count == applied.changes.count)
+        model.back()
+        #expect(model.appliedPlan == nil)
+    }
+
+    @Test func changesAreGroupedByToolWithKeystrokeToolsSaid() async throws {
+        let kimi = "/home/u/.kimi-code/config.toml"
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [(Self.probe(
+            "alpha", processes: [Self.process("claude"), Self.process("grok")],
+            tools: ["claude", "kimi", "codex"],
+            configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, "{}\n"),
+                                  SetupPlannerTests.config("kimi", kimi, "[providers]\n")]]), nil, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        let plan = try #require(model.plan(for: "alpha"))
+        let groups = model.changeGroups(for: "alpha")
+        #expect(groups.map(\.title) == ["Claude Code", "Codex", "Kimi Code", "Grok Build"])
+        #expect(groups[0].lines == plan.changes.filter { $0.tool == .claudeCode }.map(\.description))
+        #expect(groups[1].lines == [RemoteWizardModel.nothingToInstall])
+        #expect(groups[3].lines == [RemoteWizardModel.nothingToInstall])
+        #expect(groups.flatMap(\.lines).count == plan.changes.count + 2)
+        #expect(model.changeGroups(for: "nobody").isEmpty)
+    }
+
+    @Test func handEditsStayOutOfTheGroups() async throws {
+        services.aliases = ["alpha"]
+        let unreadable = ProbeResult.ConfigFile(tool: "claude", path: Self.settings, sha256: nil, text: nil)
+        services.outcomes = ["alpha": [(Self.probe("alpha", processes: [Self.process("claude")], tools: ["claude"],
+                                                   configs: ["/home/u": [unreadable]]), nil, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        let edits = model.handEdits(for: "alpha")
+        #expect(edits.count == 1)
+        #expect(!model.changeGroups(for: "alpha").flatMap(\.lines).contains(edits[0]))
+    }
+
+    @Test func theCommandAlsoListsTheHelperAndTheSudoRule() async throws {
+        services.aliases = ["devbox"]
+        services.outcomes = ["devbox": [Self.rootAgents("devbox")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        model.watchAs["devbox"] = .everyUser
+        await model.continueFromPick()
+        let plan = try #require(model.plan(for: "devbox"))
+        #expect(plan.installHelper && plan.sudoersUser == "u")
+        let shared = try #require(model.changeGroups(for: "devbox", forCommand: true).last)
+        #expect(shared.title == "Shared")
+        #expect(shared.lines == [
+            "Install SwarmBar's helper at \(HelperLaunch.rootHelperPath)",
+            "Let u run SwarmBar's helper as root, in /etc/sudoers.d/swarmbar",
+        ])
+        #expect(!model.changeGroups(for: "devbox").contains { $0.title == "Shared" })
+        #expect(RemoteWizardModel.sudoersLine(user: "u")
+            == "u ALL=(root) NOPASSWD: \(HelperLaunch.rootHelperPath)")
+    }
+
+    @Test func watchContextSaysWhoRunsWhat() async throws {
+        services.aliases = ["devbox", "alpha"]
+        services.outcomes = ["devbox": [Self.rootAgents("devbox")], "alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        let devbox = try #require(model.watchContext(for: "devbox"))
+        #expect(devbox == .init(loginUser: "u", sudoOK: false, otherSessions: 1, otherUsers: ["root"],
+                                otherSummary: "1 Codex"))
+        #expect(WizardCopy.othersRunAs(devbox) == "The 1 Codex session here runs as root.")
+        #expect(WizardCopy.loginLine(devbox)
+            == "You log in as u without passwordless sudo, so SwarmBar can't read them yet.")
+        #expect(WizardCopy.hiddenLine(devbox) == "1 session runs as root and isn't shown")
+        let alpha = try #require(model.watchContext(for: "alpha"))
+        #expect(alpha.otherSessions == 0)
+        #expect(WizardCopy.othersRunAs(alpha) == nil)
+        #expect(WizardCopy.hiddenLine(alpha) == nil)
+        #expect(model.watchContext(for: "nobody") == nil)
+    }
+
+    @Test func copyCountsReadNaturally() {
+        let two = RemoteWizardModel.WatchContext(loginUser: "u", sudoOK: true, otherSessions: 2,
+                                                 otherUsers: ["root"], otherSummary: "2 Codex")
+        #expect(WizardCopy.othersRunAs(two) == "The 2 Codex sessions here run as root.")
+        #expect(WizardCopy.loginLine(two) == "You log in as u with passwordless sudo, so SwarmBar can read them.")
+        #expect(WizardCopy.hiddenLine(two) == "2 sessions run as root and aren't shown")
+        let mixed = RemoteWizardModel.WatchContext(loginUser: "u", sudoOK: false, otherSessions: 3,
+                                                   otherUsers: ["alice", "root"], otherSummary: "2 Codex, 1 Grok Build")
+        #expect(WizardCopy.othersRunAs(mixed) == "3 sessions here run as alice, root: 2 Codex, 1 Grok Build.")
+        let unknown = RemoteWizardModel.WatchContext(loginUser: "u", sudoOK: false, otherSessions: nil,
+                                                     otherUsers: [], otherSummary: "")
+        #expect(WizardCopy.othersRunAs(unknown) == nil)
+        #expect(WizardCopy.hiddenLine(unknown) == nil)
+        #expect(WizardCopy.hosts(1) == "1 host")
+        #expect(WizardCopy.hosts(4) == "4 hosts")
+        #expect(WizardCopy.sessions(1) == "1 session")
+        #expect(WizardCopy.sessions(0) == "0 sessions")
+    }
+
+    @Test func sessionsOutsideTmuxAreCountedForKeystrokeTools() async throws {
+        let pane = RemotePane(socket: "/tmp/tmux-1000/default", id: "%1")
+        func process(_ comm: String, pane: RemotePane?) -> RemoteProcessRecord {
+            RemoteProcessRecord(pid: 100, ppid: 1, user: "u", comm: comm, args: comm, cwd: "/home/u/work",
+                                tty: "pts/1", pane: pane, open: [], openFailed: false, screen: nil)
+        }
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [(Self.probe("alpha", processes: [
+            process("kimi", pane: nil), process("claude", pane: nil), process("codex", pane: nil),
+            process("codex", pane: nil), process("grok", pane: pane),
+        ]), nil, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        // Claude answers over its hook, so tmux does not matter for it.
+        #expect(model.notInTmuxLines(for: "alpha") == [
+            "2 Codex sessions aren't in tmux: answer them in their terminals",
+            "1 Kimi Code session isn't in tmux: answer it in its terminal",
+        ])
+    }
+
+    @Test func pillsFollowTheAssessment() async throws {
+        services.aliases = ["alpha", "beta", "devbox", "gamma"]
+        let partial = Self.probe("gamma", processes: [Self.process("claude"), Self.process("codex", user: "root")],
+                                 tools: ["claude"], installed: ["claude"])
+        services.outcomes = ["alpha": [Self.ready("alpha")], "beta": [Self.needsSetup("beta")],
+                             "devbox": [(nil, nil, .needsPassword)], "gamma": [(partial, nil, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        #expect(model.pill(for: try row(model, "alpha")) == .ready)
+        #expect(model.pill(for: try row(model, "beta")) == .needsSetup)
+        #expect(model.pill(for: try row(model, "devbox")) == .cantConnect)
+        // No pick yet, and agents run as root: the pick is what it needs.
+        #expect(model.pill(for: try row(model, "gamma")) == .needsSetup)
+        model.watchAs["gamma"] = .loginUser
+        #expect(model.pill(for: try row(model, "gamma")) == .partial)
+        var broken = try row(model, "beta")
+        broken.problem = "Couldn't find a home folder for u on this host."
+        #expect(model.pill(for: broken) == .cantContinue)
+        broken.problem = RemoteWizardModel.notChecked
+        #expect(model.pill(for: broken) == nil)
+        broken.problem = nil
+        broken.isChecking = true
+        #expect(model.pill(for: broken) == nil)
+    }
+
+    @Test func watchedRowsAreTheHostsThisRunRegistered() async throws {
+        services.aliases = ["alpha", "beta", "devbox"]
+        services.outcomes = ["alpha": [Self.ready("alpha")], "beta": [Self.idle("beta")],
+                             "devbox": [(nil, nil, .timedOut)]]
+        let (model, registry) = model()
+        await model.lookForHosts()
+        #expect(model.watchedRows.isEmpty)
+        await model.continueFromPick()
+        #expect(model.step == .done)
+        #expect(model.watchedRows.map(\.id) == ["alpha"])
+        registry.upsert(RemoteHost(alias: "other", displayName: "alpha"))
+        #expect(model.watchedName("alpha") == "alpha")
+        #expect(model.helperVersion == "0.2.0")
+    }
+
+    @Test func theLauncherBuildsOneModelLateAndHandsEachRequestOnce() async throws {
+        var built = 0
+        let launcher = RemoteWizardLauncher {
+            built += 1
+            return RemoteWizardModel(services: services, registry: RemoteHostRegistry(defaults: defaults))
+        }
+        #expect(built == 0)
+        #expect(launcher.takeRequest() == nil)
+        launcher.ask(.fresh)
+        #expect(launcher.takeRequest() == .fresh)
+        #expect(launcher.takeRequest() == nil)
+        launcher.ask(.undo(alias: "beta"))
+        #expect(launcher.takeRequest() == .undo(alias: "beta"))
+        let model = try #require(launcher.model)
+        #expect(launcher.model === model)
+        #expect(built == 1)
+        #expect(RemoteWizardLauncher(makeModel: nil).model == nil)
+    }
 }
 
 /// The live service's reading of ssh config, on files in a temporary home.
