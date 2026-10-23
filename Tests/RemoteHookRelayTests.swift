@@ -292,7 +292,9 @@ struct RemoteHookRelayTests {
         // The helper gave up at 345 s, so there is nothing to answer.
         #expect(answers.isEmpty)
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
-        #expect(row.status == .working(activity: "Working…"))
+        // Claude shows its own prompt once the helper lets go, so the row
+        // must not claim the agent is working.
+        #expect(row.status == .waitingApproval(command: "git push"))
         #expect(server.resolveApproval(sessionID: row.id, allow: true) == false)
     }
 
@@ -509,6 +511,9 @@ struct RemoteHookRelayTests {
         await settle { !server.isHolding(sessionID: rowID(raw)) }
         #expect(!server.isHolding(sessionID: rowID(raw)))
         #expect(server.resolveApproval(sessionID: rowID(raw), allow: true) == false)
+        // The agent falls back to its own prompt, which the row keeps.
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.status
+            == .waitingApproval(command: "git push"))
 
         // A line the dead process said before it went, drained late, must
         // not bring the hold back.

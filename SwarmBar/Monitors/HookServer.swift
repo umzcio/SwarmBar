@@ -665,10 +665,10 @@ final class HookServer: ApprovalResponding {
                 self.finishPending(sessionID: sessionID, json: Data("{}".utf8))
             } else {
                 // The helper let go at 345 s and answered {} itself, so
-                // there is nothing left to reply to, and the row stops
-                // asking for an answer nothing can take.
+                // there is nothing left to reply to. Claude now shows its
+                // own prompt, so the row keeps asking, exactly as a local
+                // timeout leaves it, and the next poll decides.
                 self.pendingApprovals.removeValue(forKey: sessionID)
-                self.leaveApproval(sessionID: sessionID)
             }
             // Drop the sticky override too, or the row keeps showing
             // Approve/Deny buttons that can no longer answer anything.
