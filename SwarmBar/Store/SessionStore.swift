@@ -323,6 +323,10 @@ final class SessionStore {
     /// driven this Mac's terminal without ever driving it.
     @ObservationIgnored var localAnswerObserver: ((AgentSession, ApprovalRoute) -> Void)?
 
+    /// The same for replies: a local reply is reported here, with its text,
+    /// instead of being pasted into this Mac's terminal.
+    @ObservationIgnored var localReplyObserver: ((AgentSession, String) -> Void)?
+
     /// Answers rows that have a host. Weak because the app owns it.
     @ObservationIgnored weak var remoteActions: RemoteActing?
 
@@ -349,6 +353,16 @@ final class SessionStore {
         _ = remoteHoldRevision
         _ = remotePaneRevision
         return remoteActions?.answerability(for: session) ?? .terminalOnly
+    }
+
+    /// Whether the row offers Reply, for the view. A local row always
+    /// does; its status decides the rest. A remote row only while its
+    /// session sits in a tmux pane SwarmBar can type into, which moves with
+    /// the pane revision and the host's reachability.
+    func canReply(_ session: AgentSession) -> Bool {
+        guard session.host != nil else { return true }
+        _ = remotePaneRevision
+        return remoteActions?.canReply(session) ?? false
     }
 
     /// Sessions whose tool reported the session over (Claude and Grok's
@@ -781,6 +795,21 @@ final class SessionStore {
             return
         }
 
+        // A remote session's terminal is on its host. Pasting here would
+        // find a same-named directory on this Mac, if anything.
+        if let host = session.host {
+            guard let remoteActions else {
+                completion(.failed("This session isn't in tmux on \(host), so reply in its terminal."))
+                return
+            }
+            remoteActions.reply(current, text: text, completion: completion)
+            return
+        }
+        if let localReplyObserver {
+            localReplyObserver(session, text)
+            return
+        }
+
         let id = session.id
         let path = session.projectPath
         Task.detached {
@@ -789,9 +818,7 @@ final class SessionStore {
             await MainActor.run {
                 switch outcome {
                 case .sent:
-                    self.update(id: id) {
-                        $0.status = .working(activity: "Working on your reply…")
-                    }
+                    self.noteReplySent(id)
                     completion(.sent)
                 case .pasteNotVisible:
                     TerminalFocuser.focus(sessionID: id, projectPath: path)
@@ -802,6 +829,14 @@ final class SessionStore {
                         "Could not reach this session's terminal. Inline reply needs iTerm2."))
                 }
             }
+        }
+    }
+
+    /// A reply was submitted, here or on a host: the session's next turn
+    /// has started.
+    func noteReplySent(_ id: UUID) {
+        update(id: id) {
+            $0.status = .working(activity: "Working on your reply…")
         }
     }
 

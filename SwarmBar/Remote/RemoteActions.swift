@@ -18,6 +18,10 @@ enum RemoteAnswerability: Equatable {
 @MainActor
 protocol RemoteActing: AnyObject {
     func answerability(for session: AgentSession) -> RemoteAnswerability
+    /// Whether a written reply can reach this session. Separate from
+    /// `answerability` because a reply is always typed: a held Claude row
+    /// is answerable with no pane at all, but cannot be replied to.
+    func canReply(_ session: AgentSession) -> Bool
     func answer(_ session: AgentSession, allow: Bool)
     func reply(
         _ session: AgentSession, text: String,
@@ -53,12 +57,121 @@ extension RemoteMonitorSupervisor: RemoteActing {
         Task { await performAnswer(session, allow: allow) }
     }
 
-    /// Reply over tmux is not built yet, and the row does not offer it.
+    func canReply(_ session: AgentSession) -> Bool {
+        paneTarget(for: session) != nil
+    }
+
     func reply(
         _ session: AgentSession, text: String,
         completion: @escaping @MainActor (SessionStore.ReplyResult) -> Void
     ) {
-        completion(.failed("Replies cannot reach \(session.host ?? "that host") yet."))
+        Task { completion(await performReply(session, text: text)) }
+    }
+
+    /// `reply`, awaitable. The remote form of TerminalFocuser.sendReply:
+    /// paste, read the screen back, and press Enter only where the paste
+    /// is visible. A reply left unsent in the composer is recoverable, one
+    /// submitted half-delivered is not, so `.sent` means only that the
+    /// helper confirmed it pressed Enter.
+    ///
+    /// The approval switches do not gate this. A reply is not an answer,
+    /// and the local reply goes through whatever the keystroke switches
+    /// say, so the remote one does too.
+    func performReply(_ session: AgentSession, text: String) async -> SessionStore.ReplyResult {
+        let host = session.host ?? "?"
+        guard let target = paneTarget(for: session) else {
+            remoteAnswerLog.notice("reply: \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public) has no pane, nothing sent")
+            return .failed("This session isn't in tmux on \(host), so reply in its terminal.")
+        }
+        // The helper strips these anyway. Stripping first means the probe
+        // looked for on screen is cut from what actually lands.
+        let pasted = RemoteAnswerPlan.pasteText(text)
+        guard let probe = TerminalFocuser.verificationProbe(for: pasted) else {
+            return .failed("Nothing to send.")
+        }
+        // The answer's guard, shared: a second Send would paste the text
+        // twice, and a reply and an answer must not type into one pane at
+        // once.
+        guard answering.insert(session.id).inserted else {
+            remoteAnswerLog.notice("reply: already sending on \(host, privacy: .public), nothing sent")
+            return .failed("A reply is already on its way to this session.")
+        }
+        defer { answering.remove(session.id) }
+
+        let requester = requester(target.connection)
+        let pane: JSONValue = .object([
+            "socket": .string(target.pane.socket), "id": .string(target.pane.id),
+        ])
+        // pid and comm make the helper re-read its process table before
+        // pasting and before pressing, and refuse if that pid is gone, is
+        // another agent, or has left this pane.
+        let process: [String: JSONValue] = [
+            "pid": .int(target.process.pid), "comm": .string(target.process.comm),
+        ]
+
+        do {
+            let reply = try await requester.request(
+                "paste", process.merging(["pane": pane, "text": .string(pasted)]) { $1 },
+                timeout: .seconds(30))
+            if case .notSent(let reason) = RemoteAnswerPlan.keysOutcome(from: reply) {
+                remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) not sent: \(reason, privacy: .public)")
+                return .failed("Could not paste into this session on \(host), so nothing was sent.")
+            }
+        } catch {
+            remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            // A request that timed out may still have pasted, so this
+            // claims nothing about the composer.
+            return .failed("Could not reach \(host), so the reply was not submitted. Check the terminal.")
+        }
+
+        // From here the text may be sitting in the composer, so every
+        // failure says to look at the terminal.
+        let screen: String?
+        do {
+            screen = RemoteAnswerPlan.screen(fromCapture: try await requester.request(
+                "capture", ["pane": pane], timeout: .seconds(30)))
+        } catch {
+            screen = nil
+        }
+        guard let screen else {
+            remoteAnswerLog.notice("reply: capture on \(host, privacy: .public) failed, Enter not sent")
+            return .failed("Could not read the screen on \(host), so nothing was submitted. Check the terminal.")
+        }
+        guard screen.contains(probe) else {
+            return .failed(
+                "The text did not appear in the composer, so nothing was submitted. Check the terminal.")
+        }
+        // Two round trips have passed. A host that went dark or a helper
+        // that restarted meanwhile leaves a pane map from before the gap.
+        guard let current = paneTarget(for: session),
+              current.pane == target.pane, current.process.pid == target.process.pid
+        else {
+            remoteAnswerLog.notice("reply: \(host, privacy: .public) changed while pasting, Enter not sent")
+            return .failed("The session on \(host) changed while pasting, so nothing was submitted. Check the terminal.")
+        }
+
+        do {
+            // The probe goes along so the helper re-confirms the paste is
+            // still on screen at the moment it presses Enter.
+            let reply = try await requester.request(
+                "keys", process.merging([
+                    "pane": pane, "keys": .array([.string("\n")]), "expect": .array([.string(probe)]),
+                ]) { $1 },
+                timeout: .seconds(30))
+            switch RemoteAnswerPlan.keysOutcome(from: reply) {
+            case .sent:
+                store.noteReplySent(session.id)
+                return .sent
+            case .notSent(let reason):
+                remoteAnswerLog.notice("reply: Enter on \(host, privacy: .public) not sent: \(reason, privacy: .public)")
+                return .failed("The reply was pasted on \(host) but not submitted. Check the terminal.")
+            }
+        } catch {
+            // A request that timed out may still have pressed Enter, so this
+            // claims neither outcome.
+            remoteAnswerLog.notice("reply: Enter on \(host, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            return .failed("Could not confirm the reply was submitted on \(host). Check the terminal.")
+        }
     }
 
     /// `answer`, awaitable, and saying whether keys were sent. Whenever it
@@ -149,8 +262,11 @@ extension RemoteMonitorSupervisor: RemoteActing {
         }
     }
 
-    /// The process and pane a session's keys go to and the connection that
-    /// reaches them, or nil when keystrokes may not or cannot answer it.
+    private typealias PaneTarget = (
+        process: RemoteProcessRecord, pane: RemotePane, connection: RemoteHostConnection)
+
+    /// The process and pane a session's keys or reply go to and the
+    /// connection that reaches them, or nil when nothing can be typed there.
     ///
     /// The pane is the one its own process runs in, matched by pid in the
     /// snapshot last applied in full. Two agents can share a pane (a codex
@@ -159,12 +275,10 @@ extension RemoteMonitorSupervisor: RemoteActing {
     ///
     /// Only while the host is reachable, its helper is known to be the
     /// bundled one (an old helper ignores the press-time pid and comm
-    /// check), and a snapshot has landed since the last gap. Both are checked before any request, so a click on a dark
-    /// host's row never starts ssh, and a pane map from before a gap never
-    /// aims a key.
-    private func keystrokeTarget(
-        for session: AgentSession
-    ) -> (process: RemoteProcessRecord, pane: RemotePane, connection: RemoteHostConnection)? {
+    /// check), and a snapshot has landed since the last gap. All are
+    /// checked before any request, so a click on a dark host's row never
+    /// starts ssh, and a pane map from before a gap never aims a key.
+    private func paneTarget(for session: AgentSession) -> PaneTarget? {
         guard let hostName = session.host, let pid = session.pid,
               store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
@@ -172,6 +286,14 @@ extension RemoteMonitorSupervisor: RemoteActing {
               let process = connection.lastSnapshot?.processes.first(where: { $0.pid == Int(pid) }),
               let pane = process.pane
         else { return nil }
+        return (process, pane, connection)
+    }
+
+    /// `paneTarget`, for an approval: also nil when approvals are off for
+    /// this tool on this host, or its keystroke switch is off.
+    private func keystrokeTarget(for session: AgentSession) -> PaneTarget? {
+        guard let target = paneTarget(for: session) else { return nil }
+        let connection = target.connection
         // Read from the registry, not the connection's copy, so switching
         // approvals off in Settings applies at once without a restart.
         let off = registry.host(id: connection.host.id)?.approvalsOff ?? connection.host.approvalsOff
@@ -180,7 +302,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         switch session.tool {
         case .grokBuild where !toggles.grok: return nil
         case .antigravity where !toggles.antigravity: return nil
-        default: return (process, pane, connection)
+        default: return target
         }
     }
 }

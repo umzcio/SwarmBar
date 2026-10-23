@@ -1225,6 +1225,23 @@ def target_still_there(pid, comm, pane):
     return os.path.realpath(found.get("socket", "")) == os.path.realpath(pane.get("socket", ""))
 
 
+def target_refusal(request, malformed):
+    """The reply refusing a keys or paste request whose `pid` and `comm` no
+    longer describe its pane, or None to go ahead. A request carrying
+    neither is not checked; one carrying only one, or either of the wrong
+    type, is refused with `malformed`."""
+    has_pid, has_comm = "pid" in request, "comm" in request
+    if not (has_pid or has_comm):
+        return None
+    pid, comm = request.get("pid"), request.get("comm")
+    if not (has_pid and has_comm) or isinstance(pid, bool) \
+            or not isinstance(pid, int) or not isinstance(comm, str):
+        return {"ok": False, "error": malformed}
+    if not target_still_there(pid, comm, request.get("pane")):
+        return {"sent": False, "reason": "changed"}
+    return None
+
+
 def handle_tmux(request):
     """capture, keys and paste. Keys are confirmed against a fresh capture of
     the visible screen taken immediately before sending, and any missing
@@ -1237,11 +1254,14 @@ def handle_tmux(request):
         "changed" (an expect string was absent), "capture failed" (the
         confirming read failed), or "send failed" (plus "sent_count" for
         keys, how many keys landed first).
-      any command: {"ok": false, "error": "bad pane" | "bad keys" | "bad text"}
+      any command: {"ok": false, "error": "bad pane" | "bad keys" | "bad text"
+        | "bad target"}
 
-    keys may carry `pid` (int) and `comm` (str), always together. With them
-    the target is re-read before anything else, and a pid that is gone, is
-    another agent, or no longer sits in this pane answers "changed".
+    keys and paste may carry `pid` (int) and `comm` (str), always together.
+    With them the target is re-read before anything is sent, and a pid that
+    is gone, is another agent, or no longer sits in this pane answers
+    "changed". A malformed pair answers "bad keys" for keys and "bad target"
+    for paste.
     """
     pane = valid_pane(request.get("pane"))
     if pane is None:
@@ -1256,6 +1276,11 @@ def handle_tmux(request):
         text = request.get("text")
         if not isinstance(text, str):
             return {"ok": False, "error": "bad text"}
+        # A reply pasted into a pane that now holds a shell or another agent
+        # is text the Mac never meant there, so the target is re-read first.
+        refused = target_refusal(request, "bad target")
+        if refused is not None:
+            return refused
         # Precondition: tmux applies bracketed paste (-p) only when the
         # pane's app enabled the mode, and the Mac verifies the paste on
         # screen before it sends Enter. Stripping controls keeps a reply from
@@ -1276,14 +1301,9 @@ def handle_tmux(request):
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
             or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect):
         return {"ok": False, "error": "bad keys"}
-    has_pid, has_comm = "pid" in request, "comm" in request
-    if has_pid or has_comm:
-        pid, comm = request.get("pid"), request.get("comm")
-        if not (has_pid and has_comm) or isinstance(pid, bool) \
-                or not isinstance(pid, int) or not isinstance(comm, str):
-            return {"ok": False, "error": "bad keys"}
-        if not target_still_there(pid, comm, request.get("pane")):
-            return {"sent": False, "reason": "changed"}
+    refused = target_refusal(request, "bad keys")
+    if refused is not None:
+        return refused
     gap = request.get("gap", KEY_GAP_DEFAULT)
     if not isinstance(gap, (int, float)) or isinstance(gap, bool) or gap < 0:
         gap = KEY_GAP_DEFAULT

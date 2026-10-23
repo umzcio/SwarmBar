@@ -106,6 +106,20 @@ enum RemoteAnswerPlan {
         return object["text"] as? String
     }
 
+    /// A reply as the helper will paste it: C0 controls other than newline
+    /// and tab, and DEL, removed by the same rule as the helper's
+    /// PASTE_STRIP. Stripped here too so the on-screen probe is taken from
+    /// the text that actually lands, not from text the helper will alter.
+    /// By scalar, because "\r\n" is one Character and would otherwise be
+    /// kept or dropped whole.
+    static func pasteText(_ text: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: text.unicodeScalars.filter { scalar in
+            scalar == "\n" || scalar == "\t" || (scalar.value >= 0x20 && scalar.value != 0x7F)
+        })
+        return String(scalars)
+    }
+
     enum KeysOutcome: Equatable {
         case sent
         /// The helper's reason, or the error it returned instead.

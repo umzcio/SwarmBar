@@ -6,11 +6,10 @@ struct SessionRow: View {
     @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
-    /// Reply reaches into a terminal on this Mac. See
-    /// SessionRowInteraction.allowsLocalTerminalActions.
-    private var isLocal: Bool {
-        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
-    }
+    /// Reply pastes into the session's own terminal: here for a local row,
+    /// its tmux pane for a remote one, and a remote row with no pane to
+    /// reach does not offer it.
+    private var canReply: Bool { store.canReply(session) }
 
     /// Set for a remote prompt nothing here can answer.
     private var terminalOnlyNote: String? {
@@ -86,7 +85,7 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 6) {
-                        if isLocal {
+                        if canReply {
                             Button("Reply…") { store.replyingTo = session.id }
                                 .buttonStyle(ActionPill.reply)
                                 .accessibilityLabel("Reply")
@@ -106,7 +105,7 @@ struct SessionRow: View {
                         .foregroundStyle(.secondary)
                     // A finished turn is still steerable: its composer is
                     // idle, so a reply can start the next turn.
-                    if session.processAlive && isLocal {
+                    if session.processAlive && canReply {
                         Button("Reply…") { store.replyingTo = session.id }
                             .buttonStyle(ActionPill.reply)
                             .accessibilityLabel("Reply")
@@ -163,8 +162,8 @@ extension View {
 /// test can observe which one wins. Do not add a test that claims to.
 enum SessionRowInteraction {
     /// Whether a row may offer the actions that reach into a terminal on
-    /// THIS Mac: Reply, Open in Terminal and the double click behind it.
-    /// A remote row's Approve and Deny go through RemoteActing instead.
+    /// THIS Mac: Open in Terminal and the double click behind it. A remote
+    /// row's Approve, Deny and Reply go through RemoteActing instead.
     ///
     /// A remote session's terminal is on another host, and the failure is
     /// not merely that nothing happens. TerminalFocuser matches a local

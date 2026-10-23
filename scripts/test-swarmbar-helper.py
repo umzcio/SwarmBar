@@ -1189,6 +1189,35 @@ class TmuxCommandTests(unittest.TestCase):
                                             "swarmbar", "-t", "%3"])
         self.assertFalse(any("send-keys" in c for c in rec.calls))
 
+    def test_paste_sent_when_target_still_matches(self):
+        rec = self.target_recorder()
+        out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi",
+                         "pid": 700, "comm": "claude"}, rec)
+        self.assertEqual(out, {"sent": True})
+        self.assertTrue(any("paste-buffer" in c for c in rec.calls))
+
+    def test_paste_not_sent_when_target_changed(self):
+        # The pid is gone, is another agent, or has left the pane, and so is
+        # a failed ps: nothing is loaded or pasted.
+        for extra, pane_line, ps in (({"pid": 999, "comm": "claude"}, "%3 610\n", PS_SAMPLE),
+                                     ({"pid": 700, "comm": "codex"}, "%3 610\n", PS_SAMPLE),
+                                     ({"pid": 700, "comm": "claude"}, "%4 610\n", PS_SAMPLE),
+                                     ({"pid": 700, "comm": "claude"}, "%3 610\n", "")):
+            request = {"cmd": "paste", "pane": self.pane, "text": "hi"}
+            request.update(extra)
+            rec = self.target_recorder(ps=ps, pane_line=pane_line)
+            self.assertEqual(self.call(request, rec), {"sent": False, "reason": "changed"}, extra)
+            self.assertFalse(any("load-buffer" in c or "paste-buffer" in c for c in rec.calls), extra)
+
+    def test_paste_target_args_must_come_together(self):
+        for extra in ({"pid": 700}, {"comm": "claude"}, {"pid": "700", "comm": "claude"},
+                      {"pid": True, "comm": "claude"}, {"pid": 700, "comm": 3}):
+            request = {"cmd": "paste", "pane": self.pane, "text": "hi"}
+            request.update(extra)
+            rec = self.target_recorder()
+            self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad target"}, extra)
+            self.assertFalse(any("load-buffer" in c or "paste-buffer" in c for c in rec.calls), extra)
+
     def test_paste_strips_control_characters(self):
         rec = TmuxRecorder()
         self.call({"cmd": "paste", "pane": self.pane,

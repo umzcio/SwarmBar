@@ -552,16 +552,251 @@ struct RemoteAnswerTests {
         #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
     }
 
+    // MARK: - Inline reply
+
+    private static let paneValue: JSONValue = .object([
+        "socket": .string("/tmp/tmux-1000/default"), "id": .string("%3"),
+    ])
+
+    private func waiting(_ tool: AgentTool = .kimiCode, pid: pid_t? = 4242) -> AgentSession {
+        AgentSession(
+            tool: tool, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingInput(prompt: "Which branch?"), pid: pid, host: "devbox")
+    }
+
+    private static let noPane = SessionStore.ReplyResult.failed(
+        "This session isn't in tmux on devbox, so reply in its terminal.")
+
+    @Test func replyWithoutPaneFailsWithReason() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> use main"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        let session = waiting()
+        rig.store.upsert(session)
+
+        rig.land(try Self.snapshot(pid: 4242, pane: nil))
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+
+        // Every other gate fails the same way: a pid not in the snapshot,
+        // a dark host, a stale helper, and no snapshot since a gap.
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(waiting(pid: 7), text: "use main") == Self.noPane)
+        #expect(await rig.supervisor.performReply(waiting(pid: nil), text: "use main") == Self.noPane)
+        rig.store.noteRemoteReachability(host: "devbox", .unreachable("down"))
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        rig.connection?.noteHelperCurrent(false)
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+        rig.connection?.noteLost()
+        rig.store.noteRemoteReachability(host: "devbox", .reachable)
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    /// A held Claude row needs no pane to be answered, but a reply is typed,
+    /// so it does need one.
+    @Test func replyNeedsAPaneEvenForClaude() async throws {
+        let rig = Rig()
+        rig.land(try Self.snapshot(pid: 4242, pane: nil, comm: "claude"))
+        #expect(!rig.supervisor.canReply(waiting(.claudeCode)))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "claude"))
+        #expect(rig.supervisor.canReply(waiting(.claudeCode)))
+    }
+
+    /// Reply is not an approval, so the approval switches do not gate it,
+    /// as the local reply works whatever the keystroke switches say.
+    @Test func replyIgnoresTheApprovalSwitches() async throws {
+        let rig = Rig(approvalsOff: [.grokBuild])
+        rig.supervisor.keystrokeToggles = { (grok: false, antigravity: false) }
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
+        #expect(rig.supervisor.canReply(waiting(.grokBuild)))
+    }
+
+    @Test func replySubmitsOnlyWhenProbeVisible() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> something else entirely"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+
+        let result = await rig.supervisor.performReply(session, text: "use the main branch")
+        #expect(result == .failed(
+            "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
+        #expect(await rig.helper.commands == ["paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    @Test func replySendsTheExactSequence() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> first line\n  use the main branch"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+
+        let text = "first line\nuse the main branch"
+        #expect(await rig.supervisor.performReply(session, text: text) == .sent)
+        #expect(rig.store.sessions.first?.status == .working(activity: "Working on your reply…"))
+
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["paste", "capture", "keys"])
+        #expect(calls[0].arguments == [
+            "pane": Self.paneValue, "text": .string(text),
+            "pid": .int(4242), "comm": .string("kimi"),
+        ])
+        #expect(calls[1].arguments == ["pane": Self.paneValue])
+        let probe = try #require(TerminalFocuser.verificationProbe(for: text))
+        #expect(calls[2].arguments == [
+            "pane": Self.paneValue, "keys": .array([.string("\n")]),
+            "expect": .array([.string(probe)]),
+            "pid": .int(4242), "comm": .string("kimi"),
+        ])
+        #expect(rig.supervisor.answering.isEmpty)
+    }
+
+    @Test func replyStripsControlCharactersBeforeTheProbe() async throws {
+        #expect(RemoteAnswerPlan.pasteText("a\u{1b}[201~b\tc\nd\u{0}\u{7f}e\r") == "a[201~b\tc\nde")
+        #expect(RemoteAnswerPlan.pasteText("caf\u{e9} \u{1F600}") == "caf\u{e9} \u{1F600}")
+
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> ship it[201~ now"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performReply(session, text: "ship it\u{1b}[201~ now\u{7f}") == .sent)
+        let calls = await rig.helper.calls
+        #expect(calls[0].arguments["text"] == .string("ship it[201~ now"))
+        #expect(calls[2].arguments["expect"] == .array([.string("ship it[201~ now")]))
+
+        // Text that is nothing once stripped sends nothing at all.
+        let empty = Rig(replies: ["paste": #"{"sent":true}"#])
+        empty.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await empty.supervisor.performReply(waiting(), text: "\u{1b}\u{7}") == .failed("Nothing to send."))
+        #expect(await empty.helper.commands.isEmpty)
+    }
+
+    @Test func replyFailuresNeverClaimSuccess() async throws {
+        let cases: [(replies: [String: String], commands: [String])] = [
+            // The paste is refused, or never answered.
+            (["paste": #"{"sent":false,"reason":"changed"}"#], ["paste"]),
+            (["paste": #"{"ok":false,"error":"bad text"}"#], ["paste"]),
+            ([:], ["paste"]),
+            // The confirming read fails.
+            (["paste": #"{"sent":true}"#, "capture": #"{"ok":false,"error":"capture failed"}"#],
+             ["paste", "capture"]),
+            (["paste": #"{"sent":true}"#], ["paste", "capture"]),
+            // Enter is refused at press time, or its answer never comes.
+            (["paste": #"{"sent":true}"#, "capture": #"{"text":"> use main"}"#,
+              "keys": #"{"sent":false,"reason":"changed"}"#], ["paste", "capture", "keys"]),
+            (["paste": #"{"sent":true}"#, "capture": #"{"text":"> use main"}"#],
+             ["paste", "capture", "keys"]),
+        ]
+        for (replies, commands) in cases {
+            let rig = Rig(replies: replies)
+            rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+            let session = waiting()
+            rig.store.upsert(session)
+            let result = await rig.supervisor.performReply(session, text: "use main")
+            guard case .failed(let message) = result else {
+                Issue.record("claimed success for \(replies)"); continue
+            }
+            #expect(!message.isEmpty)
+            #expect(await rig.helper.commands == commands, "\(replies)")
+            #expect(rig.store.sessions.first?.status == session.status)
+            #expect(rig.supervisor.answering.isEmpty)
+        }
+    }
+
+    @Test func aSecondSendWhileReplyingPastesNothing() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> use main"}"#,
+            "keys": #"{"sent":true}"#,
+        ], delay: .milliseconds(200))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let first = Task { await rig.supervisor.performReply(session, text: "use main") }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !rig.supervisor.answering.contains(session.id) && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        let second = await rig.supervisor.performReply(session, text: "use main")
+        #expect(second != .sent)
+        #expect(await first.value == .sent)
+        #expect(await rig.helper.commands == ["paste", "capture", "keys"])
+    }
+
     // MARK: - The store
 
     @MainActor private final class RecordingActions: RemoteActing {
         var answers: [(UUID, Bool)] = []
+        var replies: [(UUID, String)] = []
+        var repliable = true
         func answerability(for session: AgentSession) -> RemoteAnswerability { .keystrokes }
+        func canReply(_ session: AgentSession) -> Bool { repliable }
         func answer(_ session: AgentSession, allow: Bool) { answers.append((session.id, allow)) }
         func reply(
             _ session: AgentSession, text: String,
             completion: @escaping @MainActor (SessionStore.ReplyResult) -> Void
-        ) {}
+        ) {
+            replies.append((session.id, text))
+            completion(.sent)
+        }
+    }
+
+    @Test func remoteReplyNeverUsesLocalTerminal() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        var local: [AgentSession] = []
+        store.localReplyObserver = { session, _ in local.append(session) }
+        let actions = RecordingActions()
+        store.remoteActions = actions
+
+        let remote = waiting()
+        store.upsert(remote)
+        var results: [SessionStore.ReplyResult] = []
+        store.sendReply(remote, text: "use main") { results.append($0) }
+        #expect(local.isEmpty)
+        #expect(actions.replies.map(\.0) == [remote.id])
+        #expect(actions.replies.map(\.1) == ["use main"])
+        #expect(results == [.sent])
+
+        // The Reply button follows the remote side's answer, and a local
+        // row always offers it.
+        #expect(store.canReply(remote))
+        actions.repliable = false
+        #expect(!store.canReply(remote))
+        store.remoteActions = nil
+        #expect(!store.canReply(remote))
+
+        // The local seam does see a local row, so the empty list above
+        // means something.
+        let here = AgentSession(
+            tool: .kimiCode, projectName: "proj", projectPath: URL(fileURLWithPath: "/tmp"),
+            status: .waitingInput(prompt: ""))
+        store.upsert(here)
+        #expect(store.canReply(here))
+        store.sendReply(here, text: "go") { _ in }
+        #expect(local.map(\.id) == [here.id])
+        #expect(actions.replies.count == 1)
     }
 
     @Test func remoteApproveNeverUsesLocalTerminal() {
