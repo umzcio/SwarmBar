@@ -2158,5 +2158,229 @@ class PeerChainTests(unittest.TestCase):
             self.assertEqual(helper.peer_chain(None), [])
 
 
+FAKE_PS = """#!/bin/sh
+# Stands in for ps in the probe's own process: one synthetic claude.
+echo "  4242     1 $(id -u) someone  ttys001  claude  claude --resume s1"
+"""
+
+FAKE_FAIL = """#!/bin/sh
+exit 1
+"""
+
+
+def tree_state(root):
+    """Every path under root with its size, mode and mtime, links unfollowed.
+    The probe passes only if this is identical before and after it runs."""
+    state = {}
+    for directory, names, files in os.walk(root):
+        for name in sorted(names + files):
+            path = os.path.join(directory, name)
+            info = os.lstat(path)
+            state[os.path.relpath(path, root)] = (info.st_size, info.st_mode, info.st_mtime_ns)
+    return state
+
+
+class ProbeTests(unittest.TestCase):
+    """`python3 - probe` reports and never changes anything on the host."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="swarmbar-probe-test-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home = os.path.join(self.root, "home", "u")
+        os.makedirs(self.home)
+        self.env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def put(self, relative, text, mode=0o644):
+        path = os.path.join(self.home, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, mode)
+        return path
+
+    def probe(self, runner=None):
+        with mock.patch.object(helper, "run_command", runner or FakeRunner(ps="")):
+            return helper.probe()
+
+    def populate(self):
+        """A home with every kind of thing the probe looks at, including the
+        bridge files that make main() set up a hook socket."""
+        self.put(".claude/projects/-home-u-work/s1.jsonl", '{"type":"user"}\n')
+        self.put(".claude/settings.json", '{"hooks": {"Stop": "swarmbar-remote-hook.sh"}}\n')
+        self.put(".kimi-code/config.toml", "[providers]\n")
+        self.put(".codex/sessions/2026/01/01/rollout-a.jsonl", "{}\n")
+        self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n", 0o700)
+        self.put(".swarmbar/swarmbar-helper", "# helper\n", 0o700)
+        self.put(".config/opencode/plugins/swarmbar-remote.js", "// plugin\n")
+
+    def test_probe_writes_nothing(self):
+        self.populate()
+        bin_dir = os.path.join(self.root, "bin")
+        os.makedirs(bin_dir)
+        for name, text in (("ps", FAKE_PS), ("sudo", FAKE_FAIL), ("tmux", FAKE_FAIL),
+                           ("lsof", FAKE_FAIL)):
+            path = os.path.join(bin_dir, name)
+            with open(path, "w") as handle:
+                handle.write(text)
+            os.chmod(path, 0o755)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        with open(script, "rb") as handle:
+            source = handle.read()
+        env = dict(os.environ, SWARMBAR_HELPER_HOMES=self.home, HOME=self.home,
+                   PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+        # Starting python at all can write: Apple's 3.9 caches its startup
+        # modules' bytecode under ~/Library/Caches, which any earlier use of
+        # python3 on the host has already done. Warm that first, so what is
+        # measured is the probe, including every module it imports itself.
+        subprocess.run([sys.executable, "-c", "pass"], env=env, timeout=30, check=True)
+        before = tree_state(self.root)
+        done = subprocess.run([sys.executable, "-", "probe"], input=source, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stderr, b"")
+        after = tree_state(self.root)
+        self.assertEqual(sorted(set(after) ^ set(before)), [])
+        self.assertEqual(after, before)
+        lines = done.stdout.decode().splitlines()
+        self.assertEqual(len(lines), 1)
+        result = json.loads(lines[0])
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["sudo_ok"])
+        self.assertEqual([p["comm"] for p in result["processes"]], ["claude"])
+        self.assertNotIn("screen", result["processes"][0])
+        self.assertIn("claude", result["installed"][self.home])
+
+    def test_probe_reports_configs_with_hash(self):
+        text = '{"hooks": {}}\n'
+        path = self.put(".claude/settings.json", text)
+        big = self.put(".config/opencode/opencode.json", "x" * (256 * 1024 + 1))
+        self.put(".bearcode/config.toml", "[hooks]\n")
+        configs = self.probe()["configs"][self.home]
+        by_path = dict((c["path"], c) for c in configs)
+        claude = by_path[os.path.realpath(path)]
+        self.assertEqual(claude["tool"], "claude")
+        self.assertEqual(claude["sha256"], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(claude["text"], text)
+        oversized = by_path[os.path.realpath(big)]
+        self.assertEqual(oversized["tool"], "opencode")
+        self.assertIsNone(oversized["text"])
+        with open(big, "rb") as handle:
+            self.assertEqual(oversized["sha256"], hashlib.sha256(handle.read()).hexdigest())
+        self.assertEqual(by_path[os.path.realpath(
+            os.path.join(self.home, ".bearcode/config.toml"))]["tool"], "bearcode")
+        # Bridge scripts are allowlisted for writing but are not configs.
+        self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n")
+        tools = [c["tool"] for c in self.probe()["configs"][self.home]]
+        self.assertEqual(sorted(tools), ["bearcode", "claude", "opencode"])
+
+    def test_probe_skips_backup_claude_roots(self):
+        self.put(".claude/settings.json", "{}\n")
+        self.put(".claude-cio.pre-symlink-backup/settings.json", "{}\n")
+        self.put(".claude-cio.pre-symlink-backup/projects/p/s.jsonl", "{}\n")
+        paths = [c["path"] for c in self.probe()["configs"][self.home]]
+        self.assertEqual(paths, [os.path.realpath(os.path.join(self.home, ".claude/settings.json"))])
+
+    def test_probe_dedupes_claude_settings_by_realpath(self):
+        shared = self.put(".claude/settings.json", "{}\n")
+        os.makedirs(os.path.join(self.home, ".claude-work"))
+        os.symlink(shared, os.path.join(self.home, ".claude-work", "settings.json"))
+        configs = self.probe()["configs"][self.home]
+        self.assertEqual([c["path"] for c in configs], [os.path.realpath(shared)])
+
+    def test_probe_reports_tools_present(self):
+        self.put(".claude/projects/p/s.jsonl", "{}\n")
+        self.put(".claude-old/projects/p/s.jsonl", "{}\n")
+        self.put(".grok/active_sessions.json", "{}\n")
+        self.put(".gemini/antigravity-cli/history.jsonl", "")
+        self.put(".local/share/opencode/opencode.db", "")
+        # A config dir with no projects is not Claude in use.
+        self.put(".claude-empty/settings.json", "{}\n")
+        tools = self.probe()["tools"][self.home]
+        self.assertEqual(tools, ["claude", "opencode", "grok", "antigravity"])
+
+    def test_probe_detects_installed_bridges(self):
+        self.put(".claude/projects/p/s.jsonl", "{}\n")
+        self.put(".claude/settings.json", '{"command": "~/.swarmbar/swarmbar-remote-hook.sh"}\n')
+        self.put(".kimi-code/config.toml", 'command = "swarmbar-hook.sh"\n')
+        self.put(".bearcode/config.toml", 'command = "swarmbar-remote-kimi-hook.sh"\n')
+        self.put(".config/opencode/opencode.jsonc", '{"plugin": ["swarmbar-remote.js"]}\n')
+        # Each bridge counts only once its script is there too.
+        self.assertEqual(self.probe()["installed"][self.home], [])
+        self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n")
+        self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n")
+        self.put(".config/opencode/plugins/swarmbar-remote.js", "// plugin\n")
+        self.assertEqual(self.probe()["installed"][self.home], ["claude", "bearcode", "opencode"])
+
+    def test_claude_counts_as_installed_only_in_every_root(self):
+        self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n")
+        self.put(".claude/projects/p/s.jsonl", "{}\n")
+        self.put(".claude/settings.json", '"swarmbar-remote-hook.sh"\n')
+        self.put(".claude-work/projects/p/s.jsonl", "{}\n")
+        self.assertEqual(self.probe()["installed"][self.home], [])
+        self.put(".claude-work/settings.json", '"swarmbar-remote-hook.sh"\n')
+        self.assertEqual(self.probe()["installed"][self.home], ["claude"])
+
+    def test_probe_sudo_ok_comes_from_sudo_n_true(self):
+        class Sudo(FakeRunner):
+            def __call__(self, argv, timeout=5):
+                if argv[0] == "sudo":
+                    self.calls.append((list(argv), timeout))
+                    return completed(argv, 0, "")
+                return FakeRunner.__call__(self, argv, timeout)
+        runner = Sudo(ps="")
+        self.assertTrue(self.probe(runner)["sudo_ok"])
+        self.assertIn((["sudo", "-n", "true"], 5), runner.calls)
+        self.assertFalse(self.probe(FakeRunner(ps=""))["sudo_ok"])
+        with mock.patch.object(helper, "run_command",
+                               side_effect=subprocess.TimeoutExpired("sudo", 5)):
+            self.assertFalse(helper.probe()["sudo_ok"])
+
+    def test_probe_never_captures_panes(self):
+        runner = FakeRunner(ps="  700  1 1000 u pts/2 agy agy\n",
+                            panes={"/tmp/tmux-1000/default": "%3 1\n"})
+        with mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]), \
+                mock.patch.object(helper, "process_cwd", return_value="/work"):
+            result = self.probe(runner)
+        self.assertFalse(any("capture-pane" in call for call in runner.calls))
+        self.assertEqual(result["processes"][0]["pane"],
+                         {"socket": "/tmp/tmux-1000/default", "id": "%3"})
+        self.assertNotIn("screen", result["processes"][0])
+        self.assertFalse(result["processes_failed"])
+
+    def test_probe_reports_failed_ps(self):
+        result = self.probe(FakeRunner(ps_code=1))
+        self.assertTrue(result["processes_failed"])
+        self.assertEqual(result["processes"], [])
+
+    def test_probe_hashes_installed_helpers(self):
+        self.put(".swarmbar/swarmbar-helper", "# helper\n", 0o700)
+        result = self.probe()
+        mine = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        self.assertIn({"path": mine, "sha256": hashlib.sha256(b"# helper\n").hexdigest()},
+                      result["helper"])
+
+    def test_probe_identity_fields(self):
+        result = self.probe()
+        self.assertEqual(result["protocol"], helper.PROTOCOL_VERSION)
+        self.assertEqual(result["euid"], os.geteuid())
+        for key in ("system", "python", "hostname", "user"):
+            self.assertIsInstance(result[key], str)
+        self.assertEqual(result["homes"], [{"path": self.home, "user": helper.home_owner(self.home)[0]}])
+
+    def test_allowed_patterns(self):
+        self.assertEqual(helper.ALLOWED, (
+            ".claude*/settings.json",
+            ".kimi-code/config.toml",
+            ".bearcode/config.toml",
+            ".config/opencode/opencode.json",
+            ".config/opencode/opencode.jsonc",
+            ".config/opencode/plugins/swarmbar-remote.js",
+            ".swarmbar/swarmbar-remote-hook.sh",
+            ".swarmbar/swarmbar-remote-kimi-hook.sh",
+        ))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

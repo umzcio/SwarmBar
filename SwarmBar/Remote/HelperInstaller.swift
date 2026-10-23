@@ -49,7 +49,8 @@ enum HelperInstaller {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private nonisolated static let bundledDigest: String? = bundledHelper.map(sha256)
+    /// The bundled helper's sha256, which an installed helper must match.
+    nonisolated static let bundledDigest: String? = bundledHelper.map(sha256)
 
     private struct PingReply: Decodable {
         let ok: Bool

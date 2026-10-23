@@ -15,6 +15,14 @@ Constraints that are not negotiable:
     under ~/.swarmbar/ (the hook sockets and their lock) are the exception.
 """
 
+import sys
+
+# The probe must leave nothing behind, and python's own bytecode cache is a
+# write like any other: Apple's python 3.9 keeps it under ~/Library/Caches.
+# Set before any other import so none of them writes one either.
+if sys.argv[1:2] == ["probe"]:
+    sys.dont_write_bytecode = True
+
 import base64
 import collections
 import errno
@@ -33,7 +41,6 @@ import socketserver
 import stat as stat_module
 import struct
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -999,8 +1006,11 @@ def pane_screen(pane):
     return "\n".join(text.splitlines()[-SCREEN_LINES:])
 
 
-def agent_processes(warnings):
-    """Live agent processes. `ps -axo` is portable; GNU long flags are not."""
+def agent_processes(warnings, screens=True):
+    """Live agent processes. `ps -axo` is portable; GNU long flags are not.
+
+    `screens` False leaves out the pane captures and the "screen" field,
+    which the probe has no use for and which cost a tmux call per agy."""
     try:
         completed = run_command(
             # uid= alongside user=: both GNU and BSD ps take it, and GNU's
@@ -1046,8 +1056,9 @@ def agent_processes(warnings):
             "cwd": process_cwd(pid),
             "pane": pane,
             "open": paths,
-            "screen": pane_screen(pane) if pane and row["comm"] == "agy" else None,
         })
+        if screens:
+            entry["screen"] = pane_screen(pane) if pane and row["comm"] == "agy" else None
         processes.append(entry)
     return processes
 
@@ -1111,6 +1122,216 @@ def ping():
         "python": platform.python_version(),
         "stream": STREAM_ID,
     }
+
+
+# The files setup may write, relative to a home. Task 19's write_file
+# enforces this list; the probe reports the first five, the agents' own
+# config files, so the Mac can plan edits against the exact bytes it read.
+# The rest are SwarmBar's own bridge files.
+ALLOWED = (
+    ".claude*/settings.json",
+    ".kimi-code/config.toml",
+    ".bearcode/config.toml",
+    ".config/opencode/opencode.json",
+    ".config/opencode/opencode.jsonc",
+    ".config/opencode/plugins/swarmbar-remote.js",
+    ".swarmbar/swarmbar-remote-hook.sh",
+    ".swarmbar/swarmbar-remote-kimi-hook.sh",
+)
+CONFIG_TOOLS = (
+    ("claude", ALLOWED[0]),
+    ("kimi", ALLOWED[1]),
+    ("bearcode", ALLOWED[2]),
+    ("opencode", ALLOWED[3]),
+    ("opencode", ALLOWED[4]),
+)
+# Past this a config's sha256 is still reported but its text is not: the
+# setup plan cannot edit what it did not read, and no real config is this big.
+CONFIG_TEXT_MAX = 256 * 1024
+# Each tool's state directory, which says the tool is in use in a home.
+# Claude is found the way discovery finds it, through claude_config_dirs.
+TOOL_STATE_DIRS = (
+    ("codex", ".codex"),
+    ("kimi", ".kimi-code"),
+    ("bearcode", ".bearcode"),
+    ("opencode", ".local/share/opencode"),
+    ("grok", ".grok"),
+    ("antigravity", ".gemini/antigravity-cli"),
+)
+# The order the probe lists tools in, matching AgentTool.allCases on the Mac.
+TOOL_ORDER = ("claude", "codex", "kimi", "bearcode", "opencode", "grok", "antigravity")
+# A bridge is installed when its config names it and the file the config
+# names is there: an entry pointing at a missing script answers nothing.
+BRIDGE_FILES = (
+    ("claude", ALLOWED[6]),
+    ("kimi", ALLOWED[7]),
+    ("bearcode", ALLOWED[7]),
+    ("opencode", ALLOWED[5]),
+)
+BRIDGE_MARK = b"swarmbar-remote"
+HELPER_PATHS = ("/usr/local/lib/swarmbar-helper",)
+USER_HELPER = ".swarmbar/swarmbar-helper"
+SUDO_SECONDS = 5
+
+
+def claude_config_dirs(home):
+    """<home>/.claude* directories, backups left out by name, the same way
+    claude_roots leaves them out of discovery."""
+    try:
+        entries = sorted(os.listdir(home))
+    except OSError:
+        return []
+    return [os.path.join(home, entry) for entry in entries
+            if entry.startswith(".claude") and not is_backup_name(entry)
+            and os.path.isdir(os.path.join(home, entry))]
+
+
+def file_digest(path, limit=None):
+    """(sha256, bytes or None) of a regular file, or None when it cannot be
+    read. The bytes come back only when the file is at most `limit`."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    kept = data if limit is None or len(data) <= limit else None
+    return hashlib.sha256(data).hexdigest(), kept
+
+
+def home_configs(home):
+    """The agent config files in a home that exist, each once by realpath."""
+    configs = []
+    seen = set()
+    for tool, pattern in CONFIG_TOOLS:
+        if pattern.startswith(".claude*/"):
+            candidates = [os.path.join(d, pattern[len(".claude*/"):])
+                          for d in claude_config_dirs(home)]
+        else:
+            candidates = [os.path.join(home, pattern)]
+        for candidate in candidates:
+            resolved = os.path.realpath(candidate)
+            if resolved in seen or not os.path.isfile(resolved):
+                continue
+            digest = file_digest(resolved, CONFIG_TEXT_MAX)
+            if digest is None:
+                continue
+            seen.add(resolved)
+            text = None
+            if digest[1] is not None:
+                try:
+                    text = digest[1].decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+            configs.append({"tool": tool, "path": resolved, "sha256": digest[0], "text": text})
+    return configs
+
+
+def mentions_bridge(path):
+    try:
+        with open(path, "rb") as handle:
+            return BRIDGE_MARK in handle.read(WHOLE_MAX_BYTES)
+    except OSError:
+        return False
+
+
+def home_tools(home):
+    """Which tools have their state directory in a home, in TOOL_ORDER."""
+    present = set()
+    if any(os.path.isdir(os.path.join(d, "projects")) for d in claude_config_dirs(home)):
+        present.add("claude")
+    for tool, relative in TOOL_STATE_DIRS:
+        if os.path.isdir(os.path.join(home, relative)):
+            present.add(tool)
+    return [tool for tool in TOOL_ORDER if tool in present]
+
+
+def home_installed(home):
+    """Which tools' remote bridges are in place in a home, in TOOL_ORDER.
+
+    Claude counts only when every config dir it is used from names the
+    bridge, so a second profile without hooks still reads as not set up."""
+    installed = set()
+    for tool, bridge in BRIDGE_FILES:
+        if not os.path.isfile(os.path.join(home, bridge)):
+            continue
+        if tool == "claude":
+            used = [d for d in claude_config_dirs(home)
+                    if os.path.isdir(os.path.join(d, "projects"))]
+            if used and all(mentions_bridge(os.path.join(d, "settings.json")) for d in used):
+                installed.add(tool)
+            continue
+        if any(mentions_bridge(os.path.join(home, pattern))
+               for name, pattern in CONFIG_TOOLS if name == tool):
+            installed.add(tool)
+    return [tool for tool in TOOL_ORDER if tool in installed]
+
+
+def installed_helpers(homes):
+    """{"path", "sha256"} for each installed helper. sha256 is None when the
+    file is there but cannot be read, as the root helper (root's, mode 700)
+    cannot be by anyone else."""
+    found = []
+    for path in list(HELPER_PATHS) + [os.path.join(home, USER_HELPER) for home in homes]:
+        if not os.path.isfile(path):
+            continue
+        digest = file_digest(path)
+        found.append({"path": path, "sha256": digest[0] if digest else None})
+    return found
+
+
+def sudo_ok():
+    try:
+        return run_command(["sudo", "-n", "true"], timeout=SUDO_SECONDS).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def probe():
+    """What the setup wizard needs to know about a host, read-only.
+
+    It runs once, as `python3 - probe` with this file on stdin, before the
+    helper is installed anywhere. It writes nothing and starts nothing that
+    outlives it: no hook homes, sockets, ~/.swarmbar or writer thread.
+    """
+    warnings = []
+    homes = home_entries(warnings)
+    paths = [home["path"] for home in homes]
+    processes = agent_processes(warnings, screens=False)
+    try:
+        import pwd
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        user = ""
+    return {
+        "ok": True,
+        "protocol": PROTOCOL_VERSION,
+        "system": platform.system(),
+        "python": platform.python_version(),
+        "hostname": platform.node(),
+        "user": user,
+        "euid": os.geteuid(),
+        "sudo_ok": sudo_ok(),
+        "homes": homes,
+        "processes": processes if processes is not None else [],
+        "processes_failed": processes is None,
+        "tools": dict((path, home_tools(path)) for path in paths),
+        "installed": dict((path, home_installed(path)) for path in paths),
+        "configs": dict((path, home_configs(path)) for path in paths),
+        "helper": installed_helpers(paths),
+        "warnings": warnings,
+    }
+
+
+def probe_main():
+    """One JSON object on stdout and exit 0, whatever happens: the Mac
+    reads a failure from the object, not from the exit status."""
+    try:
+        result = probe()
+    except Exception as error:
+        result = {"ok": False, "protocol": PROTOCOL_VERSION,
+                  "error": "probe failed: %s" % error}
+    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.flush()
 
 
 PANE_ID = re.compile(r"^%[0-9]+$")
@@ -2650,4 +2871,10 @@ def serve_requests(stdin, relay):
 
 
 if __name__ == "__main__":
-    main()
+    # The probe runs before anything is installed and must leave no trace,
+    # so it never reaches main(), which sets up hook homes and a writer
+    # thread. Its program came from stdin, so stdin is not a request stream.
+    if len(sys.argv) > 1 and sys.argv[1] == "probe":
+        probe_main()
+    else:
+        main()
