@@ -29,7 +29,7 @@ struct RemoteHostMonitor: SessionMonitor {
     }
 
     func start(into store: SessionStore) async {
-        let channel = SSHChannel(alias: host.alias)
+        let channel = SSHChannel(launch: .ssh(alias: host.alias, watchAs: host.watchAs))
         let name = host.displayName
         var installed = false
         // The warning set from the previous successful snapshot for this
@@ -41,7 +41,7 @@ struct RemoteHostMonitor: SessionMonitor {
         while !Task.isCancelled {
             if !store.isPaused && host.isEnabled {
                 if !installed {
-                    let outcome = await Self.installHelper(alias: host.alias)
+                    let outcome = await Self.installHelper(alias: host.alias, watchAs: host.watchAs)
                     installed = outcome.ok
                     // Cancel is only a request, and the supervisor clears
                     // this host's rows right after asking. Every store
@@ -121,14 +121,14 @@ struct RemoteHostMonitor: SessionMonitor {
     /// to the `@MainActor` `SessionMonitor` protocol, and `waitUntilExit()`
     /// blocks, so running this on the main actor would freeze the popover
     /// for the length of an ssh round trip.
-    nonisolated static func installHelper(alias: String) async -> InstallOutcome {
+    nonisolated static func installHelper(alias: String, watchAs: WatchAs) async -> InstallOutcome {
         guard let source = Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"),
               let data = try? Data(contentsOf: source)
         else {
             NSLog("SwarmBar: swarmbar-helper.py missing from the app bundle")
             return InstallOutcome(ok: false, message: "helper missing from the app bundle")
         }
-        return await Task.detached { install(data: data, alias: alias) }.value
+        return await Task.detached { install(data: data, alias: alias, watchAs: watchAs) }.value
     }
 
     /// Whether the install worked, and what went wrong if it did not. The
@@ -150,22 +150,17 @@ struct RemoteHostMonitor: SessionMonitor {
     /// the one failure here that is silent rather than visible.
     ///
     /// 30 seconds: three times ConnectTimeout, and the transfer itself is
-    /// one ssh handshake plus a 9 KB write. The ServerAlive options below
-    /// would take 45 seconds to fire, so this deadline is the effective
-    /// bound; they are set anyway so ssh notices on its own if this path
-    /// ever stops being the one holding the stopwatch.
+    /// one ssh handshake plus a 9 KB write. The ServerAlive options in
+    /// HelperLaunch.sshOptions would take 45 seconds to fire, so this
+    /// deadline is the effective bound; they are set anyway so ssh notices
+    /// on its own if this path ever stops being the one holding the
+    /// stopwatch.
     nonisolated static let installTimeout: TimeInterval = 30
 
-    private nonisolated static func install(data: Data, alias: String) -> InstallOutcome {
+    private nonisolated static func install(data: Data, alias: String, watchAs: WatchAs) -> InstallOutcome {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = [
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            alias,
-        ] + SSHChannel.installCommand(helperPath: "/usr/local/lib/swarmbar-helper")
+        task.arguments = HelperLaunch.sshOptions + [alias, HelperLaunch.installCommand(for: watchAs)]
         let stdin = Pipe(), stderr = Pipe()
         task.standardInput = stdin
         task.standardOutput = FileHandle.nullDevice
