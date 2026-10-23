@@ -257,22 +257,41 @@ import Testing
     }
 
     @Test func rootLoginNeedsNoSudoRule() throws {
-        // Logged in as root on a host with no sudo at all.
-        let plan = try Self.plan(Self.probe(user: "root", euid: 0, sudo: false, tools: ["/root": ["claude"]],
-                                            claudeDirs: ["/root": Self.missing("/root/.claude")]))
-        #expect(plan.sudoersUser == nil)
-        #expect(!plan.useSudo)
-        #expect(!plan.isPartial)
-        let command = try Self.command(plan)
-        #expect(!command.contains("sudo "))
-        #expect(try Self.operations(in: command).allSatisfy { $0["op"] as? String != "sudoers" })
+        // Who pastes the command decides: the login user's euid, never
+        // root's view, which has euid 0 whoever logged in.
+        let dirs = ["/root": Self.missing("/root/.claude")]
 
-        // A root view taken through sudo says sudo works; the person
-        // pasting the command is not root, so it keeps sudo.
-        let view = try Self.plan(Self.probe(user: "root", euid: 0, sudo: true, tools: ["/root": ["claude"]],
-                                            claudeDirs: ["/root": Self.missing("/root/.claude")]))
-        #expect(view.useSudo)
-        #expect(view.sudoersUser == nil)
+        // Logged in as root: no sudo and no sudo rule, with or without sudo installed.
+        for sudo in [false, true] {
+            let root = try Self.plan(Self.probe(user: "root", euid: 0, sudo: sudo, tools: ["/root": ["claude"]],
+                                                claudeDirs: dirs))
+            #expect(!root.useSudo)
+            #expect(root.sudoersUser == nil)
+            #expect(!root.isPartial)
+            let command = try Self.command(root)
+            #expect(!command.contains("sudo "))
+            #expect(try Self.operations(in: command).allSatisfy { $0["op"] as? String != "sudoers" })
+        }
+
+        // A non-root login with passwordless sudo, judged on root's view.
+        let view = Self.probe(user: "root", euid: 0, sudo: true, tools: ["/root": ["claude"]], claudeDirs: dirs)
+        let viewed = try SetupPlanner.plan(probe: view, watchAs: .everyUser, bundled: Self.bridges,
+                                           kimiEvents: [:], loginEUID: 1000)
+        #expect(viewed.useSudo)
+        #expect(viewed.sudoersUser == nil)
+        let viewedCommand = try Self.command(viewed)
+        #expect(viewedCommand.contains("&& sudo python3 "))
+        #expect(try Self.operations(in: viewedCommand).allSatisfy { $0["op"] as? String != "sudoers" })
+        #expect(try SetupPlanner.undoPlan(probe: view, watchAs: .everyUser, loginEUID: 1000).useSudo)
+
+        // A non-root login without passwordless sudo: sudo and the rule.
+        let narrow = try Self.plan(Self.probe(user: "u", sudo: false, homes: ["/home/u": "u"],
+                                              tools: ["/home/u": ["claude"]],
+                                              claudeDirs: ["/home/u": Self.missing("/home/u/.claude")]))
+        let narrowCommand = try Self.command(narrow)
+        #expect(narrowCommand.contains("&& sudo python3 "))
+        #expect(try Self.operations(in: narrowCommand).contains {
+            $0["op"] as? String == "sudoers" && $0["user"] as? String == "u" })
     }
 
     @Test func kimiPlanNarrowsToAcceptedEvents() throws {

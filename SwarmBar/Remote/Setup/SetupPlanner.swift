@@ -117,8 +117,13 @@ enum SetupPlanner {
         var needs: [String] = []
     }
 
+    /// `loginEUID` is the euid of the login user's own probe, the account
+    /// that will paste the setup command. Pass it whenever `probe` is
+    /// root's view, whose euid says nothing about who logs in. nil means
+    /// `probe` is the login user's own.
     static func plan(
-        probe: ProbeResult, watchAs: WatchAs, bundled: BundledBridges, kimiEvents: [String: [String]]
+        probe: ProbeResult, watchAs: WatchAs, bundled: BundledBridges, kimiEvents: [String: [String]],
+        loginEUID: Int? = nil
     ) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
         let owners = fileOwners(probe, homes)
@@ -224,26 +229,25 @@ enum SetupPlanner {
         var paths = Set<String>()
         let uniqueBridges = bridges.filter { paths.insert($0.change.path).inserted }
         let narrow = watchAs == .everyUser && !probe.sudoOK
-        let asRoot = probe.euid == 0
+        let rootLogin = (loginEUID ?? probe.euid) == 0
         return SetupPlan(
             changes: resolve(uniqueBridges + configs),
             installHelper: narrow,
-            // Root has no use for a rule that lets it run its own helper.
-            sudoersUser: narrow && !asRoot ? probe.user : nil,
+            // A root login has no use for a rule that lets it run its own
+            // helper, and needs no sudo to run apply.
+            sudoersUser: narrow && !rootLogin ? probe.user : nil,
             watchAs: watchAs,
             helperDestination: helperDestination(homes: homes, watchAs: watchAs),
             system: probe.system,
-            // A root login with no sudo installed runs apply as it is. A
-            // root view taken through sudo says sudo works, and the person
-            // pasting the command is then not root, so it keeps sudo.
-            useSudo: watchAs == .everyUser && !(asRoot && !probe.sudoOK),
-            isPartial: narrow && !asRoot)
+            useSudo: watchAs == .everyUser && !rootLogin,
+            isPartial: narrow && !rootLogin)
     }
 
     /// The `.remote` uninstall for every config that names a remote bridge,
     /// then the bridge files themselves, each after the configs that named
     /// it. Local entries are never touched.
-    static func undoPlan(probe: ProbeResult, watchAs: WatchAs) throws -> SetupPlan {
+    /// `loginEUID` as for `plan`.
+    static func undoPlan(probe: ProbeResult, watchAs: WatchAs, loginEUID: Int? = nil) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
         let owners = fileOwners(probe, homes)
         var configs: [Pending] = []
@@ -332,8 +336,8 @@ enum SetupPlanner {
         return SetupPlan(
             changes: resolve(configs + uniqueRemovals), installHelper: false, sudoersUser: nil, watchAs: watchAs,
             helperDestination: helperDestination(homes: homes, watchAs: watchAs), system: probe.system,
-            useSudo: watchAs == .everyUser && !(probe.euid == 0 && !probe.sudoOK),
-            isPartial: watchAs == .everyUser && !probe.sudoOK && probe.euid != 0)
+            useSudo: watchAs == .everyUser && (loginEUID ?? probe.euid) != 0,
+            isPartial: watchAs == .everyUser && !probe.sudoOK && (loginEUID ?? probe.euid) != 0)
     }
 
     /// The tool a kimi_events key names: its binary's path, or the BearCode
