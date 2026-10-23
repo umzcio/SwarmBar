@@ -757,11 +757,11 @@ class ProtocolTests(unittest.TestCase):
 
 
 PS_SAMPLE = (
-    "    1     0 root     ?        systemd         /sbin/init splash\n"
-    "  500     1 zach     pts/1    tmux: server    tmux new -s work\n"
-    "  610   500 zach     pts/2    bash            -bash\n"
-    "  700   610 zach     pts/2    claude          claude --resume abc --model x\n"
-    "  800     1 zach     ?        node            node /home/z/bearcode-cli/apps/kimi-code/dist/main.mjs --yolo\n"
+    "    1     0 0 root     ?        systemd         /sbin/init splash\n"
+    "  500     1 1000 zach     pts/1    tmux: server    tmux new -s work\n"
+    "  610   500 1000 zach     pts/2    bash            -bash\n"
+    "  700   610 1000 zach     pts/2    claude          claude --resume abc --model x\n"
+    "  800     1 1000 zach     ?        node            node /home/z/bearcode-cli/apps/kimi-code/dist/main.mjs --yolo\n"
 )
 
 
@@ -800,6 +800,9 @@ class ProcessTableTests(unittest.TestCase):
         patches = [
             mock.patch.object(helper, "process_cwd", return_value="/work"),
             mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]),
+            # No uid in these samples names a real account, so the printed
+            # user stands, whoever runs the tests.
+            mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")),
         ]
         for p in patches:
             p.start()
@@ -820,12 +823,34 @@ class ProcessTableTests(unittest.TestCase):
         self.assertEqual([r for r in rows if r["pid"] == 1][0]["tty"], "")
 
     def test_parse_ps_takes_basename_of_a_path_comm(self):
-        rows = helper.parse_ps("  9  1 zach ttys001 /opt/bin/codex codex exec go\n")
+        rows = helper.parse_ps("  9  1 1000 zach ttys001 /opt/bin/codex codex exec go\n")
         self.assertEqual(rows[0]["comm"], "codex")
         self.assertEqual(rows[0]["args"], "codex exec go")
 
+    def test_ps_asks_for_the_uid(self):
+        runner = FakeRunner()
+        self.run_table(runner)
+        ps = [call for call in runner.calls if call[0] == "ps"][0]
+        self.assertIn("uid=", ps[-1])
+        # GNU width syntax (user:64=) is rejected by BSD ps.
+        self.assertNotIn(":", ps[-1])
+
+    def test_user_resolved_from_uid_not_the_truncated_column(self):
+        """procps truncates a long name to `longuser+`, which would never
+        match the home's owner on the Mac and would drop every session."""
+        entry = mock.Mock(pw_name="longusername")
+        with mock.patch("pwd.getpwuid", return_value=entry) as lookup:
+            rows = helper.parse_ps("  10  1 1001 longuser+ pts/1 claude claude\n")
+        lookup.assert_called_with(1001)
+        self.assertEqual(rows[0]["user"], "longusername")
+        self.assertNotIn("uid", rows[0])
+
+    def test_unknown_uid_keeps_the_printed_user(self):
+        rows = helper.parse_ps("  10  1 4242 someone pts/1 claude claude\n")
+        self.assertEqual(rows[0]["user"], "someone")
+
     def test_parse_ps_skips_malformed_lines(self):
-        self.assertEqual(helper.parse_ps("garbage\n  x 1 u t c a\n"), [])
+        self.assertEqual(helper.parse_ps("garbage\n  x 1 0 u t c a\n  5 1 x u t c a\n"), [])
 
     def test_bearcode_found_by_args(self):
         table, _ = self.run_table(FakeRunner())
@@ -891,8 +916,8 @@ class ProcessTableTests(unittest.TestCase):
             self.assertIsNone(helper.agent_processes([]))
 
     def test_held_files_only_for_codex_and_agy(self):
-        ps = ("  10  1 z ttys001 codex codex\n  11  1 z ttys002 agy agy\n"
-              "  12  1 z ttys003 claude claude\n")
+        ps = ("  10  1 1000 z ttys001 codex codex\n  11  1 1000 z ttys002 agy agy\n"
+              "  12  1 1000 z ttys003 claude claude\n")
         lsof = "p10\nn/h/.codex/sessions/2026/a.jsonl\nn/etc/hosts\nn/h/presence/x.lock\n"
         with mock.patch.object(helper.platform, "system", return_value="Darwin"):
             table, _ = self.run_table(FakeRunner(ps=ps, lsof=lsof))
@@ -902,7 +927,7 @@ class ProcessTableTests(unittest.TestCase):
         self.assertEqual(by["claude"]["open"], [])
 
     def test_held_files_read_proc_on_linux(self):
-        ps = "  10  1 z pts/1 codex codex\n"
+        ps = "  10  1 1000 z pts/1 codex codex\n"
         links = ["/h/.codex/sessions/r.jsonl", "/dev/null", "/h/.codex/other.jsonl"]
         with mock.patch.object(helper.platform, "system", return_value="Linux"), \
                 mock.patch.object(helper, "proc_fd_links", return_value=links):
@@ -911,7 +936,7 @@ class ProcessTableTests(unittest.TestCase):
         self.assertFalse(table[0].get("open_failed", False))
 
     def test_unreadable_fd_dir_is_flagged_not_empty(self):
-        ps = "  10  1 z pts/1 codex codex\n"
+        ps = "  10  1 1000 z pts/1 codex codex\n"
         with mock.patch.object(helper.platform, "system", return_value="Linux"), \
                 mock.patch.object(helper, "proc_fd_links", return_value=None):
             table, warnings = self.run_table(FakeRunner(ps=ps))
@@ -919,7 +944,7 @@ class ProcessTableTests(unittest.TestCase):
         self.assertTrue([w for w in warnings if "10" in w])
 
     def test_lsof_failure_is_flagged(self):
-        ps = "  10  1 z ttys1 codex codex\n"
+        ps = "  10  1 1000 z ttys1 codex codex\n"
         def runner(argv, timeout=5):
             if argv[0] == "lsof":
                 raise OSError("gone")
@@ -929,9 +954,9 @@ class ProcessTableTests(unittest.TestCase):
         self.assertTrue(table[0]["open_failed"])
 
     def test_darwin_truncated_comm_resolved_from_argv0(self):
-        ps = ("  30  1 zach ttys001 /Users/zach/.loc /Users/zach/.local/bin/claude --resume\n"
-              "  31  1 zach ttys002 /Users/zach/.cod /Users/zach/.codex/bin/codex exec\n"
-              "  32  1 zach ttys003 /Users/zach/.loc /Users/zach/.local/bin/other --x\n")
+        ps = ("  30  1 1000 zach ttys001 /Users/zach/.loc /Users/zach/.local/bin/claude --resume\n"
+              "  31  1 1000 zach ttys002 /Users/zach/.cod /Users/zach/.codex/bin/codex exec\n"
+              "  32  1 1000 zach ttys003 /Users/zach/.loc /Users/zach/.local/bin/other --x\n")
         table, _ = self.run_table(FakeRunner(ps=ps))
         self.assertEqual(sorted((p["pid"], p["comm"]) for p in table),
                          [(30, "claude"), (31, "codex")])
@@ -942,14 +967,14 @@ class ProcessTableTests(unittest.TestCase):
         self.assertTrue(warnings)
 
     def test_agent_that_is_the_pane_pid_gets_the_pane(self):
-        runner = FakeRunner(ps="  700  1 z pts/1 claude claude\n",
+        runner = FakeRunner(ps="  700  1 1000 z pts/1 claude claude\n",
                             panes={"/tmp/tmux-1000/default": "%9 700\n"})
         table, _ = self.run_table(runner)
         self.assertEqual(table[0]["pane"]["id"], "%9")
 
     def test_screen_only_for_agy_with_a_pane_and_last_60_lines(self):
-        ps = ("  10  1 z pts/1 agy agy\n  11  1 z pts/2 claude claude\n"
-              "  500 1 z pts/3 tmux tmux\n  20 500 z pts/4 agy agy\n")
+        ps = ("  10  1 1000 z pts/1 agy agy\n  11  1 1000 z pts/2 claude claude\n"
+              "  500 1 1000 z pts/3 tmux tmux\n  20 500 1000 z pts/4 agy agy\n")
         capture = "\n".join("line%d" % n for n in range(100)) + "\n"
         runner = FakeRunner(ps=ps, panes={"/tmp/tmux-1000/default": "%7 500\n"}, capture=capture)
         with mock.patch.object(helper.platform, "system", return_value="Darwin"):

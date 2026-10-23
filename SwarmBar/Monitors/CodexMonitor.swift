@@ -20,7 +20,9 @@ struct CodexMonitor: SessionMonitor {
     /// CodexSessionParser.parse takes `now` and downgrades to idle once a
     /// line goes stale (staleAfter), so a cached parse would freeze that
     /// time-dependent verdict. Re-parsing a cached tail is cheap.
-    private nonisolated static let tailCache = TailCache<String>()
+    /// Internal rather than private so a test can show eviction reaches
+    /// the scanned root under its real path.
+    nonisolated static let tailCache = TailCache<String>()
 
     /// The head only carries session_meta (cwd, session id, and whether the
     /// rollout belongs to a subagent), a pure function of the file's bytes
@@ -119,13 +121,23 @@ struct CodexMonitor: SessionMonitor {
                 attentionEventID: parsed.attentionEventID
             ))
         }
-        // The enumerator hands back resolved paths (/private/var for /var),
-        // so the root is offered in both spellings or a temp-dir root would
-        // never match its own entries.
-        let scanned = [root.path, root.resolvingSymlinksInPath().path]
+        // The enumerator hands back real paths (/private/var for /var), so
+        // the root is offered in both spellings or a root under a symlinked
+        // directory would never match its own entries. Foundation's
+        // resolvingSymlinksInPath() is no use here: it strips /private
+        // again, back to the spelling that does not match.
+        let scanned = [root.path, realPath(root.path) ?? root.path]
         tailCache.retain(paths: seenPaths, under: scanned)
         headCache.retain(paths: seenPaths, under: scanned)
         return sessions.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// realpath(3): every symlink resolved, /private prefix kept, which is
+    /// how FileManager.enumerator spells the paths it returns.
+    nonisolated static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// Enough of the file to contain its first line, which is session_meta.

@@ -790,30 +790,46 @@ ANCESTRY_LIMIT = 32
 SCREEN_LINES = 60
 
 
-def parse_ps(text):
-    """Rows of `ps -axo pid=,ppid=,user=,tty=,comm=,args=`, args kept whole.
+def user_for(uid, printed):
+    """The account name for a uid, or the name ps printed when that fails.
 
-    The first five fields never contain whitespace except that comm might
-    (a Linux kernel thread name, say), so this splits on the first five runs
+    procps cuts a long user name to fit its column (`longuser+`, or the
+    bare uid), and the Mac matches each process to a home by the full
+    owner name, so a truncated one would quietly drop every session that
+    user runs. The uid is never truncated.
+    """
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError, OverflowError):
+        return printed
+
+
+def parse_ps(text):
+    """Rows of `ps -axo pid=,ppid=,uid=,user=,tty=,comm=,args=`, args kept whole.
+
+    The first six fields never contain whitespace except that comm might
+    (a Linux kernel thread name, say), so this splits on the first six runs
     and treats everything after as args. A comm with a space therefore bleeds
     its tail into args; no agent's comm has one. comm may be a full path on
-    Darwin, so only its basename is kept. A tty of ? or ?? means none.
+    Darwin, so only its basename is kept. A tty of ? or ?? means none. The
+    user comes from the uid, and the printed name is only the fallback.
     """
     rows = []
     for line in text.splitlines():
-        parts = line.split(None, 5)
-        if len(parts) < 5:
+        parts = line.split(None, 6)
+        if len(parts) < 6:
             continue
         try:
-            pid, ppid = int(parts[0]), int(parts[1])
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        tty = parts[3]
+        tty = parts[4]
         rows.append({
-            "pid": pid, "ppid": ppid, "user": parts[2],
+            "pid": pid, "ppid": ppid, "user": user_for(uid, parts[3]),
             "tty": "" if tty in ("?", "??", "-") else tty,
-            "comm": parts[4].split("/")[-1],
-            "args": parts[5].strip() if len(parts) > 5 else "",
+            "comm": parts[5].split("/")[-1],
+            "args": parts[6].strip() if len(parts) > 6 else "",
         })
     return rows
 
@@ -971,7 +987,10 @@ def agent_processes(warnings):
     """Live agent processes. `ps -axo` is portable; GNU long flags are not."""
     try:
         completed = run_command(
-            ["ps", "-axo", "pid=,ppid=,user=,tty=,comm=,args="], timeout=15,
+            # uid= alongside user=: both GNU and BSD ps take it, and GNU's
+            # user:64= width syntax is not portable. parse_ps relies on
+            # this exact field order.
+            ["ps", "-axo", "pid=,ppid=,uid=,user=,tty=,comm=,args="], timeout=15,
         )
     except (OSError, subprocess.SubprocessError) as error:
         warnings.append("ps failed: %s" % error)

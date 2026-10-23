@@ -290,6 +290,9 @@ struct RemoteDiscoveryTests {
             snapshot: snapshot, mirror: mirror, hostID: hostID, hostName: "devbox", now: .now)
         #expect(result.warnings.contains { $0.contains("/home/../etc") })
         #expect(result.sessions.values.allSatisfy { $0.isEmpty })
+        // Its sessions could not be read, not found gone, so no tool's
+        // empty result may be synced.
+        #expect(result.unverifiedTools == Set(AgentTool.allCases))
     }
 }
 
@@ -418,6 +421,31 @@ struct RemoteDiscoveryMirrorTests {
         let result = discover(snapshot(homes: [RemoteHome(path: "/home/u", user: "u")], processes: []))
         #expect(result.sessions[.kimiCode]?.isEmpty == true)
         #expect(result.warnings.contains { $0.contains("/home/u/../../etc/session_a") })
+    }
+
+    /// The Codex enumerator returns real paths, so the mirror root under
+    /// /var/folders comes back as /private/var/folders. Eviction has to
+    /// reach entries spelled that way, or a rollout that left the window
+    /// would stay cached for good.
+    @Test func codexEvictsStaleEntriesUnderTheRealRoot() throws {
+        defer { try? FileManager.default.removeItem(at: mirror.root) }
+        try write(
+            try fixture("codex-running"),
+            remote: "/home/u/.codex/sessions/2026/08/01/rollout-2026-08-01T10-00-00-0198a6b9-1111-7abc-9def-0123456789ab.jsonl")
+        let root = try #require(mirror.local("/home/u/.codex/sessions"))
+        let real = try #require(CodexMonitor.realPath(root.path))
+        let stale = URL(fileURLWithPath: real + "/2026/07/01/rollout-gone-\(UUID().uuidString.lowercased()).jsonl")
+        let modified = Date()
+        _ = CodexMonitor.tailCache.value(for: stale, size: 1, modified: modified) { "stale" }
+
+        let result = discover(snapshot(homes: [RemoteHome(path: "/home/u", user: "u")], processes: []))
+        #expect(result.sessions[.codex]?.count == 1)
+
+        var recomputed = false
+        _ = CodexMonitor.tailCache.value(for: stale, size: 1, modified: modified) {
+            recomputed = true; return "again"
+        }
+        #expect(recomputed)
     }
 
     /// One shared tail cache serves this Mac and every remote home. A

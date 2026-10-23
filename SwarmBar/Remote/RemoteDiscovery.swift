@@ -27,7 +27,8 @@ enum RemoteDiscovery {
         /// Codex and Antigravity know a session is alive only from the
         /// files its process holds, so one of their processes with
         /// unreadable open files leaves that tool unverified. A failed
-        /// process list leaves every tool unverified.
+        /// process list, or a home the mirror refuses, leaves every tool
+        /// unverified.
         var unverifiedTools: Set<AgentTool>
     }
 
@@ -65,7 +66,10 @@ enum RemoteDiscovery {
 
         for home in snapshot.homes {
             guard let local = mirror.local(home.path) else {
+                // Its sessions are not missing, only unreadable here, and any
+                // tool could have had some. Syncing would delete them.
                 warnings.append("skipped home \(home.path): it cannot be mapped into the mirror")
+                unverified = Set(AgentTool.allCases)
                 continue
             }
             // Only the home's own user's processes. A root process sharing
