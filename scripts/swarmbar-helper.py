@@ -1299,7 +1299,11 @@ def home_configs(home, warnings):
     and text and a warning: dropping it would make the plan create a file
     that is already there, and could-not-read would read as absent. So is
     one that is not the home owner's own all the way down (owner_only_path):
-    run as root, reading it would hand its contents to whoever planted it."""
+    run as root, reading it would hand its contents to whoever planted it.
+
+    Each entry carries the file's dev and ino, so the Mac can plan one
+    write for profiles that share one file by hardlink: two realpaths, one
+    file, and a second write would find the hash it expected already gone."""
     configs = []
     seen = set()
     uid = home_owner(home)[1]
@@ -1314,15 +1318,23 @@ def home_configs(home, warnings):
             if resolved in seen or not os.path.isfile(resolved):
                 continue
             seen.add(resolved)
+            # stat reads no contents, so it is safe even on a refused file.
+            try:
+                info = os.stat(resolved)
+                identity = {"dev": info.st_dev, "ino": info.st_ino}
+            except OSError:
+                identity = {"dev": None, "ino": None}
+            entry = {"tool": tool, "path": resolved, "sha256": None, "text": None}
+            entry.update(identity)
             if not owner_only_path(home, resolved, uid):
                 warnings.append("refusing %s config %s: it is not the home owner's own"
                                 % (tool, resolved))
-                configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None})
+                configs.append(entry)
                 continue
             digest = read_owned(resolved, uid, CONFIG_TEXT_MAX)
             if digest is None:
                 warnings.append("cannot read %s config %s" % (tool, resolved))
-                configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None})
+                configs.append(entry)
                 continue
             text = None
             if digest[1] is not None:
@@ -1330,7 +1342,8 @@ def home_configs(home, warnings):
                     text = digest[1].decode("utf-8")
                 except UnicodeDecodeError:
                     text = None
-            configs.append({"tool": tool, "path": resolved, "sha256": digest[0], "text": text})
+            entry["sha256"], entry["text"] = digest[0], text
+            configs.append(entry)
     return configs
 
 

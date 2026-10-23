@@ -2288,6 +2288,20 @@ class ProbeTests(unittest.TestCase):
         configs = self.probe()["configs"][self.home]
         self.assertEqual([c["path"] for c in configs], [os.path.realpath(shared)])
 
+    def test_probe_reports_config_identity_for_hardlinks(self):
+        # Two profiles sharing one settings.json by hardlink have two
+        # realpaths but one file. dev and ino let the Mac plan one write for
+        # it, where a second write would find the hash already changed.
+        shared = self.put(".claude/settings.json", "{}\n")
+        os.makedirs(os.path.join(self.home, ".claude-work"))
+        linked = os.path.join(self.home, ".claude-work", "settings.json")
+        os.link(shared, linked)
+        configs = self.probe()["configs"][self.home]
+        self.assertEqual(len(configs), 2)
+        info = os.stat(shared)
+        for config in configs:
+            self.assertEqual((config["dev"], config["ino"]), (info.st_dev, info.st_ino))
+
     def test_probe_reports_tools_present(self):
         self.put(".claude/projects/p/s.jsonl", "{}\n")
         self.put(".claude-old/projects/p/s.jsonl", "{}\n")
@@ -2378,8 +2392,10 @@ class ProbeTests(unittest.TestCase):
             return real_open(name, *args, **kwargs)
         with mock.patch("builtins.open", side_effect=refusing):
             result = self.probe()
+        info = os.stat(path)
         self.assertEqual(result["configs"][self.home], [
-            {"tool": "kimi", "path": os.path.realpath(path), "sha256": None, "text": None}])
+            {"tool": "kimi", "path": os.path.realpath(path), "sha256": None, "text": None,
+             "dev": info.st_dev, "ino": info.st_ino}])
         self.assertTrue(any("kimi" in w and path in w for w in result["warnings"]), result["warnings"])
 
     def test_unreadable_bridge_config_is_unknown_not_missing(self):

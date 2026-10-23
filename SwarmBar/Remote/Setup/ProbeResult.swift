@@ -15,6 +15,12 @@ struct ProbeResult: Decodable, Sendable, Equatable {
         var path: String
         var sha256: String?
         var text: String?
+        /// The file's identity. Profiles sharing one file by hardlink name
+        /// it under two realpaths, and the plan must write it once: a second
+        /// write would find the hash it expected already gone. Unsigned,
+        /// since an inode number can use all 64 bits.
+        var dev: UInt64? = nil
+        var ino: UInt64? = nil
     }
 
     /// An installed copy of SwarmBar's helper. `sha256` is nil when the file
