@@ -25,6 +25,7 @@ import http.server
 import json
 import os
 import platform
+import queue
 import re
 import select
 import socket
@@ -1271,13 +1272,28 @@ def handle_tmux(request):
 # its own Mac, and keeps trying the lock so it takes over when the owner
 # exits.
 #
+# Running as root, the helper never creates, binds or changes anything in a
+# user's home itself. Each of those steps runs in a forked child that has
+# become the home's owner, and the child hands back only file descriptors.
+# Done as root, a user could hardlink a root-owned file in as hook.lock for
+# root to hand over, or swap ~/.swarmbar for a link between a check and a
+# bind.
+#
 # Broker protocol, newline-delimited JSON over broker.sock:
-#   owner -> follower: a Mac event, verbatim, which the follower writes to
-#     its own Mac unchanged: {"event": "hook", ...} or
-#     {"event": "hook_resolved", "rid": ...}.
-#   follower -> owner: {"type": "reply", "rid": str, "body": {...}}, its
-#     Mac's hook_reply. The first reply for a rid, from any Mac, answers it.
-# Connecting is registering. There is no handshake and no other message.
+#   owner -> follower:
+#     a Mac event, verbatim, which the follower writes to its own Mac
+#       unchanged: {"event": "hook", ...} or {"event": "hook_resolved", ...};
+#     {"type": "held", "rid": str}, just before the hook event of a request
+#       the owner is holding, so the follower knows which rows to clear if
+#       the owner dies holding them;
+#     {"type": "pending", "rids": [str]}, first on every connection: the
+#       holds still open. Each is then replayed as "held" plus its hook
+#       event, so a follower that reconnects can still answer it, and one
+#       that missed a resolution while away can clear the row.
+#   follower -> owner:
+#     {"type": "reply", "rid": str, "body": {...}}, its Mac's hook_reply. The
+#       first reply for a rid, from any Mac, answers it.
+# Connecting is registering. There is no other handshake.
 HOOK_DIR = ".swarmbar"
 HOOK_SOCKET = "hook.sock"
 BROKER_SOCKET = "broker.sock"
@@ -1299,6 +1315,8 @@ MAX_HOOK_DRAIN = 4 * 1024 * 1024
 # A held request gives up just inside the bridge's own curl -m 350, so the
 # agent hears {} rather than a dropped connection.
 HOLD_SECONDS = 345
+# Holds per home at once. Past it a request is answered {} at once.
+MAX_HOLDS = 32
 # How often a hold checks that its client is still there.
 HOLD_POLL_SECONDS = 0.5
 # How often a follower whose owner has gone tries the lock.
@@ -1307,8 +1325,10 @@ LOCK_RETRY_SECONDS = 2.0
 SERVE_POLL_SECONDS = 0.5
 # The peer and its ancestors, at most this many names.
 PEER_DEPTH = 8
-# ps runs before a PermissionRequest is answered. Grok counts a hook that
-# takes about 3 seconds as consent, so a slow ps must fail, not stall.
+# The whole decision to hold, peer lookup and Grok checks together, runs on
+# a thread given this long. Grok counts a hook that takes about 3 seconds as
+# consent, so a decision that is late is a refusal, answered {}.
+DECIDE_SECONDS = 1.5
 PEER_PS_TIMEOUT = 1
 # Reading the request itself. A client that connects and says nothing must
 # not hold a thread forever.
@@ -1317,32 +1337,112 @@ HOOK_READ_TIMEOUT = 10
 # the owner's broadcasts.
 BROKER_SEND_TIMEOUT = 2
 MAX_BROKER_LINE = 8 * 1024 * 1024
+# Events for this helper's Mac wait here for the one writer thread. A Mac
+# that stops reading costs dropped events, never a stalled request: a held
+# request whose event is dropped times out to {}.
+EMIT_QUEUE_SIZE = 256
 # sun_path is 104 bytes on Darwin and 108 on Linux, NUL included.
 MAX_SOCKET_PATH = 103
+# None forks a child for each home step exactly when running as root. Tests
+# set True to run the forked path as an ordinary user.
+HOOK_FORK = None
+# A forked step that has not answered by then is killed.
+USER_STEP_SECONDS = 5
+GROK_INDEX_MAX_BYTES = 4 * 1024 * 1024
 
 HOOK_PATH = re.compile(r"^/hook/([A-Za-z0-9_]+)$")
+GROK_SESSION_KEYS = ("id", "session_id", "sessionId", "sessionID")
 
 # os.umask is process-wide. Binding under a tight umask creates each socket
-# 600 from the start, with no chmod-by-path afterwards: as root that path is
-# inside a directory the user owns, who could swap it for a symlink to a
-# file root would then chmod.
+# 600 from the start, with no chmod by path afterwards. A forked child is
+# single-threaded and sets it without this lock, which another thread may
+# have held at the fork.
 _UMASK_LOCK = threading.Lock()
 
 
+def nearest_agent(peer):
+    """The first agent walking up from the client: the one that ran the hook."""
+    for name in peer:
+        if name in AGENT_COMMANDS:
+            return name
+    return None
+
+
 def is_holdable(event, peer):
-    """Whether a hook may be held for a decision from a Mac.
+    """Whether a hook may be held for a decision from a Mac, by its peer.
 
     Only Claude Code answers through its hook response, so only its
     PermissionRequest is held. Grok imports Claude-compatible hooks and
     reaches this same socket with the same script, but Grok 0.2.118 treats
     a hook that times out as consent, so a held Grok prompt is an approved
-    one. Any chain containing grok is answered at once, and so is one that
-    does not prove claude, since an unknown peer could be Grok. OpenCode's
-    event comes only from SwarmBar's own plugin, which holds on purpose.
+    one. A chain containing grok is answered at once, and so is one that
+    does not prove claude, or whose nearest agent is another one, since the
+    agent that ran the hook is the one waiting on it. OpenCode's event comes
+    only from SwarmBar's own plugin, which holds on purpose.
     """
     if event == "OpenCodePermission":
         return True
-    return event == "PermissionRequest" and "claude" in peer and "grok" not in peer
+    return (event == "PermissionRequest" and "claude" in peer and "grok" not in peer
+            and nearest_agent(peer) == "claude")
+
+
+def names_session(value, session_id):
+    """Whether parsed JSON names a session: as a bare string in a list, as a
+    key, or under one of GROK_SESSION_KEYS, at any depth. Broader than the
+    file's shape needs, which only ever refuses more."""
+    if isinstance(value, list):
+        return any(item == session_id or names_session(item, session_id) for item in value)
+    if isinstance(value, dict):
+        if session_id in value:
+            return True
+        if any(value.get(key) == session_id for key in GROK_SESSION_KEYS):
+            return True
+        return any(names_session(item, session_id) for item in value.values())
+    return False
+
+
+def grok_session(home, session_id):
+    """Whether a session might be Grok's, mirroring HookServer.originTool:
+    named in ~/.grok/active_sessions.json, or a ~/.grok/sessions/*/<id>
+    directory. A session id that cannot be checked, or Grok state that
+    exists but cannot be read, counts as Grok: the cost is one prompt
+    answered in the terminal, where the other mistake approves it."""
+    if not isinstance(session_id, str) or not session_id or "/" in session_id \
+            or "\0" in session_id or session_id in (".", ".."):
+        return True
+    grok = os.path.join(home, ".grok")
+    try:
+        # Not followed, and never blocking on a FIFO: this may run as root
+        # on a path the user controls.
+        fd = os.open(os.path.join(grok, "active_sessions.json"),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return True
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if not stat_module.S_ISREG(info.st_mode) or info.st_size > GROK_INDEX_MAX_BYTES:
+                return True
+            data = os.read(fd, GROK_INDEX_MAX_BYTES + 1)
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+        try:
+            if names_session(json.loads(data.decode("utf-8")), session_id):
+                return True
+        except (ValueError, RecursionError):
+            return True
+    sessions = os.path.join(grok, "sessions")
+    try:
+        directories = os.listdir(sessions)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return any(os.path.isdir(os.path.join(sessions, name, session_id)) for name in directories)
 
 
 def peer_pid(sock):
@@ -1356,6 +1456,24 @@ def peer_pid(sock):
         if platform.system() == "Darwin":
             # SOL_LOCAL is 0 and LOCAL_PEERPID 0x002; python names neither.
             return struct.unpack("i", sock.getsockopt(0, 0x002, 4))[0] or None
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def peer_uid(sock):
+    """The uid on the other end of a Unix socket, or None."""
+    try:
+        if hasattr(socket, "SO_PEERCRED"):
+            size = struct.calcsize("3i")
+            _, uid, _ = struct.unpack(
+                "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))
+            return uid
+        if platform.system() == "Darwin":
+            # LOCAL_PEERCRED (0x001 at SOL_LOCAL) is a struct xucred:
+            # u_int cr_version, uid_t cr_uid, short cr_ngroups, gid_t[16].
+            raw = sock.getsockopt(0, 0x001, 76)
+            return struct.unpack_from("=II", raw, 0)[1]
     except (OSError, struct.error):
         return None
     return None
@@ -1414,6 +1532,23 @@ def process_label(row):
     return row["comm"].lstrip("-") or "?"
 
 
+def bounded(work, seconds, default):
+    """work() on a daemon thread, or `default` when it raises or has not
+    finished in `seconds`. A late result is discarded."""
+    result = []
+
+    def run():
+        try:
+            result.append(work())
+        except Exception:
+            pass
+    thread = threading.Thread(target=run, name="swarmbar-bounded")
+    thread.daemon = True
+    thread.start()
+    thread.join(seconds)
+    return result[0] if result else default
+
+
 def hook_homes():
     """Homes with a remote bridge installed, in home_dirs order."""
     return [home for home in home_dirs()
@@ -1422,6 +1557,168 @@ def hook_homes():
 
 class HookHomeError(Exception):
     """A home whose hook socket cannot be served, with the reason."""
+
+
+def error_text(error):
+    return getattr(error, "strerror", None) or str(error)
+
+
+def supplementary_groups(user, gid):
+    """The owner's groups, computed before any fork: NSS lookups are not
+    safe in the child of a threaded process."""
+    try:
+        groups = os.getgrouplist(user, gid)
+    except (OSError, KeyError, TypeError):
+        groups = [gid]
+    try:
+        limit = os.sysconf("SC_NGROUPS_MAX")
+    except (OSError, ValueError):
+        limit = 16
+    return groups[:max(limit, 1)]
+
+
+def run_as_user(owner, step):
+    """Runs step(in_child) as the home's owner and returns the descriptors it
+    produced.
+
+    As root, or when HOOK_FORK is set, the step runs in a forked child that
+    drops to the owner (groups, then gid, then uid, the only order that
+    works) and passes the descriptors back over a socketpair. Otherwise the
+    helper already is the owner, or the home is not its to serve.
+    """
+    user, uid, gid = owner
+    fork = HOOK_FORK if HOOK_FORK is not None else os.geteuid() == 0
+    if not fork:
+        if os.geteuid() != uid:
+            raise HookHomeError("home has another owner")
+        return step(False)
+    groups = supplementary_groups(user, gid)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    pid = os.fork()
+    if pid == 0:
+        # Only system calls from here: no imports, no locks another thread
+        # might have held at the fork, and no exit handlers.
+        try:
+            parent.close()
+            if os.geteuid() == 0:
+                os.setgroups(groups)
+                os.setgid(gid)
+                os.setuid(uid)
+            if os.geteuid() != uid or os.getuid() != uid:
+                raise HookHomeError("cannot act as the home's owner")
+            fds = step(True)
+            socket.send_fds(child, [b"ok"], fds)
+        except BaseException as error:
+            try:
+                child.sendall(("error:" + error_text(error)).encode("utf-8", "replace"))
+            except BaseException:
+                pass
+        finally:
+            os._exit(0)
+    child.close()
+    try:
+        parent.settimeout(USER_STEP_SECONDS)
+        try:
+            data, fds, _, _ = socket.recv_fds(parent, 4096, 8)
+        except socket.timeout:
+            os.kill(pid, 9)
+            raise HookHomeError("setup did not finish")
+    finally:
+        parent.close()
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    if data != b"ok":
+        for fd in fds:
+            os.close(fd)
+        raise HookHomeError(data.decode("utf-8", "replace")[len("error:"):] or "setup failed")
+    return fds
+
+
+def step_prepare(directory):
+    """~/.swarmbar (700, this user's own, never through a link) and its
+    lock file. Returns [directory fd, lock fd]."""
+    def step(in_child):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
+        try:
+            info = os.fstat(dir_fd)
+            if not stat_module.S_ISDIR(info.st_mode):
+                raise HookHomeError("%s is not a directory" % HOOK_DIR)
+            if info.st_uid != os.geteuid():
+                raise HookHomeError("%s has another owner" % HOOK_DIR)
+            if stat_module.S_IMODE(info.st_mode) != 0o700:
+                os.fchmod(dir_fd, 0o700)
+            lock_fd = os.open(HOOK_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+                              dir_fd=dir_fd)
+            lock = os.fstat(lock_fd)
+            # A second link is someone else's file wearing this name.
+            if not stat_module.S_ISREG(lock.st_mode) or lock.st_uid != os.geteuid() \
+                    or lock.st_nlink != 1:
+                os.close(lock_fd)
+                raise HookHomeError("%s is not this user's own file" % HOOK_LOCK)
+        except BaseException:
+            os.close(dir_fd)
+            raise
+        return [dir_fd, lock_fd]
+    return step
+
+
+def step_bind(directory):
+    """Removes whatever a crashed owner left and binds both sockets, 600 by
+    umask. Returns [hook fd, broker fd], listening."""
+    def step(in_child):
+        fds = []
+        try:
+            for name in (HOOK_SOCKET, BROKER_SOCKET):
+                path = os.path.join(directory, name)
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    if in_child:
+                        previous = os.umask(0o177)
+                        try:
+                            sock.bind(path)
+                        finally:
+                            os.umask(previous)
+                    else:
+                        with _UMASK_LOCK:
+                            previous = os.umask(0o177)
+                            try:
+                                sock.bind(path)
+                            finally:
+                                os.umask(previous)
+                    sock.listen(16)
+                except BaseException:
+                    sock.close()
+                    raise
+                fds.append(sock.detach())
+        except BaseException:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
+    return step
+
+
+def step_connect(directory):
+    """A connection to the owner's broker. Returns [fd]."""
+    def step(in_child):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(os.path.join(directory, BROKER_SOCKET))
+        except BaseException:
+            sock.close()
+            raise
+        return [sock.detach()]
+    return step
 
 
 def read_lines(sock, stopping):
@@ -1451,11 +1748,16 @@ def read_lines(sock, stopping):
 
 
 def parse_line(line):
+    """A JSON object, or None for anything else, deeply nested input included."""
     try:
         message = json.loads(line.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return message if isinstance(message, dict) else None
+
+
+def encode_lines(messages):
+    return b"".join((json.dumps(message) + "\n").encode("utf-8") for message in messages)
 
 
 def client_gone(sock):
@@ -1562,6 +1864,12 @@ class BrokerHandler(socketserver.BaseRequestHandler):
     def handle(self):
         hub = self.server.hub
         conn = self.request
+        # The 700 directory already keeps everyone else out; this holds even
+        # if it were opened. None means the platform would not say, which
+        # leaves the directory as the only bound.
+        uid = peer_uid(conn)
+        if uid is not None and uid not in (hub.uid, 0):
+            return
         conn.settimeout(BROKER_SEND_TIMEOUT)
         if not hub.add_follower(conn):
             return
@@ -1575,10 +1883,12 @@ class BrokerHandler(socketserver.BaseRequestHandler):
 
 
 class Held(object):
-    """One request waiting for a Mac's decision."""
+    """One request waiting for a Mac's decision, and the event announcing
+    it, kept to replay to followers that connect while it waits."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, message):
         self.conn = conn
+        self.message = message
         self.done = threading.Event()
         self.body = None
         self.dropped = False
@@ -1606,8 +1916,14 @@ class HookHome(object):
         self.pending = {}
         self.broker = None
         self.broker_send = threading.Lock()
+        # Follower side: rids the owner holds, and rids whose replayed hook
+        # event this Mac already has.
         self.relayed = set()
+        self.replayed = set()
         self.error = None
+
+    def owner(self):
+        return self.user, self.uid, self.gid
 
     # Setup
 
@@ -1615,94 +1931,48 @@ class HookHome(object):
         for name in (HOOK_SOCKET, BROKER_SOCKET):
             if len(os.path.join(self.directory, name).encode("utf-8")) > MAX_SOCKET_PATH:
                 raise HookHomeError("socket path too long")
+        if self.uid is None:
+            raise HookHomeError("cannot examine home")
         try:
-            self.open_directory()
-            self.lock_fd = os.open(HOOK_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                                   0o600, dir_fd=self.dir_fd)
-            info = os.fstat(self.lock_fd)
-            if not stat_module.S_ISREG(info.st_mode):
-                raise HookHomeError("hook.lock is not a regular file")
-            if os.geteuid() == 0 and self.uid is not None and info.st_uid != self.uid:
-                os.fchown(self.lock_fd, self.uid, self.gid)
-        except OSError as error:
-            self.release()
-            raise HookHomeError(error.strerror or str(error))
-        except HookHomeError:
-            self.release()
-            raise
+            self.dir_fd, self.lock_fd = run_as_user(self.owner(), step_prepare(self.directory))
+        except (OSError, HookHomeError) as error:
+            raise HookHomeError(error_text(error))
         with self.transition:
             if self.try_lock():
                 try:
                     self.become_owner()
                 except (OSError, HookHomeError) as error:
                     self.release()
-                    raise HookHomeError(getattr(error, "strerror", None) or str(error))
+                    raise HookHomeError(error_text(error))
                 return
         self.role = "follower"
         thread = threading.Thread(target=self.follow, name="swarmbar-follower")
         thread.daemon = True
         thread.start()
 
-    def open_directory(self):
-        """Opens ~/.swarmbar without following a link, owned by the home's
-        owner and mode 700. Everything after goes through this descriptor,
-        so a directory swapped out by name later cannot redirect it."""
-        if self.uid is None:
-            raise HookHomeError("cannot examine home")
-        try:
-            os.mkdir(self.directory, 0o700)
-        except FileExistsError:
-            pass
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
-        self.dir_fd = os.open(self.directory, flags)
-        info = os.fstat(self.dir_fd)
-        if not stat_module.S_ISDIR(info.st_mode):
-            raise HookHomeError("%s is not a directory" % HOOK_DIR)
-        root = os.geteuid() == 0
-        expected = self.uid if root else os.geteuid()
-        if info.st_uid != expected:
-            if not (root and info.st_uid == 0):
-                raise HookHomeError("%s has another owner" % HOOK_DIR)
-            os.fchown(self.dir_fd, self.uid, self.gid)
-        if stat_module.S_IMODE(info.st_mode) != 0o700:
-            os.fchmod(self.dir_fd, 0o700)
-
     def try_lock(self):
         try:
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except OSError:
+        except (OSError, TypeError):
             return False
 
     def become_owner(self):
-        """Unlinks whatever a crashed owner left and serves both sockets.
-        Only the lock holder ever gets here, so it never removes a live
-        owner's socket. The caller holds `transition`."""
+        """Binds and serves both sockets. Only the lock holder ever gets
+        here, so the stale ones its step removes are never a live owner's.
+        The caller holds `transition`."""
         if self.closing:
             return
-        for name in (HOOK_SOCKET, BROKER_SOCKET):
-            try:
-                os.unlink(name, dir_fd=self.dir_fd)
-            except FileNotFoundError:
-                pass
+        fds = run_as_user(self.owner(), step_bind(self.directory))
         servers = []
-        try:
-            for name, handler in ((HOOK_SOCKET, HookHandler), (BROKER_SOCKET, BrokerHandler)):
-                with _UMASK_LOCK:
-                    previous = os.umask(0o177)
-                    try:
-                        server = _QuietServer(os.path.join(self.directory, name), handler)
-                    finally:
-                        os.umask(previous)
-                server.hub = self
-                servers.append(server)
-                if os.geteuid() == 0:
-                    os.chown(name, self.uid, self.gid, dir_fd=self.dir_fd,
-                             follow_symlinks=False)
-        except Exception:
-            for server in servers:
-                server.server_close()
-            raise
+        for fd, name, handler in zip(fds, (HOOK_SOCKET, BROKER_SOCKET),
+                                     (HookHandler, BrokerHandler)):
+            server = _QuietServer(os.path.join(self.directory, name), handler,
+                                  bind_and_activate=False)
+            server.socket.close()
+            server.socket = socket.socket(fileno=fd)
+            server.hub = self
+            servers.append(server)
         with self.lock:
             self.servers = servers
             self.role = "owner"
@@ -1719,89 +1989,131 @@ class HookHome(object):
     # Follower
 
     def follow(self):
-        """Relays the owner's events until it goes, then tries the lock.
-
-        The first attempt comes straight after the connection drops, so a
-        clean exit hands over at once; after that, every LOCK_RETRY_SECONDS.
-        """
+        """Relays the owner's events until the connection drops, then tries
+        the lock at once, so a clean owner exit hands over immediately.
+        Otherwise it waits LOCK_RETRY_SECONDS between rounds."""
         while not self.closing:
-            with self.transition:
-                if self.closing:
+            if self.take_over():
+                return
+            conn = self.connect_broker()
+            if conn is not None:
+                self.read_broker(conn)
+                if self.take_over():
                     return
-                locked = self.try_lock()
-                if locked:
-                    try:
-                        self.become_owner()
-                        return
-                    except (OSError, HookHomeError) as error:
-                        self.error = getattr(error, "strerror", None) or str(error)
-                        fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
-            if not locked and self.connect_broker():
-                self.read_broker()
-                continue
-            self.stopped.wait(LOCK_RETRY_SECONDS)
+            if self.stopped.wait(LOCK_RETRY_SECONDS):
+                return
+
+    def take_over(self):
+        """True when this follower is done following: it took the lock, or
+        it is closing."""
+        with self.transition:
+            if self.closing:
+                return True
+            if not self.try_lock():
+                return False
+            # The owner is really gone, and whatever it held died with it:
+            # the agent has fallen back to its own prompt.
+            lost, self.relayed, self.replayed = self.relayed, set(), set()
+            for rid in sorted(lost):
+                self.relay.emit({"event": "hook_resolved", "rid": rid})
+            try:
+                self.become_owner()
+                return True
+            except (OSError, HookHomeError) as error:
+                self.error = error_text(error)
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                return False
 
     def connect_broker(self):
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            conn.connect(os.path.join(self.directory, BROKER_SOCKET))
-        except OSError:
-            conn.close()
-            return False
+            (fd,) = run_as_user(self.owner(), step_connect(self.directory))
+        except (OSError, HookHomeError, ValueError):
+            return None
+        conn = socket.socket(fileno=fd)
         conn.settimeout(BROKER_SEND_TIMEOUT)
         with self.lock:
             if self.closing:
                 conn.close()
-                return False
+                return None
             self.broker = conn
-        return True
+        return conn
 
-    def read_broker(self):
-        conn = self.broker
+    def read_broker(self, conn):
+        """Relays until the connection drops. Dropping clears nothing: the
+        owner may simply have let this follower go, and its holds are still
+        open. Only a resolution, the owner's "pending" list on reconnect, or
+        taking the lock from a dead owner clears a row."""
         try:
             for line in read_lines(conn, lambda: self.closing):
                 message = parse_line(line)
-                if message is None or "event" not in message:
-                    continue
-                rid = message.get("rid")
-                peer = message.get("peer")
-                if message["event"] == "hook" and isinstance(rid, str) and is_holdable(
-                        str(message.get("path", "")).rsplit("/", 1)[-1],
-                        peer if isinstance(peer, list) else []):
-                    self.relayed.add(rid)
-                elif message["event"] == "hook_resolved":
-                    self.relayed.discard(rid)
-                self.relay.emit(message)
+                if message is not None:
+                    self.relay_message(message)
         finally:
             with self.lock:
                 self.broker = None
             conn.close()
-        # Whatever the owner was holding died with it, and the agent has
-        # fallen back to its own prompt. Clear those rows on this Mac.
-        lost, self.relayed = self.relayed, set()
-        if not self.closing:
-            for rid in sorted(lost):
-                self.relay.emit({"event": "hook_resolved", "rid": rid})
+
+    def relay_message(self, message):
+        kind, rid = message.get("type"), message.get("rid")
+        if kind == "pending":
+            rids = message.get("rids")
+            still = set(r for r in rids if isinstance(r, str)) if isinstance(rids, list) else set()
+            for gone in sorted(self.relayed - still):
+                self.relay.emit({"event": "hook_resolved", "rid": gone})
+            self.relayed &= still
+            self.replayed &= still
+            return
+        if kind == "held":
+            if isinstance(rid, str):
+                if rid in self.relayed:
+                    self.replayed.add(rid)
+                self.relayed.add(rid)
+            return
+        event = message.get("event")
+        if event == "hook" and rid in self.replayed:
+            # A replay of a hold this Mac already shows.
+            self.replayed.discard(rid)
+            return
+        if event == "hook_resolved":
+            self.relayed.discard(rid)
+            self.replayed.discard(rid)
+        if event in ("hook", "hook_resolved"):
+            self.relay.emit(message)
 
     def forward_reply(self, rid, body):
         conn = self.broker
         if conn is None:
             return
-        line = (json.dumps({"type": "reply", "rid": rid, "body": body}) + "\n").encode("utf-8")
         with self.broker_send:
             try:
-                conn.sendall(line)
+                conn.sendall(encode_lines([{"type": "reply", "rid": rid, "body": body}]))
             except OSError:
                 drop_connection(conn)
 
     # Owner
 
     def add_follower(self, conn):
+        """Registers a follower and replays the open holds to it. The send
+        lock is taken before the follower is visible to broadcasts, so
+        nothing about a hold can reach it ahead of the replay."""
+        send_lock = threading.Lock()
         with self.lock:
             if self.closing:
                 return False
-            self.followers[conn] = threading.Lock()
-            return True
+            self.followers[conn] = send_lock
+            open_holds = [(rid, held.message) for rid, held in self.pending.items()
+                          if not held.done.is_set()]
+            send_lock.acquire()
+        try:
+            messages = [{"type": "pending", "rids": [rid for rid, _ in open_holds]}]
+            for rid, message in open_holds:
+                messages += [{"type": "held", "rid": rid}, message]
+            conn.sendall(encode_lines(messages))
+        except OSError:
+            drop_connection(conn)
+        finally:
+            send_lock.release()
+        return True
 
     def remove_follower(self, conn):
         with self.lock:
@@ -1811,24 +2123,28 @@ class HookHome(object):
         with self.lock:
             return len(self.followers)
 
-    def broadcast(self, message):
-        """Sends a Mac event to every follower. One that cannot take it in
-        BROKER_SEND_TIMEOUT is dropped, and will reconnect."""
-        line = (json.dumps(message) + "\n").encode("utf-8")
+    def broadcast(self, messages):
+        """Sends messages to every follower in one write each. One that
+        cannot take it in BROKER_SEND_TIMEOUT is dropped, and reconnects."""
+        data = encode_lines(messages)
         with self.lock:
             followers = list(self.followers.items())
         for conn, send_lock in followers:
+            failed = False
             with send_lock:
                 try:
-                    conn.sendall(line)
+                    conn.sendall(data)
                 except OSError:
-                    drop_connection(conn)
-                    self.remove_follower(conn)
+                    failed = True
+            if failed:
+                drop_connection(conn)
+                self.remove_follower(conn)
 
-    def publish(self, message):
-        """To this helper's Mac and to every follower's."""
+    def publish(self, message, held=False):
+        """To every follower first, then queued for this helper's Mac, so a
+        Mac that is not reading delays nobody."""
+        self.broadcast(([{"type": "held", "rid": message["rid"]}] if held else []) + [message])
         self.relay.emit(message)
-        self.broadcast(message)
 
     def resolve(self, rid, body):
         """Answers a held request with the first reply to reach it. True
@@ -1844,6 +2160,16 @@ class HookHome(object):
                 held.done.set()
         return True
 
+    def permission_check(self, sock, body):
+        """(peer, holdable) for a PermissionRequest. The Grok session check
+        runs only for a chain that already proves claude."""
+        peer = peer_chain(sock)
+        if not isinstance(peer, list):
+            peer = []
+        if not is_holdable("PermissionRequest", peer):
+            return peer, False
+        return peer, not grok_session(self.home, body.get("session_id"))
+
     def handle_post(self, handler):
         match = HOOK_PATH.match(handler.path)
         try:
@@ -1855,12 +2181,13 @@ class HookHome(object):
             handler.answer({})
             return
         event = match.group(1)
-        try:
-            peer = peer_chain(handler.connection)
-        except Exception:
-            peer = []
-        if not isinstance(peer, list):
-            peer = []
+        # Only a PermissionRequest needs the peer, and it is bounded: a late
+        # decision is a refusal. Every other event is answered without one.
+        peer, holdable = [], event == "OpenCodePermission"
+        if event == "PermissionRequest":
+            peer, holdable = bounded(
+                lambda: self.permission_check(handler.connection, payload),
+                DECIDE_SECONDS, ([], False))
         account = handler.headers.get("X-Claude-Account", "").strip() or None
         message = {
             "event": "hook",
@@ -1872,24 +2199,30 @@ class HookHome(object):
             "peer": peer,
             "body": payload,
         }
-        if not is_holdable(event, peer):
-            # Answered before anything else happens, Grok above all: the
-            # Mac is only told afterwards, for status.
-            handler.answer({})
-            self.publish(message)
+        if holdable:
+            self.hold(handler, message)
             return
-        self.hold(handler, message)
+        # Answered before anything else happens, Grok above all: the Macs
+        # are only told afterwards, for status.
+        handler.answer({})
+        self.publish(message)
 
     def hold(self, handler, message):
         rid = message["rid"]
-        held = Held(handler.connection)
+        held = Held(handler.connection, message)
+        deadline = time.monotonic() + HOLD_SECONDS
         with self.lock:
             if self.closing:
                 drop_connection(held.conn)
                 return
-            self.pending[rid] = held
-        self.publish(message)
-        deadline = time.monotonic() + HOLD_SECONDS
+            full = len(self.pending) >= MAX_HOLDS
+            if not full:
+                self.pending[rid] = held
+        if full:
+            handler.answer({})
+            self.publish(message)
+            return
+        self.publish(message, held=True)
         gone = False
         while not held.done.is_set():
             remaining = deadline - time.monotonic()
@@ -1936,13 +2269,15 @@ class HookHome(object):
                 drop_connection(held.conn)
             broker = self.broker
         self.stopped.set()
-        for rid, _ in dropped:
-            self.broadcast({"event": "hook_resolved", "rid": rid})
+        if dropped:
+            self.broadcast([{"event": "hook_resolved", "rid": rid} for rid, _ in dropped])
         with self.transition:
             with self.lock:
                 servers, self.servers = self.servers, []
                 followers = list(self.followers)
-            if servers:
+            if servers and self.dir_fd is not None:
+                # unlinkat through the directory this helper opened. Removing
+                # a name never touches the file behind it.
                 for name in (HOOK_SOCKET, BROKER_SOCKET):
                     try:
                         os.unlink(name, dir_fd=self.dir_fd)
@@ -1965,26 +2300,51 @@ class HookHome(object):
 
 class HookRelay(object):
     """Every hook home this helper serves or follows. `emit` sends one event
-    to this helper's Mac; it is write_line except in tests."""
+    to this helper's Mac; it is write_line except in tests. Events reach it
+    through a bounded queue and one writer thread, so a Mac that stops
+    reading never stalls a request or another Mac."""
 
     def __init__(self, emit=None):
         self.emit_line = emit if emit is not None else write_line
         self.hubs = {}
         self.lock = threading.Lock()
         self.closed = False
+        self.dropped = 0
+        self.queue = queue.Queue(EMIT_QUEUE_SIZE)
+        writer = threading.Thread(target=self.drain, name="swarmbar-emit")
+        writer.daemon = True
+        writer.start()
 
     def emit(self, message):
         try:
-            self.emit_line(message)
-        except Exception:
-            # The Mac is gone or going. Its helper exits on stdin EOF.
-            pass
+            self.queue.put_nowait(message)
+        except queue.Full:
+            with self.lock:
+                self.dropped += 1
+
+    def drain(self):
+        while True:
+            try:
+                message = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if self.closed:
+                    return
+                continue
+            try:
+                self.emit_line(message)
+            except Exception:
+                # The Mac is gone or going. Its helper exits on stdin EOF.
+                pass
 
     def refresh(self):
         """Starts a hub for every newly qualifying home and keeps the rest.
-        Returns warnings for homes that cannot be served, which are retried
-        on the next refresh."""
+        Returns warnings: homes that cannot be served, which are retried on
+        the next refresh, and events dropped since the last one."""
         warnings = []
+        with self.lock:
+            dropped, self.dropped = self.dropped, 0
+        if dropped:
+            warnings.append("dropped %d hook events: the Mac was not reading" % dropped)
         for home in hook_homes():
             with self.lock:
                 if self.closed:

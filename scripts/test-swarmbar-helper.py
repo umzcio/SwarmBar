@@ -1342,12 +1342,15 @@ class HookRelayTests(unittest.TestCase):
             mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "peer_chain", side_effect=self.fake_peer),
+            mock.patch.object(helper, "peer_uid", side_effect=lambda sock: os.getuid(),
+                              create=True),
             mock.patch.object(helper, "agent_processes", return_value=[]),
         ]
         self.addCleanup(shutil.rmtree, self.home, True)
         for patch in self.patches:
             patch.start()
             self.addCleanup(patch.stop)
+        self.peer_mock = helper.peer_chain
         self.relays = []
         self.clients = []
 
@@ -1392,7 +1395,7 @@ class HookRelayTests(unittest.TestCase):
         self.assertRegex(event["rid"], r"^[0-9a-f]{32}$")
         self.assertEqual(event["home"], self.home)
         self.assertEqual(event["account"], "work")
-        self.assertEqual(event["peer"], ["curl", "bash", "claude"])
+        self.assertEqual(event["peer"], [])
         self.assertEqual(event["body"], {"session_id": "s1"})
         self.assertIn("user", event)
         self.assertEqual(sink.matching(lambda e: e.get("event") == "hook_resolved"), [])
@@ -1585,6 +1588,260 @@ class HookRelayTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.lstat(self.bridge_dir).st_mode), 0o700)
 
 
+    # Review round 1
+
+    def hold_one(self, relay, sink, body=None):
+        body = body or {"session_id": "s1"}
+        client = self.post("PermissionRequest", body)
+        event = sink.wait_for(lambda e: is_hook("/hook/PermissionRequest")(e)
+                              and e["body"] == body)
+        self.assertIsNotNone(event)
+        return client, event
+
+    def test_forked_setup_serves_and_follows(self):
+        # Root forks each home step and drops to the owner. Run as an
+        # ordinary user here, the drop is to this same uid, but the fork and
+        # the descriptors passed back are the real thing.
+        with mock.patch.object(helper, "HOOK_FORK", True):
+            owner, owner_sink = self.relay()
+            follower, follower_sink = self.relay()
+            self.assertEqual(self.hub(owner).role, "owner")
+            self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+            self.assertEqual(read_response(self.post("Stop", {"n": 1}))[2], {})
+            client, event = self.hold_one(owner, owner_sink)
+            self.assertIsNotNone(follower_sink.wait_for(is_hook("/hook/PermissionRequest")))
+            follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
+            self.assertEqual(read_response(client)[2], self.DECISION)
+            info = os.lstat(self.sock_path)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+
+    def test_source_never_changes_ownership(self):
+        with open(helper.__file__) as handle:
+            self.assertNotRegex(handle.read(), r"chown\s*\(")
+
+    def test_hardlinked_lock_is_refused_and_never_chowned(self):
+        target = os.path.join(self.home, "someone-elses-file")
+        with open(target, "w") as handle:
+            handle.write("keep")
+        os.link(target, os.path.join(self.bridge_dir, "hook.lock"))
+        refuse = mock.Mock(side_effect=AssertionError("ownership changed"))
+        for fork in (False, True):
+            with mock.patch.object(helper, "HOOK_FORK", fork), \
+                    mock.patch.object(os, "chown", refuse), \
+                    mock.patch.object(os, "fchown", refuse), \
+                    mock.patch.object(os, "lchown", refuse):
+                relay = helper.HookRelay(emit=EventSink())
+                self.relays.append(relay)
+                warnings = relay.refresh()
+            self.assertTrue(any("hook.lock" in w for w in warnings), warnings)
+            self.assertFalse(os.path.exists(self.sock_path))
+        refuse.assert_not_called()
+        self.assertEqual(os.stat(target).st_nlink, 2)
+
+    def test_symlinked_bridge_dir_is_refused(self):
+        elsewhere = os.path.join(self.home, "elsewhere")
+        os.rename(self.bridge_dir, elsewhere)
+        os.symlink(elsewhere, self.bridge_dir)
+        relay = helper.HookRelay(emit=EventSink())
+        self.relays.append(relay)
+        warnings = relay.refresh()
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertFalse(os.path.exists(os.path.join(elsewhere, "hook.sock")))
+        self.assertFalse(os.path.exists(os.path.join(elsewhere, "hook.lock")))
+
+    def test_bridge_dir_owned_by_another_uid_is_refused(self):
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                values = list(info)
+                values[stat.ST_UID] = info.st_uid + 4242
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(os, "fstat", side_effect=fstat):
+            relay = helper.HookRelay(emit=EventSink())
+            self.relays.append(relay)
+            warnings = relay.refresh()
+        self.assertTrue(any("another owner" in w for w in warnings), warnings)
+        self.assertFalse(os.path.exists(self.sock_path))
+
+    def test_blocked_mac_never_stalls_requests_or_followers(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        blocked = EventSink()
+        blocked.gate = gate
+        owner, _ = self.relay(blocked)
+        follower, follower_sink = self.relay()
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        # The owner's stdout is stuck from the first event on.
+        self.assertEqual(read_response(self.post("Stop", {"n": 1}), timeout=2)[2], {})
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        event = follower_sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertIsNotNone(event)
+        self.assertEqual(read_response(self.post("Stop", {"n": 2}), timeout=2)[2], {})
+        started = time.monotonic()
+        self.assertEqual(owner.handle_reply({"rid": "unknown", "body": {}}), {"ok": True})
+        self.assertLess(time.monotonic() - started, 0.5)
+        follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client, timeout=2)[2], self.DECISION)
+
+    def test_events_a_stuck_mac_cannot_take_are_dropped_and_counted(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        blocked = EventSink()
+        blocked.gate = gate
+        with mock.patch.object(helper, "EMIT_QUEUE_SIZE", 2):
+            relay, _ = self.relay(blocked)
+        for n in range(6):
+            self.assertEqual(read_response(self.post("Stop", {"n": n}), timeout=2)[2], {})
+        warnings = relay.refresh()
+        self.assertTrue(any("dropped" in w for w in warnings), warnings)
+
+    def put_grok(self, relative, text):
+        path = os.path.join(self.home, ".grok", relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def assert_answered_at_once(self, relay, sink, body):
+        sink.gate = threading.Event()
+        client = self.post("PermissionRequest", body)
+        self.assertEqual(read_response(client, timeout=2)[2], {}, body)
+        sink.gate.set()
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_session_in_grok_active_sessions_is_never_held(self):
+        relay, sink = self.relay()
+        shapes = [
+            ["g-bare"],
+            [{"id": "g-id"}],
+            [{"session_id": "g-snake"}],
+            [{"sessionId": "g-camel"}],
+            {"sessions": [{"sessionID": "g-upper"}]},
+        ]
+        for shape in shapes:
+            self.put_grok("active_sessions.json", json.dumps(shape))
+            sid = json.dumps(shape).split('"')[-2]
+            self.assert_answered_at_once(relay, sink, {"session_id": sid})
+        # A session the file does not name is still held.
+        client, event = self.hold_one(relay, sink, {"session_id": "claude-1"})
+        relay.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client)[2], self.DECISION)
+
+    def test_session_with_a_grok_session_dir_is_never_held(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))
+        relay, sink = self.relay()
+        self.assert_answered_at_once(relay, sink, {"session_id": "g-dir"})
+
+    def test_unreadable_or_missing_session_id_is_never_held(self):
+        relay, sink = self.relay()
+        for body in ({}, {"session_id": 7}, {"session_id": "../x"}, {"session_id": ""}):
+            self.assert_answered_at_once(relay, sink, body)
+        self.put_grok("active_sessions.json", "{not json")
+        self.assert_answered_at_once(relay, sink, {"session_id": "s1"})
+
+    def test_nearest_agent_must_be_claude(self):
+        relay, sink = self.relay()
+        for peer in (["curl", "bash", "kimi", "bash", "claude"],
+                     ["curl", "bash", "codex", "zsh", "claude"]):
+            self.peer = peer
+            self.assert_answered_at_once(relay, sink, {"session_id": "s1"})
+
+    def test_slow_peer_lookup_is_answered_empty(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.peer_mock.side_effect = lambda sock: (release.wait(5), ["curl", "bash", "claude"])[1]
+        relay, sink = self.relay()
+        started = time.monotonic()
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        self.assertEqual(read_response(client, timeout=4)[2], {})
+        self.assertLess(time.monotonic() - started, 2.2)
+        self.assertEqual(sink.wait_for(is_hook("/hook/PermissionRequest"))["peer"], [])
+
+    def test_only_permission_requests_look_up_the_peer(self):
+        relay, sink = self.relay()
+        for event in ("Stop", "PreToolUse", "Notification", "OpenCodePermission"):
+            if event == "OpenCodePermission":
+                client = self.post(event, {"id": "per_1"})
+                held = sink.wait_for(is_hook("/hook/" + event))
+                relay.handle_reply({"rid": held["rid"], "body": {}})
+            else:
+                client = self.post(event, {"session_id": "s1"})
+            read_response(client)
+        self.peer_mock.assert_not_called()
+
+    def test_broker_peer_of_another_uid_is_turned_away(self):
+        with mock.patch.object(helper, "peer_uid", return_value=os.getuid() + 4242):
+            owner, _ = self.relay()
+            follower, follower_sink = self.relay()
+            time.sleep(0.3)
+            self.assertEqual(self.hub(owner).follower_count(), 0)
+
+    def test_new_follower_gets_open_holds_replayed(self):
+        owner, owner_sink = self.relay()
+        client, event = self.hold_one(owner, owner_sink)
+        follower, follower_sink = self.relay()
+        replayed = follower_sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertEqual(replayed, event)
+        follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client)[2], self.DECISION)
+        self.assertIsNotNone(follower_sink.wait_for(is_resolved(event["rid"])))
+
+    def drop_followers(self, owner):
+        hub = self.hub(owner)
+        with hub.lock:
+            conns = list(hub.followers)
+        for conn in conns:
+            helper.drop_connection(conn)
+
+    def test_dropped_follower_keeps_rows_still_held(self):
+        owner, owner_sink = self.relay()
+        follower, follower_sink = self.relay()
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        client, event = self.hold_one(owner, owner_sink)
+        self.assertIsNotNone(follower_sink.wait_for(is_hook("/hook/PermissionRequest")))
+        self.drop_followers(owner)
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 0))
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        time.sleep(0.1)
+        self.assertEqual(follower_sink.matching(is_resolved(event["rid"])), [])
+        self.assertEqual(len(follower_sink.matching(is_hook("/hook/PermissionRequest"))), 1)
+        follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client)[2], self.DECISION)
+
+    def test_follower_clears_rows_resolved_while_away(self):
+        with mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.3):
+            owner, owner_sink = self.relay()
+            follower, follower_sink = self.relay()
+            self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+            client, event = self.hold_one(owner, owner_sink)
+            self.assertIsNotNone(follower_sink.wait_for(is_hook("/hook/PermissionRequest")))
+            self.drop_followers(owner)
+            self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 0))
+            owner.handle_reply({"rid": event["rid"], "body": self.DECISION})
+            self.assertEqual(read_response(client)[2], self.DECISION)
+            self.assertIsNotNone(follower_sink.wait_for(is_resolved(event["rid"])))
+
+    def test_holds_are_capped_per_home(self):
+        with mock.patch.object(helper, "MAX_HOLDS", 1):
+            relay, sink = self.relay()
+            first, _ = self.hold_one(relay, sink, {"session_id": "s1"})
+            second = self.post("PermissionRequest", {"session_id": "s2"})
+            self.assertEqual(read_response(second, timeout=2)[2], {})
+            self.assertIsNotNone(sink.wait_for(
+                lambda e: e.get("event") == "hook" and e["body"].get("session_id") == "s2"))
+            self.assertFalse(answered_within(first, 0.1))
+
+    def test_non_object_bodies_are_answered_and_not_forwarded(self):
+        relay, sink = self.relay()
+        for raw in (b"[1, 2]", b'"text"', b"7", b"[" * 100000 + b"]" * 100000):
+            self.assertEqual(read_response(self.post("Stop", raw=raw))[2], {}, raw[:10])
+        self.assertEqual(read_response(self.post("Stop", {"last": 1}))[2], {})
+        self.assertIsNotNone(sink.wait_for(is_hook("/hook/Stop")))
+        self.assertEqual(len(sink.matching(lambda e: e.get("event") == "hook")), 1)
+        self.assertIsNone(helper.parse_line(b"[" * 100000))
+
 
 class PeerChainTests(unittest.TestCase):
     """peer_chain itself, against a fake process table."""
@@ -1604,6 +1861,14 @@ class PeerChainTests(unittest.TestCase):
             chain = helper.peer_chain(None)
         self.assertEqual(chain, ["curl", "swarmbar-remote", "claude", "bash", "tmux:", "Terminal"])
         self.assertEqual(runner.calls[0][:2], ["ps", "-axo"])
+
+    def test_peer_uid_of_a_socketpair_is_ours(self):
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.assertEqual(helper.peer_uid(left), os.getuid())
+        finally:
+            left.close()
+            right.close()
 
     def test_peer_chain_is_bounded_and_fails_empty(self):
         rows = "".join("%5d %5d sh sh\n" % (pid, pid + 1) for pid in range(100, 130))
