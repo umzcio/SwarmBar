@@ -36,14 +36,17 @@ import platform
 import queue
 import re
 import select
+import shutil
 import socket
 import socketserver
 import stat as stat_module
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+import zlib
 
 # 2 added "created" to every session record. Additive: an older Mac
 # ignores the field and an older helper simply omits it.
@@ -777,17 +780,20 @@ def home_owner(home):
     return user, uid, gid
 
 
-def run_command(argv, timeout=5, input=None):
-    """The one place the helper starts a subprocess (ps, tmux, lsof).
+def run_command(argv, timeout=5, input=None, **options):
+    """The one place the helper starts a subprocess (ps, tmux, lsof, kimi
+    doctor, visudo).
 
     Tests replace this so no unit test ever inspects a real process. It
     raises OSError or SubprocessError like subprocess.run, and callers decide
     whether a failure matters. `input` is bytes for the child's stdin (tmux
     load-buffer reads the paste text there); None leaves stdin alone.
+    `options` go to subprocess.run as they are: env, and user, group and
+    extra_groups to run as someone other than root.
     """
     return subprocess.run(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        input=input,
+        input=input, **options
     )
 
 
@@ -1695,7 +1701,12 @@ def handle_tmux(request):
 # this threaded process can deadlock in the child on any lock another
 # thread held, and python 3.12 says so on stderr.
 STEP_SOURCE = r'''
+import base64
+import errno
+import hashlib
+import json
 import os
+import shutil
 import socket
 import stat
 import sys
@@ -1788,12 +1799,180 @@ def step_connect(directory, umask_lock):
 
 BY_KIND = {"prepare": step_prepare, "bind": step_bind, "connect": step_connect}
 
+BACKUP_SUFFIX = ".backup-swarmbar"
+# A job is a few config files' worth of JSON. Past this the parent is not
+# one this child should be listening to.
+MAX_JOB_BYTES = 16 * 1024 * 1024
+
+
+def refusal(error):
+    return {"ok": False, "error": error}
+
+
+def write_bytes(handle, data):
+    """Replaces a file's bytes through an open handle, so the inode, and
+    with it every hardlink, stays the one the user had."""
+    handle.seek(0)
+    handle.truncate()
+    handle.write(data)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def make_parents(home, target):
+    """The directories between the home and a new file, made 700 by their
+    owner. ~/.swarmbar must be 700 for the hook steps, and nothing here is
+    for anyone else to read. A umask could strip the mode, so it is set."""
+    relative = os.path.relpath(os.path.dirname(target), home)
+    if relative == os.curdir:
+        return
+    current = home
+    for part in relative.split(os.sep):
+        current = os.path.join(current, part)
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            continue
+        os.chmod(current, 0o700)
+
+
+def open_existing(target):
+    """An fd open for read and write on the target, or None when there is
+    no file. O_NOFOLLOW refuses a link swapped in after the parent resolved
+    the path, and O_NONBLOCK keeps a planted FIFO from hanging the open."""
+    try:
+        return os.open(target, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+
+
+def file_write(job):
+    """The write half of write_file, run as the home's owner.
+
+    Root never opens a path in a user's home: as root this runs in a child
+    that already is the owner, so a file swapped for a link to someone
+    else's can only make the write fail, never redirect it. The parent has
+    checked the allowlist; this checks that the path still resolves where
+    it did, then the precondition hash, then backs up and writes in place.
+    """
+    path, target = job["path"], job["target"]
+    if os.path.realpath(path) != target:
+        return refusal("not allowed")
+    data = base64.b64decode(job["content_b64"])
+    expect = job["expect_sha256"]
+    try:
+        fd = open_existing(target)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return refusal("not allowed")
+        return refusal("cannot open: %s" % (error.strerror or error))
+    if fd is None:
+        return create_file(job, data)
+    with os.fdopen(fd, "r+b") as handle:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return refusal("not allowed")
+        current = handle.read()
+        if expect == "absent" or hashlib.sha256(current).hexdigest() != expect:
+            return refusal("changed")
+        backup = target + BACKUP_SUFFIX
+        try:
+            # One-time: the backup is the file as it was before SwarmBar
+            # first changed it, and a later setup must not replace that.
+            if not os.path.lexists(backup):
+                shutil.copy2(target, backup)
+        except OSError as error:
+            return refusal("cannot back up: %s" % (error.strerror or error))
+        try:
+            write_bytes(handle, data)
+        except Exception as error:
+            # The bytes the hash just matched, which are the backup's when
+            # this call took it. An older backup would also undo whatever
+            # the user changed since, so it is not the one written back.
+            try:
+                write_bytes(handle, current)
+                restored = "restored"
+            except Exception:
+                restored = "not restored, the backup is at %s" % backup
+            return refusal("write failed: %s; %s" % (getattr(error, "strerror", None) or error,
+                                                     restored))
+    return {"ok": True, "written": True, "backup": backup}
+
+
+def create_file(job, data):
+    """A file the plan expected to be absent. O_EXCL makes "absent" hold at
+    the moment of creation, and the mode is set outright since a umask
+    would otherwise narrow it."""
+    if job["expect_sha256"] != "absent":
+        return refusal("changed")
+    target, mode = job["target"], job["mode"]
+    try:
+        make_parents(job["home"], target)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    except FileExistsError:
+        return refusal("changed")
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return refusal("not allowed")
+        return refusal("cannot create: %s" % (error.strerror or error))
+    with os.fdopen(fd, "wb") as handle:
+        try:
+            os.fchmod(fd, mode)
+            write_bytes(handle, data)
+        except Exception as error:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            return refusal("write failed: %s" % (getattr(error, "strerror", None) or error))
+    return {"ok": True, "written": True, "backup": None}
+
+
+def file_remove(job):
+    """The remove half of remove_file, run as the home's owner. Already
+    gone counts as done, so undo can run twice."""
+    path, target = job["path"], job["target"]
+    if os.path.realpath(path) != target:
+        return refusal("not allowed")
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return {"ok": True, "removed": False}
+    if not stat.S_ISREG(info.st_mode):
+        return refusal("not allowed")
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        return {"ok": True, "removed": False}
+    except OSError as error:
+        return refusal("cannot remove: %s" % (error.strerror or error))
+    return {"ok": True, "removed": True}
+
+
+FILE_BY_KIND = {"write": file_write, "remove": file_remove}
+
+
+def read_job(channel):
+    chunks, size = [], 0
+    while True:
+        chunk = channel.recv(65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_JOB_BYTES:
+            raise StepError("job too large")
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks).decode("utf-8"))
+
 
 def run_child(argv):
-    """The child's whole life: one step, its descriptors or its error back
-    to the parent, and nothing on any standard stream."""
+    """The child's whole life: one step, its descriptors, its file result
+    or its error back to the parent, and nothing on any standard stream."""
     channel = socket.socket(fileno=int(argv[3]))
     try:
+        work = FILE_BY_KIND.get(argv[1])
+        if work is not None:
+            channel.sendall(json.dumps(work(read_job(channel))).encode("utf-8"))
+            return
         step = BY_KIND.get(argv[1])
         if step is None:
             raise StepError("unknown step")
@@ -2102,6 +2281,24 @@ def supplementary_groups(user, gid):
     return groups[:max(limit, 1)]
 
 
+def spawn_step(owner, kind, directory, child):
+    """A step child: STEP_SOURCE run with `kind`, as the owner when this is
+    root (uid, gid and the owner's groups, always all three), umask 177, no
+    environment to speak of and nothing on stdio. `child` is its end of the
+    socketpair."""
+    ids = {}
+    if os.geteuid() == 0:
+        user, uid, gid = owner
+        ids = {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
+    return subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", STEP_SOURCE, kind, directory,
+         str(child.fileno())],
+        umask=0o177, cwd="/", env={"PATH": "/usr/bin:/bin"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, pass_fds=(child.fileno(),), close_fds=True,
+        **ids)
+
+
 def run_as_user(owner, kind, directory):
     """Runs one step ("prepare", "bind" or "connect") as the home's owner
     and returns the descriptors it produced.
@@ -2121,19 +2318,10 @@ def run_as_user(owner, kind, directory):
             return STEP_BY_KIND[kind](directory, _UMASK_LOCK)
         except StepError as error:
             raise HookHomeError(str(error))
-    ids = {}
-    if root:
-        ids = {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-I", "-S", "-c", STEP_SOURCE, kind, directory,
-                 str(child.fileno())],
-                umask=0o177, cwd="/", env={"PATH": "/usr/bin:/bin"},
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, pass_fds=(child.fileno(),), close_fds=True,
-                **ids)
+            proc = spawn_step(owner, kind, directory, child)
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             raise HookHomeError("cannot start a step as the owner: %s" % error_text(error))
         finally:
@@ -2157,6 +2345,298 @@ def run_as_user(owner, kind, directory):
             os.close(fd)
         raise HookHomeError(data.decode("utf-8", "replace")[len("error:"):] or "step failed")
     return fds
+
+
+# Setup writes. Config files change only through write_file, which holds
+# them to ALLOWED, to the hash the plan was made against and to a one-time
+# backup. As root each write runs in a step child that is the home's owner,
+# so root never opens a path inside a user's home.
+#
+# remove_file takes only SwarmBar's own bridge files: the plugin and the
+# two scripts. An agent's config is edited back, never deleted.
+REMOVABLE = (ALLOWED[5], ALLOWED[6], ALLOWED[7])
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+# Far past any config or bridge script.
+WRITE_MAX_BYTES = 4 * 1024 * 1024
+# fsync on a slow disk is the long part.
+FILE_STEP_SECONDS = 30
+
+
+def matches_allowed(relative, patterns):
+    """Whether a path relative to a home is one the patterns name, compared
+    a component at a time. The one wildcard, .claude*, means a directory
+    whose name starts with .claude and is not a backup, the same rule
+    discovery and the probe use."""
+    parts = relative.split("/")
+    for pattern in patterns:
+        wanted = pattern.split("/")
+        if len(wanted) != len(parts):
+            continue
+        ok = True
+        for want, part in zip(wanted, parts):
+            if want == ".claude*":
+                ok = part.startswith(".claude") and not is_backup_name(part)
+            else:
+                ok = part == want
+            if not ok:
+                break
+        if ok:
+            return True
+    return False
+
+
+def allowed_target(path, patterns=ALLOWED):
+    """(home, realpath) when a path may be written, else None.
+
+    The path must be absolute, with no ".." component and no NUL. Its
+    realpath must sit inside a home from home_dirs(), and inside the same
+    home the path itself names, so a symlink can move a write within a home
+    (one profile linked to another) but never out of it. The realpath,
+    relative to that home, must match a pattern. home is as home_dirs()
+    spells it, matching the probe and the snapshot.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path or not os.path.isabs(path):
+        return None
+    if ".." in path.split("/"):
+        return None
+    resolved = os.path.realpath(path)
+    lexical = os.path.normpath(path)
+    for home in home_dirs():
+        real_home = os.path.realpath(home)
+        spellings = set(h.rstrip("/") + "/" for h in (home, real_home))
+        if not any(lexical.startswith(prefix) for prefix in spellings):
+            continue
+        inside = real_home.rstrip("/") + "/"
+        if not resolved.startswith(inside):
+            continue
+        if matches_allowed(resolved[len(inside):], patterns):
+            return home, resolved
+    return None
+
+
+def run_file_step(owner, kind, job):
+    """Runs a file job ("write" or "remove") as the home's owner and returns
+    its result.
+
+    As root, or when STEP_CHILD is set, the job goes to a step child over
+    the socketpair as JSON and its result comes back the same way.
+    Otherwise the helper already is the owner, or the home is not its to
+    write.
+    """
+    user, uid, gid = owner
+    root = os.geteuid() == 0
+    if uid is None or (not root and os.geteuid() != uid):
+        return {"ok": False, "error": "not allowed"}
+    child_path = STEP_CHILD if STEP_CHILD is not None else root
+    if not child_path:
+        try:
+            return _STEPS["FILE_BY_KIND"][kind](job)
+        except Exception as error:
+            return {"ok": False, "error": error_text(error)}
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            proc = spawn_step(owner, kind, "-", child)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            return {"ok": False, "error": "cannot start a write as the owner: %s"
+                    % error_text(error)}
+        finally:
+            child.close()
+        chunks = []
+        try:
+            parent.settimeout(FILE_STEP_SECONDS)
+            parent.sendall(json.dumps(job).encode("utf-8"))
+            parent.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = parent.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (socket.timeout, OSError) as error:
+            proc.kill()
+            proc.wait()
+            return {"ok": False, "error": "write did not finish: %s" % error_text(error)}
+    finally:
+        parent.close()
+    try:
+        proc.wait(FILE_STEP_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    reply = b"".join(chunks)
+    try:
+        result = json.loads(reply.decode("utf-8"))
+    except ValueError:
+        text = reply.decode("utf-8", "replace")
+        return {"ok": False, "error": text[len("error:"):] if text.startswith("error:")
+                else "write step failed"}
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "write step failed"}
+    return result
+
+
+def write_file(request):
+    """{path, content_b64, expect_sha256, mode}: replaces an allowed file
+    whose sha256 is expect_sha256, or creates one with `mode` when it is
+    "absent". Answers {"ok": true, "written": true, "backup": path or null}
+    or {"ok": false, "error": "not allowed" | "changed" | why}."""
+    path = request.get("path")
+    content = request.get("content_b64")
+    expect = request.get("expect_sha256")
+    mode = request.get("mode", 0o644)
+    if not isinstance(content, str) or not isinstance(expect, str) \
+            or (expect != "absent" and not SHA256_HEX.match(expect)) \
+            or isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
+        return {"ok": False, "error": "malformed request"}
+    try:
+        data = base64.b64decode(content, validate=True)
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "malformed request"}
+    if len(data) > WRITE_MAX_BYTES:
+        return {"ok": False, "error": "too large"}
+    target = allowed_target(path)
+    if target is None:
+        return {"ok": False, "error": "not allowed"}
+    home, resolved = target
+    job = {"path": path, "target": resolved, "home": os.path.realpath(home),
+           "content_b64": content, "expect_sha256": expect, "mode": mode}
+    return run_file_step(home_owner(home), "write", job)
+
+
+def remove_file(request):
+    """{path}: removes one of SwarmBar's bridge files. Answers {"ok": true,
+    "removed": true | false} or {"ok": false, "error"}."""
+    path = request.get("path")
+    target = allowed_target(path, REMOVABLE)
+    if target is None:
+        return {"ok": False, "error": "not allowed"}
+    home, resolved = target
+    job = {"path": path, "target": resolved, "home": os.path.realpath(home)}
+    return run_file_step(home_owner(home), "remove", job)
+
+
+# kimi_events. The [[hooks]] schema of a Kimi-family build is a strict
+# enum, and one name it does not know drops the whole hooks section (see
+# CLAUDE.md, "Things not to do"). The enum is printed verbatim when doctor
+# meets a name it does not know, so a throwaway home holding one bogus
+# event lists exactly what that build allows.
+KIMI_BINARIES = ("kimi", "kimi-code", "bearcode")
+KIMI_PROBE_EVENT = "SwarmBarProbeEvent"
+KIMI_PROBE_CONFIG = '[[hooks]]\nevent = "%s"\ncommand = "true"\n' % KIMI_PROBE_EVENT
+KIMI_DOCTOR_SECONDS = 15
+EVENT_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def accepted_events(text):
+    """The event names a doctor error lists after "expected one of", in
+    order, or None when it lists none.
+
+    Today's builds print `expected one of "PreToolUse"|"Stop"|...`. Quoted
+    names are taken whatever the quotes and separators; with no quotes the
+    list is split on |, commas, "or" and "and". A line naming the event
+    field is preferred, since other config errors print the same phrase.
+    """
+    lines = ANSI_ESCAPE.sub("", text or "").splitlines()
+    ordered = [l for l in lines if "event" in l] + [l for l in lines if "event" not in l]
+    for line in ordered:
+        index = line.lower().find("expected one of")
+        if index < 0:
+            continue
+        rest = line[index + len("expected one of"):]
+        names = re.findall(r"[\"'`]([A-Za-z][A-Za-z0-9_]*)[\"'`]", rest)
+        if not names:
+            names = [part.strip(" \t:[]().") for part in
+                     re.split(r"\s*(?:[|,]|\bor\b|\band\b)\s*", rest)]
+        found = []
+        for name in names:
+            if EVENT_NAME.match(name) and name != KIMI_PROBE_EVENT and name not in found:
+                found.append(name)
+        if found:
+            return found
+    return None
+
+
+def kimi_executable(binary):
+    """The file a kimi_events request names, or None. A plain name must be
+    one of the family's own and is found on PATH; anything else must be an
+    absolute path to an executable file."""
+    if not isinstance(binary, str) or not binary or "\x00" in binary:
+        return None
+    if binary in KIMI_BINARIES:
+        # A relative PATH entry would find whatever the current directory
+        # holds.
+        found = shutil.which(binary)
+        return found if found and os.path.isabs(found) else None
+    if os.path.isabs(binary) and ".." not in binary.split("/") \
+            and os.path.isfile(binary) and os.access(binary, os.X_OK):
+        return binary
+    return None
+
+
+def doctor_identity(executable):
+    """subprocess options that run a build as whoever could have changed
+    it. As root, a binary owned by someone else, or root's binary in a
+    directory someone else owns, runs as that owner: running it as root
+    would hand them root. {} means run as this process."""
+    if os.geteuid() != 0:
+        return {}
+    real = os.path.realpath(executable)
+    info = os.stat(real)
+    uid = info.st_uid
+    if uid == 0:
+        uid = os.stat(os.path.dirname(real)).st_uid
+    if uid == 0:
+        return {}
+    import pwd
+    entry = pwd.getpwuid(uid)
+    return {"user": uid, "group": entry.pw_gid,
+            "extra_groups": supplementary_groups(entry.pw_name, entry.pw_gid),
+            "home": entry.pw_dir}
+
+
+def kimi_events(request):
+    """{binary}: the hook event names that build accepts, as
+    {"events": [...]}, or {"events": null, "error": why}."""
+    binary = request.get("binary")
+    executable = kimi_executable(binary)
+    if executable is None:
+        if binary in KIMI_BINARIES:
+            return {"events": None, "error": "%s is not on PATH" % binary}
+        return {"events": None, "error": "not a Kimi-family binary"}
+    try:
+        ids = doctor_identity(executable)
+    except (OSError, KeyError) as error:
+        return {"events": None, "error": "cannot tell who owns it: %s" % error_text(error)}
+    home = ids.pop("home", None)
+    temp = tempfile.mkdtemp(prefix="swarmbar-kimi-")
+    try:
+        config = os.path.join(temp, "config.toml")
+        with open(config, "w") as handle:
+            handle.write(KIMI_PROBE_CONFIG)
+        if ids:
+            # Its owner must read the config. It names a bogus event and
+            # nothing else, so there is nothing in it to keep private.
+            os.chmod(temp, 0o755)
+            os.chmod(config, 0o644)
+        env = dict(os.environ, KIMI_CODE_HOME=temp)
+        if home:
+            env["HOME"] = home
+        try:
+            done = run_command([executable, "doctor"], timeout=KIMI_DOCTOR_SECONDS,
+                               env=env, cwd=temp, **ids)
+        except subprocess.TimeoutExpired:
+            return {"events": None, "error": "doctor timed out"}
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            return {"events": None, "error": "cannot run doctor: %s" % error_text(error)}
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+    text = (done.stdout or b"").decode("utf-8", "replace") + "\n" \
+        + (done.stderr or b"").decode("utf-8", "replace")
+    events = accepted_events(text)
+    if events is None:
+        return {"events": None, "error": "doctor did not list the events it accepts"}
+    return {"events": events}
 
 
 def read_lines(sock, stopping):
@@ -2841,6 +3321,222 @@ class HookRelay(object):
             hub.close()
 
 
+# The pasted command: `python3 swarmbar-helper.py apply <blob>`, the blob
+# being base64 of zlib-compressed JSON, a list of operations. It is how a
+# host is set up when the Mac cannot do it over ssh itself (no passwordless
+# sudo), so a person runs it, with sudo when every user is watched. It is
+# also the only way the narrow sudo rule is ever installed.
+SUDOERS_PATH = "/etc/sudoers.d/swarmbar"
+SUDOERS_USER = re.compile(r"[a-z_][a-z0-9_-]*[$]?")
+SUDOERS_USER_MAX = 32
+VISUDO_PATHS = ("/usr/sbin/visudo",)
+
+
+def visudo_path():
+    for path in VISUDO_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("visudo")
+
+
+def helper_destination():
+    """Where install_helper puts the helper: root's copy, the one the sudo
+    rule names, or the login user's own."""
+    if os.geteuid() == 0:
+        return HELPER_PATHS[0]
+    return os.path.join(os.path.expanduser("~"), USER_HELPER)
+
+
+def own_bytes():
+    path = globals().get("__file__")
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def install_helper(request, source=None):
+    """{dest}: this file, installed atomically (a temp file beside it, then
+    a rename) at helper_destination(), mode 700. It is SwarmBar's own file,
+    so replacing the inode is right, unlike an agent's config.
+
+    As root the directory must be root's and writable by nobody else: the
+    sudo rule runs whatever sits at that path as root, so a directory
+    another user can write would let them choose it. The user's own copy
+    goes in ~/.swarmbar, which must be theirs and not a link.
+    """
+    dest = request.get("dest")
+    if not isinstance(dest, str) or dest != helper_destination():
+        return {"ok": False, "error": "not allowed"}
+    if source is None:
+        source = own_bytes()
+    if source is None:
+        return {"ok": False, "error": "cannot read the helper itself"}
+    directory = os.path.dirname(dest)
+    try:
+        if os.geteuid() == 0:
+            os.makedirs(directory, 0o755, exist_ok=True)
+            info = os.stat(directory)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return {"ok": False, "error": "%s is writable by another user" % directory}
+        else:
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(directory)
+            if not stat_module.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                return {"ok": False, "error": "%s is not this user's own directory" % directory}
+            if stat_module.S_IMODE(info.st_mode) != 0o700:
+                os.chmod(directory, 0o700)
+        fd, temp = tempfile.mkstemp(prefix=".swarmbar-helper.", dir=directory)
+    except OSError as error:
+        return {"ok": False, "error": "cannot install: %s" % error_text(error)}
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(fd, 0o700)
+            handle.write(source)
+            handle.flush()
+            os.fsync(fd)
+        os.replace(temp, dest)
+    except OSError as error:
+        return {"ok": False, "error": "cannot install: %s" % error_text(error)}
+    finally:
+        if os.path.lexists(temp):
+            os.unlink(temp)
+    return {"ok": True, "installed": dest, "sha256": hashlib.sha256(source).hexdigest()}
+
+
+def install_sudoers(request):
+    """{user}: /etc/sudoers.d/swarmbar, letting one user run the root helper
+    and nothing else without a password. Root only. The rule is written
+    to a temp file, checked by visudo, and only then renamed into place,
+    mode 440. The temp name has a dot in it, which sudo's includedir skips,
+    so an unchecked rule is never live."""
+    if os.geteuid() != 0:
+        return {"ok": False, "error": "needs root"}
+    user = request.get("user")
+    if not isinstance(user, str) or len(user) > SUDOERS_USER_MAX \
+            or not SUDOERS_USER.fullmatch(user):
+        return {"ok": False, "error": "bad user name"}
+    try:
+        import pwd
+        pwd.getpwnam(user)
+    except (ImportError, KeyError):
+        return {"ok": False, "error": "no such user: %s" % user}
+    visudo = visudo_path()
+    if visudo is None:
+        return {"ok": False, "error": "visudo not found"}
+    rule = "%s ALL=(root) NOPASSWD: %s\n" % (user, HELPER_PATHS[0])
+    temp = None
+    try:
+        fd, temp = tempfile.mkstemp(prefix=".swarmbar.", dir=os.path.dirname(SUDOERS_PATH))
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(fd, 0o440)
+            handle.write(rule)
+            handle.flush()
+            os.fsync(fd)
+        try:
+            checked = run_command([visudo, "-cf", temp], timeout=10)
+        except (OSError, subprocess.SubprocessError) as error:
+            return {"ok": False, "error": "cannot run visudo: %s" % error_text(error)}
+        if checked.returncode != 0:
+            said = (checked.stderr or checked.stdout or b"").decode("utf-8", "replace").strip()
+            return {"ok": False, "error": "visudo rejected the rule: %s" % said}
+        os.replace(temp, SUDOERS_PATH)
+    except OSError as error:
+        return {"ok": False, "error": "cannot install the rule: %s" % error_text(error)}
+    finally:
+        if temp is not None and os.path.lexists(temp):
+            os.unlink(temp)
+    return {"ok": True, "installed": SUDOERS_PATH}
+
+
+def apply_operation(operation, source):
+    kind = operation.get("op")
+    if kind == "write_file":
+        return write_file(operation)
+    if kind == "remove_file":
+        return remove_file(operation)
+    if kind == "install_helper":
+        return install_helper(operation, source)
+    if kind == "sudoers":
+        return install_sudoers(operation)
+    return {"ok": False, "error": "unknown operation"}
+
+
+def describe_operation(operation, result):
+    """One line for a person reading the terminal: what ran, on what, and
+    how it went."""
+    kind = operation.get("op")
+    subject = operation.get("path") or operation.get("dest") or operation.get("user") or ""
+    label = ("%s %s" % (kind, subject)).strip()
+    if result.get("ok"):
+        if result.get("backup"):
+            return "ok: %s (backup at %s)" % (label, result["backup"])
+        if result.get("removed") is False:
+            return "ok: %s (already gone)" % label
+        return "ok: %s" % label
+    return "failed: %s: %s" % (label, result.get("error", "unknown error"))
+
+
+def decode_operations(blob):
+    """The operations in a blob, or None. zlib as python writes it, or the
+    raw deflate that Foundation's .zlib produces."""
+    try:
+        packed = base64.b64decode("".join(blob.split()), validate=True)
+    except (ValueError, TypeError):
+        return None
+    data = None
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            data = zlib.decompress(packed, wbits)
+            break
+        except zlib.error:
+            continue
+    if data is None:
+        return None
+    try:
+        operations = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(operations, list) or not all(isinstance(o, dict) for o in operations):
+        return None
+    return operations
+
+
+def apply_main(args):
+    """Runs every operation in order, printing a line for each, and stops at
+    the first failure. Returns the exit status."""
+    operations = decode_operations(args[0]) if len(args) == 1 else None
+    if not operations:
+        sys.stdout.write("failed: cannot read the setup operations\n")
+        sys.stdout.flush()
+        return 2
+    try:
+        # Read once, now, so every install in the list is the same bytes.
+        source = own_bytes()
+    except OSError:
+        source = None
+    for index, operation in enumerate(operations):
+        try:
+            result = apply_operation(operation, source)
+        except Exception as error:
+            result = {"ok": False, "error": "internal error: %s" % error}
+        sys.stdout.write(describe_operation(operation, result) + "\n")
+        if not result.get("ok"):
+            left = len(operations) - index - 1
+            if left:
+                # Otherwise a person reading the output cannot tell that
+                # the rest was skipped rather than never planned.
+                sys.stdout.write("stopped: %d more %s not run\n"
+                                 % (left, "change" if left == 1 else "changes"))
+            sys.stdout.flush()
+            return 1
+        sys.stdout.flush()
+    return 0
+
+
 def main(stdin=None, stdout=None):
     global _OUT
     stdin = stdin if stdin is not None else sys.stdin
@@ -2892,6 +3588,12 @@ def serve_requests(stdin, relay):
                 response = ping()
             elif command in ("capture", "keys", "paste"):
                 response = handle_tmux(request)
+            elif command == "write_file":
+                response = write_file(request)
+            elif command == "remove_file":
+                response = remove_file(request)
+            elif command == "kimi_events":
+                response = kimi_events(request)
             elif command == "echo":
                 # Hands back whatever the request carried, under the
                 # request's own id. It proves on the Mac that concurrent
@@ -2917,5 +3619,9 @@ if __name__ == "__main__":
     # thread. Its program came from stdin, so stdin is not a request stream.
     if len(sys.argv) > 1 and sys.argv[1] == "probe":
         probe_main()
+    elif len(sys.argv) > 1 and sys.argv[1] == "apply":
+        # The pasted setup command. Like the probe it is one shot: no hook
+        # homes, no writer thread, and stdin is not a request stream.
+        sys.exit(apply_main(sys.argv[2:]))
     else:
         main()
