@@ -166,7 +166,7 @@ enum HelperInstaller {
     private nonisolated static func install(data: Data, alias: String, watchAs: WatchAs) throws {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = HelperLaunch.sshOptions + [alias, HelperLaunch.installCommand(for: watchAs)]
+        task.arguments = HelperLaunch.installArguments(alias: alias, watchAs: watchAs)
         let stdin = Pipe(), stderr = Pipe()
         task.standardInput = stdin
         task.standardOutput = FileHandle.nullDevice

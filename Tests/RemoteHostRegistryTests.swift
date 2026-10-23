@@ -27,6 +27,13 @@ struct RemoteHostRegistryTests {
         #expect(reloaded.host(id: host.id) == host)
     }
 
+    @Test func legacyBlobWithOptionLikeAliasLoadsWithoutThatHost() {
+        let json = #"[{"id":"6F9619FF-8B86-D011-B42D-00C04FC964FF","alias":"-oProxyCommand=x","displayName":"x","isEnabled":true},{"id":"7F9619FF-8B86-D011-B42D-00C04FC964FF","alias":"devbox","displayName":"devbox","isEnabled":true}]"#
+        defaults.set(Data(json.utf8), forKey: RemoteHostStore.defaultsKey)
+        let registry = RemoteHostRegistry(defaults: defaults)
+        #expect(registry.hosts.map(\.alias) == ["devbox"])
+    }
+
     @Test func upsertRefusesAliasesThatReadAsSSHOptions() {
         let registry = RemoteHostRegistry(defaults: defaults)
         #expect(registry.upsert(RemoteHost(alias: "-v")) == false)

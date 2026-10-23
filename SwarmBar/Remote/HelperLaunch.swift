@@ -36,15 +36,21 @@ enum HelperLaunch: Sendable, Equatable {
     var arguments: [String] {
         switch self {
         case .ssh(let alias, .everyUser):
-            Self.sshOptions + [alias, "sudo", "-n", Self.rootHelperPath]
+            Self.sshOptions + ["--", alias, "sudo", "-n", Self.rootHelperPath]
         case .ssh(let alias, .loginUser):
             // One string on purpose: ssh hands it to the remote login shell,
             // which is what expands $HOME. Split into separate arguments, the
             // quotes would arrive literally.
-            Self.sshOptions + [alias, #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#]
+            Self.sshOptions + ["--", alias, #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#]
         case .local(_, let script, _):
             [script]
         }
+    }
+
+    /// The install push's ssh argv. The `--` precedes the alias in every ssh
+    /// argv the app builds, so an alias can never be read as an option.
+    static func installArguments(alias: String, watchAs: WatchAs) -> [String] {
+        sshOptions + ["--", alias, installCommand(for: watchAs)]
     }
 
     /// nil inherits SwarmBar's own environment, which is what ssh needs to

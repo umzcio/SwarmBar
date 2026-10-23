@@ -62,7 +62,8 @@ struct HelperChannelTests {
         let launch = HelperLaunch.ssh(alias: "devbox", watchAs: .everyUser)
         #expect(launch.executable == "/usr/bin/ssh")
         #expect(Array(launch.arguments.suffix(3)) == ["sudo", "-n", "/usr/local/lib/swarmbar-helper"])
-        #expect(launch.arguments.contains("devbox"))
+        #expect(launch.arguments == HelperLaunch.sshOptions
+            + ["--", "devbox", "sudo", "-n", "/usr/local/lib/swarmbar-helper"])
         #expect(launch.arguments.contains("BatchMode=yes"))
         #expect(launch.environment == nil)
     }
@@ -72,7 +73,15 @@ struct HelperChannelTests {
         let launch = HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser)
         #expect(launch.arguments.last == #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#)
         #expect(!launch.arguments.contains { $0.contains("sudo") })
-        #expect(launch.arguments.contains("devbox"))
+        #expect(launch.arguments == HelperLaunch.sshOptions
+            + ["--", "devbox", #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#])
+    }
+
+    @Test("the install argv ends option parsing before the alias")
+    func installArgvHasDoubleDash() {
+        let argv = HelperLaunch.installArguments(alias: "devbox", watchAs: .everyUser)
+        #expect(argv == HelperLaunch.sshOptions
+            + ["--", "devbox", HelperLaunch.installCommand(for: .everyUser)])
     }
 
     @Test("the login user install stays inside its home")

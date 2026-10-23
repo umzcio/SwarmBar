@@ -52,7 +52,14 @@ enum RemoteHostStore {
         guard let data = defaults.data(forKey: defaultsKey),
               let hosts = try? JSONDecoder().decode([RemoteHost].self, from: data)
         else { return [] }
-        return hosts
+        // A legacy or hand-edited blob can hold an alias that ssh would read
+        // as an option. Drop it here so no argv builder ever sees it; the
+        // log names the count only, since the alias is the hostile part.
+        let safe = hosts.filter { SSHConfigParser.isSafeAlias($0.alias) }
+        if safe.count != hosts.count {
+            NSLog("SwarmBar: dropped \(hosts.count - safe.count) remote host(s) with an unusable alias")
+        }
+        return safe
     }
 
     static func save(_ hosts: [RemoteHost], to defaults: UserDefaults) {
