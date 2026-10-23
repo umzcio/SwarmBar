@@ -12,8 +12,17 @@ final class SessionStore {
     /// routinely exercised path rather than an error case, so rows keep
     /// their last known status and say the host cannot be reached.
     private(set) var remoteReachability: [String: RemoteReachability] = [:]
+    /// When each host's current outage began, for "Unreachable for 4 min".
+    /// One outage can change its reason between polls (a timeout, then a
+    /// refused connection), so only reaching the host again ends it.
+    private(set) var remoteUnreachableSince: [String: Date] = [:]
 
-    func noteRemoteReachability(host: String, _ state: RemoteReachability) {
+    func noteRemoteReachability(host: String, _ state: RemoteReachability, now: Date = .now) {
+        if case .unreachable = state {
+            if remoteUnreachableSince[host] == nil { remoteUnreachableSince[host] = now }
+        } else if remoteUnreachableSince[host] != nil {
+            remoteUnreachableSince.removeValue(forKey: host)
+        }
         guard remoteReachability[host] != state else { return }
         remoteReachability[host] = state
     }
@@ -26,6 +35,7 @@ final class SessionStore {
         let ids = Set(sessions.filter { $0.host == host }.map(\.id))
         sessions.removeAll { $0.host == host }
         remoteReachability.removeValue(forKey: host)
+        remoteUnreachableSince.removeValue(forKey: host)
         for id in ids {
             hookOverrides.removeValue(forKey: id)
             acknowledgedAt.removeValue(forKey: id)

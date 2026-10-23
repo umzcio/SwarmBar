@@ -43,6 +43,20 @@ struct RemoteHost: Codable, Identifiable, Equatable, Sendable {
     static func defaultDisplayName(for alias: String) -> String {
         alias.hasSuffix(".ts") ? String(alias.dropLast(3)) : alias
     }
+
+    /// Settings shows each switch as "approvals on", the opposite of what
+    /// is stored, so the inversion lives in one place.
+    func approvalsOn(for tool: AgentTool) -> Bool {
+        !approvalsOff.contains(tool)
+    }
+
+    /// This host with one tool's approvals switched, to hand to the
+    /// registry's upsert.
+    func settingApprovals(_ on: Bool, for tool: AgentTool) -> RemoteHost {
+        var host = self
+        if on { host.approvalsOff.remove(tool) } else { host.approvalsOff.insert(tool) }
+        return host
+    }
 }
 
 enum RemoteHostStore {

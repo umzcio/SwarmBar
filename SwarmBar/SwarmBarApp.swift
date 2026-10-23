@@ -123,6 +123,9 @@ struct SwarmBarApp: App {
         Settings {
             SettingsView()
                 .environment(store)
+                // Nil under --mock, where the Hosts tab says so.
+                .environment(remoteRegistry)
+                .environment(remoteSupervisor)
                 .remoteWizardLauncher(remoteWizard)
         }
 

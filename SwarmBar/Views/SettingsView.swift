@@ -2,8 +2,8 @@ import ServiceManagement
 import SwiftUI
 
 /// Settings in the System Settings idiom: toolbar tabs for General
-/// (behavior), Providers (per-tool approval wiring), and Notifications
-/// (alerts when an agent needs you).
+/// (behavior), Providers (per-tool approval wiring), Notifications (alerts
+/// when an agent needs you), and Hosts (remote hosts watched over ssh).
 struct SettingsView: View {
     var body: some View {
         TabView {
@@ -13,6 +13,8 @@ struct SettingsView: View {
                 .tabItem { Label("Providers", systemImage: "circle.hexagongrid") }
             NotificationSettingsTab()
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
+            HostsSettingsTab()
+                .tabItem { Label("Hosts", systemImage: "server.rack") }
         }
         .frame(width: 440)
         .background(
@@ -381,9 +383,9 @@ struct NotificationSettingsTab: View {
 
 // The card, its group label, divider and toggle row are internal because the
 // remote hosts wizard is built from them too, so the two windows read as one
-// app.
+// app. The card list is internal for the Hosts tab, which has its own file.
 
-private struct SettingsCardList<Content: View>: View {
+struct SettingsCardList<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
