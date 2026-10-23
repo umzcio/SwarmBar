@@ -15,11 +15,16 @@ final class RemoteMonitorSupervisor {
         let host: RemoteHost
         let task: Task<Void, Never>
         let connection: RemoteHostConnection?
+        /// The host's hook relay, which runs and stops with its monitor.
+        let relay: Task<Void, Never>?
     }
 
     private let store: SessionStore
     private let registry: RemoteHostRegistry
     private let factory: Factory
+    /// Where relayed hook events go. Nil in tests that only watch the
+    /// supervisor's bookkeeping, which then start no relay.
+    private let hookServer: HookServer?
     private var running: [UUID: Running] = [:]
     /// A stopped monitor until it has actually finished, and its mirror is
     /// deleted where that was asked for. Cancel is only a request: a poll in
@@ -28,10 +33,14 @@ final class RemoteMonitorSupervisor {
     /// with its predecessor, and a deletion never races a write.
     private var stopping: [UUID: Task<Void, Never>] = [:]
 
-    init(store: SessionStore, registry: RemoteHostRegistry, factory: @escaping Factory = defaultFactory) {
+    init(
+        store: SessionStore, registry: RemoteHostRegistry,
+        factory: @escaping Factory = defaultFactory, hookServer: HookServer? = nil
+    ) {
         self.store = store
         self.registry = registry
         self.factory = factory
+        self.hookServer = hookServer
     }
 
     /// One ssh helper per host, and a mirror in Caches keyed by the host's
@@ -95,13 +104,26 @@ final class RemoteMonitorSupervisor {
                 await previous?.value
                 await monitor.start(into: store)
             }
-            running[host.id] = Running(host: host, task: task, connection: connection)
+            var relay: Task<Void, Never>?
+            if let connection, let hookServer {
+                let id = host.id, fallback = host.approvalsOff
+                let relayer = RemoteHookRelay(
+                    connection: connection, hookServer: hookServer,
+                    approvalsOff: { [weak registry = self.registry] in
+                        registry?.host(id: id)?.approvalsOff ?? fallback
+                    })
+                relay = Task { await relayer.run() }
+            }
+            running[host.id] = Running(host: host, task: task, connection: connection, relay: relay)
         }
     }
 
     private func stop(_ id: UUID, deletingMirror: Bool) {
         guard let entry = running.removeValue(forKey: id) else { return }
         entry.task.cancel()
+        entry.relay?.cancel()
+        // Before clearHost, so no hold outlives the rows it was for.
+        hookServer?.dropRemote(hostID: id)
         store.clearHost(entry.host.displayName)
         let mirrorRoot = deletingMirror ? entry.connection?.mirror.root : nil
         let previous = stopping[id]

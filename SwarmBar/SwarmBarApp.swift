@@ -92,7 +92,8 @@ struct SwarmBarApp: App {
             Task { await GrokBuildMonitor().start(into: store) }
             Task { await AntigravityMonitor().start(into: store) }
             let registry = RemoteHostRegistry(defaults: .standard)
-            let supervisor = RemoteMonitorSupervisor(store: store, registry: registry)
+            let supervisor = RemoteMonitorSupervisor(
+                store: store, registry: registry, hookServer: hookServer)
             registry.onChange = { [supervisor] in supervisor.reconcile() }
             supervisor.reconcile()
             remoteRegistry = registry

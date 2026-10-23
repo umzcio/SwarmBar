@@ -351,7 +351,8 @@ final class SessionStore {
         sticky: Bool,
         cwd: String?,
         accountLabel: String?,
-        title: String? = nil
+        title: String? = nil,
+        host: String? = nil
     ) {
         // Hooks arrive independently of polling, so a disabled tool would
         // otherwise reappear the moment one of its agents did anything.
@@ -379,6 +380,9 @@ final class SessionStore {
                 projectPath: path,
                 status: status,
                 accountLabel: accountLabel,
+                // A row a relayed hook creates belongs to its host from the
+                // start, so it never offers this Mac's terminal actions.
+                host: host,
                 attentionEventID: eventID
             ))
         }

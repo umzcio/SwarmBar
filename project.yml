@@ -38,6 +38,14 @@ targets:
         buildPhase: resources
       - path: scripts/swarmbar-opencode.js
         buildPhase: resources
+      # The remote bridges, pushed to hosts by the setup flow. They post to
+      # the helper's socket in the agent user's home, never to loopback.
+      - path: scripts/swarmbar-remote-hook.sh
+        buildPhase: resources
+      - path: scripts/swarmbar-remote-kimi-hook.sh
+        buildPhase: resources
+      - path: scripts/swarmbar-remote-opencode.js
+        buildPhase: resources
       - path: scripts/swarmbar-helper.py
         buildPhase: resources
     info:
