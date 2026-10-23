@@ -1198,8 +1198,12 @@ def file_digest(path, limit=None):
     return hashlib.sha256(data).hexdigest(), kept
 
 
-def home_configs(home):
-    """The agent config files in a home that exist, each once by realpath."""
+def home_configs(home, warnings):
+    """The agent config files in a home that exist, each once by realpath.
+
+    One that exists but cannot be read is still listed, with a null hash
+    and text and a warning: dropping it would make the plan create a file
+    that is already there, and could-not-read would read as absent."""
     configs = []
     seen = set()
     for tool, pattern in CONFIG_TOOLS:
@@ -1212,10 +1216,12 @@ def home_configs(home):
             resolved = os.path.realpath(candidate)
             if resolved in seen or not os.path.isfile(resolved):
                 continue
+            seen.add(resolved)
             digest = file_digest(resolved, CONFIG_TEXT_MAX)
             if digest is None:
+                warnings.append("cannot read %s config %s" % (tool, resolved))
+                configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None})
                 continue
-            seen.add(resolved)
             text = None
             if digest[1] is not None:
                 try:
@@ -1227,11 +1233,14 @@ def home_configs(home):
 
 
 def mentions_bridge(path):
+    """True or False, or None when the file is there but cannot be read."""
     try:
         with open(path, "rb") as handle:
             return BRIDGE_MARK in handle.read(WHOLE_MAX_BYTES)
-    except OSError:
-        return False
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return False
+        return None
 
 
 def home_tools(home):
@@ -1245,25 +1254,37 @@ def home_tools(home):
     return [tool for tool in TOOL_ORDER if tool in present]
 
 
-def home_installed(home):
-    """Which tools' remote bridges are in place in a home, in TOOL_ORDER.
+def home_installed(home, warnings):
+    """(installed, unknown): which tools' remote bridges are in place in a
+    home, and which could not be told because a config could not be read,
+    each in TOOL_ORDER.
 
     Claude counts only when every config dir it is used from names the
     bridge, so a second profile without hooks still reads as not set up."""
-    installed = set()
+    installed, unknown = set(), set()
     for tool, bridge in BRIDGE_FILES:
         if not os.path.isfile(os.path.join(home, bridge)):
             continue
         if tool == "claude":
             used = [d for d in claude_config_dirs(home)
                     if os.path.isdir(os.path.join(d, "projects"))]
-            if used and all(mentions_bridge(os.path.join(d, "settings.json")) for d in used):
-                installed.add(tool)
+            found = [mentions_bridge(os.path.join(d, "settings.json")) for d in used]
+        else:
+            found = [mentions_bridge(os.path.join(home, pattern))
+                     for name, pattern in CONFIG_TOOLS if name == tool]
+            # One OpenCode config naming the bridge is enough.
+            if True in found:
+                found = [True]
+        if not found or False in found:
             continue
-        if any(mentions_bridge(os.path.join(home, pattern))
-               for name, pattern in CONFIG_TOOLS if name == tool):
+        if None in found:
+            unknown.add(tool)
+            warnings.append("cannot tell whether %s is set up in %s: a config cannot be read"
+                            % (tool, home))
+        else:
             installed.add(tool)
-    return [tool for tool in TOOL_ORDER if tool in installed]
+    return ([tool for tool in TOOL_ORDER if tool in installed],
+            [tool for tool in TOOL_ORDER if tool in unknown])
 
 
 def installed_helpers(homes):
@@ -1279,6 +1300,16 @@ def installed_helpers(homes):
     return found
 
 
+def own_digest():
+    """This file's sha256 when it runs from a file, as the installed root
+    helper does under the narrow sudo rule; None when it came from stdin."""
+    path = globals().get("__file__")
+    if not path or not os.path.isfile(path):
+        return None
+    digest = file_digest(path)
+    return digest[0] if digest else None
+
+
 def sudo_ok():
     try:
         return run_command(["sudo", "-n", "true"], timeout=SUDO_SECONDS).returncode == 0
@@ -1289,8 +1320,9 @@ def sudo_ok():
 def probe():
     """What the setup wizard needs to know about a host, read-only.
 
-    It runs once, as `python3 - probe` with this file on stdin, before the
-    helper is installed anywhere. It writes nothing and starts nothing that
+    It runs as `python3 -B - probe` with this file on stdin, before the
+    helper is installed anywhere, and as `/usr/local/lib/swarmbar-helper
+    probe` under the narrow sudo rule for the view of every user. It writes nothing and starts nothing that
     outlives it: no hook homes, sockets, ~/.swarmbar or writer thread.
     """
     warnings = []
@@ -1302,6 +1334,10 @@ def probe():
         user = pwd.getpwuid(os.geteuid()).pw_name
     except (ImportError, KeyError):
         user = ""
+    installed, unknown, configs = {}, {}, {}
+    for path in paths:
+        installed[path], unknown[path] = home_installed(path, warnings)
+        configs[path] = home_configs(path, warnings)
     return {
         "ok": True,
         "protocol": PROTOCOL_VERSION,
@@ -1315,9 +1351,11 @@ def probe():
         "processes": processes if processes is not None else [],
         "processes_failed": processes is None,
         "tools": dict((path, home_tools(path)) for path in paths),
-        "installed": dict((path, home_installed(path)) for path in paths),
-        "configs": dict((path, home_configs(path)) for path in paths),
+        "installed": installed,
+        "installed_unknown": unknown,
+        "configs": configs,
         "helper": installed_helpers(paths),
+        "self_sha256": own_digest(),
         "warnings": warnings,
     }
 
@@ -1328,7 +1366,10 @@ def probe_main():
     try:
         result = probe()
     except Exception as error:
+        # The version rides along so an old python reads as too old, not as
+        # an unexplained failure.
         result = {"ok": False, "protocol": PROTOCOL_VERSION,
+                  "python": platform.python_version(),
                   "error": "probe failed: %s" % error}
     sys.stdout.write(json.dumps(result) + "\n")
     sys.stdout.flush()

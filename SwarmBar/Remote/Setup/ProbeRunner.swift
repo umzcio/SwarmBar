@@ -38,13 +38,22 @@ actor ProbeRunner {
     static let sshOptions = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
     /// The `--` ends option parsing before the alias, as in every ssh argv
-    /// the app builds.
+    /// the app builds. `-B` keeps python from writing bytecode caches, which
+    /// Apple's python 3.9 otherwise does under ~/Library/Caches before the
+    /// helper's first line runs.
     static func userArguments(alias: String) -> [String] {
-        sshOptions + ["--", alias, "python3", "-", "probe"]
+        sshOptions + ["--", alias, "python3", "-B", "-", "probe"]
     }
 
     static func rootArguments(alias: String) -> [String] {
-        sshOptions + ["--", alias, "sudo", "-n", "python3", "-", "probe"]
+        sshOptions + ["--", alias, "sudo", "-n", "python3", "-B", "-", "probe"]
+    }
+
+    /// The view of every user under the narrow sudo rule, which lets the
+    /// login user run exactly root's installed helper and nothing else. That
+    /// copy runs as itself, so nothing goes on its stdin.
+    static func narrowRootArguments(alias: String) -> [String] {
+        sshOptions + ["--", alias, "sudo", "-n", HelperLaunch.rootHelperPath, "probe"]
     }
 
     private let helperSource: Data
@@ -64,7 +73,17 @@ actor ProbeRunner {
         case .answered(let result): user = result
         case .failed(let problem): return (nil, nil, problem)
         }
-        guard user.sudoOK else { return (user, nil, nil) }
+        guard user.sudoOK else {
+            guard user.helper.contains(where: { $0.path == HelperLaunch.rootHelperPath }) else {
+                return (user, nil, nil)
+            }
+            // The installed helper may predate the probe, or the rule may be
+            // gone. Anything but a good answer is simply no view of every
+            // user, which the assessment never reads as Ready.
+            let run = await runner(Self.narrowRootArguments(alias: alias), Data(), Self.deadline)
+            if case .answered(let root) = Self.interpret(run, alias: alias) { return (user, root, nil) }
+            return (user, nil, nil)
+        }
         // sudo worked a moment ago, so a root view that fails is a failure
         // to look, never a host with nothing on it.
         switch Self.interpret(await runner(Self.rootArguments(alias: alias), helperSource, Self.deadline),
@@ -113,6 +132,9 @@ actor ProbeRunner {
         if let line = jsonLine(in: run.stdout) {
             let decoder = JSONDecoder()
             if let envelope = try? decoder.decode(ProbeResult.Envelope.self, from: line), !envelope.ok {
+                if let python = envelope.python, !supportsHelper(python: python) {
+                    return .failed(.pythonTooOld(python))
+                }
                 return .failed(.other(envelope.error ?? "The probe failed on the host"))
             }
             if var result = try? decoder.decode(ProbeResult.self, from: line) {

@@ -51,7 +51,9 @@ enum SSHFailure {
                 || lowered.contains("keyboard-interactive") {
                 return .needsPassword
             }
-            if stderr.contains("Permission denied (publickey)") { return .keyRejected }
+            // Any method list led by publickey, (publickey,gssapi-keyex,...)
+            // included, once password methods are ruled out above.
+            if stderr.contains("Permission denied (publickey") { return .keyRejected }
         }
         if stderr.contains("Could not resolve hostname") { return .unresolvable }
         if stderr.lowercased().contains("timed out") { return .timedOut }
@@ -63,7 +65,20 @@ enum SSHFailure {
         // A python old enough not to parse the helper fails before it can
         // report its own version.
         if stderr.contains("SyntaxError") { return .pythonTooOld(nil) }
-        let line = SSHChannel.firstLine(of: Data(stderr.utf8))
+        let line = lastMeaningfulLine(of: stderr)
         return .other(line.isEmpty ? "ssh exited \(exitStatus)" : line)
+    }
+
+    /// The line that says what went wrong is usually the last one: ssh puts
+    /// its warnings first ("Warning: Permanently added ..."), and a python
+    /// traceback ends with the exception. Frames and warnings are skipped.
+    static func lastMeaningfulLine(of stderr: String, limit: Int = 200) -> String {
+        let lines = stderr.split(whereSeparator: \.isNewline).filter { raw in
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            return !line.isEmpty && !line.hasPrefix("Warning:")
+                && !line.hasPrefix("Traceback (most recent call last)")
+                && !(raw.first?.isWhitespace ?? false)
+        }
+        return lines.last.map { String($0.trimmingCharacters(in: .whitespaces).prefix(limit)) } ?? ""
     }
 }

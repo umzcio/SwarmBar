@@ -6,12 +6,14 @@ import Foundation
 struct ProbeResult: Decodable, Sendable, Equatable {
     /// An agent config file the setup plan may edit, read as it stood when
     /// the probe ran. `text` is nil when the file was too big or not UTF-8,
-    /// and the plan cannot edit what it did not read.
+    /// and the plan cannot edit what it did not read. Both are nil when the
+    /// file is there but could not be read at all, which is never the same
+    /// as the file being absent.
     struct ConfigFile: Decodable, Sendable, Equatable {
         var tool: String
         /// Resolved through symlinks, so profiles sharing one file name it once.
         var path: String
-        var sha256: String
+        var sha256: String?
         var text: String?
     }
 
@@ -25,10 +27,10 @@ struct ProbeResult: Decodable, Sendable, Equatable {
 
     /// The ssh alias that was probed. Set by the runner, never by the host.
     var alias: String = ""
-    var protocolVersion: Int = 3
-    var system: String = "Linux"
-    var python: String = "3.12.3"
-    var hostname: String = ""
+    var protocolVersion: Int
+    var system: String
+    var python: String
+    var hostname: String
     /// The account the probe ran as: the login user, or root under sudo.
     var user: String
     var euid: Int
@@ -41,8 +43,14 @@ struct ProbeResult: Decodable, Sendable, Equatable {
     var tools: [String: [String]]
     /// Keyed by home path: which tools' remote bridges are in place there.
     var installed: [String: [String]]
+    /// Keyed by home path: tools whose setup state could not be told,
+    /// because a config that would say could not be read.
+    var installedUnknown: [String: [String]] = [:]
     var configs: [String: [ConfigFile]] = [:]
     var helper: [HelperFile] = []
+    /// The probing helper's own sha256 when it ran from an installed file,
+    /// as it does under the narrow sudo rule; nil when it came from stdin.
+    var selfSHA256: String?
     var warnings: [String] = []
 
     enum CodingKeys: String, CodingKey {
@@ -51,6 +59,8 @@ struct ProbeResult: Decodable, Sendable, Equatable {
         case protocolVersion = "protocol"
         case sudoOK = "sudo_ok"
         case processesFailed = "processes_failed"
+        case installedUnknown = "installed_unknown"
+        case selfSHA256 = "self_sha256"
     }
 
     /// The helper's tool names, as in its SPECS table and the probe's
@@ -88,5 +98,7 @@ struct ProbeResult: Decodable, Sendable, Equatable {
     struct Envelope: Decodable {
         var ok: Bool
         var error: String?
+        /// Sent even on failure, so an old python reads as too old.
+        var python: String?
     }
 }

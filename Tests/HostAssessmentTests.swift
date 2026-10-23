@@ -16,15 +16,18 @@ import Testing
     private static func probe(
         user: String = "u", sudo: Bool = false, homes: [String] = ["/home/u"],
         processes: [RemoteProcessRecord] = [], tools: [String] = [], installed: [String] = [],
-        helper: [ProbeResult.HelperFile] = [], processesFailed: Bool = false
+        unknown: [String] = [], helper: [ProbeResult.HelperFile] = [], processesFailed: Bool = false,
+        selfSHA256: String? = nil
     ) -> ProbeResult {
         ProbeResult(
-            alias: "devbox", user: user, euid: user == "root" ? 0 : 1000, sudoOK: sudo,
+            alias: "devbox", protocolVersion: 3, system: "Linux", python: "3.12.3", hostname: "devbox",
+            user: user, euid: user == "root" ? 0 : 1000, sudoOK: sudo,
             homes: homes.map { RemoteHome(path: $0, user: $0 == "/root" ? "root" : "u") },
             processes: processes, processesFailed: processesFailed,
             tools: Dictionary(uniqueKeysWithValues: homes.map { ($0, tools) }),
             installed: Dictionary(uniqueKeysWithValues: homes.map { ($0, installed) }),
-            helper: helper)
+            installedUnknown: Dictionary(uniqueKeysWithValues: homes.map { ($0, unknown) }),
+            helper: helper, selfSHA256: selfSHA256)
     }
 
     private static func assess(
@@ -81,15 +84,22 @@ import Testing
         let path = HelperLaunch.rootHelperPath
         let stale = Self.probe(helper: [.init(path: path, sha256: String(repeating: "2", count: 64))])
         #expect(Self.assess(user: stale, watchAs: .everyUser).status
-            == .needsSetup([HelperInstaller.updateNeedsSetupMessage]))
+            == .needsSetup([HostAssessment.narrowProbeFailedReason, HelperInstaller.updateNeedsSetupMessage]))
 
-        let current = Self.probe(helper: [.init(path: path, sha256: Self.appHelper)])
-        #expect(Self.assess(user: current, watchAs: .everyUser).status == .ready)
-
-        // Root's own 700 file cannot be read without sudo. Unknown is not
-        // stale: the monitor's ping finds out once it runs.
+        // With the narrow rule's root view: ready when root's helper is this
+        // build's, stale when it says otherwise.
         let unreadable = Self.probe(helper: [.init(path: path, sha256: nil)])
-        #expect(Self.assess(user: unreadable, watchAs: .everyUser).status == .ready)
+        let rootView = Self.probe(user: "root", homes: ["/root", "/home/u"], selfSHA256: Self.appHelper)
+        #expect(Self.assess(user: unreadable, root: rootView, watchAs: .everyUser).status == .ready)
+        let oldRoot = Self.probe(user: "root", homes: ["/root"], selfSHA256: String(repeating: "3", count: 64))
+        #expect(Self.assess(user: unreadable, root: oldRoot, watchAs: .everyUser).status
+            == .needsSetup([HelperInstaller.updateNeedsSetupMessage]))
+        // Root's own 700 file cannot be read without sudo. Unknown is not
+        // stale, but without a root view the host is still never Ready.
+        #expect(Self.assess(user: unreadable, watchAs: .everyUser).status
+            == .needsSetup([HostAssessment.narrowProbeFailedReason]))
+        #expect(HostAssessment.narrowProbeFailedReason
+            == "SwarmBar can't look at the other users' sessions yet. Run the setup command.")
 
         let absent = Self.probe()
         #expect(Self.assess(user: absent, watchAs: .everyUser).status
@@ -99,6 +109,61 @@ import Testing
         let wrongFile = Self.probe(helper: [.init(path: "/home/u/.swarmbar/swarmbar-helper", sha256: Self.appHelper)])
         #expect(Self.assess(user: wrongFile, watchAs: .everyUser).status
             == .needsSetup([HostAssessment.sudoRuleReason]))
+    }
+
+    @Test func narrowRuleRootViewIsJudgedForEveryHome() {
+        let user = Self.probe(processes: [Self.process("claude", user: "root")],
+                              helper: [.init(path: HelperLaunch.rootHelperPath, sha256: nil)])
+        let root = Self.probe(user: "root", homes: ["/root", "/home/u"], processes: user.processes,
+                              tools: ["claude"], selfSHA256: Self.appHelper)
+        let result = Self.assess(user: user, root: root, watchAs: .everyUser)
+        #expect(result.status == .needsSetup(["Claude Code approvals not set up"]))
+        #expect(result.summary == "1 Claude Code")
+    }
+
+    @Test func processesFailedWithoutSudoLeavesThePickOpen() {
+        let user = Self.probe(tools: ["codex"], processesFailed: true)
+        let result = Self.assess(user: user)
+        #expect(result.suggestedWatchAs == nil)
+        #expect(result.hiddenSessions == nil)
+        #expect(result.status == .needsSetup([HostAssessment.processesFailedReason]))
+        #expect(HostAssessment.processesFailedReason
+            == "SwarmBar couldn't list the processes on this host. Check again.")
+        // Picked, it is still not Ready: nobody knows what runs there.
+        let picked = Self.assess(user: user, watchAs: .loginUser)
+        #expect(picked.status == .needsSetup([HostAssessment.processesFailedReason]))
+        #expect(picked.hiddenSessions == nil)
+        // A host that cannot connect says that instead.
+        #expect(Self.assess(user: nil, failure: .timedOut).status == .cantConnect(.timedOut))
+    }
+
+    @Test func sudoWithoutARootViewIsNeverJudgedOnTheUserView() {
+        let user = Self.probe(sudo: true, tools: ["claude"], installed: ["claude"])
+        let result = Self.assess(user: user, root: nil)
+        #expect(result.suggestedWatchAs == .everyUser)
+        #expect(result.status == .needsSetup([HostAssessment.rootViewMissingReason]))
+    }
+
+    @Test func rootFailureMattersOnlyWhenWatchingEveryUser() {
+        let user = Self.probe(sudo: true, processes: [Self.process("claude")], tools: ["claude"],
+                              installed: ["claude"])
+        let failure = HostProblem.other("sudo: a password is required")
+        #expect(Self.assess(user: user, failure: failure).status == .cantConnect(failure))
+        #expect(Self.assess(user: user, failure: failure, watchAs: .everyUser).status == .cantConnect(failure))
+        let mine = Self.assess(user: user, failure: failure, watchAs: .loginUser)
+        #expect(mine.status == .ready)
+        #expect(mine.hiddenSessions == 0)
+        #expect(mine.summary == "1 Claude Code")
+    }
+
+    @Test func unreadableConfigIsNeverReady() {
+        let user = Self.probe(processes: [Self.process("kimi")], tools: ["kimi"], unknown: ["kimi"])
+        #expect(Self.assess(user: user).status
+            == .needsSetup(["SwarmBar couldn't read the Kimi Code config on this host. Check again."]))
+        // A home where it is plainly missing says so instead.
+        let mixed = Self.probe(homes: ["/home/u", "/home/v"], processes: [Self.process("kimi")],
+                               tools: ["kimi"])
+        #expect(Self.assess(user: mixed).status == .needsSetup(["Kimi Code approvals not set up"]))
     }
 
     @Test func pickedLoginUserNeedsNoPick() {
@@ -135,6 +200,7 @@ import Testing
         #expect(result.status == .cantConnect(.timedOut))
         #expect(result.suggestedWatchAs == nil)
         #expect(Self.assess(user: nil).status == .cantConnect(.other("No answer from the host")))
+        #expect(result.hiddenSessions == nil)
     }
 
     @Test func classifiesSSHFailures() {
@@ -161,6 +227,17 @@ import Testing
         #expect(classify("bash: line 1: python3: command not found\n", 127) == .noPython)
         #expect(classify("", 127) == .noPython)
         #expect(classify("  File \"<stdin>\", line 40\nSyntaxError: invalid syntax\n", 1) == .pythonTooOld(nil))
+        #expect(classify("u@devbox: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).\r\n")
+            == .keyRejected)
+        #expect(classify("""
+            Warning: Permanently added 'devbox' (ED25519) to the list of known hosts.
+            kex_exchange_identification: Connection closed by remote host
+            """) == .other("kex_exchange_identification: Connection closed by remote host"))
+        #expect(classify("""
+            Traceback (most recent call last):
+              File "<stdin>", line 12, in <module>
+            ModuleNotFoundError: No module named 'fcntl'
+            """, 1) == .other("ModuleNotFoundError: No module named 'fcntl'"))
         #expect(classify("kex_exchange_identification: read: Connection reset by peer\r\n")
             == .other("kex_exchange_identification: read: Connection reset by peer"))
         #expect(classify("", 255) == .other("ssh exited 255"))
@@ -188,13 +265,16 @@ import Testing
         #expect(result.processes.first?.screen == nil)
         #expect(result.tools["/home/u"] == ["claude"])
         #expect(result.configs["/home/u"]?.first?.text == nil)
+        #expect(result.configs["/home/u"]?.last == ProbeResult.ConfigFile(
+            tool: "kimi", path: "/home/u/.kimi-code/config.toml", sha256: nil, text: nil))
+        #expect(result.selfSHA256 == nil)
         #expect(result.helper == [ProbeResult.HelperFile(path: "/usr/local/lib/swarmbar-helper", sha256: nil)])
         #expect(result.alias == "")
     }
 
     // MARK: ProbeRunner
 
-    static func probeJSON(sudo: Bool, python: String = "3.12.3") -> String {
+    static func probeJSON(sudo: Bool, python: String = "3.12.3", rootHelper: Bool = true) -> String {
         """
         {"ok": true, "protocol": 3, "system": "Linux", "python": "\(python)", "hostname": "devbox",
          "user": "u", "euid": 1000, "sudo_ok": \(sudo),
@@ -203,9 +283,12 @@ import Testing
                         "args": "claude", "cwd": "/home/u/work", "pane": null, "open": []}],
          "processes_failed": false,
          "tools": {"/home/u": ["claude"]}, "installed": {"/home/u": []},
+         "installed_unknown": {"/home/u": []},
          "configs": {"/home/u": [{"tool": "claude", "path": "/home/u/.claude/settings.json",
-                                  "sha256": "abc", "text": null}]},
-         "helper": [{"path": "/usr/local/lib/swarmbar-helper", "sha256": null}],
+                                  "sha256": "abc", "text": null},
+                                 {"tool": "kimi", "path": "/home/u/.kimi-code/config.toml",
+                                  "sha256": null, "text": null}]},
+         "helper": \(rootHelper ? #"[{"path": "/usr/local/lib/swarmbar-helper", "sha256": null}]"# : "[]"),
          "warnings": []}
         """.replacingOccurrences(of: "\n", with: " ") + "\n"
     }
@@ -245,15 +328,18 @@ import Testing
 
     @Test func runnerArgumentsEndOptionsBeforeTheAlias() {
         #expect(ProbeRunner.userArguments(alias: "devbox")
-            == ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "devbox", "python3", "-", "probe"])
+            == ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "devbox", "python3", "-B", "-", "probe"])
         #expect(ProbeRunner.rootArguments(alias: "devbox")
             == ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "devbox",
-                "sudo", "-n", "python3", "-", "probe"])
+                "sudo", "-n", "python3", "-B", "-", "probe"])
+        #expect(ProbeRunner.narrowRootArguments(alias: "devbox")
+            == ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "devbox",
+                "sudo", "-n", "/usr/local/lib/swarmbar-helper", "probe"])
     }
 
     @Test func rootProbeRunsOnlyWithSudo() async {
         let source = Data("# helper source\n".utf8)
-        let noSudo = FakeSSH { _ in Self.ok(Self.probeJSON(sudo: false)) }
+        let noSudo = FakeSSH { _ in Self.ok(Self.probeJSON(sudo: false, rootHelper: false)) }
         let plain = await ProbeRunner(helperSource: source, runner: noSudo.runner).probe(alias: "alpha")
         #expect(noSudo.calls.map(\.arguments) == [ProbeRunner.userArguments(alias: "alpha")])
         #expect(noSudo.calls.first?.stdin == source)
@@ -269,6 +355,35 @@ import Testing
         #expect(sudo.calls.last?.stdin == source)
         #expect(both.root?.alias == "beta")
         #expect(both.failure == nil)
+    }
+
+    @Test func narrowRuleRootViewUsesTheInstalledHelper() async {
+        let fake = FakeSSH { arguments in
+            arguments.contains("sudo")
+                ? Self.ok(Self.probeJSON(sudo: true).replacingOccurrences(of: "\"user\": \"u\", \"euid\": 1000",
+                                                                         with: "\"user\": \"root\", \"euid\": 0"))
+                : Self.ok(Self.probeJSON(sudo: false))
+        }
+        let result = await ProbeRunner(helperSource: Data("# helper\n".utf8), runner: fake.runner)
+            .probe(alias: "alpha")
+        #expect(fake.calls.map(\.arguments)
+            == [ProbeRunner.userArguments(alias: "alpha"), ProbeRunner.narrowRootArguments(alias: "alpha")])
+        #expect(fake.calls.last?.stdin == Data())
+        #expect(result.root?.user == "root")
+        #expect(result.failure == nil)
+
+        // A stale helper that does not know the probe, or a rule that is
+        // gone, is no root view, never a failure to connect.
+        for reply in [Self.ok("not json\n"),
+                      Self.ok("{\"ok\": false, \"error\": \"unknown command\"}\n"),
+                      ProbeRunner.RunResult(status: 1, stdout: Data(),
+                                            stderr: Data("sudo: a password is required\n".utf8), timedOut: false)] {
+            let stale = FakeSSH { arguments in arguments.contains("sudo") ? reply : Self.ok(Self.probeJSON(sudo: false)) }
+            let outcome = await ProbeRunner(helperSource: Data(), runner: stale.runner).probe(alias: "alpha")
+            #expect(outcome.user != nil)
+            #expect(outcome.root == nil)
+            #expect(outcome.failure == nil)
+        }
     }
 
     @Test func unsafeAliasIsRefusedWithoutRunningSSH() async {
@@ -308,6 +423,12 @@ import Testing
         #expect(rootless.user != nil)
         #expect(rootless.root == nil)
         #expect(rootless.failure == .other("sudo: a password is required"))
+
+        let ancient = FakeSSH { _ in
+            Self.ok("{\"ok\": false, \"protocol\": 3, \"python\": \"3.6.9\", \"error\": \"probe failed: x\"}\n")
+        }
+        #expect(await ProbeRunner(helperSource: Data(), runner: ancient.runner).probe(alias: "alpha").failure
+            == .pythonTooOld("3.6.9"))
 
         let broken = FakeSSH { _ in Self.ok("{\"ok\": false, \"protocol\": 3, \"error\": \"probe failed: boom\"}\n") }
         #expect(await ProbeRunner(helperSource: Data(), runner: broken.runner).probe(alias: "alpha").failure

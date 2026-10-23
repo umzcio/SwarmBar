@@ -2230,13 +2230,11 @@ class ProbeTests(unittest.TestCase):
             source = handle.read()
         env = dict(os.environ, SWARMBAR_HELPER_HOMES=self.home, HOME=self.home,
                    PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
-        # Starting python at all can write: Apple's 3.9 caches its startup
-        # modules' bytecode under ~/Library/Caches, which any earlier use of
-        # python3 on the host has already done. Warm that first, so what is
-        # measured is the probe, including every module it imports itself.
-        subprocess.run([sys.executable, "-c", "pass"], env=env, timeout=30, check=True)
         before = tree_state(self.root)
-        done = subprocess.run([sys.executable, "-", "probe"], input=source, env=env,
+        # The Mac's exact argv. -B matters: Apple's python 3.9 otherwise
+        # caches its startup modules' bytecode under ~/Library/Caches before
+        # the first line of the helper runs.
+        done = subprocess.run([sys.executable, "-B", "-", "probe"], input=source, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stderr, b"")
@@ -2368,6 +2366,57 @@ class ProbeTests(unittest.TestCase):
         for key in ("system", "python", "hostname", "user"):
             self.assertIsInstance(result[key], str)
         self.assertEqual(result["homes"], [{"path": self.home, "user": helper.home_owner(self.home)[0]}])
+
+    def test_unreadable_config_is_reported_not_dropped(self):
+        path = self.put(".kimi-code/config.toml", "[hooks]\n")
+        real_open = open
+
+        def refusing(name, *args, **kwargs):
+            if os.path.realpath(name) == os.path.realpath(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+        with mock.patch("builtins.open", side_effect=refusing):
+            result = self.probe()
+        self.assertEqual(result["configs"][self.home], [
+            {"tool": "kimi", "path": os.path.realpath(path), "sha256": None, "text": None}])
+        self.assertTrue(any("kimi" in w and path in w for w in result["warnings"]), result["warnings"])
+
+    def test_unreadable_bridge_config_is_unknown_not_missing(self):
+        self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n")
+        path = self.put(".kimi-code/config.toml", 'command = "swarmbar-remote-kimi-hook.sh"\n')
+        real_open = open
+
+        def refusing(name, *args, **kwargs):
+            if os.path.realpath(name) == os.path.realpath(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+        with mock.patch("builtins.open", side_effect=refusing):
+            result = self.probe()
+        self.assertEqual(result["installed"][self.home], [])
+        self.assertEqual(result["installed_unknown"][self.home], ["kimi"])
+        self.assertTrue(any("kimi" in w for w in result["warnings"]), result["warnings"])
+        # Readable again, it is simply installed, and nothing is unknown.
+        result = self.probe()
+        self.assertEqual(result["installed"][self.home], ["kimi"])
+        self.assertEqual(result["installed_unknown"][self.home], [])
+
+    def test_probe_hashes_itself_only_when_run_from_a_file(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        with open(script, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        self.assertEqual(self.probe()["self_sha256"], digest)
+        with mock.patch.object(helper, "__file__", "<stdin>"):
+            self.assertIsNone(self.probe()["self_sha256"])
+
+    def test_failed_probe_names_its_python(self):
+        out = io.StringIO()
+        with mock.patch.object(helper, "probe", side_effect=RuntimeError("boom")), \
+                mock.patch.object(sys, "stdout", out):
+            helper.probe_main()
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["python"], helper.platform.python_version())
+        self.assertIn("boom", result["error"])
 
     def test_allowed_patterns(self):
         self.assertEqual(helper.ALLOWED, (
