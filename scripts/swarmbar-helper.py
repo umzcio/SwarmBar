@@ -974,16 +974,10 @@ def held_files(comm, pid):
 
 
 def pane_screen(pane):
-    try:
-        done = run_command(
-            ["tmux", "-S", pane["socket"], "capture-pane", "-p", "-t", pane["id"]],
-        )
-    except (OSError, subprocess.SubprocessError):
+    text = pane_text(pane)
+    if text is None:
         return None
-    if done.returncode != 0:
-        return None
-    lines = done.stdout.decode("utf-8", "replace").splitlines()
-    return "\n".join(lines[-SCREEN_LINES:])
+    return "\n".join(text.splitlines()[-SCREEN_LINES:])
 
 
 def agent_processes(warnings):
@@ -1101,78 +1095,105 @@ def ping():
 
 
 PANE_ID = re.compile(r"^%[0-9]+$")
-CAPTURE_DEFAULT_LINES = 60
-CAPTURE_MAX_LINES = 2000
 KEY_GAP_DEFAULT = 0.08
+KEY_GAP_MAX = 0.5
 PASTE_BUFFER = "swarmbar"
 NAMED_KEYS = {"UP": "Up", "DOWN": "Down", "ESC": "Escape", "\n": "Enter"}
+# C0 controls other than newline and tab, plus DEL. ESC is the one that
+# matters: it could close the bracketed paste early or open a sequence.
+PASTE_STRIP = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def tmux_key_args(key):
     """The send-keys arguments for one key. Anything unnamed is sent literally
-    with -l so a label such as "Up" typed as text is never read as a key name."""
+    with -l, and "--" ends option parsing so a literal such as "-x" or "Up"
+    is never read as a flag or a key name."""
     if key in NAMED_KEYS:
         return [NAMED_KEYS[key]]
-    return ["-l", key]
+    return ["-l", "--", key]
 
 
 def valid_pane(pane):
-    """Whether a request's pane names a tmux socket this helper may drive.
+    """The pane with its socket resolved, or None when it is not drivable.
 
     The pane comes off the wire, so it is checked as hostile input: the id
     must be a bare pane id, and the socket must sit in a tmux-* directory both
-    as written and after symlinks resolve, under /tmp or TMUX_TMPDIR, so a
-    request can never point tmux at an arbitrary socket path.
+    as written and after symlinks resolve, under /tmp or TMUX_TMPDIR, be a
+    real socket, and be owned by whoever owns its tmux-* directory. The
+    resolved path is what every later tmux call uses, so the path checked is
+    the path run, with no window for a symlink to be swapped in between.
     """
     if not isinstance(pane, dict):
-        return False
+        return None
     pane_id, sock = pane.get("id"), pane.get("socket")
     if not isinstance(pane_id, str) or not PANE_ID.match(pane_id):
-        return False
+        return None
     if not isinstance(sock, str) or not os.path.isabs(sock):
-        return False
+        return None
     if not os.path.basename(os.path.dirname(sock)).startswith("tmux-"):
-        return False
-    real_dir = os.path.dirname(os.path.realpath(sock))
+        return None
+    real = os.path.realpath(sock)
+    real_dir = os.path.dirname(real)
     if not os.path.basename(real_dir).startswith("tmux-"):
-        return False
+        return None
     roots = ["/tmp"]
     if os.environ.get("TMUX_TMPDIR"):
         roots.append(os.environ["TMUX_TMPDIR"])
     parent = os.path.dirname(real_dir)
-    return any(parent == os.path.realpath(root) for root in roots)
+    if not any(parent == os.path.realpath(root) for root in roots):
+        return None
+    try:
+        info = os.stat(real)
+        dir_info = os.stat(real_dir)
+    except OSError:
+        return None
+    if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
+        return None
+    return {"socket": real, "id": pane_id}
 
 
 def tmux_run(pane, args, input=None):
     """One tmux call against the pane's own server. Returns the completed
     process, or None when tmux could not run at all."""
+    argv = ["tmux", "-S", pane["socket"]] + args
     try:
-        return run_command(["tmux", "-S", pane["socket"]] + args, input=input)
+        if input is None:
+            return run_command(argv)
+        return run_command(argv, input=input)
     except (OSError, subprocess.SubprocessError):
         return None
 
 
-def tmux_capture(pane, lines):
-    done = tmux_run(pane, ["capture-pane", "-p", "-t", pane["id"], "-S", "-%d" % lines])
+def pane_text(pane):
+    """The VISIBLE screen of a pane, or None when it cannot be read. This is
+    the only pane read in the helper: no -S, so scrollback never counts. A
+    label that lingers in history must not confirm a prompt that has moved."""
+    done = tmux_run(pane, ["capture-pane", "-p", "-t", pane["id"]])
     if done is None or done.returncode != 0:
         return None
     return done.stdout.decode("utf-8", "replace")
 
 
 def handle_tmux(request):
-    """capture, keys and paste. Keys are confirmed against a fresh capture
-    taken immediately before sending, and any missing expectation sends
-    nothing, because a prompt that moved under the Mac's read could otherwise
-    take a keystroke meant for another prompt."""
-    pane = request.get("pane")
-    if not valid_pane(pane):
+    """capture, keys and paste. Keys are confirmed against a fresh capture of
+    the visible screen taken immediately before sending, and any missing
+    expectation sends nothing, because a prompt that moved under the Mac's
+    read could otherwise take a keystroke meant for another prompt.
+
+    Response shapes the Mac decodes (the request id is added by main):
+      capture: {"text": str}, or {"ok": false, "error": "capture failed"}
+      keys and paste: {"sent": true}, or {"sent": false, "reason": r} with r
+        "changed" (an expect string was absent), "capture failed" (the
+        confirming read failed), or "send failed" (plus "sent_count" for
+        keys, how many keys landed first).
+      any command: {"ok": false, "error": "bad pane" | "bad keys" | "bad text"}
+    """
+    pane = valid_pane(request.get("pane"))
+    if pane is None:
         return {"ok": False, "error": "bad pane"}
     command = request.get("cmd")
     if command == "capture":
-        lines = request.get("lines", CAPTURE_DEFAULT_LINES)
-        if not isinstance(lines, int) or isinstance(lines, bool):
-            lines = CAPTURE_DEFAULT_LINES
-        text = tmux_capture(pane, max(1, min(CAPTURE_MAX_LINES, lines)))
+        text = pane_text(pane)
         if text is None:
             return {"ok": False, "error": "capture failed"}
         return {"text": text}
@@ -1180,6 +1201,11 @@ def handle_tmux(request):
         text = request.get("text")
         if not isinstance(text, str):
             return {"ok": False, "error": "bad text"}
+        # Precondition: tmux applies bracketed paste (-p) only when the
+        # pane's app enabled the mode, and the Mac verifies the paste on
+        # screen before it sends Enter. Stripping controls keeps a reply from
+        # carrying its own escape sequences or ending the paste early.
+        text = PASTE_STRIP.sub("", text)
         loaded = tmux_run(pane, ["load-buffer", "-b", PASTE_BUFFER, "-"],
                           input=text.encode("utf-8"))
         if loaded is None or loaded.returncode != 0:
@@ -1198,9 +1224,12 @@ def handle_tmux(request):
     gap = request.get("gap", KEY_GAP_DEFAULT)
     if not isinstance(gap, (int, float)) or isinstance(gap, bool) or gap < 0:
         gap = KEY_GAP_DEFAULT
+    gap = min(gap, KEY_GAP_MAX)
     if expect:
-        screen = tmux_capture(pane, CAPTURE_DEFAULT_LINES)
-        if screen is None or any(e not in screen for e in expect):
+        screen = pane_text(pane)
+        if screen is None:
+            return {"sent": False, "reason": "capture failed"}
+        if any(e not in screen for e in expect):
             return {"sent": False, "reason": "changed"}
     for index, key in enumerate(keys):
         if index:

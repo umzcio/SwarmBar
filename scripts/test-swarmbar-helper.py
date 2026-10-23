@@ -991,7 +991,8 @@ class ProcessTableTests(unittest.TestCase):
 class TmuxRecorder(object):
     """Stands in for helper.run_command and records argv lists and inputs."""
 
-    def __init__(self, screen="", fail_on_send=None):
+    def __init__(self, screen="", fail_on_send=None, capture_code=0):
+        self.capture_code = capture_code
         self.calls = []
         self.inputs = []
         self.screen = screen
@@ -1007,16 +1008,31 @@ class TmuxRecorder(object):
             if self.fail_on_send == self.sends:
                 code = 1
         out = self.screen.encode("utf-8") if "capture-pane" in argv else b""
+        if "capture-pane" in argv:
+            code = self.capture_code
         return subprocess.CompletedProcess(argv, code, stdout=out, stderr=b"")
 
     def sent(self):
         return [c for c in self.calls if "send-keys" in c]
 
 
-PANE = {"socket": "/tmp/tmux-1000/default", "id": "%3"}
-
-
 class TmuxCommandTests(unittest.TestCase):
+    def setUp(self):
+        import socket as socket_module
+        # Short path: unix socket paths are limited to about 100 bytes.
+        self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        os.makedirs(os.path.join(self.root, "tmux-1"))
+        path = os.path.join(self.root, "tmux-1", "default")
+        self.server = socket_module.socket(socket_module.AF_UNIX)
+        self.addCleanup(self.server.close)
+        self.server.bind(path)
+        self.sock = path
+        self.pane = {"socket": path, "id": "%3"}
+        patcher = mock.patch.dict(os.environ, {"TMUX_TMPDIR": self.root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def call(self, request, recorder):
         with mock.patch.object(helper, "run_command", recorder), \
                 mock.patch.object(helper.time, "sleep"):
@@ -1027,21 +1043,18 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(helper.tmux_key_args("DOWN"), ["Down"])
         self.assertEqual(helper.tmux_key_args("ESC"), ["Escape"])
         self.assertEqual(helper.tmux_key_args("\n"), ["Enter"])
-        self.assertEqual(helper.tmux_key_args("1"), ["-l", "1"])
+        self.assertEqual(helper.tmux_key_args("1"), ["-l", "--", "1"])
 
-    def test_capture_uses_clamped_lines(self):
+    def test_capture_is_visible_screen_only(self):
         rec = TmuxRecorder(screen="hello")
-        out = self.call({"cmd": "capture", "pane": PANE, "lines": 99999}, rec)
+        out = self.call({"cmd": "capture", "pane": self.pane, "lines": 500}, rec)
         self.assertEqual(out["text"], "hello")
-        self.assertEqual(rec.calls[0], ["tmux", "-S", PANE["socket"], "capture-pane",
-                                        "-p", "-t", "%3", "-S", "-2000"])
-        rec = TmuxRecorder()
-        self.call({"cmd": "capture", "pane": PANE}, rec)
-        self.assertEqual(rec.calls[0][-1], "-60")
+        self.assertEqual(rec.calls[0], ["tmux", "-S", self.sock, "capture-pane",
+                                        "-p", "-t", "%3"])
 
     def test_keys_not_sent_when_expect_missing(self):
         rec = TmuxRecorder(screen="1. Approve once\n2. Deny")
-        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["2"],
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["2"],
                          "expect": ["3. Approve always"]}, rec)
         self.assertEqual(out, {"sent": False, "reason": "changed"})
         self.assertEqual(rec.sent(), [])
@@ -1051,31 +1064,56 @@ class TmuxCommandTests(unittest.TestCase):
         sleeps = []
         with mock.patch.object(helper, "run_command", rec), \
                 mock.patch.object(helper.time, "sleep", sleeps.append):
-            out = helper.handle_tmux({"cmd": "keys", "pane": PANE,
+            out = helper.handle_tmux({"cmd": "keys", "pane": self.pane,
                                       "keys": ["DOWN", "1", "\n"],
-                                      "expect": ["Approve once"], "gap": 0.5})
+                                      "expect": ["Approve once"], "gap": 0.3})
         self.assertEqual(out, {"sent": True})
-        self.assertEqual([c[-1] for c in rec.sent()], ["Down", "1", "Enter"])
-        self.assertIn("-l", rec.sent()[1])
-        self.assertNotIn("-l", rec.sent()[0])
-        self.assertEqual(sleeps, [0.5, 0.5])
+        base = ["tmux", "-S", self.sock, "send-keys", "-t", "%3"]
+        self.assertEqual(rec.sent(), [base + ["Down"], base + ["-l", "--", "1"],
+                                      base + ["Enter"]])
+        self.assertEqual(sleeps, [0.3, 0.3])
+
+    def test_gap_is_clamped(self):
+        rec = TmuxRecorder()
+        sleeps = []
+        with mock.patch.object(helper, "run_command", rec), \
+                mock.patch.object(helper.time, "sleep", sleeps.append):
+            helper.handle_tmux({"cmd": "keys", "pane": self.pane, "keys": ["UP", "UP"],
+                                "expect": [], "gap": 60})
+        self.assertEqual(sleeps, [0.5])
+
+    def test_label_only_in_history_sends_nothing(self):
+        # The fake returns the visible screen; history is never requested.
+        rec = TmuxRecorder(screen="2. Deny")
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": ["Approve once"]}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+        self.assertTrue(all("-S" not in c[3:] for c in rec.calls))
+
+    def test_failed_confirming_capture_sends_nothing(self):
+        rec = TmuxRecorder(capture_code=1)
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": ["Approve"]}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "capture failed"})
+        self.assertEqual(rec.sent(), [])
 
     def test_empty_expect_skips_confirmation(self):
         rec = TmuxRecorder()
-        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["ESC"], "expect": []}, rec)
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["ESC"], "expect": []}, rec)
         self.assertEqual(out, {"sent": True})
         self.assertFalse(any("capture-pane" in c for c in rec.calls))
 
     def test_send_failure_reports_count(self):
         rec = TmuxRecorder(fail_on_send=2)
-        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["UP", "UP", "UP"],
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["UP", "UP", "UP"],
                          "expect": []}, rec)
         self.assertEqual(out, {"sent": False, "reason": "send failed", "sent_count": 1})
         self.assertEqual(len(rec.sent()), 2)
 
     def test_paste_never_sends_enter(self):
         rec = TmuxRecorder()
-        out = self.call({"cmd": "paste", "pane": PANE, "text": "hi\nthere"}, rec)
+        out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi\nthere"}, rec)
         self.assertEqual(out, {"sent": True})
         self.assertEqual(rec.calls[0][3:], ["load-buffer", "-b", "swarmbar", "-"])
         self.assertEqual(rec.inputs[0], b"hi\nthere")
@@ -1083,10 +1121,16 @@ class TmuxCommandTests(unittest.TestCase):
                                             "swarmbar", "-t", "%3"])
         self.assertFalse(any("send-keys" in c for c in rec.calls))
 
+    def test_paste_strips_control_characters(self):
+        rec = TmuxRecorder()
+        self.call({"cmd": "paste", "pane": self.pane,
+                   "text": "a\x1b[201~b\tc\nd\x00\x7fe"}, rec)
+        self.assertEqual(rec.inputs[0], b"a[201~b\tc\nde")
+
     def test_bad_pane_refused(self):
         bad = [
-            {"socket": "/tmp/tmux-1000/default", "id": "3"},
-            {"socket": "/tmp/tmux-1000/default", "id": "%3; rm"},
+            {"socket": self.sock, "id": "3"},
+            {"socket": self.sock, "id": "%3; rm"},
             {"socket": "/tmp/other/default", "id": "%3"},
             {"socket": "tmux-1000/default", "id": "%3"},
             {"socket": "/etc/tmux-x/../passwd", "id": "%3"},
@@ -1098,15 +1142,40 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(out, {"ok": False, "error": "bad pane"}, pane)
             self.assertEqual(rec.calls, [])
 
+    def test_real_socket_accepted_and_resolved_path_used(self):
+        link = os.path.join(self.root, "tmux-1", "alias")
+        os.symlink(self.sock, link)
+        rec = TmuxRecorder()
+        out = self.call({"cmd": "keys", "pane": {"socket": link, "id": "%3"},
+                         "keys": ["UP"], "expect": []}, rec)
+        self.assertEqual(out, {"sent": True})
+        self.assertEqual(rec.calls[0][2], self.sock)
+
+    def test_non_socket_file_refused(self):
+        plain = os.path.join(self.root, "tmux-1", "plain")
+        open(plain, "w").close()
+        self.assertIsNone(helper.valid_pane({"socket": plain, "id": "%1"}))
+
+    def test_owner_mismatch_refused(self):
+        real_stat = os.stat
+        directory = os.path.join(self.root, "tmux-1")
+
+        def fake(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if path == directory:
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev,
+                                       info.st_nlink, info.st_uid + 1, info.st_gid,
+                                       info.st_size, 0, 0, 0))
+            return info
+        with mock.patch.object(helper.os, "stat", fake):
+            self.assertIsNone(helper.valid_pane(self.pane))
+        self.assertIsNotNone(helper.valid_pane(self.pane))
+
     def test_symlink_escaping_tmux_dir_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = os.path.realpath(tmp)
-            os.makedirs(os.path.join(root, "tmux-1"))
-            os.makedirs(os.path.join(root, "elsewhere"))
-            link = os.path.join(root, "tmux-1", "sock")
-            os.symlink(os.path.join(root, "elsewhere", "sock"), link)
-            with mock.patch.dict(os.environ, {"TMUX_TMPDIR": root}):
-                self.assertFalse(helper.valid_pane({"socket": link, "id": "%1"}))
+        os.makedirs(os.path.join(self.root, "elsewhere"))
+        link = os.path.join(self.root, "tmux-1", "sock")
+        os.symlink(os.path.join(self.root, "elsewhere", "sock"), link)
+        self.assertIsNone(helper.valid_pane({"socket": link, "id": "%1"}))
 
     def test_main_dispatch_echoes_id_on_bad_pane(self):
         out = io.StringIO()
