@@ -47,6 +47,16 @@ os.environ.setdefault("SWARMBAR_HELPER_HOMES", _EMPTY_HOME)
 atexit.register(shutil.rmtree, _EMPTY_HOME, True)
 
 
+# Several tests create a home or a config and then ask whether only its owner
+# can write it. That judgement reads the mode, and the mode a temp dir gets
+# depends on the process umask: macOS defaults to 022, Ubuntu to 002, which
+# makes every temp home group-writable and the helper correctly refuses it.
+# Pin 022 for the whole run, so a test that means a specific mode chmods it
+# and every other test sees the same modes on every OS.
+_PREVIOUS_UMASK = os.umask(0o022)
+atexit.register(os.umask, _PREVIOUS_UMASK)
+
+
 def record(text):
     """One JSONL record of roughly `text` shape, newline terminated."""
     return text + "\n"
