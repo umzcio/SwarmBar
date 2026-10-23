@@ -19,6 +19,7 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -985,6 +986,135 @@ class ProcessTableTests(unittest.TestCase):
         lines = by[20]["screen"].splitlines()
         self.assertEqual(len(lines), 60)
         self.assertEqual(lines[-1], "line99")
+
+
+class TmuxRecorder(object):
+    """Stands in for helper.run_command and records argv lists and inputs."""
+
+    def __init__(self, screen="", fail_on_send=None):
+        self.calls = []
+        self.inputs = []
+        self.screen = screen
+        self.fail_on_send = fail_on_send
+        self.sends = 0
+
+    def __call__(self, argv, timeout=5, input=None):
+        self.calls.append(list(argv))
+        self.inputs.append(input)
+        code = 0
+        if "send-keys" in argv:
+            self.sends += 1
+            if self.fail_on_send == self.sends:
+                code = 1
+        out = self.screen.encode("utf-8") if "capture-pane" in argv else b""
+        return subprocess.CompletedProcess(argv, code, stdout=out, stderr=b"")
+
+    def sent(self):
+        return [c for c in self.calls if "send-keys" in c]
+
+
+PANE = {"socket": "/tmp/tmux-1000/default", "id": "%3"}
+
+
+class TmuxCommandTests(unittest.TestCase):
+    def call(self, request, recorder):
+        with mock.patch.object(helper, "run_command", recorder), \
+                mock.patch.object(helper.time, "sleep"):
+            return helper.handle_tmux(request)
+
+    def test_key_mapping(self):
+        self.assertEqual(helper.tmux_key_args("UP"), ["Up"])
+        self.assertEqual(helper.tmux_key_args("DOWN"), ["Down"])
+        self.assertEqual(helper.tmux_key_args("ESC"), ["Escape"])
+        self.assertEqual(helper.tmux_key_args("\n"), ["Enter"])
+        self.assertEqual(helper.tmux_key_args("1"), ["-l", "1"])
+
+    def test_capture_uses_clamped_lines(self):
+        rec = TmuxRecorder(screen="hello")
+        out = self.call({"cmd": "capture", "pane": PANE, "lines": 99999}, rec)
+        self.assertEqual(out["text"], "hello")
+        self.assertEqual(rec.calls[0], ["tmux", "-S", PANE["socket"], "capture-pane",
+                                        "-p", "-t", "%3", "-S", "-2000"])
+        rec = TmuxRecorder()
+        self.call({"cmd": "capture", "pane": PANE}, rec)
+        self.assertEqual(rec.calls[0][-1], "-60")
+
+    def test_keys_not_sent_when_expect_missing(self):
+        rec = TmuxRecorder(screen="1. Approve once\n2. Deny")
+        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["2"],
+                         "expect": ["3. Approve always"]}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_keys_sent_in_order_with_literal_flag(self):
+        rec = TmuxRecorder(screen="1. Approve once")
+        sleeps = []
+        with mock.patch.object(helper, "run_command", rec), \
+                mock.patch.object(helper.time, "sleep", sleeps.append):
+            out = helper.handle_tmux({"cmd": "keys", "pane": PANE,
+                                      "keys": ["DOWN", "1", "\n"],
+                                      "expect": ["Approve once"], "gap": 0.5})
+        self.assertEqual(out, {"sent": True})
+        self.assertEqual([c[-1] for c in rec.sent()], ["Down", "1", "Enter"])
+        self.assertIn("-l", rec.sent()[1])
+        self.assertNotIn("-l", rec.sent()[0])
+        self.assertEqual(sleeps, [0.5, 0.5])
+
+    def test_empty_expect_skips_confirmation(self):
+        rec = TmuxRecorder()
+        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["ESC"], "expect": []}, rec)
+        self.assertEqual(out, {"sent": True})
+        self.assertFalse(any("capture-pane" in c for c in rec.calls))
+
+    def test_send_failure_reports_count(self):
+        rec = TmuxRecorder(fail_on_send=2)
+        out = self.call({"cmd": "keys", "pane": PANE, "keys": ["UP", "UP", "UP"],
+                         "expect": []}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "send failed", "sent_count": 1})
+        self.assertEqual(len(rec.sent()), 2)
+
+    def test_paste_never_sends_enter(self):
+        rec = TmuxRecorder()
+        out = self.call({"cmd": "paste", "pane": PANE, "text": "hi\nthere"}, rec)
+        self.assertEqual(out, {"sent": True})
+        self.assertEqual(rec.calls[0][3:], ["load-buffer", "-b", "swarmbar", "-"])
+        self.assertEqual(rec.inputs[0], b"hi\nthere")
+        self.assertEqual(rec.calls[1][3:], ["paste-buffer", "-p", "-d", "-b",
+                                            "swarmbar", "-t", "%3"])
+        self.assertFalse(any("send-keys" in c for c in rec.calls))
+
+    def test_bad_pane_refused(self):
+        bad = [
+            {"socket": "/tmp/tmux-1000/default", "id": "3"},
+            {"socket": "/tmp/tmux-1000/default", "id": "%3; rm"},
+            {"socket": "/tmp/other/default", "id": "%3"},
+            {"socket": "tmux-1000/default", "id": "%3"},
+            {"socket": "/etc/tmux-x/../passwd", "id": "%3"},
+            None, "x", {},
+        ]
+        for pane in bad:
+            rec = TmuxRecorder()
+            out = self.call({"cmd": "keys", "pane": pane, "keys": ["1"], "expect": []}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad pane"}, pane)
+            self.assertEqual(rec.calls, [])
+
+    def test_symlink_escaping_tmux_dir_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            os.makedirs(os.path.join(root, "tmux-1"))
+            os.makedirs(os.path.join(root, "elsewhere"))
+            link = os.path.join(root, "tmux-1", "sock")
+            os.symlink(os.path.join(root, "elsewhere", "sock"), link)
+            with mock.patch.dict(os.environ, {"TMUX_TMPDIR": root}):
+                self.assertFalse(helper.valid_pane({"socket": link, "id": "%1"}))
+
+    def test_main_dispatch_echoes_id_on_bad_pane(self):
+        out = io.StringIO()
+        req = json.dumps({"cmd": "paste", "id": 9, "pane": {"socket": "/x", "id": "%1"},
+                          "text": "a"}) + "\n"
+        helper.main(stdin=io.StringIO(req), stdout=out)
+        self.assertEqual(json.loads(out.getvalue()),
+                         {"ok": False, "error": "bad pane", "id": 9})
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import stat as stat_module
 import subprocess
 import sys
@@ -750,15 +751,17 @@ def home_entries(warnings, omitted=None):
     return entries
 
 
-def run_command(argv, timeout=5):
+def run_command(argv, timeout=5, input=None):
     """The one place the helper starts a subprocess (ps, tmux, lsof).
 
     Tests replace this so no unit test ever inspects a real process. It
     raises OSError or SubprocessError like subprocess.run, and callers decide
-    whether a failure matters.
+    whether a failure matters. `input` is bytes for the child's stdin (tmux
+    load-buffer reads the paste text there); None leaves stdin alone.
     """
     return subprocess.run(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        input=input,
     )
 
 
@@ -1097,6 +1100,117 @@ def ping():
     }
 
 
+PANE_ID = re.compile(r"^%[0-9]+$")
+CAPTURE_DEFAULT_LINES = 60
+CAPTURE_MAX_LINES = 2000
+KEY_GAP_DEFAULT = 0.08
+PASTE_BUFFER = "swarmbar"
+NAMED_KEYS = {"UP": "Up", "DOWN": "Down", "ESC": "Escape", "\n": "Enter"}
+
+
+def tmux_key_args(key):
+    """The send-keys arguments for one key. Anything unnamed is sent literally
+    with -l so a label such as "Up" typed as text is never read as a key name."""
+    if key in NAMED_KEYS:
+        return [NAMED_KEYS[key]]
+    return ["-l", key]
+
+
+def valid_pane(pane):
+    """Whether a request's pane names a tmux socket this helper may drive.
+
+    The pane comes off the wire, so it is checked as hostile input: the id
+    must be a bare pane id, and the socket must sit in a tmux-* directory both
+    as written and after symlinks resolve, under /tmp or TMUX_TMPDIR, so a
+    request can never point tmux at an arbitrary socket path.
+    """
+    if not isinstance(pane, dict):
+        return False
+    pane_id, sock = pane.get("id"), pane.get("socket")
+    if not isinstance(pane_id, str) or not PANE_ID.match(pane_id):
+        return False
+    if not isinstance(sock, str) or not os.path.isabs(sock):
+        return False
+    if not os.path.basename(os.path.dirname(sock)).startswith("tmux-"):
+        return False
+    real_dir = os.path.dirname(os.path.realpath(sock))
+    if not os.path.basename(real_dir).startswith("tmux-"):
+        return False
+    roots = ["/tmp"]
+    if os.environ.get("TMUX_TMPDIR"):
+        roots.append(os.environ["TMUX_TMPDIR"])
+    parent = os.path.dirname(real_dir)
+    return any(parent == os.path.realpath(root) for root in roots)
+
+
+def tmux_run(pane, args, input=None):
+    """One tmux call against the pane's own server. Returns the completed
+    process, or None when tmux could not run at all."""
+    try:
+        return run_command(["tmux", "-S", pane["socket"]] + args, input=input)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def tmux_capture(pane, lines):
+    done = tmux_run(pane, ["capture-pane", "-p", "-t", pane["id"], "-S", "-%d" % lines])
+    if done is None or done.returncode != 0:
+        return None
+    return done.stdout.decode("utf-8", "replace")
+
+
+def handle_tmux(request):
+    """capture, keys and paste. Keys are confirmed against a fresh capture
+    taken immediately before sending, and any missing expectation sends
+    nothing, because a prompt that moved under the Mac's read could otherwise
+    take a keystroke meant for another prompt."""
+    pane = request.get("pane")
+    if not valid_pane(pane):
+        return {"ok": False, "error": "bad pane"}
+    command = request.get("cmd")
+    if command == "capture":
+        lines = request.get("lines", CAPTURE_DEFAULT_LINES)
+        if not isinstance(lines, int) or isinstance(lines, bool):
+            lines = CAPTURE_DEFAULT_LINES
+        text = tmux_capture(pane, max(1, min(CAPTURE_MAX_LINES, lines)))
+        if text is None:
+            return {"ok": False, "error": "capture failed"}
+        return {"text": text}
+    if command == "paste":
+        text = request.get("text")
+        if not isinstance(text, str):
+            return {"ok": False, "error": "bad text"}
+        loaded = tmux_run(pane, ["load-buffer", "-b", PASTE_BUFFER, "-"],
+                          input=text.encode("utf-8"))
+        if loaded is None or loaded.returncode != 0:
+            return {"sent": False, "reason": "send failed"}
+        # -p wraps the text in bracketed paste, -d drops the buffer after, and
+        # no Enter follows: the Mac decides separately whether to submit.
+        pasted = tmux_run(pane, ["paste-buffer", "-p", "-d", "-b", PASTE_BUFFER,
+                                 "-t", pane["id"]])
+        if pasted is None or pasted.returncode != 0:
+            return {"sent": False, "reason": "send failed"}
+        return {"sent": True}
+    keys, expect = request.get("keys"), request.get("expect") or []
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
+            or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect):
+        return {"ok": False, "error": "bad keys"}
+    gap = request.get("gap", KEY_GAP_DEFAULT)
+    if not isinstance(gap, (int, float)) or isinstance(gap, bool) or gap < 0:
+        gap = KEY_GAP_DEFAULT
+    if expect:
+        screen = tmux_capture(pane, CAPTURE_DEFAULT_LINES)
+        if screen is None or any(e not in screen for e in expect):
+            return {"sent": False, "reason": "changed"}
+    for index, key in enumerate(keys):
+        if index:
+            time.sleep(gap)
+        done = tmux_run(pane, ["send-keys", "-t", pane["id"]] + tmux_key_args(key))
+        if done is None or done.returncode != 0:
+            return {"sent": False, "reason": "send failed", "sent_count": index}
+    return {"sent": True}
+
+
 def main(stdin=None, stdout=None):
     global _OUT
     stdin = stdin if stdin is not None else sys.stdin
@@ -1119,6 +1233,8 @@ def main(stdin=None, stdout=None):
                 response = snapshot()
             elif command == "ping":
                 response = ping()
+            elif command in ("capture", "keys", "paste"):
+                response = handle_tmux(request)
             elif command == "echo":
                 # Hands back whatever the request carried, under the
                 # request's own id. It proves on the Mac that concurrent
