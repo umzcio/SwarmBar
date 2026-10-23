@@ -147,6 +147,49 @@ def owned_home(path):
         return False
 
 
+def home_refusal(path):
+    """Why owned_home refuses a directory that is somebody's home, or None
+    when it is accepted or is nobody's home at all. A refused home's users
+    vanish from the snapshot and the probe, so the refusal is reported
+    rather than silent; a directory that is nobody's home (lost+found,
+    /Users/Shared) hides no one and says nothing."""
+    if owned_home(path):
+        return None
+    try:
+        import pwd
+        real = os.path.realpath(path)
+        owners = [entry for entry in pwd.getpwall()
+                  if entry.pw_dir and os.path.realpath(entry.pw_dir) == real]
+    except (ImportError, OSError):
+        return None
+    if not owners:
+        return None
+    try:
+        info = os.stat(real)
+    except OSError as error:
+        return "cannot examine it: %s" % error.strerror
+    if not stat_module.S_ISDIR(info.st_mode):
+        return "it is not a directory"
+    if info.st_uid not in [entry.pw_uid for entry in owners]:
+        return "it is not owned by its user"
+    if not only_owner_can_write(info):
+        return "someone other than its owner can write to it"
+    return "it is not its owner's home"
+
+
+def refused_homes():
+    """(path, reason) for each candidate home owned_home refuses. None under
+    the test override, which names its homes outright."""
+    if os.environ.get("SWARMBAR_HELPER_HOMES"):
+        return []
+    refused = []
+    for path in home_candidates():
+        reason = home_refusal(path)
+        if reason is not None:
+            refused.append((path, reason))
+    return refused
+
+
 def home_candidates():
     """Where homes may be, before owned_home has a say."""
     if os.geteuid() != 0:
@@ -772,8 +815,14 @@ def home_entries(warnings, omitted=None):
 
     Such a home also goes into `omitted` when a list is passed. The warning
     is free text for a person; the omission is what tells the Mac not to
-    sweep its mirror of that home empty."""
+    sweep its mirror of that home empty. A home owned_home refuses is
+    reported the same way: its users' sessions are not looked at, which
+    must not read as there being none."""
     entries = []
+    for home, reason in refused_homes():
+        warnings.append("refused home %s: %s" % (home, reason))
+        if omitted is not None:
+            omitted.append({"path": home, "reason": "refused: %s" % reason})
     for home in home_dirs():
         try:
             os.listdir(home)
@@ -1322,6 +1371,20 @@ def file_digest(path, limit=None):
     return hashlib.sha256(data).hexdigest(), kept
 
 
+def lookup_state(path):
+    """"absent", "present" or "unknown" for a path, not following a final
+    link. Absent only when lstat says there is no such entry: a directory
+    on the way that cannot be searched hides the file, and that is could
+    not look, never not there."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
+
+
 def owner_only_path(home, resolved, uid):
     """Whether every directory from the home down to a file is owned by
     `uid` and writable by nobody else, the file included and links not
@@ -1392,9 +1455,18 @@ def home_configs(home, warnings):
             candidates = [os.path.join(home, pattern)]
         for candidate in candidates:
             resolved = os.path.realpath(candidate)
-            if resolved in seen or not os.path.isfile(resolved):
+            if resolved in seen:
+                continue
+            state = lookup_state(resolved)
+            if state == "absent" or (state == "present" and not os.path.isfile(resolved)):
                 continue
             seen.add(resolved)
+            if state == "unknown":
+                warnings.append("cannot read %s config %s: cannot look in its directory"
+                                % (tool, resolved))
+                configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None,
+                                "dev": None, "ino": None})
+                continue
             # stat reads no contents, so it is safe even on a refused file.
             try:
                 info = os.stat(resolved)
@@ -1492,9 +1564,10 @@ def mentions_bridge(home, path, uid):
     the config reads, it refuses rather than reads: one bit is still a
     read of a file someone else planted."""
     resolved = os.path.realpath(path)
-    if not os.path.lexists(resolved):
+    state = lookup_state(resolved)
+    if state == "absent":
         return False
-    if not owner_only_path(home, resolved, uid):
+    if state == "unknown" or not owner_only_path(home, resolved, uid):
         return None
     data = read_owned_bytes(resolved, uid, WHOLE_MAX_BYTES)
     if data is None:
@@ -1515,30 +1588,46 @@ def home_tools(home):
 
 def home_installed(home, warnings):
     """(installed, unknown): which tools' remote bridges are in place in a
-    home, and which could not be told because a config could not be read,
-    each in TOOL_ORDER.
+    home, and which could not be told because a config could not be read
+    or the bridge file could not be looked for, each in TOOL_ORDER.
 
     Claude counts only when every config dir it is used from names the
     bridge, so a second profile without hooks still reads as not set up."""
     installed, unknown = set(), set()
     uid = home_owner(home)[1]
     for tool, bridge in BRIDGE_FILES:
-        if not os.path.isfile(os.path.join(home, bridge)):
-            continue
         if tool == "claude":
             used = [d for d in claude_config_dirs(home)
                     if os.path.isdir(os.path.join(d, "projects"))]
             found = [mentions_bridge(home, os.path.join(d, "settings.json"), uid)
                      for d in used]
         else:
-            found = [mentions_bridge(home, os.path.join(home, pattern), uid)
-                     for name, pattern in CONFIG_TOOLS if name == tool]
-            # One OpenCode config naming the bridge is enough.
+            # Only the configs that are there, or may be: a missing
+            # opencode.json beside an .jsonc that cannot be read is could
+            # not tell, and its False must not decide it.
+            paths = [os.path.join(home, pattern) for name, pattern in CONFIG_TOOLS if name == tool]
+            found = [mentions_bridge(home, path, uid) for path in paths
+                     if lookup_state(os.path.realpath(path)) != "absent"]
+            # One OpenCode config naming the bridge is enough, and one that
+            # cannot be read leaves the rest unable to say no.
             if True in found:
                 found = [True]
+            elif None in found:
+                found = [None]
         if not found or False in found:
             continue
-        if None in found:
+        # The configs name the bridge, or may. Whether the file they name
+        # is there decides it, and a directory that cannot be searched
+        # leaves that unknown rather than missing.
+        bridge_path = os.path.join(home, bridge)
+        state = lookup_state(bridge_path)
+        if state == "absent" or (state == "present" and not os.path.isfile(bridge_path)):
+            continue
+        if state == "unknown":
+            unknown.add(tool)
+            warnings.append("cannot tell whether %s is set up in %s: cannot look for %s"
+                            % (tool, home, bridge_path))
+        elif None in found:
             unknown.add(tool)
             warnings.append("cannot tell whether %s is set up in %s: a config cannot be read "
                             "or is not the home owner's own" % (tool, home))

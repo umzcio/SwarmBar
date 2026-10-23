@@ -2588,6 +2588,112 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["installed"][self.home], ["kimi"])
         self.assertEqual(result["installed_unknown"][self.home], [])
 
+    def refusing_open(self, *paths):
+        """open() that refuses these files, the way a mode 600 file of
+        another user refuses."""
+        real_open = open
+        refused = set(os.path.realpath(p) for p in paths)
+
+        def refusing(name, *args, **kwargs):
+            if isinstance(name, str) and os.path.realpath(name) in refused:
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+        return mock.patch("builtins.open", side_effect=refusing)
+
+    def test_unreadable_opencode_config_is_unknown_not_missing(self):
+        # No opencode.json at all, and an .jsonc that cannot be read: that
+        # is could-not-tell, never not-set-up.
+        self.put(".config/opencode/plugins/swarmbar-remote.js", "// plugin\n")
+        jsonc = self.put(".config/opencode/opencode.jsonc", '{"plugin": ["swarmbar-remote"]}\n')
+        with self.refusing_open(jsonc):
+            result = self.probe()
+        self.assertEqual(result["installed"][self.home], [])
+        self.assertEqual(result["installed_unknown"][self.home], ["opencode"])
+        self.assertTrue(any("opencode" in w for w in result["warnings"]), result["warnings"])
+
+        # One that does not name the plugin beside one that cannot be read
+        # still cannot say.
+        self.put(".config/opencode/opencode.json", "{}\n")
+        with self.refusing_open(jsonc):
+            result = self.probe()
+        self.assertEqual(result["installed_unknown"][self.home], ["opencode"])
+
+        # Readable, it is simply installed; and with neither naming it, not.
+        self.assertEqual(self.probe()["installed"][self.home], ["opencode"])
+        self.put(".config/opencode/opencode.jsonc", "{}\n")
+        result = self.probe()
+        self.assertEqual((result["installed"][self.home], result["installed_unknown"][self.home]), ([], []))
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
+    def test_config_in_an_untraversable_dir_is_unreadable_not_absent(self):
+        self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n", 0o700)
+        path = os.path.realpath(
+            self.put(".kimi-code/config.toml", 'command = "swarmbar-remote-kimi-hook.sh"\n'))
+        locked = os.path.join(self.home, ".kimi-code")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o755)
+        result = self.probe()
+        entries = [c for c in result["configs"][self.home] if c["tool"] == "kimi"]
+        self.assertEqual([(c["path"], c["sha256"], c["text"]) for c in entries], [(path, None, None)])
+        self.assertTrue(any("kimi" in w and path in w for w in result["warnings"]), result["warnings"])
+        self.assertEqual(result["installed"][self.home], [])
+        self.assertEqual(result["installed_unknown"][self.home], ["kimi"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory")
+    def test_bridge_in_an_untraversable_dir_is_unknown_not_missing(self):
+        self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n", 0o700)
+        self.put(".kimi-code/config.toml", 'command = "swarmbar-remote-kimi-hook.sh"\n')
+        locked = os.path.join(self.home, ".swarmbar")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        result = self.probe()
+        self.assertEqual(result["installed"][self.home], [])
+        self.assertEqual(result["installed_unknown"][self.home], ["kimi"])
+
+    def refused_home_setup(self):
+        """Two homes from the passwd file, one of them writable by anyone,
+        found the way root finds them, without the test override."""
+        good = os.path.join(self.root, "home", "u")
+        bad = os.path.join(self.root, "home", "w")
+        stray = os.path.join(self.root, "home", "lost+found")
+        for path in (bad, stray):
+            os.makedirs(path)
+        os.chmod(bad, 0o777)
+        self.addCleanup(os.chmod, bad, 0o755)
+        uid, gid = os.getuid(), os.getgid()
+        entry = lambda name, home: mock.Mock(pw_name=name, pw_uid=uid, pw_gid=gid, pw_dir=home)
+        entries = {good: entry("u", good), bad: entry("w", bad)}
+        patches = [
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch.object(helper, "home_candidates", return_value=[good, bad, stray]),
+            mock.patch("pwd.getpwall", return_value=list(entries.values())),
+            mock.patch("pwd.getpwuid", side_effect=lambda u: entries[good]),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.environ.pop("SWARMBAR_HELPER_HOMES", None)
+        return good, bad
+
+    def test_a_refused_home_is_named_not_dropped(self):
+        good, bad = self.refused_home_setup()
+        warnings, omitted = [], []
+        homes = helper.home_entries(warnings, omitted)
+        self.assertEqual([h["path"] for h in homes], [good])
+        self.assertEqual(len([w for w in warnings if bad in w]), 1, warnings)
+        self.assertEqual([o["path"] for o in omitted], [bad])
+        self.assertIn("write", omitted[0]["reason"])
+        # A directory that is nobody's home is not one SwarmBar left out.
+        self.assertFalse(any("lost+found" in w for w in warnings))
+
+    def test_a_refused_home_shows_in_the_snapshot_and_probe(self):
+        good, bad = self.refused_home_setup()
+        with mock.patch.object(helper, "run_command", FakeRunner(ps="")):
+            result = helper.snapshot()
+        self.assertIn(bad, [o["path"] for o in result["omitted"]])
+        self.assertTrue(any(bad in w for w in result["warnings"]), result["warnings"])
+        self.assertTrue(any(bad in w for w in self.probe()["warnings"]))
+
     def test_probe_hashes_itself_only_when_run_from_a_file(self):
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
         with open(script, "rb") as handle:
