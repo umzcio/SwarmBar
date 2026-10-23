@@ -818,24 +818,99 @@ def run_command(argv, timeout=5, input=None, **options):
     start_new_session, a timeout kills the child's whole process group,
     since a wrapper script that execs node can leave a grandchild running
     after its own pid is gone.
+
+    A grandchild can also leave the group with setsid, as a daemonizing
+    tool does, and killpg never reaches it. With an `env` given, every
+    descendant inherits a marker of this call's own, and whatever still
+    carries it once the call is over is killed, whether the call finished
+    or timed out. Such a grandchild may also hold the output pipes open,
+    so reading what is left after a timeout is bounded too: the call
+    returns either way, never waiting on a process it did not start.
     """
     if not options.get("start_new_session"):
         return subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
             input=input, **options
         )
-    with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as proc:
-        try:
-            out, err = proc.communicate(input, timeout=timeout)
-        except subprocess.TimeoutExpired:
+    marker = None
+    if options.get("env") is not None:
+        marker = os.urandom(8).hex()
+        options = dict(options, env=dict(options["env"], **{RUN_MARKER: marker}))
+    try:
+        with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as proc:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                out, err = proc.communicate(input, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                if marker is not None:
+                    kill_marked(marker)
+                try:
+                    proc.communicate(timeout=DRAIN_SECONDS)
+                except subprocess.TimeoutExpired:
+                    # Something outside the group still holds a pipe.
+                    for stream in (proc.stdout, proc.stderr):
+                        if stream is not None:
+                            stream.close()
+                    proc.kill()
+                    proc.wait()
+                raise
+            return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+    finally:
+        if marker is not None:
+            kill_marked(marker)
+
+
+# The environment variable run_command marks a call's descendants with.
+RUN_MARKER = "SWARMBAR_RUN"
+# How long a timed-out call waits for its output pipes after the kill.
+DRAIN_SECONDS = 2
+
+
+def kill_marked(marker):
+    """SIGKILLs every process whose environment carries this run_command
+    call's marker. The marker is random per call, so only its descendants
+    can carry it. Linux reads it from /proc; elsewhere ps -E is asked,
+    which shows it only where the system lets it, so on Darwin this is a
+    best effort."""
+    needle = ("%s=%s" % (RUN_MARKER, marker)).encode("ascii")
+    pids = []
+    if os.path.isdir("/proc/self"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/environ" % entry, "rb") as handle:
+                    environ = handle.read()
             except OSError:
-                proc.kill()
-            proc.communicate()
-            raise
-        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+                continue
+            if needle in environ.split(b"\0"):
+                pids.append(int(entry))
+    else:
+        try:
+            listing = subprocess.run(["ps", "-E", "-ww", "-axo", "pid=,command="],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            listing = b""
+        for line in listing.splitlines():
+            fields = line.split()
+            if fields and fields[0].isdigit() and needle in fields[1:]:
+                pids.append(int(fields[0]))
+    for pid in pids:
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def process_cwd(pid):
@@ -2894,7 +2969,13 @@ def accepted_events(text):
 
 
 def kimi_executable(binary):
-    """The vetted realpath of the build a kimi_events request names, or None.
+    """The vetted realpath of the build a kimi_events request names, or None."""
+    build = kimi_build(binary)
+    return build[1] if build is not None else None
+
+
+def kimi_build(binary):
+    """(found, realpath) of the build a kimi_events request names, or None.
 
     A plain name must be one of the family's own and is found on PATH;
     anything else must be an absolute path to an executable file. Either
@@ -2919,7 +3000,28 @@ def kimi_executable(binary):
         return None
     if os.path.basename(found) in KIMI_BINARIES or os.path.basename(real) in KIMI_BINARIES \
             or real.endswith("/" + BEARCODE_ARGS):
-        return real
+        return found, real
+    return None
+
+
+def link_locations(path):
+    """Where each symlink on the way from `path` to its file lives: the
+    link itself, inside its own directory's realpath. Whoever can change
+    one of those can repoint the name, so each is vetted like the file it
+    leads to. None for a chain too long to follow."""
+    locations = []
+    current = path
+    for _ in range(40):
+        if not os.path.islink(current):
+            return locations
+        location = os.path.join(os.path.realpath(os.path.dirname(current)),
+                                os.path.basename(current))
+        locations.append(location)
+        try:
+            target = os.readlink(location)
+        except OSError:
+            return None
+        current = os.path.join(os.path.dirname(location), target)
     return None
 
 
@@ -2940,19 +3042,26 @@ def root_only_path(path):
         current = parent
 
 
-def doctor_identity(home, executable):
+def doctor_identity(home, executable, found=None):
     """subprocess options that run doctor as the owner of the home being
     configured, or None when it must not run at all. As root, it runs as
     root only for root's own home and only a build nobody but root can
-    have changed: anything else would hand root to whoever could. {} means
-    run as this process."""
+    have changed: anything else would hand root to whoever could. That
+    holds for the name it was found by as much as for the file, since a
+    link in a directory someone else can write is theirs to repoint, so
+    every link from `found` to the file is vetted too. {} means run as
+    this process."""
     user, uid, gid = home_owner(home)
     if uid is None:
         return None
     if os.geteuid() != 0:
         return {} if uid == os.geteuid() else None
     if uid == 0:
-        return {} if root_only_path(executable) else None
+        links = link_locations(found) if found is not None else []
+        if links is None or not root_only_path(executable) \
+                or not all(root_only_path(link) for link in links):
+            return None
+        return {}
     return {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
 
 
@@ -2961,7 +3070,8 @@ def kimi_events(request):
     the owner of the home being configured, as {"events": [...]}, or
     {"events": null, "error": why}."""
     binary = request.get("binary")
-    executable = kimi_executable(binary)
+    build = kimi_build(binary)
+    found, executable = build if build is not None else (None, None)
     if executable is None:
         if binary in KIMI_BINARIES:
             return {"events": None, "error": "%s is not on PATH" % binary}
@@ -2971,7 +3081,7 @@ def kimi_events(request):
     if not isinstance(home, str) or "\x00" in home or os.path.realpath(home) not in homes:
         return {"events": None, "error": "not a home"}
     home = homes[os.path.realpath(home)]
-    ids = doctor_identity(home, executable)
+    ids = doctor_identity(home, executable, found)
     if ids is None:
         return {"events": None, "error": "will not run %s for %s" % (executable, home)}
     temp = tempfile.mkdtemp(prefix="swarmbar-kimi-")

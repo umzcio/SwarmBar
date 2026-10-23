@@ -22,6 +22,7 @@ import random
 import re
 import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -3257,6 +3258,104 @@ class KimiEventsTests(unittest.TestCase):
             return state.startswith(b"Z") or not state
         self.assertTrue(wait_until(gone, 5))
 
+    def detaching_script(self, pidfile, keep_stdout):
+        """A doctor stand-in whose grandchild leaves the process group with
+        setsid, as a daemonizing node tool can, and writes its pid."""
+        detach = ("import os, sys, time\n"
+                  "os.setsid()\n"
+                  "open(%r, 'w').write(str(os.getpid()))\n"
+                  "time.sleep(20)\n" % pidfile)
+        helper_py = self.executable(os.path.join(self.root, "detach.py"), detach)
+        redirect = "" if keep_stdout else " >/dev/null 2>&1"
+        return self.executable(os.path.join(self.root, "doctor"),
+                               "#!/bin/sh\n%s %s%s &\nsleep %s\n"
+                               % (sys.executable, helper_py, redirect, "30" if keep_stdout else "0"))
+
+    def grandchild(self, pidfile):
+        self.assertTrue(wait_until(lambda: os.path.exists(pidfile) and open(pidfile).read(), 5))
+        pid = int(open(pidfile).read())
+
+        def cleanup():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        self.addCleanup(cleanup)
+        return pid
+
+    def test_a_detached_grandchild_holding_the_pipe_cannot_stall_the_call(self):
+        pidfile = os.path.join(self.root, "detached")
+        script = self.detaching_script(pidfile, keep_stdout=True)
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            helper.run_command([script], timeout=1, start_new_session=True, env={"PATH": "/usr/bin:/bin"})
+        self.assertLess(time.monotonic() - started, 8)
+        self.grandchild(pidfile)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "finds stray processes through /proc")
+    def test_a_detached_grandchild_does_not_outlive_the_call(self):
+        for keep in (True, False):
+            pidfile = os.path.join(self.root, "detached-%s" % keep)
+            script = self.detaching_script(pidfile, keep_stdout=keep)
+            try:
+                helper.run_command([script], timeout=2, start_new_session=True,
+                                   env={"PATH": "/usr/bin:/bin"})
+            except subprocess.TimeoutExpired:
+                pass
+            pid = self.grandchild(pidfile)
+
+            def gone():
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                with open("/proc/%d/stat" % pid) as handle:
+                    return handle.read().split(")")[-1].split()[0] == "Z"
+            self.assertTrue(wait_until(gone, 5), keep)
+
+    def test_root_home_vets_where_the_symlink_itself_lives(self):
+        # The realpath is root's alone, but the name it was found by sits in
+        # a directory someone else can write, who could point it anywhere.
+        real = self.executable(os.path.join(self.root, "sys", "kimi"), "#!/bin/sh\n")
+        link = os.path.join(self.bin, "kimi-code")
+        os.symlink(real, link)
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        trusted = lambda path: path == real or path.startswith(os.path.join(self.root, "sys"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("root", 0, 0)), \
+                mock.patch.object(helper, "root_only_path", side_effect=trusted), \
+                mock.patch.object(helper, "run_command", runner):
+            result = self.events(link)
+        self.assertIsNone(result["events"])
+        self.assertIn("will not run", result["error"])
+        runner.assert_not_called()
+
+        # A link in a place only root can change, to a build only root can
+        # change, still runs.
+        root_link = os.path.join(self.root, "sys", "kimi-code")
+        os.symlink(real, root_link)
+        seen = {}
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("root", 0, 0)), \
+                mock.patch.object(helper, "root_only_path", side_effect=trusted), \
+                mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events(root_link)["events"])
+        self.assertEqual(seen["argv"][0], real)
+
+    def test_root_home_vets_every_link_in_a_chain(self):
+        real = self.executable(os.path.join(self.root, "sys", "kimi"), "#!/bin/sh\n")
+        middle = os.path.join(self.bin, "kimi-middle")
+        os.symlink(real, middle)
+        first = os.path.join(self.root, "sys", "kimi-code")
+        os.symlink(middle, first)
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        trusted = lambda path: path.startswith(os.path.join(self.root, "sys"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("root", 0, 0)), \
+                mock.patch.object(helper, "root_only_path", side_effect=trusted), \
+                mock.patch.object(helper, "run_command", runner):
+            self.assertIsNone(self.events(first)["events"])
+        runner.assert_not_called()
 
 class ApplyTests(unittest.TestCase):
     """`swarmbar-helper.py apply <blob>`: the pasted-command path."""
