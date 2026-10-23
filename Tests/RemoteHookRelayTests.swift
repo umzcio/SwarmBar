@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 @testable import SwarmBar
 
@@ -53,10 +54,16 @@ struct RemoteHookRelayTests {
         return object?.isEmpty == true
     }
 
+    /// Suite defaults, never the real ones, and a local home under a temp
+    /// dir, so the local path's Grok and Kimi lookups read nothing real.
     private func rig(remoteHold: Duration = .seconds(350)) -> (SessionStore, HookServer) {
-        let store = SessionStore()
-        let server = HookServer(store: store, remoteDecisionHold: remoteHold)
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        let localHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-hook-local-\(UUID().uuidString)", isDirectory: true)
+        let server = HookServer(store: store, remoteDecisionHold: remoteHold, localHome: localHome)
         store.approvalResponder = server
+        // Nothing here may ever drive this Mac's terminal.
+        store.localAnswerObserver = { _, _ in }
         return (store, server)
     }
 
@@ -70,7 +77,7 @@ struct RemoteHookRelayTests {
 
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: "work",
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
 
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
         #expect(row.status == .waitingApproval(command: "git push"))
@@ -97,7 +104,7 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
 
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
         store.deny(row)
@@ -115,7 +122,7 @@ struct RemoteHookRelayTests {
         ]
         server.handleRemote(
             event: "OpenCodePermission", body: body, accountLabel: nil,
-            origin: origin(mirror: mirror, peer: []), rid: "r2", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror, peer: []), rid: "r2", held: true) { json, _ in answers.append(json) }
 
         let id = RemoteIdentity.sessionID(
             hostID: hostID, home: home, localID: StableID.uuid(for: "ses_abc"))
@@ -138,7 +145,7 @@ struct RemoteHookRelayTests {
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
             origin: origin(mirror: mirror, peer: ["curl", "bash", "grok", "claude"]),
-            rid: "r1", held: true) { answers.append($0) }
+            rid: "r1", held: true) { json, _ in answers.append(json) }
 
         // Answered before handleRemote returned, so the helper lets go at once.
         #expect(answers.count == 1)
@@ -160,7 +167,7 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
 
         #expect(answers.count == 1)
         #expect(isEmptyAnswer(answers[0]))
@@ -176,7 +183,7 @@ struct RemoteHookRelayTests {
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
             origin: origin(mirror: mirror, approvalsOff: [.claudeCode]),
-            rid: "r1", held: true) { answers.append($0) }
+            rid: "r1", held: true) { json, _ in answers.append(json) }
 
         #expect(answers.count == 1)
         #expect(isEmptyAnswer(answers[0]))
@@ -189,7 +196,7 @@ struct RemoteHookRelayTests {
             event: "OpenCodePermission",
             body: ["sessionID": "ses_off", "permission": "bash", "patterns": ["ls"]],
             accountLabel: nil, origin: origin(mirror: mirror, peer: [], approvalsOff: [.openCode]),
-            rid: "r2", held: true) { openCodeAnswers.append($0) }
+            rid: "r2", held: true) { json, _ in openCodeAnswers.append(json) }
         #expect(openCodeAnswers.count == 1)
         #expect(isEmptyAnswer(openCodeAnswers[0]))
     }
@@ -203,7 +210,7 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: false) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: false) { json, _ in answers.append(json) }
 
         #expect(answers.isEmpty)
         #expect(!server.isHolding(sessionID: rowID(raw)))
@@ -221,7 +228,7 @@ struct RemoteHookRelayTests {
         server.handleRemote(
             event: "UserPromptSubmit", body: ["session_id": raw, "cwd": "/home/u/proj"],
             accountLabel: nil, origin: origin(mirror: mirror), rid: "r1", held: false
-        ) { answers.append($0) }
+        ) { json, _ in answers.append(json) }
         #expect(answers.isEmpty)
         #expect(store.sessions.first { $0.id == rowID(raw) }?.status
             == .working(activity: "Thinking…"))
@@ -238,7 +245,7 @@ struct RemoteHookRelayTests {
             mirrorHome: nil, peer: ["claude"], approvalsOff: [])
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin, rid: "r1", held: true) { answers.append($0) }
+            origin: origin, rid: "r1", held: true) { json, _ in answers.append(json) }
         #expect(answers.count == 1)
         #expect(isEmptyAnswer(answers[0]))
         #expect(store.sessions.isEmpty)
@@ -253,11 +260,14 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
         #expect(server.isHolding(sessionID: rowID(raw)))
 
         server.cancelRemote(rid: "r1")
         #expect(!server.isHolding(sessionID: rowID(raw)))
+        // Settled elsewhere, so the row stops asking for approval.
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.status
+            == .working(activity: "Working…"))
         // Answered on the host, so nothing is sent back for it.
         #expect(answers.isEmpty)
         #expect(server.resolveApproval(sessionID: rowID(raw), allow: true) == false)
@@ -271,7 +281,7 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
         #expect(server.isHolding(sessionID: rowID(raw)))
 
         let deadline = ContinuousClock.now + .seconds(2)
@@ -282,6 +292,7 @@ struct RemoteHookRelayTests {
         // The helper gave up at 345 s, so there is nothing to answer.
         #expect(answers.isEmpty)
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
+        #expect(row.status == .working(activity: "Working…"))
         #expect(server.resolveApproval(sessionID: row.id, allow: true) == false)
     }
 
@@ -295,7 +306,7 @@ struct RemoteHookRelayTests {
         for _ in 0..<2 {
             server.handleRemote(
                 event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-                origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+                origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
         }
         #expect(answers.isEmpty)
         #expect(server.isHolding(sessionID: rowID(raw)))
@@ -308,7 +319,7 @@ struct RemoteHookRelayTests {
         var answers: [Data] = []
         server.handleRemote(
             event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
-            origin: origin(mirror: mirror), rid: "r1", held: true) { answers.append($0) }
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in answers.append(json) }
         server.dropRemote(hostID: hostID)
         #expect(!server.isHolding(sessionID: rowID(raw)))
         #expect(answers.isEmpty)
@@ -318,19 +329,24 @@ struct RemoteHookRelayTests {
 
     @MainActor private final class FakeReplier: RemoteHookReplying {
         var replies: [(rid: String, body: JSONValue)] = []
+        var fails = false
         func sendHookReply(rid: String, body: JSONValue) async throws {
             replies.append((rid, body))
+            if fails { throw SSHChannelError.closed("synthetic") }
         }
     }
 
     private func hookLine(
-        rid: String, path: String, body: [String: Any], peer: [String], held: Bool
+        rid: String, path: String, body: [String: Any], peer: [String], held: Bool,
+        generation: Int = 0
     ) throws -> HelperEvent {
         let object: [String: Any] = [
             "event": "hook", "rid": rid, "home": home, "user": "u", "path": path,
             "account": NSNull(), "peer": peer, "body": body, "held": held,
         ]
-        return HelperEvent(name: "hook", payload: try JSONSerialization.data(withJSONObject: object))
+        return HelperEvent(
+            name: "hook", payload: try JSONSerialization.data(withJSONObject: object),
+            generation: generation)
     }
 
     private func settle(until condition: () -> Bool) async {
@@ -465,6 +481,193 @@ struct RemoteHookRelayTests {
         await settle { !replier.replies.isEmpty }
         #expect(replier.replies.first?.body == .object([:]))
         #expect(!server.isHolding(sessionID: rowID(raw)))
+    }
+
+    // MARK: - Review round 1
+
+    /// The helper that held the request is gone, so no reply can land.
+    /// Approve must go away at once and pressing it must not claim success.
+    @Test func relayDropsHoldsWhenTheHelperExits() async throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let replier = FakeReplier()
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: replier, hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+
+        let raw = UUID().uuidString
+        sink.yield(try hookLine(
+            rid: "e1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["claude"], held: true, generation: 3))
+        await settle { server.isHolding(sessionID: rowID(raw)) }
+        #expect(server.isHolding(sessionID: rowID(raw)))
+
+        sink.yield(HelperEvent(name: HelperEvent.helperExited, payload: Data(), generation: 3))
+        await settle { !server.isHolding(sessionID: rowID(raw)) }
+        #expect(!server.isHolding(sessionID: rowID(raw)))
+        #expect(server.resolveApproval(sessionID: rowID(raw), allow: true) == false)
+
+        // A line the dead process said before it went, drained late, must
+        // not bring the hold back.
+        let other = UUID().uuidString
+        sink.yield(try hookLine(
+            rid: "e2", path: "/hook/PermissionRequest", body: permissionBody(other),
+            peer: ["claude"], held: true, generation: 3))
+        // A marker from the next process, to know the stale line was seen.
+        let marker = UUID().uuidString
+        sink.yield(try hookLine(
+            rid: "e3", path: "/hook/UserPromptSubmit", body: ["session_id": marker],
+            peer: [], held: false, generation: 4))
+        await settle { store.sessions.contains { $0.id == rowID(marker) } }
+        #expect(!server.isHolding(sessionID: rowID(other)))
+        #expect(!store.sessions.contains { $0.id == rowID(other) })
+        #expect(replier.replies.isEmpty)
+    }
+
+    @Test func relayDropsHoldsWhenTheStreamEnds() async throws {
+        let (_, server) = rig()
+        let mirror = try makeMirror()
+        let replier = FakeReplier()
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: replier, hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+
+        let raw = UUID().uuidString
+        sink.yield(try hookLine(
+            rid: "s1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["claude"], held: true))
+        await settle { server.isHolding(sessionID: rowID(raw)) }
+        sink.finish()
+        await running.value
+        #expect(!server.isHolding(sessionID: rowID(raw)))
+        #expect(replier.replies.isEmpty)
+    }
+
+    @Test func aReplyThatFailsSaysSoOnTheRow() async throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let replier = FakeReplier()
+        replier.fails = true
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: replier, hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+
+        let raw = UUID().uuidString
+        sink.yield(try hookLine(
+            rid: "f1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["claude"], held: true))
+        await settle { server.isHolding(sessionID: rowID(raw)) }
+        let row = try #require(store.sessions.first { $0.id == rowID(raw) })
+        store.approve(row)
+        let undelivered = SessionStatus.waitingInput(
+            prompt: "Answer at the terminal, SwarmBar could not deliver")
+        await settle { store.sessions.first { $0.id == rowID(raw) }?.status == undelivered }
+        #expect(replier.replies.count == 1)
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.status == undelivered)
+    }
+
+    @Test func aDisabledToolIsNeverHeld() throws {
+        let (store, server) = rig()
+        store.setToolEnabled(.claudeCode, false)
+        store.setToolEnabled(.openCode, false)
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        var answers: [Data] = []
+        server.handleRemote(
+            event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
+            origin: origin(mirror: mirror), rid: "d1", held: true) { json, _ in answers.append(json) }
+        server.handleRemote(
+            event: "OpenCodePermission", body: ["sessionID": "ses_d", "permission": "bash"],
+            accountLabel: nil, origin: origin(mirror: mirror, peer: []), rid: "d2", held: true
+        ) { json, _ in answers.append(json) }
+        #expect(answers.count == 2)
+        #expect(answers.allSatisfy(isEmptyAnswer))
+        #expect(store.sessions.isEmpty)
+
+        // The local socket takes the same path.
+        let connection = NWConnection(host: .ipv4(.loopback), port: 9, using: .tcp)
+        defer { connection.cancel() }
+        let local = UUID()
+        server.route(.init(
+            path: "/hook/PermissionRequest", accountLabel: nil, token: nil,
+            body: ["session_id": local.uuidString, "tool_name": "Bash",
+                   "tool_input": ["command": "ls"]]), connection: connection)
+        #expect(!server.isHolding(sessionID: local))
+    }
+
+    @Test func pathLikeIdsAreNoTool() throws {
+        let mirror = try makeMirror()
+        let home = try #require(mirror.local(self.home))
+        for raw in ["../x", "a/b", ".", "..", "/etc/passwd", ""] {
+            #expect(HookServer.originTool(rawSessionID: raw, home: home) == nil, "\(raw)")
+        }
+        #expect(HookServer.originTool(rawSessionID: UUID().uuidString, home: home) == .claudeCode)
+
+        let (store, server) = rig()
+        var answers: [Data] = []
+        server.handleRemote(
+            event: "PermissionRequest", body: permissionBody("../../etc"), accountLabel: nil,
+            origin: origin(mirror: mirror), rid: "p1", held: true) { json, _ in answers.append(json) }
+        #expect(answers.count == 1)
+        #expect(isEmptyAnswer(answers[0]))
+        #expect(store.sessions.isEmpty)
+    }
+
+    /// Approve and Deny on a remote row must never fall through to the
+    /// routes that drive a terminal on this Mac.
+    @Test func remoteApproveNeverReachesTheLocalTerminal() {
+        let (store, _) = rig()
+        var routed: [AgentSession] = []
+        store.localAnswerObserver = { session, _ in routed.append(session) }
+        let remote = AgentSession(
+            tool: .kimiCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "ls"), host: "devbox")
+        store.upsert(remote)
+        store.approve(remote)
+        store.deny(remote)
+        #expect(routed.isEmpty)
+        #expect(store.sessions.first { $0.id == remote.id }?.status
+            == .waitingApproval(command: "ls"))
+
+        // The seam does see a local row, so the empty list above means
+        // something.
+        let local = AgentSession(
+            tool: .kimiCode, projectName: "proj", projectPath: URL(fileURLWithPath: "/tmp"),
+            status: .waitingApproval(command: "ls"))
+        store.upsert(local)
+        store.approve(local)
+        #expect(routed.map(\.id) == [local.id])
+    }
+
+    /// The local socket path: a held request whose client goes away can no
+    /// longer be answered.
+    @Test func localHoldEndsWhenItsConnectionDoes() async throws {
+        let (_, server) = rig()
+        let connection = NWConnection(host: .ipv4(.loopback), port: 9, using: .tcp)
+        defer { connection.cancel() }
+        let id = UUID()
+        server.route(.init(
+            path: "/hook/PermissionRequest", accountLabel: nil, token: nil,
+            body: ["session_id": id.uuidString, "tool_name": "Bash",
+                   "tool_input": ["command": "ls"]]), connection: connection)
+        #expect(server.isHolding(sessionID: id))
+
+        // A connection's state only moves once it has a queue, so it is
+        // started here, after routing, and closed at once.
+        connection.start(queue: .main)
+        connection.cancel()
+        await settle { !server.isHolding(sessionID: id) }
+        #expect(!server.isHolding(sessionID: id))
+        #expect(server.resolveApproval(sessionID: id, allow: true) == false)
     }
 
     // MARK: - Scripts

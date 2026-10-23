@@ -250,6 +250,22 @@ struct HelperChannelTests {
         await channel.shutdown()
     }
 
+    /// A held request dies with the process that held it, so a reader must
+    /// hear about the exit itself rather than wait out a hold window.
+    @Test("a torn-down helper says so on the events stream", .enabled(if: pythonAvailable))
+    func teardownIsYielded() async throws {
+        let channel = SSHChannel(launch: try scriptedHelper())
+        _ = try await channel.request("emit")
+        var events = channel.events.makeAsyncIterator()
+        let hook = try #require(await events.next())
+        #expect(hook.name == "hook")
+        #expect(hook.generation == 1)
+        await channel.shutdown()
+        let exited = try #require(await events.next())
+        #expect(exited.name == HelperEvent.helperExited)
+        #expect(exited.generation == 1)
+    }
+
     @Test("a helper that keeps answering ok false backs off further each time", .enabled(if: pythonAvailable))
     func refusedSnapshotsGrowTheBackoff() async throws {
         let channel = SSHChannel(launch: try scriptedHelper())

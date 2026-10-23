@@ -67,9 +67,17 @@ final class HookServer: ApprovalResponding {
     /// the connection. Injectable so tests need not wait it out.
     private let remoteDecisionHold: Duration
 
-    init(store: SessionStore, remoteDecisionHold: Duration = .seconds(350)) {
+    /// Whose agent state tells local hooks apart. This Mac's home, except
+    /// in tests, which must never read a real one.
+    private let localHome: URL
+
+    init(
+        store: SessionStore, remoteDecisionHold: Duration = .seconds(350),
+        localHome: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
         self.store = store
         self.remoteDecisionHold = remoteDecisionHold
+        self.localHome = localHome
     }
 
     func start() {
@@ -267,7 +275,7 @@ final class HookServer: ApprovalResponding {
             // Grok Build imports Claude-compatible hooks from the shared
             // settings and runs them too, so events arriving here are not
             // necessarily Claude Code's.
-            tool: { Self.originTool(rawSessionID: $0) },
+            tool: { [localHome] in Self.originTool(rawSessionID: $0, home: localHome) },
             cwd: cwd,
             accountLabel: request.accountLabel,
             host: nil,
@@ -317,6 +325,13 @@ final class HookServer: ApprovalResponding {
         let release: () -> Void
         /// Parks the request for the popover to answer.
         let hold: (UUID, ApprovalKind) -> Void
+    }
+
+    /// A tool switched off in Settings shows no row, so a held request
+    /// from it could only stall its agent for the whole hold with nothing
+    /// on screen to answer. It is answered {} at once instead.
+    private func mayHold(_ kind: ApprovalKind, _ tool: AgentTool, _ context: HookContext) -> Bool {
+        store.isEnabled(tool) && context.mayHold(kind, tool)
     }
 
     /// Every path through here calls exactly one of `release` and `hold`,
@@ -370,7 +385,7 @@ final class HookServer: ApprovalResponding {
         switch event {
         case "PermissionRequest", "PreToolUseHold":
             apply(.waitingApproval(command: Self.commandDescription(body)), sticky: true)
-            if context.mayHold(.claudeHook, tool) {
+            if mayHold(.claudeHook, tool, context) {
                 context.hold(sessionID, .claudeHook)
             } else {
                 context.release()
@@ -379,11 +394,7 @@ final class HookServer: ApprovalResponding {
         case "PermissionResult":
             cancelPending(sessionID: sessionID)
             store.clearHookOverride(sessionID: sessionID)
-            store.update(id: sessionID) { session in
-                if case .waitingApproval = session.status {
-                    session.status = .working(activity: "Working…")
-                }
-            }
+            leaveApproval(sessionID: sessionID)
             context.release()
 
         case "PreToolUse":
@@ -429,19 +440,19 @@ final class HookServer: ApprovalResponding {
     func handleRemote(
         event: String, body: [String: Any], accountLabel: String?,
         origin: RemoteHookOrigin, rid: String, held: Bool,
-        respond: @escaping (Data) -> Void
+        respond: @escaping (Data, ((Bool) -> Void)?) -> Void
     ) {
         // A follower that reconnects replays every hold still open. The
         // first copy is already answerable, and holding the second would
         // supersede the first by answering it {}.
         if held, pendingApprovals.values.contains(where: { $0.remote?.rid == rid }) { return }
 
-        let release: () -> Void = held ? { respond(Data("{}".utf8)) } : {}
+        let release: () -> Void = held ? { respond(Data("{}".utf8), nil) } : {}
         let context = HookContext(
             rowID: { RemoteIdentity.sessionID(hostID: origin.hostID, home: origin.home, localID: $0) },
             // A home the mirror refuses cannot say whose session this is,
             // so it is treated as unknown rather than guessed at.
-            tool: { raw in origin.mirrorHome.map { Self.originTool(rawSessionID: raw, home: $0) } },
+            tool: { raw in origin.mirrorHome.flatMap { Self.originTool(rawSessionID: raw, home: $0) } },
             cwd: body["cwd"] as? String,
             accountLabel: accountLabel,
             host: origin.hostName,
@@ -464,7 +475,7 @@ final class HookServer: ApprovalResponding {
                 guard let self else { release(); return }
                 self.holdForDecision(
                     sessionID: sessionID, kind: kind, window: self.remoteDecisionHold,
-                    respond: { json, _ in respond(json) },
+                    respond: respond,
                     isGone: { false },
                     remote: (rid, origin.hostID))
             })
@@ -472,16 +483,32 @@ final class HookServer: ApprovalResponding {
     }
 
     /// The helper says a held request is over: answered from another Mac,
-    /// at the terminal, or let go. Nothing is sent back for it.
+    /// at the terminal, or let go. Nothing is sent back for it, and the row
+    /// stops asking, as it does for a local PermissionResult.
     func cancelRemote(rid: String) {
         for (sessionID, pending) in pendingApprovals where pending.remote?.rid == rid {
             dropPending(sessionID: sessionID)
+            leaveApproval(sessionID: sessionID)
         }
     }
 
-    /// A host's relay stopped. Its holds are forgotten without an answer:
-    /// replying would start a helper for a host that was just stopped, and
-    /// a helper whose Mac goes away drops its holds by itself.
+    /// The prompt was settled somewhere other than this popover, so the
+    /// row stops claiming it needs approval rather than waiting a poll.
+    private func leaveApproval(sessionID: UUID) {
+        store.update(id: sessionID) { session in
+            if case .waitingApproval = session.status {
+                session.status = .working(activity: "Working…")
+            }
+        }
+    }
+
+    /// A host's relay stopped, or its helper process exited. Its holds are
+    /// forgotten without an answer: the helper that held them is gone, so
+    /// a reply could only reach a new one that has never heard of them,
+    /// and replying to a stopped host would start a helper for it. The row
+    /// keeps its prompt, which an agent whose hook lost its helper falls
+    /// back to showing in its own terminal; a hold a surviving owner still
+    /// has is replayed to the next helper and held again.
     func dropRemote(hostID: UUID) {
         for (sessionID, pending) in pendingApprovals where pending.remote?.hostID == hostID {
             dropPending(sessionID: sessionID)
@@ -503,10 +530,19 @@ final class HookServer: ApprovalResponding {
     ///
     /// `home` is whose state to consult: this Mac's for the local hook
     /// server, a host's mirrored home for an event relayed from it.
+    ///
+    /// Nil for an id that could name a path: Grok's lookup joins the id
+    /// onto a directory, and a relayed id is the remote host's to choose,
+    /// so one holding a slash or a dot component could reach outside the
+    /// mirror. Such an id is no tool's, and above all not Claude's, so it is
+    /// never held.
     nonisolated static func originTool(
         rawSessionID: String,
         home: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) -> AgentTool {
+    ) -> AgentTool? {
+        guard !rawSessionID.isEmpty, !rawSessionID.contains("/"), !rawSessionID.contains("\0"),
+              rawSessionID != ".", rawSessionID != ".."
+        else { return nil }
         if rawSessionID.hasPrefix("session_") {
             let indexes: [(String, AgentTool)] = [
                 (".kimi-code/session_index.jsonl", .kimiCode),
@@ -567,7 +603,7 @@ final class HookServer: ApprovalResponding {
             sticky: true, cwd: body["directory"] as? String, accountLabel: nil,
             host: context.host
         )
-        if context.mayHold(.openCodePlugin, .openCode) {
+        if mayHold(.openCodePlugin, .openCode, context) {
             context.hold(sessionID, .openCodePlugin)
         } else {
             context.release()
@@ -629,8 +665,10 @@ final class HookServer: ApprovalResponding {
                 self.finishPending(sessionID: sessionID, json: Data("{}".utf8))
             } else {
                 // The helper let go at 345 s and answered {} itself, so
-                // there is nothing left to reply to.
+                // there is nothing left to reply to, and the row stops
+                // asking for an answer nothing can take.
                 self.pendingApprovals.removeValue(forKey: sessionID)
+                self.leaveApproval(sessionID: sessionID)
             }
             // Drop the sticky override too, or the row keeps showing
             // Approve/Deny buttons that can no longer answer anything.

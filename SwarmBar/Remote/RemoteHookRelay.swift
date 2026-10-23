@@ -28,7 +28,13 @@ protocol RemoteHookReplying: Sendable {
 
 extension SSHChannel: RemoteHookReplying {
     func sendHookReply(rid: String, body: JSONValue) async throws {
-        _ = try await request("hook_reply", ["rid": .string(rid), "body": body])
+        let line = try await request("hook_reply", ["rid": .string(rid), "body": body])
+        // `request` hands back any answer, and a refused reply landed
+        // nowhere, so it counts as undelivered.
+        let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+        guard object?["ok"] as? Bool == true else {
+            throw SSHChannelError.badResponse(String(decoding: line.prefix(200), as: UTF8.self))
+        }
     }
 }
 
@@ -47,6 +53,10 @@ final class RemoteHookRelay {
     /// Read per event rather than once, so switching approvals off for a
     /// host in Settings applies to its next prompt without a restart.
     private let approvalsOff: @MainActor () -> Set<AgentTool>
+    /// The newest helper process known to have exited. Its events, and any
+    /// older one's, can still be draining from the old reader, and a hold
+    /// they describe died with it.
+    private var exitedGeneration = 0
 
     convenience init(
         connection: RemoteHostConnection, hookServer: HookServer,
@@ -73,15 +83,24 @@ final class RemoteHookRelay {
         self.approvalsOff = approvalsOff
     }
 
-    /// Runs until the task is cancelled or the channel ends.
+    /// Runs until the task is cancelled or the channel ends. Either way no
+    /// helper is left to take a reply, so the host's holds go with it.
     func run() async {
         for await event in events {
-            if Task.isCancelled { return }
+            if Task.isCancelled { break }
             handle(event)
         }
+        hookServer.dropRemote(hostID: hostID)
     }
 
     func handle(_ event: HelperEvent) {
+        if event.name == HelperEvent.helperExited {
+            exitedGeneration = max(exitedGeneration, event.generation)
+            hookServer.dropRemote(hostID: hostID)
+            return
+        }
+        // From a process already gone: whatever it held is gone too.
+        if event.generation != 0 && event.generation <= exitedGeneration { return }
         guard let object = (try? JSONSerialization.jsonObject(with: event.payload)) as? [String: Any],
               let rid = object["rid"] as? String
         else { return }
@@ -100,20 +119,22 @@ final class RemoteHookRelay {
         // else it has already answered {}, and must be left alone.
         let held = object["held"] as? Bool == true
         let replier = replier
-        let respond: (Data) -> Void = { json in
+        let respond: (Data, ((Bool) -> Void)?) -> Void = { json, completion in
             let body = (try? JSONDecoder().decode(JSONValue.self, from: json)) ?? .object([:])
-            Task {
+            Task { @MainActor in
                 do {
                     try await replier.sendHookReply(rid: rid, body: body)
+                    completion?(true)
                 } catch {
-                    // The helper drops its holds when its Mac goes away, and
-                    // the row is released when the hold window runs out.
+                    // A decision that never landed leaves the agent at its
+                    // own prompt, which the row then says.
                     NSLog("SwarmBar: hook_reply for \(rid) failed: \(error)")
+                    completion?(false)
                 }
             }
         }
         guard let home = object["home"] as? String, let path = object["path"] as? String else {
-            if held { respond(Data("{}".utf8)) }
+            if held { respond(Data("{}".utf8), nil) }
             return
         }
         let origin = RemoteHookOrigin(

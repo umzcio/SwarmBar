@@ -318,6 +318,11 @@ final class SessionStore {
     @ObservationIgnored private(set) var hookOverrides: [UUID: HookOverride] = [:]
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
+    /// Test seam. When set, a local answer is reported here instead of
+    /// being carried out, so a test can prove which sessions would have
+    /// driven this Mac's terminal without ever driving it.
+    @ObservationIgnored var localAnswerObserver: ((AgentSession, ApprovalRoute) -> Void)?
+
     /// Sessions whose tool reported the session over (Claude and Grok's
     /// SessionEnd hook fires on /exit), and when. The transcript keeps
     /// looking fresh for a while, so without this an exited session reads
@@ -530,6 +535,10 @@ final class SessionStore {
             update(id: session.id) { $0.status = .runningTool(activity: running(command)) }
             return
         }
+        // Every route below reaches into a terminal on THIS Mac, which a
+        // remote session is not in. Nothing is sent until the remote
+        // keystroke path exists.
+        guard session.host == nil else { return }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: true, in: environment(for: session)),
             for: session,
@@ -544,6 +553,7 @@ final class SessionStore {
             update(id: session.id) { $0.status = .working(activity: "Rethinking after deny…") }
             return
         }
+        guard session.host == nil else { return }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: false, in: environment(for: session)),
             for: session,
@@ -568,6 +578,10 @@ final class SessionStore {
         choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?,
         mockStatus: SessionStatus
     ) {
+        if let localAnswerObserver {
+            localAnswerObserver(session, route)
+            return
+        }
         switch route {
         case .keys(let keys):       answerTuiPrompt(session, keys: keys)
         case .numberedSelector:     answerNumberedPrompt(session, choose: choose)

@@ -22,9 +22,20 @@ enum SSHChannelError: Error, Equatable {
 /// A line the helper pushed on its own rather than in answer to a request.
 /// The payload is the whole line, so a caller decodes whatever fields its
 /// event carries without this type having to know them.
+///
+/// `generation` is the helper process that said it, 0 where unknown.
+/// Anything an event refers to, a held request above all, lives only as
+/// long as that process, so a reader that saw `helperExited` for a
+/// generation knows every later event from it is stale.
 struct HelperEvent: Sendable {
     let name: String
     let payload: Data
+    var generation: Int = 0
+
+    /// Pushed by the channel itself, never by a helper, when a helper
+    /// process is torn down for any reason. The name cannot collide with a
+    /// helper event, which never starts with an underscore.
+    static let helperExited = "_helper_exited"
 }
 
 /// The tail end of a helper's stderr, drained as it arrives. Draining keeps
@@ -386,7 +397,7 @@ actor SSHChannel {
                         guard let self else { return }
                         await self.deliver(Reply(line: line, ok: ok, generation: generation), id: id)
                     case .event(let name):
-                        events.yield(HelperEvent(name: name, payload: line))
+                        events.yield(HelperEvent(name: name, payload: line, generation: generation))
                     case .unrouted:
                         // The helper answers a request it could not parse
                         // with no id, so nothing is waiting on it.
@@ -450,6 +461,14 @@ actor SSHChannel {
     }
 
     private func tearDown(failing error: SSHChannelError) {
+        if process != nil {
+            // Whatever the helper was holding went with it, so a reader
+            // must stop offering answers to it now, not when a hold window
+            // runs out. Said here because every way a process ends, a
+            // crash, a timeout or a shutdown, comes through here.
+            eventSink.yield(HelperEvent(
+                name: HelperEvent.helperExited, payload: Data(), generation: generation))
+        }
         output?.readabilityHandler = nil
         errorOutput?.readabilityHandler = nil
         chunkSink?.finish()
