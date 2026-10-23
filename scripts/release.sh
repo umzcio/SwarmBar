@@ -15,13 +15,13 @@ APP_NAME="SwarmBar"
 APP_DIR="$ROOT/build/$APP_NAME.app"
 DMG="$ROOT/build/$APP_NAME-$VERSION.dmg"
 
-echo "==> [1/6] Run the test suite"
+echo "==> [1/7] Run the test suite"
 (cd "$ROOT" && xcodegen generate)
 xcodebuild -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Debug \
     -destination 'platform=macOS' \
     test
 
-echo "==> [2/6] Build + sign app"
+echo "==> [2/7] Build + sign app"
 bash "$ROOT/scripts/build-app.sh"
 
 BUILT_VERSION="$(defaults read "$APP_DIR/Contents/Info" CFBundleShortVersionString)"
@@ -31,21 +31,21 @@ if [ "$BUILT_VERSION" != "$VERSION" ]; then
     exit 1
 fi
 
-echo "==> [3/6] Package .dmg"
+echo "==> [3/7] Package .dmg"
 bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
 
-echo "==> [4/6] Notarize the .dmg (which notarizes the app inside it)"
+echo "==> [4/7] Notarize the .dmg (which notarizes the app inside it)"
 bash "$ROOT/scripts/notarize.sh" "$DMG"
 
 # Stapling the dmg does not staple the app inside it, so a user who copies
 # SwarmBar.app out and later goes offline has no ticket to check. Staple the
 # app, repackage, and notarize the new dmg, which is a different file.
-echo "==> [5/6] Staple the app, repackage, notarize again"
+echo "==> [5/7] Staple the app, repackage, notarize again"
 xcrun stapler staple "$APP_DIR"
 bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
 bash "$ROOT/scripts/notarize.sh" "$DMG"
 
-echo "==> [6/6] Verifying the way Gatekeeper will"
+echo "==> [6/7] Verifying the way Gatekeeper will"
 # The real question is not "is it signed" but "would a first launch on
 # someone else's Mac be allowed", and that is what spctl answers. Both
 # artifacts are checked: the dmg is what gets downloaded, the app is what
@@ -54,6 +54,22 @@ spctl --assess --type execute --verbose=4 "$APP_DIR"
 xcrun stapler validate "$APP_DIR"
 spctl --assess --type open --context context:primary-signature -v "$DMG"
 xcrun stapler validate "$DMG"
+
+# The remote setup command downloads exactly this file for this version
+# (releases/download/v<version>/swarmbar-helper.py) and refuses to run it
+# unless its sha256 matches the helper bundled in the app. A release that
+# does not carry the helper makes that URL a 404, and one that carries a
+# different helper makes every setup command fail its check, so the asset
+# is the bundled copy, byte for byte.
+echo "==> [7/7] Stage the remote helper"
+HELPER="$ROOT/build/swarmbar-helper.py"
+cp "$ROOT/scripts/swarmbar-helper.py" "$HELPER"
+if ! cmp -s "$HELPER" "$APP_DIR/Contents/Resources/swarmbar-helper.py"; then
+    echo "error: scripts/swarmbar-helper.py differs from the copy inside $APP_NAME.app." >&2
+    echo "       The app was built from a different helper than the one this release would ship." >&2
+    exit 1
+fi
+HELPER_SHA="$(shasum -a 256 "$HELPER" | awk '{print $1}')"
 
 echo "==> Generating the signed Sparkle appcast"
 # generate_appcast reads the EdDSA private key from the login keychain,
@@ -73,8 +89,10 @@ cp "$DIST/appcast.xml" "$ROOT/appcast.xml"
 echo
 echo "  DMG    : $DMG"
 echo "  appcast: $ROOT/appcast.xml"
+echo "  helper : $HELPER"
+echo "  sha256 : $HELPER_SHA"
 echo
 echo "  Next:"
-echo "    1) gh release create v$VERSION \"$DMG\" --title \"SwarmBar $VERSION\" --notes \"...\""
+echo "    1) gh release create v$VERSION \"$DMG\" \"$HELPER\" --title \"SwarmBar $VERSION\" --notes \"...\""
 echo "    2) git add appcast.xml && git commit -m \"appcast: $VERSION\" && git push"
 echo "       The feed is read from main, so until it is pushed nobody is offered the update."

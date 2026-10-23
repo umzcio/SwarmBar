@@ -29,6 +29,12 @@ jobs:
       - name: Generate the project
         run: xcodegen generate
 
+      # The remote helper is plain python3 that runs on hosts we do not
+      # control, and the Swift suite never executes it. Its own tests are
+      # fast and need no build, so a helper regression fails here first.
+      - name: Test the remote helper
+        run: python3 scripts/test-swarmbar-helper.py
+
       # No output formatter in the pipeline on purpose: piping xcodebuild
       # moves the exit status onto the formatter, and a green tick on a
       # failed build is worse than verbose logs.
