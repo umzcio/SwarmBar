@@ -297,6 +297,43 @@ def head_chunk(path, size):
         return None
 
 
+def has_timestamp(line):
+    """Whether a JSONL line is an object with a top-level string timestamp."""
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except ValueError:
+        return False
+    return isinstance(record, dict) and isinstance(record.get("timestamp"), str)
+
+
+def stamped_head_chunk(path, size, limit=None):
+    """Claude's head: (0, bytes) from the start through the first complete
+    line carrying a top-level timestamp, newline included.
+
+    The Mac dates a session from that timestamp when the remote reports no
+    birth time, which is always on Linux. A first-line-only head almost
+    never has one: most transcripts open with a `last-prompt` record that
+    carries none, and the first timestamp is on the record after it. With
+    no such line within `limit` (MAX_HEAD_BYTES) this ships the first line
+    alone, exactly as head_chunk would.
+    """
+    limit = MAX_HEAD_BYTES if limit is None else limit
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(min(size, limit))
+    except OSError:
+        return None
+    start = 0
+    while True:
+        newline = data.find(b"\n", start)
+        if newline == -1:
+            break
+        if has_timestamp(data[start:newline]):
+            return 0, data[:newline + 1]
+        start = newline + 1
+    return head_chunk(path, size)
+
+
 def whole_chunk(path, size):
     try:
         with open(path, "rb") as handle:
@@ -319,10 +356,11 @@ def created_time(stat):
 
 
 # One row of SPECS. `tail_start` is the first tail window for "tail" and
-# "head_tail"; `gate`, when set, is a predicate a matched path must pass.
+# "head_tail"; `gate`, when set, is a predicate a matched path must pass;
+# `stamped_head` makes a "head_tail" head run to the first timestamped line.
 Spec = collections.namedtuple(
-    "Spec", "tool pattern mode windowed tail_start gate",
-    defaults=(TAIL_BYTES, None))
+    "Spec", "tool pattern mode windowed tail_start gate stamped_head",
+    defaults=(TAIL_BYTES, None, False))
 
 # Patterns under this prefix expand only beneath the Claude config dirs
 # that claude_roots accepts, so backups are skipped and a symlinked second
@@ -362,7 +400,8 @@ _AGY = ".gemini/antigravity-cli/"
 # SQLiteSnapshot copies the pair and lets sqlite rebuild the index.
 SPECS = (
     [
-        Spec("claude", CLAUDE_PREFIX + "projects/*/*.jsonl", "head_tail", True),
+        Spec("claude", CLAUDE_PREFIX + "projects/*/*.jsonl", "head_tail", True,
+             stamped_head=True),
         Spec("claude", CLAUDE_PREFIX + "sessions/*.json", "whole", False),
         # CodexMonitor.parsedStatus falls back from 64 KB to 1 MB to 4 MB
         # when the newest records are ones its parser skips, so the mirror
@@ -511,7 +550,8 @@ def file_chunks(spec, path, size, mtime, prev):
     chunk, covered = tail
     chunks = [chunk]
     if spec.mode == "head_tail":
-        head = head_chunk(path, size)
+        head = (stamped_head_chunk(path, size) if spec.stamped_head
+                else head_chunk(path, size))
         reason = omission_reason(head)
         if reason:
             return reason
@@ -680,10 +720,14 @@ def manifest(now, warnings, shipped_before):
     return files, [dirs[path] for path in sorted(dirs)], omitted, shipped
 
 
-def home_entries(warnings):
+def home_entries(warnings, omitted=None):
     """The homes scanned, each with its owner, and a warning for any home
     that cannot be listed: a glob there finds nothing, which must not read
-    as nothing being there."""
+    as nothing being there.
+
+    Such a home also goes into `omitted` when a list is passed. The warning
+    is free text for a person; the omission is what tells the Mac not to
+    sweep its mirror of that home empty."""
     try:
         import pwd
     except ImportError:
@@ -694,6 +738,8 @@ def home_entries(warnings):
             os.listdir(home)
         except OSError as error:
             warnings.append("cannot list home %s: %s" % (home, error))
+            if omitted is not None:
+                omitted.append({"path": home, "reason": "cannot list: %s" % error.strerror})
         user = os.path.basename(home)
         try:
             if pwd is not None:
@@ -974,8 +1020,13 @@ def agent_processes(warnings):
 def snapshot():
     now = time.time()
     warnings = []
-    homes = home_entries(warnings)
+    home_omitted = []
+    homes = home_entries(warnings, home_omitted)
     files, dirs, omitted, shipped = manifest(now, warnings, SHIPPED)
+    # An unlistable home can also surface from the manifest's own walk, so
+    # each path is reported once.
+    named = set(item["path"] for item in home_omitted)
+    omitted = home_omitted + [item for item in omitted if item["path"] not in named]
     processes = agent_processes(warnings)
     payload = {
         "ok": True,

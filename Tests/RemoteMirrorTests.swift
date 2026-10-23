@@ -138,6 +138,47 @@ struct RemoteMirrorTests {
         #expect(try bytes(try #require(mirror.local(path))) == Data("abc".utf8))
     }
 
+    @Test("on a small file a head overlapping the tail writes the same bytes, in either order")
+    func overlappingHeadAndTailAgree() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let head = #"{"type":"last-prompt"}"# + "\n" + #"{"type":"user","timestamp":"2026-10-02T08:30:00.000Z"}"# + "\n"
+        let content = head + #"{"n":3}"# + "\n" + #"{"half"#
+        for order in [[(0, head), (0, content)], [(0, content), (0, head)]] {
+            let path = "/home/u/.claude/projects/-home-u-a/small-\(UUID().uuidString).jsonl"
+            try mirror.apply(snapshot(files: [file(path, size: content.utf8.count, chunks: order)]))
+            #expect(try bytes(try #require(mirror.local(path))) == Data(content.utf8))
+        }
+    }
+
+    @Test("chunks listed out of order never have a hole punched over them")
+    func outOfOrderChunksKeepTheirBytes() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let head = #"{"type":"session_meta","payload":{"cwd":"/home/u/demo"}}"# + "\n"
+        let tail = "\n" + #"{"n":2}"# + "\n"
+        let size = 5_000_000
+        let path = "/root/.codex/sessions/2026/10/22/rollout-order.jsonl"
+        try mirror.apply(snapshot(homes: ["/root"], files: [
+            file(path, size: size, chunks: [(size - tail.utf8.count, tail), (0, head)])
+        ]))
+        let data = try bytes(try #require(mirror.local(path)))
+        #expect(data.prefix(head.utf8.count) == Data(head.utf8))
+        #expect(data.suffix(tail.utf8.count) == Data(tail.utf8))
+    }
+
+    @Test("a chunk whose end overflows is skipped with a warning rather than trapping")
+    func overflowingChunkIsSkipped() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.grok/active_sessions.json"
+        let warnings = try mirror.apply(snapshot(files: [RemoteFileRecord(
+            path: path, size: 2, mtime: 0, created: nil, reset: true,
+            chunks: [RemoteChunk(offset: Int.max - 1, data: Data("xyz".utf8)), RemoteChunk(offset: 0, data: Data("{}".utf8))])]))
+        #expect(warnings.count == 1)
+        #expect(try bytes(try #require(mirror.local(path))) == Data("{}".utf8))
+    }
+
     @Test("an unchanged file keeps its bytes")
     func unchangedFileKeepsBytes() throws {
         let mirror = makeMirror()
@@ -182,6 +223,32 @@ struct RemoteMirrorTests {
             RemoteOmission(path: path, reason: "no complete record within 4194304 bytes")
         ]))
         #expect(try bytes(try #require(mirror.local(path))) == Data(line.utf8))
+    }
+
+    @Test("a home the helper could not list is not swept")
+    func omittedHomeIsNotSwept() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.claude/projects/-home-u-a/kept.jsonl"
+        try mirror.apply(snapshot(files: [file(path, size: 2, chunks: [(0, "{}")])]))
+        // An unlistable home yields no files at all; that is "could not
+        // look", and the mirror must not read it as "nothing there".
+        try mirror.apply(snapshot(files: [], omitted: [RemoteOmission(path: "/home/u", reason: "cannot list: Permission denied")]))
+        #expect(try bytes(try #require(mirror.local(path))) == Data("{}".utf8))
+    }
+
+    @Test("records naming the remote root itself are skipped, so the mirror root is never replaced")
+    func rootRecordsAreSkipped() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        try mirror.apply(snapshot(
+            files: [file("/", size: 2, chunks: [(0, "{}")]), file("///", size: 2, chunks: [(0, "{}")])],
+            dirs: [RemoteDirRecord(path: "//", mtime: 0, created: nil)]))
+        var isDirectory: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: mirror.root.path, isDirectory: &isDirectory))
+        #expect(isDirectory.boolValue)
+        let attributes = try FileManager.default.attributesOfItem(atPath: mirror.root.path)
+        #expect((attributes[.posixPermissions] as? Int) == 0o700)
     }
 
     @Test("a dir listed in dirs survives with no files in it")
@@ -293,6 +360,25 @@ struct RemoteMirrorTests {
         let attributes = try FileManager.default.attributesOfItem(atPath: try #require(mirror.local(path)).path)
         let created = try #require(attributes[.creationDate] as? Date)
         #expect(created == ClaudeSessionParser.date("2026-10-01T10:00:00.000Z"))
+    }
+
+    @Test("the creation fallback reads past a leading record with no timestamp")
+    func creationFallbackSkipsLastPrompt() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        // The shape most real transcripts open with: a last-prompt record
+        // that carries no timestamp, then the first record that does. The
+        // helper ships the head through that second line.
+        let path = "/home/u/.claude/projects/-home-u-a/w.jsonl"
+        let head = #"{"type":"last-prompt","lastPrompt":"Synthetic."}"# + "\n"
+            + #"{"type":"user","timestamp":"2026-10-02T08:30:00.000Z"}"# + "\n"
+        let tail = "\n" + #"{"type":"assistant","timestamp":"2026-10-02T09:00:00.000Z"}"# + "\n"
+        let size = 300_000
+        try mirror.apply(snapshot(files: [
+            file(path, size: size, created: nil, chunks: [(0, head), (size - tail.utf8.count, tail)])
+        ]))
+        let attributes = try FileManager.default.attributesOfItem(atPath: try #require(mirror.local(path)).path)
+        #expect(attributes[.creationDate] as? Date == ClaudeSessionParser.date("2026-10-02T08:30:00.000Z"))
     }
 
     @Test("dirs take the times the manifest gives them")

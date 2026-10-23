@@ -35,7 +35,7 @@ extension RemoteChunk: Decodable {
 /// unchanged since the last snapshot on this stream, but it is still
 /// listed, because the listing is what tells the mirror the file still
 /// exists.
-struct RemoteFileRecord: Decodable, Sendable, Equatable {
+struct RemoteFileRecord: Sendable, Equatable {
     let path: String
     let size: Int
     let mtime: TimeInterval
@@ -46,6 +46,30 @@ struct RemoteFileRecord: Decodable, Sendable, Equatable {
     /// Discard whatever the mirror holds for this path before writing.
     let reset: Bool
     let chunks: [RemoteChunk]
+}
+
+extension RemoteFileRecord: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case path, size, mtime, created, reset, chunks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let size = try container.decode(Int.self, forKey: .size)
+        // Rejected like a negative offset: the mirror truncates to `size`,
+        // and there is no honest file of negative length to make.
+        guard size >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .size, in: container, debugDescription: "negative file size \(size)")
+        }
+        self.init(
+            path: try container.decode(String.self, forKey: .path),
+            size: size,
+            mtime: try container.decode(TimeInterval.self, forKey: .mtime),
+            created: try container.decodeIfPresent(TimeInterval.self, forKey: .created),
+            reset: try container.decode(Bool.self, forKey: .reset),
+            chunks: try container.decode([RemoteChunk].self, forKey: .chunks))
+    }
 }
 
 /// A directory the mirror must hold: every ancestor of a shipped file

@@ -274,6 +274,47 @@ class ManifestTests(unittest.TestCase):
         item = self.entry(helper.snapshot(), path)
         self.assertEqual(decode_chunks(item)[0], (0, first.encode("utf-8")))
 
+    LAST_PROMPT = record('{"type":"last-prompt","lastPrompt":"Synthetic prompt."}')
+    STAMPED = record('{"type":"user","timestamp":"2026-10-01T10:00:00.000Z","cwd":"/home/u/demo"}')
+
+    def test_claude_head_runs_to_the_first_timestamped_line(self):
+        path = self.put(".claude/projects/-home-u-demo/b.jsonl",
+                        self.LAST_PROMPT + self.STAMPED + self.many_records(4000))
+        chunks = decode_chunks(self.entry(helper.snapshot(), path))
+        self.assertEqual(chunks[0], (0, (self.LAST_PROMPT + self.STAMPED).encode("utf-8")))
+
+    def test_claude_head_without_a_timestamp_in_the_cap_is_the_first_line(self):
+        content = self.LAST_PROMPT + self.many_records(200) + self.STAMPED
+        path = self.put(".claude/projects/-home-u-demo/c.jsonl", content)
+        size = os.stat(path).st_size
+        self.assertEqual(helper.stamped_head_chunk(path, size, limit=4096),
+                         (0, self.LAST_PROMPT.encode("utf-8")))
+        # Within a cap that reaches it, the same file runs to the stamp.
+        self.assertEqual(helper.stamped_head_chunk(path, size)[1], content.encode("utf-8"))
+
+    def test_codex_head_stays_the_first_line(self):
+        first = record('{"type":"session_meta","payload":{"cwd":"/home/u/demo"}}')
+        path = self.put(".codex/sessions/2026/10/22/rollout-stamped.jsonl",
+                        first + self.STAMPED + self.many_records(10))
+        self.assertEqual(decode_chunks(self.entry(helper.snapshot(), path))[0],
+                         (0, first.encode("utf-8")))
+
+    def test_overlapping_head_and_tail_agree_on_a_small_file(self):
+        content = self.LAST_PROMPT + self.STAMPED + self.many_records(5, partial='{"half')
+        path = self.put(".claude/projects/-home-u-demo/d.jsonl", content)
+        item = self.entry(helper.snapshot(), path)
+        chunks = decode_chunks(item)
+        self.assertEqual(len(chunks), 2)
+        # The tail starts at zero too, so the head covers part of it. Both
+        # are the file's own bytes at their own offsets, so either write
+        # order leaves the same mirror.
+        self.assertEqual(chunks[1][0], 0)
+        for ordered in (chunks, list(reversed(chunks))):
+            mirror = bytearray(item["size"])
+            for offset, data in ordered:
+                mirror[offset:offset + len(data)] = data
+            self.assertEqual(bytes(mirror), content.encode("utf-8"))
+
     def test_whole_file_reships_on_change(self):
         path = self.put(".grok/active_sessions.json", '{"sessions":[]}')
         first = self.entry(helper.snapshot(), path)
@@ -448,6 +489,19 @@ class ManifestTests(unittest.TestCase):
         # Paths that simply do not exist stay out of omitted.
         for path in reasons:
             self.assertTrue(path.startswith(session) or path == grok, path)
+
+    @unittest.skipIf(os.geteuid() == 0, "root lists a chmod 000 directory anyway")
+    def test_unlistable_home_is_omitted_not_only_warned(self):
+        self.put(self.EVENTS, record('{"t":1}'))
+        os.chmod(self.home, 0)
+        try:
+            snap = helper.snapshot()
+        finally:
+            os.chmod(self.home, 0o755)
+        homes = [o for o in snap["omitted"] if o["path"] == self.home]
+        self.assertEqual(len(homes), 1)
+        self.assertTrue(homes[0]["reason"].startswith("cannot list"))
+        self.assertTrue(any(w.startswith("cannot list home") for w in snap["warnings"]))
 
     def test_homes_and_shape(self):
         snap = helper.snapshot()

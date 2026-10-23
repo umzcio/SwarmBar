@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 enum RemoteMirrorError: Error, CustomStringConvertible {
     case cannotCreate(String)
@@ -23,6 +24,10 @@ enum RemoteMirrorError: Error, CustomStringConvertible {
 /// which the helper computes against what it believes was shipped.
 struct RemoteMirror: Sendable {
     let root: URL
+    /// Whether a refused F_PUNCHHOLE has been logged yet. Shared by every
+    /// copy of this mirror, so a volume that refuses every punch is
+    /// reported once rather than on every write of every poll.
+    private let punchFailureLogged = PunchFailureFlag()
 
     /// A file whose mirror occupies more than this is trimmed. Growth chunks
     /// append for as long as a session runs, and without a bound one long
@@ -91,7 +96,11 @@ struct RemoteMirror: Sendable {
     /// unknown state relative to what the helper believes it shipped, so the
     /// caller must reset it and start a fresh helper stream rather than
     /// carry on.
-    func apply(_ snapshot: RemoteSnapshot) throws {
+    ///
+    /// Returns warnings for chunks that were skipped rather than written,
+    /// so the caller can surface them beside the helper's own.
+    @discardableResult
+    func apply(_ snapshot: RemoteSnapshot) throws -> [String] {
         let fm = FileManager.default
         // 700 because the mirror holds other users' transcripts when the
         // helper runs as root, and Caches is otherwise readable by anything
@@ -101,10 +110,16 @@ struct RemoteMirror: Sendable {
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
 
         // A path that does not map is skipped outright: not written, not
-        // kept, and not counted toward anything.
-        let files = snapshot.files.compactMap { record in local(record.path).map { (record, $0) } }
-        let dirs = snapshot.dirs.compactMap { record in local(record.path).map { (record, $0) } }
-        let omitted = Set(snapshot.omitted.compactMap { local($0.path)?.path })
+        // kept, and not counted toward anything. Nor is one that maps to the
+        // root itself, which a record must never replace.
+        func mapped(_ path: String) -> URL? {
+            guard let url = local(path), url.path != root.path else { return nil }
+            return url
+        }
+        let files = snapshot.files.compactMap { record in mapped(record.path).map { (record, $0) } }
+        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
+        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path })
+        var warnings: [String] = []
 
         var keep = Set<String>()
         for path in files.map(\.1.path) + dirs.map(\.1.path) + omitted {
@@ -115,7 +130,9 @@ struct RemoteMirror: Sendable {
         // Sweep first. It also removes any symlink beneath a home, so the
         // writes below never pass through one.
         for home in snapshot.homes {
-            guard let local = local(home.path), local.path != root.path,
+            // A home the helper could not list yielded no files, which is
+            // "could not look" and not "nothing there".
+            guard let local = mapped(home.path), !omitted.contains(local.path),
                   try clearLinks(to: local.path, including: false)
             else { continue }
             var info = stat()
@@ -131,7 +148,7 @@ struct RemoteMirror: Sendable {
             try createDirectory(url)
         }
         for (record, url) in files {
-            try write(record, to: url)
+            warnings += try write(record, to: url)
         }
         // Last, because creating and removing entries above moves a
         // directory's mtime.
@@ -144,6 +161,7 @@ struct RemoteMirror: Sendable {
             }
             try fm.setAttributes(attributes, ofItemAtPath: url.path)
         }
+        return warnings
     }
 
     /// Every directory between `path` and `root`, both excluded.
@@ -165,7 +183,15 @@ struct RemoteMirror: Sendable {
     /// is not the same as there being nothing to see.
     private func sweep(_ directory: String, keep: Set<String>, omitted: Set<String>) throws {
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: directory) else { return }
+        let names: [String]
+        do {
+            names = try fm.contentsOfDirectory(atPath: directory)
+        } catch {
+            // Logged, not thrown: what cannot be listed cannot be swept, and
+            // the writes that follow are still right.
+            NSLog("SwarmBar: cannot list mirror directory \(directory): \(error)")
+            return
+        }
         for name in names {
             let path = directory + "/" + name
             var info = stat()
@@ -217,7 +243,7 @@ struct RemoteMirror: Sendable {
         return true
     }
 
-    private func write(_ record: RemoteFileRecord, to url: URL) throws {
+    private func write(_ record: RemoteFileRecord, to url: URL) throws -> [String] {
         let fm = FileManager.default
         try createDirectory(url.deletingLastPathComponent())
 
@@ -234,6 +260,7 @@ struct RemoteMirror: Sendable {
             }
         }
 
+        var warnings: [String] = []
         let unchanged = present && !record.reset && record.chunks.isEmpty && Int(info.st_size) == record.size
         if !unchanged {
             let handle = try FileHandle(forUpdating: url)
@@ -242,10 +269,18 @@ struct RemoteMirror: Sendable {
                 try handle.truncate(atOffset: 0)
             }
             // Where the file ends as each chunk lands. A chunk past it
-            // leaves a gap that should be a hole and, on APFS, is not.
+            // leaves a gap that should be a hole and, on APFS, is not. In
+            // offset order, or a later chunk listed first would open a gap
+            // over bytes an earlier one is about to write, and the punch
+            // would erase them.
             var end = record.reset || !present ? 0 : UInt64(info.st_size)
             var gaps: [(UInt64, UInt64)] = []
-            for chunk in record.chunks {
+            for chunk in record.chunks.sorted(by: { $0.offset < $1.offset }) {
+                guard !chunk.offset.addingReportingOverflow(chunk.data.count).overflow else {
+                    warnings.append("skipped a chunk of \(record.path) whose end overflows: "
+                        + "offset \(chunk.offset), \(chunk.data.count) bytes")
+                    continue
+                }
                 let offset = UInt64(chunk.offset)
                 if offset > end { gaps.append((end, offset)) }
                 try handle.seek(toOffset: offset)
@@ -256,7 +291,7 @@ struct RemoteMirror: Sendable {
             // no disk.
             try handle.truncate(atOffset: UInt64(record.size))
             for (from, to) in gaps {
-                Self.punchHole(handle, from: from, to: min(to, UInt64(record.size)))
+                punchHole(handle, from: from, to: min(to, UInt64(record.size)))
             }
             if !Self.isWhole(record) {
                 try trimIfOversized(handle, size: record.size)
@@ -271,6 +306,7 @@ struct RemoteMirror: Sendable {
             attributes[.creationDate] = created
         }
         try fm.setAttributes(attributes, ofItemAtPath: url.path)
+        return warnings
     }
 
     /// True when one chunk carries the whole file. That is the helper's
@@ -311,7 +347,7 @@ struct RemoteMirror: Sendable {
         try handle.seek(toOffset: UInt64(keepFrom))
         try handle.write(contentsOf: tail)
         try handle.truncate(atOffset: UInt64(size))
-        Self.punchHole(handle, from: UInt64(head.count), to: UInt64(keepFrom))
+        punchHole(handle, from: UInt64(head.count), to: UInt64(keepFrom))
     }
 
     /// Deallocates a range the mirror never wrote. APFS zero-fills the gap
@@ -321,8 +357,8 @@ struct RemoteMirror: Sendable {
     /// a full copy after all. F_PUNCHHOLE takes whole blocks, so the range
     /// is narrowed to them and the partial blocks at either edge stay as
     /// allocated zeros. Best effort: a volume that refuses it still holds
-    /// the right bytes, only more of them.
-    private static func punchHole(_ handle: FileHandle, from: UInt64, to: UInt64) {
+    /// the right bytes, only more of them, and the trim then fires sooner.
+    private func punchHole(_ handle: FileHandle, from: UInt64, to: UInt64) {
         var info = stat()
         guard fstat(handle.fileDescriptor, &info) == 0 else { return }
         let block = UInt64(max(info.st_blksize, 512))
@@ -331,21 +367,47 @@ struct RemoteMirror: Sendable {
         guard stop > start else { return }
         var hole = fpunchhole_t(
             fp_flags: 0, reserved: 0, fp_offset: off_t(start), fp_length: off_t(stop - start))
-        _ = fcntl(handle.fileDescriptor, F_PUNCHHOLE, &hole)
+        if fcntl(handle.fileDescriptor, F_PUNCHHOLE, &hole) != 0 {
+            let reason = String(cString: strerror(errno))
+            if punchFailureLogged.claim() {
+                NSLog("SwarmBar: mirror at \(root.path) cannot punch holes (\(reason)); files stay dense")
+            }
+        }
     }
 
-    /// The first record's `timestamp`, read from a chunk at offset zero
-    /// when it holds a complete JSON line. Linux reports no birth time, and
-    /// the transcript's own first record is the platform-neutral start.
+    /// The first top-level `timestamp` among the complete lines of a chunk
+    /// at offset zero. Linux reports no birth time, and the transcript's own
+    /// records are the platform-neutral start. Not just the first line:
+    /// most Claude transcripts open with a `last-prompt` record that has no
+    /// timestamp, and the helper ships the head through the first line that
+    /// does.
     private static func headTimestamp(_ record: RemoteFileRecord) -> Date? {
         guard let chunk = record.chunks.first(where: { $0.offset == 0 }),
               chunk.data.first == UInt8(ascii: "{")
         else { return nil }
         let window = chunk.data.prefix(CodexMonitor.maxHeadBytes)
-        guard let newline = window.firstIndex(of: UInt8(ascii: "\n")),
-              let line = (try? JSONSerialization.jsonObject(with: window[..<newline])) as? [String: Any],
-              let stamp = line["timestamp"] as? String
-        else { return nil }
-        return ClaudeSessionParser.date(stamp)
+        var start = window.startIndex
+        while let newline = window[start...].firstIndex(of: UInt8(ascii: "\n")) {
+            if let line = (try? JSONSerialization.jsonObject(with: window[start..<newline])) as? [String: Any],
+               let stamp = line["timestamp"] as? String,
+               let date = ClaudeSessionParser.date(stamp) {
+                return date
+            }
+            start = window.index(after: newline)
+        }
+        return nil
+    }
+}
+
+/// A one-way flag that hands out a single `true`, however many copies of a
+/// mirror and however many threads ask.
+private final class PunchFailureFlag: Sendable {
+    private let claimed = Mutex(false)
+
+    func claim() -> Bool {
+        claimed.withLock { claimed in
+            defer { claimed = true }
+            return !claimed
+        }
     }
 }

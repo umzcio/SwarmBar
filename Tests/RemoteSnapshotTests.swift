@@ -119,6 +119,16 @@ struct RemoteSnapshotTests {
         #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
     }
 
+    @Test("a file with a negative size fails the decode")
+    func negativeSizeThrows() {
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+         "homes":[],"dirs":[],"omitted":[],"warnings":[],"processes":[],"processes_failed":false,
+         "files":[{"path":"/home/u/x","size":-1,"mtime":0,"created":null,"reset":true,"chunks":[]}]}
+        """
+        #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
+    }
+
     @Test("a chunk with a negative offset fails the decode")
     func negativeOffsetThrows() {
         let json = """
