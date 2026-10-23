@@ -40,6 +40,33 @@ extension SSHChannel: RemoteRequesting {}
 
 private let remoteAnswerLog = Logger(subsystem: "app.swarmbar.SwarmBar", category: "remote")
 
+/// What a remote reply tells the composer when it did not submit. Every
+/// message from the moment a paste may have landed says the text may be
+/// in the composer, so nobody presses Send again and pastes it twice.
+private enum ReplyMessage {
+    static func noPane(_ host: String) -> String {
+        "This session isn't in tmux on \(host), so reply in its terminal."
+    }
+    static func alreadyOnScreen(_ host: String) -> String {
+        "That text is already on screen in the session on \(host), so nothing was pasted. It may already be in the composer. Check the terminal."
+    }
+    static func pasteUncertain(_ host: String) -> String {
+        "The reply may have been partly pasted into the session on \(host), so it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."
+    }
+    static func pastedNotSubmitted(_ host: String) -> String {
+        "The reply was pasted into the session on \(host) but not submitted, so it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice."
+    }
+    static func notVisible(_ host: String) -> String {
+        "The reply did not appear on screen in the session on \(host), so it was not submitted. Part of it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."
+    }
+    static func changedWhilePasting(_ host: String) -> String {
+        "The session on \(host) changed while pasting, so the reply was not submitted, but it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice."
+    }
+    static func unconfirmed(_ host: String) -> String {
+        "Could not confirm the reply was submitted in the session on \(host). It may be sitting in the composer or already sent. Check the terminal before sending again."
+    }
+}
+
 extension RemoteMonitorSupervisor: RemoteActing {
     func answerability(for session: AgentSession) -> RemoteAnswerability {
         switch session.tool {
@@ -74,6 +101,12 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// submitted half-delivered is not, so `.sent` means only that the
     /// helper confirmed it pressed Enter.
     ///
+    /// The screen is read before the paste as well. A probe already on it
+    /// would confirm a paste that never landed, and is most likely a retry
+    /// whose first paste is still in the composer, so nothing is pasted.
+    /// Every failure once a paste has landed, or may have, says so, because
+    /// sending again would paste the text a second time.
+    ///
     /// The approval switches do not gate this. A reply is not an answer,
     /// and the local reply goes through whatever the keystroke switches
     /// say, so the remote one does too.
@@ -81,7 +114,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         let host = session.host ?? "?"
         guard let target = paneTarget(for: session) else {
             remoteAnswerLog.notice("reply: \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public) has no pane, nothing sent")
-            return .failed("This session isn't in tmux on \(host), so reply in its terminal.")
+            return .failed(ReplyMessage.noPane(host))
         }
         // The helper strips these anyway. Stripping first means the probe
         // looked for on screen is cut from what actually lands.
@@ -93,8 +126,8 @@ extension RemoteMonitorSupervisor: RemoteActing {
         // twice, and a reply and an answer must not type into one pane at
         // once.
         guard answering.insert(session.id).inserted else {
-            remoteAnswerLog.notice("reply: already sending on \(host, privacy: .public), nothing sent")
-            return .failed("A reply is already on its way to this session.")
+            remoteAnswerLog.notice("reply: already answering on \(host, privacy: .public), nothing sent")
+            return .failed("SwarmBar is already answering this session.")
         }
         defer { answering.remove(session.id) }
 
@@ -108,46 +141,62 @@ extension RemoteMonitorSupervisor: RemoteActing {
         let process: [String: JSONValue] = [
             "pid": .int(target.process.pid), "comm": .string(target.process.comm),
         ]
+        func capture() async -> String? {
+            guard let data = try? await requester.request("capture", ["pane": pane], timeout: .seconds(30))
+            else { return nil }
+            return RemoteAnswerPlan.screen(fromCapture: data)
+        }
+        // A round trip has passed. A host that went dark or a helper that
+        // restarted meanwhile leaves a pane map from before the gap.
+        func targetHeld() -> Bool {
+            guard let current = paneTarget(for: session) else { return false }
+            return current.pane == target.pane && current.process.pid == target.process.pid
+        }
 
+        guard let before = await capture() else {
+            remoteAnswerLog.notice("reply: capture on \(host, privacy: .public) failed, nothing sent")
+            return .failed("Could not read the screen on \(host), so nothing was sent.")
+        }
+        guard !before.contains(probe) else {
+            remoteAnswerLog.notice("reply: probe already on screen on \(host, privacy: .public), nothing pasted")
+            return .failed(ReplyMessage.alreadyOnScreen(host))
+        }
+        guard targetHeld() else {
+            remoteAnswerLog.notice("reply: \(host, privacy: .public) changed while reading the screen, nothing sent")
+            return .failed("The session on \(host) changed while reading its screen, so nothing was sent.")
+        }
+
+        let outcome: RemoteAnswerPlan.PasteOutcome
         do {
-            let reply = try await requester.request(
+            outcome = RemoteAnswerPlan.pasteOutcome(from: try await requester.request(
                 "paste", process.merging(["pane": pane, "text": .string(pasted)]) { $1 },
-                timeout: .seconds(30))
-            if case .notSent(let reason) = RemoteAnswerPlan.keysOutcome(from: reply) {
-                remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) not sent: \(reason, privacy: .public)")
-                return .failed("Could not paste into this session on \(host), so nothing was sent.")
-            }
+                timeout: .seconds(30)))
         } catch {
-            remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-            // A request that timed out may still have pasted, so this
-            // claims nothing about the composer.
-            return .failed("Could not reach \(host), so the reply was not submitted. Check the terminal.")
+            // A request that timed out may still have pasted.
+            outcome = .uncertain(String(describing: error))
+        }
+        switch outcome {
+        case .pasted:
+            break
+        case .refused(let reason):
+            remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) refused: \(reason, privacy: .public)")
+            return .failed("Could not paste into this session on \(host), so nothing was sent.")
+        case .uncertain(let reason):
+            remoteAnswerLog.notice("reply: paste on \(host, privacy: .public) failed: \(reason, privacy: .public)")
+            return .failed(ReplyMessage.pasteUncertain(host))
         }
 
-        // From here the text may be sitting in the composer, so every
-        // failure says to look at the terminal.
-        let screen: String?
-        do {
-            screen = RemoteAnswerPlan.screen(fromCapture: try await requester.request(
-                "capture", ["pane": pane], timeout: .seconds(30)))
-        } catch {
-            screen = nil
-        }
-        guard let screen else {
+        // From here the text is in the composer, so every failure says so.
+        guard let after = await capture() else {
             remoteAnswerLog.notice("reply: capture on \(host, privacy: .public) failed, Enter not sent")
-            return .failed("Could not read the screen on \(host), so nothing was submitted. Check the terminal.")
+            return .failed(ReplyMessage.pastedNotSubmitted(host))
         }
-        guard screen.contains(probe) else {
-            return .failed(
-                "The text did not appear in the composer, so nothing was submitted. Check the terminal.")
+        guard after.contains(probe) else {
+            return .failed(ReplyMessage.notVisible(host))
         }
-        // Two round trips have passed. A host that went dark or a helper
-        // that restarted meanwhile leaves a pane map from before the gap.
-        guard let current = paneTarget(for: session),
-              current.pane == target.pane, current.process.pid == target.process.pid
-        else {
+        guard targetHeld() else {
             remoteAnswerLog.notice("reply: \(host, privacy: .public) changed while pasting, Enter not sent")
-            return .failed("The session on \(host) changed while pasting, so nothing was submitted. Check the terminal.")
+            return .failed(ReplyMessage.changedWhilePasting(host))
         }
 
         do {
@@ -164,13 +213,13 @@ extension RemoteMonitorSupervisor: RemoteActing {
                 return .sent
             case .notSent(let reason):
                 remoteAnswerLog.notice("reply: Enter on \(host, privacy: .public) not sent: \(reason, privacy: .public)")
-                return .failed("The reply was pasted on \(host) but not submitted. Check the terminal.")
+                return .failed(ReplyMessage.pastedNotSubmitted(host))
             }
         } catch {
             // A request that timed out may still have pressed Enter, so this
             // claims neither outcome.
             remoteAnswerLog.notice("reply: Enter on \(host, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-            return .failed("Could not confirm the reply was submitted on \(host). Check the terminal.")
+            return .failed(ReplyMessage.unconfirmed(host))
         }
     }
 

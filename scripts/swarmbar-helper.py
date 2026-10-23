@@ -1117,6 +1117,9 @@ PANE_ID = re.compile(r"^%[0-9]+$")
 KEY_GAP_DEFAULT = 0.08
 KEY_GAP_MAX = 0.5
 PASTE_BUFFER = "swarmbar"
+# ESC[200~ and ESC[201~ as send-keys -H hex, the bracketed paste markers.
+PASTE_START = ["1b", "5b", "32", "30", "30", "7e"]
+PASTE_END = ["1b", "5b", "32", "30", "31", "7e"]
 NAMED_KEYS = {"UP": "Up", "DOWN": "Down", "ESC": "Escape", "\n": "Enter"}
 # C0 controls other than newline and tab, plus DEL. ESC is the one that
 # matters: it could close the bracketed paste early or open a sequence.
@@ -1281,21 +1284,26 @@ def handle_tmux(request):
         refused = target_refusal(request, "bad target")
         if refused is not None:
             return refused
-        # Precondition: tmux applies bracketed paste (-p) only when the
-        # pane's app enabled the mode, and the Mac verifies the paste on
-        # screen before it sends Enter. Stripping controls keeps a reply from
-        # carrying its own escape sequences or ending the paste early.
+        # The local reply's form, verified live on all seven tools: the
+        # bracket markers are sent explicitly and the text goes between them
+        # with -r. paste-buffer -p would bracket only when the pane's app has
+        # enabled the mode, which tmux 3.4 cannot report, and without -r tmux
+        # turns every LF into CR, an Enter, so a multi-line reply would
+        # submit line by line before the Mac ever checked the screen. No
+        # Enter follows: the Mac decides separately whether to submit.
+        # Stripping controls means the text itself can never carry ESC, so
+        # it cannot close the paste early or open a sequence of its own.
         text = PASTE_STRIP.sub("", text)
-        loaded = tmux_run(pane, ["load-buffer", "-b", PASTE_BUFFER, "-"],
-                          input=text.encode("utf-8"))
-        if loaded is None or loaded.returncode != 0:
-            return {"sent": False, "reason": "send failed"}
-        # -p wraps the text in bracketed paste, -d drops the buffer after, and
-        # no Enter follows: the Mac decides separately whether to submit.
-        pasted = tmux_run(pane, ["paste-buffer", "-p", "-d", "-b", PASTE_BUFFER,
-                                 "-t", pane["id"]])
-        if pasted is None or pasted.returncode != 0:
-            return {"sent": False, "reason": "send failed"}
+        steps = (
+            (["load-buffer", "-b", PASTE_BUFFER, "-"], text.encode("utf-8")),
+            (["send-keys", "-t", pane["id"], "-H"] + PASTE_START, None),
+            (["paste-buffer", "-r", "-d", "-b", PASTE_BUFFER, "-t", pane["id"]], None),
+            (["send-keys", "-t", pane["id"], "-H"] + PASTE_END, None),
+        )
+        for args, data in steps:
+            done = tmux_run(pane, args, input=data)
+            if done is None or done.returncode != 0:
+                return {"sent": False, "reason": "send failed"}
         return {"sent": True}
     keys, expect = request.get("keys"), request.get("expect") or []
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \

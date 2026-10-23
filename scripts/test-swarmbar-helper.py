@@ -1002,8 +1002,11 @@ class ProcessTableTests(unittest.TestCase):
 class TmuxRecorder(object):
     """Stands in for helper.run_command and records argv lists and inputs."""
 
-    def __init__(self, screen="", fail_on_send=None, capture_code=0, ps=None, panes=None):
+    def __init__(self, screen="", fail_on_send=None, capture_code=0, ps=None, panes=None,
+                 fail_when=None):
         self.capture_code = capture_code
+        # A predicate on argv: a matching tmux call exits 1.
+        self.fail_when = fail_when
         self.ps, self.panes = ps, panes or {}
         self.calls = []
         self.inputs = []
@@ -1030,6 +1033,8 @@ class TmuxRecorder(object):
         out = self.screen.encode("utf-8") if "capture-pane" in argv else b""
         if "capture-pane" in argv:
             code = self.capture_code
+        if self.fail_when is not None and self.fail_when(argv):
+            code = 1
         return subprocess.CompletedProcess(argv, code, stdout=out, stderr=b"")
 
     def sent(self):
@@ -1179,15 +1184,35 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad keys"}, extra)
             self.assertEqual(rec.sent(), [])
 
-    def test_paste_never_sends_enter(self):
+    def test_paste_brackets_itself_and_never_sends_enter(self):
+        # The local reply's form, verified live on every tool: the markers
+        # are sent whatever mode the app is in, and -r keeps LF as LF where
+        # plain paste-buffer would turn each one into a CR, an Enter.
         rec = TmuxRecorder()
         out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi\nthere"}, rec)
         self.assertEqual(out, {"sent": True})
-        self.assertEqual(rec.calls[0][3:], ["load-buffer", "-b", "swarmbar", "-"])
+        base = ["tmux", "-S", self.sock]
+        self.assertEqual(rec.calls, [
+            base + ["load-buffer", "-b", "swarmbar", "-"],
+            base + ["send-keys", "-t", "%3", "-H", "1b", "5b", "32", "30", "30", "7e"],
+            base + ["paste-buffer", "-r", "-d", "-b", "swarmbar", "-t", "%3"],
+            base + ["send-keys", "-t", "%3", "-H", "1b", "5b", "32", "30", "31", "7e"],
+        ])
         self.assertEqual(rec.inputs[0], b"hi\nthere")
-        self.assertEqual(rec.calls[1][3:], ["paste-buffer", "-p", "-d", "-b",
-                                            "swarmbar", "-t", "%3"])
-        self.assertFalse(any("send-keys" in c for c in rec.calls))
+        self.assertFalse(any("Enter" in c or "-p" in c for c in rec.calls))
+
+    def test_paste_stops_at_the_first_failed_step(self):
+        steps = ("load-buffer", "200", "paste-buffer", "201")
+
+        def matcher(step):
+            if step in ("200", "201"):
+                return lambda argv: "send-keys" in argv and argv[-2] == {"200": "30", "201": "31"}[step]
+            return lambda argv: step in argv
+        for index, step in enumerate(steps):
+            rec = TmuxRecorder(fail_when=matcher(step))
+            out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi"}, rec)
+            self.assertEqual(out, {"sent": False, "reason": "send failed"}, step)
+            self.assertEqual(len(rec.calls), index + 1, step)
 
     def test_paste_sent_when_target_still_matches(self):
         rec = self.target_recorder()

@@ -8,12 +8,16 @@ import Testing
 private actor FakeHelper: RemoteRequesting {
     private(set) var calls: [(command: String, arguments: [String: JSONValue])] = []
     private let replies: [String: String]
+    /// Replies used in order, one per request, before `replies` applies:
+    /// a reply reads the screen both before and after it pastes.
+    private var sequences: [String: [String]]
     /// Holds every answer back this long, so a test can act while a
     /// request is still in flight.
     private let delay: Duration?
 
-    init(replies: [String: String], delay: Duration? = nil) {
+    init(replies: [String: String], sequences: [String: [String]] = [:], delay: Duration? = nil) {
         self.replies = replies
+        self.sequences = sequences
         self.delay = delay
     }
 
@@ -22,6 +26,10 @@ private actor FakeHelper: RemoteRequesting {
     ) async throws -> Data {
         calls.append((command, arguments))
         if let delay { try await Task.sleep(for: delay) }
+        if let next = sequences[command]?.first {
+            sequences[command]?.removeFirst()
+            return Data(next.utf8)
+        }
         guard let reply = replies[command] else { throw SSHChannelError.timedOut }
         return Data(reply.utf8)
     }
@@ -180,6 +188,7 @@ struct RemoteAnswerTests {
 
         init(
             approvalsOff: Set<AgentTool> = [], replies: [String: String] = [:],
+            sequences: [String: [String]] = [:],
             delay: Duration? = nil, remoteHold: Duration = .seconds(350)
         ) {
             let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
@@ -192,7 +201,7 @@ struct RemoteAnswerTests {
             let registry = RemoteHostRegistry(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
             let mirrorRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("remote-answer-mirror-\(UUID().uuidString)", isDirectory: true)
-            let helper = FakeHelper(replies: replies, delay: delay)
+            let helper = FakeHelper(replies: replies, sequences: sequences, delay: delay)
             let supervisor = RemoteMonitorSupervisor(
                 store: store, registry: registry,
                 factory: { host in
@@ -567,6 +576,15 @@ struct RemoteAnswerTests {
 
     private static let noPane = SessionStore.ReplyResult.failed(
         "This session isn't in tmux on devbox, so reply in its terminal.")
+    /// Every failure after a paste landed, or may have, says so: sending
+    /// again would paste the text a second time.
+    private static let pastedNotSubmitted = SessionStore.ReplyResult.failed(
+        "The reply was pasted into the session on devbox but not submitted, so it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice.")
+    private static let pasteUncertain = SessionStore.ReplyResult.failed(
+        "The reply may have been partly pasted into the session on devbox, so it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice.")
+
+    /// The screen before the paste, then after it.
+    private static let screens = [#"{"text":"> "}"#, #"{"text":"> use main"}"#]
 
     @Test func replyWithoutPaneFailsWithReason() async throws {
         let rig = Rig(replies: [
@@ -634,17 +652,32 @@ struct RemoteAnswerTests {
 
         let result = await rig.supervisor.performReply(session, text: "use the main branch")
         #expect(result == .failed(
-            "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
-        #expect(await rig.helper.commands == ["paste", "capture"])
+            "The reply did not appear on screen in the session on devbox, so it was not submitted. Part of it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."))
+        #expect(await rig.helper.commands == ["capture", "paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    /// A probe already on screen would confirm a paste that never landed,
+    /// and is most likely a retry whose first paste is still there.
+    @Test func replyRefusesWhenTheTextIsAlreadyOnScreen() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> use main"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performReply(session, text: "use main") == .failed(
+            "That text is already on screen in the session on devbox, so nothing was pasted. It may already be in the composer. Check the terminal."))
+        #expect(await rig.helper.commands == ["capture"])
         #expect(rig.store.sessions.first?.status == session.status)
     }
 
     @Test func replySendsTheExactSequence() async throws {
-        let rig = Rig(replies: [
-            "paste": #"{"sent":true}"#,
-            "capture": #"{"text":"> first line\n  use the main branch"}"#,
-            "keys": #"{"sent":true}"#,
-        ])
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"> "}"#, #"{"text":"> first line\n  use the main branch"}"#]])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
         let session = waiting()
         rig.store.upsert(session)
@@ -654,14 +687,15 @@ struct RemoteAnswerTests {
         #expect(rig.store.sessions.first?.status == .working(activity: "Working on your reply…"))
 
         let calls = await rig.helper.calls
-        #expect(calls.map(\.command) == ["paste", "capture", "keys"])
-        #expect(calls[0].arguments == [
+        #expect(calls.map(\.command) == ["capture", "paste", "capture", "keys"])
+        #expect(calls[0].arguments == ["pane": Self.paneValue])
+        #expect(calls[1].arguments == [
             "pane": Self.paneValue, "text": .string(text),
             "pid": .int(4242), "comm": .string("kimi"),
         ])
-        #expect(calls[1].arguments == ["pane": Self.paneValue])
+        #expect(calls[2].arguments == ["pane": Self.paneValue])
         let probe = try #require(TerminalFocuser.verificationProbe(for: text))
-        #expect(calls[2].arguments == [
+        #expect(calls[3].arguments == [
             "pane": Self.paneValue, "keys": .array([.string("\n")]),
             "expect": .array([.string(probe)]),
             "pid": .int(4242), "comm": .string("kimi"),
@@ -673,18 +707,16 @@ struct RemoteAnswerTests {
         #expect(RemoteAnswerPlan.pasteText("a\u{1b}[201~b\tc\nd\u{0}\u{7f}e\r") == "a[201~b\tc\nde")
         #expect(RemoteAnswerPlan.pasteText("caf\u{e9} \u{1F600}") == "caf\u{e9} \u{1F600}")
 
-        let rig = Rig(replies: [
-            "paste": #"{"sent":true}"#,
-            "capture": #"{"text":"> ship it[201~ now"}"#,
-            "keys": #"{"sent":true}"#,
-        ])
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"> "}"#, #"{"text":"> ship it[201~ now"}"#]])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
         let session = waiting()
         rig.store.upsert(session)
         #expect(await rig.supervisor.performReply(session, text: "ship it\u{1b}[201~ now\u{7f}") == .sent)
         let calls = await rig.helper.calls
-        #expect(calls[0].arguments["text"] == .string("ship it[201~ now"))
-        #expect(calls[2].arguments["expect"] == .array([.string("ship it[201~ now")]))
+        #expect(calls[1].arguments["text"] == .string("ship it[201~ now"))
+        #expect(calls[3].arguments["expect"] == .array([.string("ship it[201~ now")]))
 
         // Text that is nothing once stripped sends nothing at all.
         let empty = Rig(replies: ["paste": #"{"sent":true}"#])
@@ -693,44 +725,110 @@ struct RemoteAnswerTests {
         #expect(await empty.helper.commands.isEmpty)
     }
 
+    @Test func pasteRepliesDecodeByCertainty() {
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":true}"#.utf8)) == .pasted)
+        // Refused before anything was typed.
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":false,"reason":"changed"}"#.utf8))
+            == .refused("changed"))
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"ok":false,"error":"bad text"}"#.utf8))
+            == .refused("bad text"))
+        // A step failed partway, or the reply is unreadable: some of the
+        // text may be in the composer.
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":false,"reason":"send failed"}"#.utf8))
+            == .uncertain("send failed"))
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data("garbage".utf8)) == .uncertain("unreadable reply"))
+    }
+
     @Test func replyFailuresNeverClaimSuccess() async throws {
-        let cases: [(replies: [String: String], commands: [String])] = [
-            // The paste is refused, or never answered.
-            (["paste": #"{"sent":false,"reason":"changed"}"#], ["paste"]),
-            (["paste": #"{"ok":false,"error":"bad text"}"#], ["paste"]),
-            ([:], ["paste"]),
-            // The confirming read fails.
+        let screens = Self.screens
+        let cases: [(replies: [String: String], sequences: [String: [String]],
+                     commands: [String], result: SessionStore.ReplyResult)] = [
+            // The first read fails: nothing is pasted.
+            ([:], [:], ["capture"],
+             .failed("Could not read the screen on devbox, so nothing was sent.")),
+            (["capture": #"{"ok":false,"error":"capture failed"}"#], [:], ["capture"],
+             .failed("Could not read the screen on devbox, so nothing was sent.")),
+            // The paste is refused before anything is typed.
+            (["paste": #"{"sent":false,"reason":"changed"}"#], ["capture": screens], ["capture", "paste"],
+             .failed("Could not paste into this session on devbox, so nothing was sent.")),
+            (["paste": #"{"ok":false,"error":"bad text"}"#], ["capture": screens], ["capture", "paste"],
+             .failed("Could not paste into this session on devbox, so nothing was sent.")),
+            // The paste fails partway, or its answer never comes.
+            (["paste": #"{"sent":false,"reason":"send failed"}"#], ["capture": screens], ["capture", "paste"],
+             Self.pasteUncertain),
+            ([:], ["capture": [screens[0]]], ["capture", "paste"], Self.pasteUncertain),
+            // The confirming read fails after the paste.
             (["paste": #"{"sent":true}"#, "capture": #"{"ok":false,"error":"capture failed"}"#],
-             ["paste", "capture"]),
-            (["paste": #"{"sent":true}"#], ["paste", "capture"]),
-            // Enter is refused at press time, or its answer never comes.
-            (["paste": #"{"sent":true}"#, "capture": #"{"text":"> use main"}"#,
-              "keys": #"{"sent":false,"reason":"changed"}"#], ["paste", "capture", "keys"]),
-            (["paste": #"{"sent":true}"#, "capture": #"{"text":"> use main"}"#],
-             ["paste", "capture", "keys"]),
+             ["capture": [screens[0]]], ["capture", "paste", "capture"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#], ["capture": [screens[0]]], ["capture", "paste", "capture"],
+             Self.pastedNotSubmitted),
+            // Enter is refused at press time, fails, or its answer never comes.
+            (["paste": #"{"sent":true}"#, "keys": #"{"sent":false,"reason":"changed"}"#],
+             ["capture": screens], ["capture", "paste", "capture", "keys"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#, "keys": #"{"sent":false,"reason":"send failed","sent_count":0}"#],
+             ["capture": screens], ["capture", "paste", "capture", "keys"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#], ["capture": screens], ["capture", "paste", "capture", "keys"],
+             .failed("Could not confirm the reply was submitted in the session on devbox. It may be sitting in the composer or already sent. Check the terminal before sending again.")),
         ]
-        for (replies, commands) in cases {
-            let rig = Rig(replies: replies)
+        for (replies, sequences, commands, expected) in cases {
+            let rig = Rig(replies: replies, sequences: sequences)
             rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
             let session = waiting()
             rig.store.upsert(session)
             let result = await rig.supervisor.performReply(session, text: "use main")
-            guard case .failed(let message) = result else {
-                Issue.record("claimed success for \(replies)"); continue
-            }
-            #expect(!message.isEmpty)
-            #expect(await rig.helper.commands == commands, "\(replies)")
+            #expect(result == expected, "\(replies) \(sequences)")
+            #expect(await rig.helper.commands == commands, "\(replies) \(sequences)")
             #expect(rig.store.sessions.first?.status == session.status)
             #expect(rig.supervisor.answering.isEmpty)
         }
     }
 
+    /// Waits until the helper has been asked `count` things, so a test can
+    /// change the host while the last of them is in flight.
+    private func untilCalls(_ count: Int, on rig: Rig) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await rig.helper.calls.count < count && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+    }
+
+    @Test func aTargetThatChangesWhilePastingGetsNoEnter() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(150))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let reply = Task { await rig.supervisor.performReply(session, text: "use main") }
+        // The paste is in flight when the session leaves its pane.
+        await untilCalls(2, on: rig)
+        rig.land(try Self.snapshot(pid: 4242, pane: nil))
+        #expect(await reply.value == .failed(
+            "The session on devbox changed while pasting, so the reply was not submitted, but it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice."))
+        #expect(await rig.helper.commands == ["capture", "paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    @Test func aTargetThatChangesBeforeThePastePastesNothing() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(150))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let reply = Task { await rig.supervisor.performReply(session, text: "use main") }
+        // The first read is in flight when the host goes dark.
+        await untilCalls(1, on: rig)
+        rig.store.noteRemoteReachability(host: "devbox", .unreachable("down"))
+        #expect(await reply.value == .failed(
+            "The session on devbox changed while reading its screen, so nothing was sent."))
+        #expect(await rig.helper.commands == ["capture"])
+    }
+
     @Test func aSecondSendWhileReplyingPastesNothing() async throws {
-        let rig = Rig(replies: [
-            "paste": #"{"sent":true}"#,
-            "capture": #"{"text":"> use main"}"#,
-            "keys": #"{"sent":true}"#,
-        ], delay: .milliseconds(200))
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(200))
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
         let session = waiting()
         rig.store.upsert(session)
@@ -739,10 +837,10 @@ struct RemoteAnswerTests {
         while !rig.supervisor.answering.contains(session.id) && ContinuousClock.now < deadline {
             await Task.yield()
         }
-        let second = await rig.supervisor.performReply(session, text: "use main")
-        #expect(second != .sent)
+        #expect(await rig.supervisor.performReply(session, text: "use main")
+            == .failed("SwarmBar is already answering this session."))
         #expect(await first.value == .sent)
-        #expect(await rig.helper.commands == ["paste", "capture", "keys"])
+        #expect(await rig.helper.commands == ["capture", "paste", "capture", "keys"])
     }
 
     // MARK: - The store

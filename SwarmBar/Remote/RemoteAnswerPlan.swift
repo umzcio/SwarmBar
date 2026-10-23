@@ -120,6 +120,31 @@ enum RemoteAnswerPlan {
         return String(scalars)
     }
 
+    enum PasteOutcome: Equatable {
+        case pasted
+        /// Refused before anything was typed: the target changed, or the
+        /// request itself was rejected.
+        case refused(String)
+        /// A step failed partway, or the reply could not be read, so some
+        /// of the text may be in the composer.
+        case uncertain(String)
+    }
+
+    /// Unlike keys, a paste's failures differ in what they leave behind,
+    /// and a reply that says "nothing was sent" over half a paste invites
+    /// a second Send that pastes it twice.
+    static func pasteOutcome(from data: Data) -> PasteOutcome {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .uncertain("unreadable reply")
+        }
+        if object["ok"] as? Bool == false {
+            return .refused(object["error"] as? String ?? "error")
+        }
+        if object["sent"] as? Bool == true { return .pasted }
+        let reason = object["reason"] as? String ?? "not sent"
+        return reason == "changed" ? .refused(reason) : .uncertain(reason)
+    }
+
     enum KeysOutcome: Equatable {
         case sent
         /// The helper's reason, or the error it returned instead.
