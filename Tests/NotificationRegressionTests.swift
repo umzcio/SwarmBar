@@ -133,12 +133,12 @@ struct NotificationRegressionTests {
 
     private func remoteQuestion(event: String, modified: Date) throws -> AgentSession {
         let tail = #"{"uuid":"\#(event)","type":"assistant","message":{"content":[{"type":"text","text":"Continue?"}]}}"#
-        let snapshot = RemoteSnapshot(ok: true, protocolVersion: 2, hostname: "host", system: "Linux",
-            now: modified.timeIntervalSince1970, roots: [], sessions: [
-                RemoteSessionRecord(tool: "claudeCode", path: "/session.jsonl", root: "/", projectDir: "-test",
-                    mtime: modified.timeIntervalSince1970, created: nil, size: tail.utf8.count, tail: tail)
-            ], processes: [], processesFailed: false, warnings: [])
-        return try #require(RemoteSnapshot.sessions(from: snapshot, host: "host", now: modified).first)
+        // A remote row as a poll would build it: the same session identity
+        // every time, its status and event read from the transcript tail.
+        let parsed = try #require(ClaudeSessionParser.parse(tail: tail, now: modified))
+        return AgentSession(id: StableID.uuid(for: "host:/session.jsonl"), tool: .claudeCode,
+            projectName: "test", status: parsed.status, startedAt: modified, lastActivityAt: modified,
+            host: "host", attentionEventID: parsed.attentionEventID)
     }
 
     @Test func identicalQuestionsBetweenPollsHaveDistinctEvents() throws {

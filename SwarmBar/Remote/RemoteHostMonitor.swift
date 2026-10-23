@@ -59,17 +59,8 @@ struct RemoteHostMonitor: SessionMonitor {
                 }
                 do {
                     let snapshot = try await channel.snapshot()
-                    let now = Date.now
-                    // Off the main actor, exactly as ClaudeCodeMonitor.start
-                    // does with its own discovery. This splits every tail on
-                    // newlines and runs JSONSerialization over the trailing
-                    // lines, on the order of a megabyte of string work, and
-                    // the SessionMonitor protocol is @MainActor.
-                    let sessions = await Task.detached {
-                        RemoteSnapshot.sessions(from: snapshot, host: name, now: now)
-                    }.value
                     if Task.isCancelled { break }
-                    store.sync(tool: .claudeCode, host: name, sessions: sessions)
+                    // Task 10 restores discovery, from the mirror this snapshot feeds.
                     store.noteRemoteReachability(host: name, .reachable)
                     if snapshot.processesFailed {
                         // An empty process list would otherwise read as
