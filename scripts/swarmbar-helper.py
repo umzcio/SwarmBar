@@ -37,6 +37,7 @@ import queue
 import re
 import select
 import shutil
+import signal
 import socket
 import socketserver
 import stat as stat_module
@@ -126,20 +127,30 @@ def is_backup_name(name):
     return any(marker in lowered for marker in BACKUP_MARKERS)
 
 
-def home_dirs():
-    """The homes to scan. Darwin and Linux differ.
+def owned_home(path):
+    """Whether a directory is somebody's home: a passwd entry's pw_dir
+    resolves to it, the entry's uid owns it, and nobody else can write it.
 
-    SWARMBAR_HELPER_HOMES (colon-separated) replaces discovery so tests never
-    read a real home. Without it, root sees every home, while any other user
-    sees only its own: listing /home as an unprivileged user would offer
-    directories it cannot read.
+    Darwin's /Users/Shared sits beside the homes, root-owned and mode 1777.
+    Taken as a home it was root's, so a hardlink any user planted in it
+    was read by the probe and written by root. Checking the owner's own
+    entry, not merely the owner, keeps out every shared directory like it.
     """
-    override = os.environ.get("SWARMBAR_HELPER_HOMES")
-    if override:
-        return [h for h in override.split(":") if h and os.path.isdir(h)]
+    try:
+        import pwd
+        real = os.path.realpath(path)
+        info = os.stat(real)
+        if not stat_module.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+            return False
+        return os.path.realpath(pwd.getpwuid(info.st_uid).pw_dir) == real
+    except (ImportError, KeyError, OSError):
+        return False
+
+
+def home_candidates():
+    """Where homes may be, before owned_home has a say."""
     if os.geteuid() != 0:
-        home = os.path.expanduser("~")
-        return [home] if os.path.isdir(home) else []
+        return [os.path.expanduser("~")]
     homes = []
     if platform.system() == "Darwin":
         homes.append("/var/root")
@@ -149,12 +160,26 @@ def home_dirs():
         parent = "/home"
     try:
         for entry in sorted(os.listdir(parent)):
-            path = os.path.join(parent, entry)
-            if os.path.isdir(path):
-                homes.append(path)
+            homes.append(os.path.join(parent, entry))
     except OSError:
         pass
-    return [h for h in homes if os.path.isdir(h)]
+    return homes
+
+
+def home_dirs():
+    """The homes to scan. Darwin and Linux differ.
+
+    SWARMBAR_HELPER_HOMES (colon-separated) replaces discovery so tests never
+    read a real home. Without it, root sees every home, while any other user
+    sees only its own: listing /home as an unprivileged user would offer
+    directories it cannot read. Either way a directory is a home only when
+    owned_home says so, and that holds for discovery, the probe, the hook
+    homes and setup writes alike.
+    """
+    override = os.environ.get("SWARMBAR_HELPER_HOMES")
+    if override:
+        return [h for h in override.split(":") if h and os.path.isdir(h)]
+    return [h for h in home_candidates() if owned_home(h)]
 
 
 def claude_roots(warnings):
@@ -788,13 +813,29 @@ def run_command(argv, timeout=5, input=None, **options):
     raises OSError or SubprocessError like subprocess.run, and callers decide
     whether a failure matters. `input` is bytes for the child's stdin (tmux
     load-buffer reads the paste text there); None leaves stdin alone.
-    `options` go to subprocess.run as they are: env, and user, group and
-    extra_groups to run as someone other than root.
+    `options` go to subprocess as they are: env, cwd, and user, group and
+    extra_groups to run as someone other than root. With
+    start_new_session, a timeout kills the child's whole process group,
+    since a wrapper script that execs node can leave a grandchild running
+    after its own pid is gone.
     """
-    return subprocess.run(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        input=input, **options
-    )
+    if not options.get("start_new_session"):
+        return subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+            input=input, **options
+        )
+    with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def process_cwd(pid):
@@ -1204,14 +1245,56 @@ def file_digest(path, limit=None):
     return hashlib.sha256(data).hexdigest(), kept
 
 
+def owner_only_path(home, resolved, uid):
+    """Whether every directory from the home down to a file is owned by
+    `uid` and writable by nobody else, the file included and links not
+    followed. Anything less and someone else chose what sits at that
+    path: a hardlink to /etc/sudoers in a shared directory has exactly
+    the right name."""
+    real_home = os.path.realpath(home).rstrip("/")
+    if uid is None or not resolved.startswith(real_home + "/"):
+        return False
+    current = real_home
+    for part in [""] + resolved[len(real_home) + 1:].split("/"):
+        current = os.path.join(current, part) if part else current
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        if info.st_uid != uid or info.st_mode & 0o022 or stat_module.S_ISLNK(info.st_mode):
+            return False
+    return True
+
+
+def read_owned(path, uid, limit=None):
+    """file_digest for a file that must be `uid`'s own regular file, checked
+    on the descriptor actually read, so a swap after the path was checked
+    is caught. None when it is not, or cannot be read."""
+    def opener(name, flags):
+        return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        with open(path, "rb", opener=opener) as handle:
+            info = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(info.st_mode) or info.st_uid != uid:
+                return None
+            data = handle.read()
+    except OSError:
+        return None
+    kept = data if limit is None or len(data) <= limit else None
+    return hashlib.sha256(data).hexdigest(), kept
+
+
 def home_configs(home, warnings):
     """The agent config files in a home that exist, each once by realpath.
 
     One that exists but cannot be read is still listed, with a null hash
     and text and a warning: dropping it would make the plan create a file
-    that is already there, and could-not-read would read as absent."""
+    that is already there, and could-not-read would read as absent. So is
+    one that is not the home owner's own all the way down (owner_only_path):
+    run as root, reading it would hand its contents to whoever planted it."""
     configs = []
     seen = set()
+    uid = home_owner(home)[1]
     for tool, pattern in CONFIG_TOOLS:
         if pattern.startswith(".claude*/"):
             candidates = [os.path.join(d, pattern[len(".claude*/"):])
@@ -1223,7 +1306,12 @@ def home_configs(home, warnings):
             if resolved in seen or not os.path.isfile(resolved):
                 continue
             seen.add(resolved)
-            digest = file_digest(resolved, CONFIG_TEXT_MAX)
+            if not owner_only_path(home, resolved, uid):
+                warnings.append("refusing %s config %s: it is not the home owner's own"
+                                % (tool, resolved))
+                configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None})
+                continue
+            digest = read_owned(resolved, uid, CONFIG_TEXT_MAX)
             if digest is None:
                 warnings.append("cannot read %s config %s" % (tool, resolved))
                 configs.append({"tool": tool, "path": resolved, "sha256": None, "text": None})
@@ -1819,95 +1907,195 @@ def write_bytes(handle, data):
     os.fsync(handle.fileno())
 
 
-def make_parents(home, target):
-    """The directories between the home and a new file, made 700 by their
-    owner. ~/.swarmbar must be 700 for the hook steps, and nothing here is
-    for anyone else to read. A umask could strip the mode, so it is set."""
-    relative = os.path.relpath(os.path.dirname(target), home)
-    if relative == os.curdir:
-        return
-    current = home
-    for part in relative.split(os.sep):
-        current = os.path.join(current, part)
-        try:
-            os.mkdir(current, 0o700)
-        except FileExistsError:
-            continue
-        os.chmod(current, 0o700)
+class Refused(Exception):
+    """A file job refused, with the error the response carries."""
 
 
-def open_existing(target):
-    """An fd open for read and write on the target, or None when there is
-    no file. O_NOFOLLOW refuses a link swapped in after the parent resolved
-    the path, and O_NONBLOCK keeps a planted FIFO from hanging the open."""
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+
+
+def checked_directory(fd):
+    """A directory this user owns and nobody else can write, or Refused.
+    Anything less and someone else decides what its names point at."""
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() \
+            or info.st_mode & 0o022:
+        os.close(fd)
+        raise Refused("not allowed")
+    return fd
+
+
+def open_directory(name, parent_fd=None):
     try:
-        return os.open(target, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if parent_fd is None:
+            fd = os.open(name, DIRECTORY_FLAGS)
+        else:
+            fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused("not allowed")
+        raise
+    return checked_directory(fd)
+
+
+def walk_to_parent(job, create):
+    """An fd on the directory that holds the target, reached from the home
+    one component at a time with O_NOFOLLOW, every step checked by
+    checked_directory. Nothing is resolved by path after the parent
+    process checked the allowlist, so a link swapped in anywhere along
+    the way refuses the job instead of steering it. With `create`, a
+    missing directory is made 700 (~/.swarmbar must be 700 for the hook
+    steps) and the mode set outright, since a umask would narrow it.
+    Returns (fd, leaf name); None as fd when a directory is missing and
+    `create` is false."""
+    home, target = job["home"], job["target"]
+    if not target.startswith(home.rstrip("/") + "/"):
+        raise Refused("not allowed")
+    parts = target[len(home.rstrip("/")) + 1:].split("/")
+    fd = open_directory(home)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = open_directory(part, fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None, parts[-1]
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+                try:
+                    os.fchmod(child, 0o700)
+                except BaseException:
+                    os.close(child)
+                    raise
+                child = checked_directory(child)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return fd, parts[-1]
+
+
+def take_backup(parent_fd, leaf, current, mode):
+    """The one-time backup beside the file: written from the bytes the hash
+    just matched, through the directory fd, O_EXCL and O_NOFOLLOW, with the
+    original's mode. One already there is kept, since it is the file as it
+    was before SwarmBar first changed it, but only when it is this user's
+    own regular file. Returns the backup's name."""
+    name = leaf + BACKUP_SUFFIX
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return None
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise Refused("backup path is not a file")
+        return name
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=parent_fd)
+    except FileExistsError:
+        raise Refused("backup path is not a file")
+    with os.fdopen(fd, "wb") as handle:
+        try:
+            handle.write(current)
+            handle.flush()
+            os.fsync(fd)
+            os.fchmod(fd, mode)
+        except BaseException:
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    return name
 
 
 def file_write(job):
     """The write half of write_file, run as the home's owner.
 
     Root never opens a path in a user's home: as root this runs in a child
-    that already is the owner, so a file swapped for a link to someone
-    else's can only make the write fail, never redirect it. The parent has
-    checked the allowlist; this checks that the path still resolves where
-    it did, then the precondition hash, then backs up and writes in place.
+    that already is the owner. The parent checked the allowlist; this
+    checks the path still resolves where it did, walks to it by descriptor
+    (walk_to_parent), and refuses a file that is not this user's own, which
+    is what a hardlink to someone else's file looks like. A second link to
+    the user's own file is fine: that is how profiles share one config.
+    Then the precondition hash, the backup, and the write in place.
     """
+    try:
+        return write_checked(job)
+    except Refused as refused:
+        return refusal(str(refused))
+
+
+def write_checked(job):
     path, target = job["path"], job["target"]
     if os.path.realpath(path) != target:
         return refusal("not allowed")
     data = base64.b64decode(job["content_b64"])
     expect = job["expect_sha256"]
     try:
-        fd = open_existing(target)
+        parent_fd, leaf = walk_to_parent(job, create=expect == "absent")
     except OSError as error:
-        if error.errno == errno.ELOOP:
-            return refusal("not allowed")
         return refusal("cannot open: %s" % (error.strerror or error))
-    if fd is None:
-        return create_file(job, data)
-    with os.fdopen(fd, "r+b") as handle:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return refusal("not allowed")
-        current = handle.read()
-        if expect == "absent" or hashlib.sha256(current).hexdigest() != expect:
-            return refusal("changed")
-        backup = target + BACKUP_SUFFIX
+    if parent_fd is None:
+        return refusal("changed")
+    try:
         try:
-            # One-time: the backup is the file as it was before SwarmBar
-            # first changed it, and a later setup must not replace that.
-            if not os.path.lexists(backup):
-                shutil.copy2(target, backup)
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return create_file(job, data, parent_fd, leaf)
         except OSError as error:
-            return refusal("cannot back up: %s" % (error.strerror or error))
-        try:
-            write_bytes(handle, data)
-        except Exception as error:
-            # The bytes the hash just matched, which are the backup's when
-            # this call took it. An older backup would also undo whatever
-            # the user changed since, so it is not the one written back.
+            if error.errno == errno.ELOOP:
+                return refusal("not allowed")
+            return refusal("cannot open: %s" % (error.strerror or error))
+        with os.fdopen(fd, "r+b") as handle:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                return refusal("not allowed")
+            current = handle.read()
+            if expect == "absent" or hashlib.sha256(current).hexdigest() != expect:
+                return refusal("changed")
             try:
-                write_bytes(handle, current)
-                restored = "restored"
-            except Exception:
-                restored = "not restored, the backup is at %s" % backup
-            return refusal("write failed: %s; %s" % (getattr(error, "strerror", None) or error,
-                                                     restored))
-    return {"ok": True, "written": True, "backup": backup}
+                backup = take_backup(parent_fd, leaf, current, stat.S_IMODE(info.st_mode))
+            except OSError as error:
+                return refusal("cannot back up: %s" % (error.strerror or error))
+            backup = os.path.join(os.path.dirname(target), backup)
+            try:
+                write_bytes(handle, data)
+            except Exception as error:
+                # The bytes the hash just matched, which are the backup's when
+                # this call took it. An older backup would also undo whatever
+                # the user changed since, so it is not the one written back.
+                try:
+                    write_bytes(handle, current)
+                    restored = "restored"
+                except Exception:
+                    restored = "not restored, the backup is at %s" % backup
+                return refusal("write failed: %s; %s"
+                               % (getattr(error, "strerror", None) or error, restored))
+        return {"ok": True, "written": True, "backup": backup}
+    finally:
+        os.close(parent_fd)
 
 
-def create_file(job, data):
+def create_file(job, data, parent_fd, leaf):
     """A file the plan expected to be absent. O_EXCL makes "absent" hold at
     the moment of creation, and the mode is set outright since a umask
     would otherwise narrow it."""
     if job["expect_sha256"] != "absent":
         return refusal("changed")
-    target, mode = job["target"], job["mode"]
+    mode = job["mode"]
     try:
-        make_parents(job["home"], target)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode,
+                     dir_fd=parent_fd)
     except FileExistsError:
         return refusal("changed")
     except OSError as error:
@@ -1920,7 +2108,7 @@ def create_file(job, data):
             write_bytes(handle, data)
         except Exception as error:
             try:
-                os.unlink(target)
+                os.unlink(leaf, dir_fd=parent_fd)
             except OSError:
                 pass
             return refusal("write failed: %s" % (getattr(error, "strerror", None) or error))
@@ -1928,24 +2116,36 @@ def create_file(job, data):
 
 
 def file_remove(job):
-    """The remove half of remove_file, run as the home's owner. Already
-    gone counts as done, so undo can run twice."""
+    """The remove half of remove_file, run as the home's owner and reached
+    the same way as a write. Already gone counts as done, so undo can run
+    twice."""
     path, target = job["path"], job["target"]
     if os.path.realpath(path) != target:
         return refusal("not allowed")
     try:
-        info = os.lstat(target)
-    except FileNotFoundError:
-        return {"ok": True, "removed": False}
-    if not stat.S_ISREG(info.st_mode):
-        return refusal("not allowed")
-    try:
-        os.unlink(target)
-    except FileNotFoundError:
-        return {"ok": True, "removed": False}
+        parent_fd, leaf = walk_to_parent(job, create=False)
+    except Refused as refused:
+        return refusal(str(refused))
     except OSError as error:
-        return refusal("cannot remove: %s" % (error.strerror or error))
-    return {"ok": True, "removed": True}
+        return refusal("cannot open: %s" % (error.strerror or error))
+    if parent_fd is None:
+        return {"ok": True, "removed": False}
+    try:
+        try:
+            info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"ok": True, "removed": False}
+        if not stat.S_ISREG(info.st_mode):
+            return refusal("not allowed")
+        try:
+            os.unlink(leaf, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return {"ok": True, "removed": False}
+        except OSError as error:
+            return refusal("cannot remove: %s" % (error.strerror or error))
+        return {"ok": True, "removed": True}
+    finally:
+        os.close(parent_fd)
 
 
 FILE_BY_KIND = {"write": file_write, "remove": file_remove}
@@ -2355,7 +2555,7 @@ def run_as_user(owner, kind, directory):
 # remove_file takes only SwarmBar's own bridge files: the plugin and the
 # two scripts. An agent's config is edited back, never deleted.
 REMOVABLE = (ALLOWED[5], ALLOWED[6], ALLOWED[7])
-SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Far past any config or bridge script.
 WRITE_MAX_BYTES = 4 * 1024 * 1024
 # fsync on a slow disk is the long part.
@@ -2485,7 +2685,7 @@ def write_file(request):
     expect = request.get("expect_sha256")
     mode = request.get("mode", 0o644)
     if not isinstance(content, str) or not isinstance(expect, str) \
-            or (expect != "absent" and not SHA256_HEX.match(expect)) \
+            or (expect != "absent" and not SHA256_HEX.fullmatch(expect)) \
             or isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
         return {"ok": False, "error": "malformed request"}
     try:
@@ -2558,57 +2758,86 @@ def accepted_events(text):
 
 
 def kimi_executable(binary):
-    """The file a kimi_events request names, or None. A plain name must be
-    one of the family's own and is found on PATH; anything else must be an
-    absolute path to an executable file."""
+    """The vetted realpath of the build a kimi_events request names, or None.
+
+    A plain name must be one of the family's own and is found on PATH;
+    anything else must be an absolute path to an executable file. Either
+    way the name it was asked by, or the file it resolves to, must be a
+    Kimi-family name, or the BearCode bundle agent_name recognizes, so a
+    request cannot run an arbitrary program. The realpath is what runs,
+    never a name that could be repointed in between."""
     if not isinstance(binary, str) or not binary or "\x00" in binary:
         return None
     if binary in KIMI_BINARIES:
         # A relative PATH entry would find whatever the current directory
         # holds.
         found = shutil.which(binary)
-        return found if found and os.path.isabs(found) else None
-    if os.path.isabs(binary) and ".." not in binary.split("/") \
-            and os.path.isfile(binary) and os.access(binary, os.X_OK):
-        return binary
+        if not found or not os.path.isabs(found):
+            return None
+    elif os.path.isabs(binary) and ".." not in binary.split("/"):
+        found = binary
+    else:
+        return None
+    real = os.path.realpath(found)
+    if not os.path.isfile(real) or not os.access(real, os.X_OK):
+        return None
+    if os.path.basename(found) in KIMI_BINARIES or os.path.basename(real) in KIMI_BINARIES \
+            or real.endswith("/" + BEARCODE_ARGS):
+        return real
     return None
 
 
-def doctor_identity(executable):
-    """subprocess options that run a build as whoever could have changed
-    it. As root, a binary owned by someone else, or root's binary in a
-    directory someone else owns, runs as that owner: running it as root
-    would hand them root. {} means run as this process."""
+def root_only_path(path):
+    """Whether only root can have changed a file: it and every directory
+    above it are root's and writable by nobody else."""
+    current = path
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
+def doctor_identity(home, executable):
+    """subprocess options that run doctor as the owner of the home being
+    configured, or None when it must not run at all. As root, it runs as
+    root only for root's own home and only a build nobody but root can
+    have changed: anything else would hand root to whoever could. {} means
+    run as this process."""
+    user, uid, gid = home_owner(home)
+    if uid is None:
+        return None
     if os.geteuid() != 0:
-        return {}
-    real = os.path.realpath(executable)
-    info = os.stat(real)
-    uid = info.st_uid
+        return {} if uid == os.geteuid() else None
     if uid == 0:
-        uid = os.stat(os.path.dirname(real)).st_uid
-    if uid == 0:
-        return {}
-    import pwd
-    entry = pwd.getpwuid(uid)
-    return {"user": uid, "group": entry.pw_gid,
-            "extra_groups": supplementary_groups(entry.pw_name, entry.pw_gid),
-            "home": entry.pw_dir}
+        return {} if root_only_path(executable) else None
+    return {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
 
 
 def kimi_events(request):
-    """{binary}: the hook event names that build accepts, as
-    {"events": [...]}, or {"events": null, "error": why}."""
+    """{binary, home}: the hook event names that build accepts, asked as
+    the owner of the home being configured, as {"events": [...]}, or
+    {"events": null, "error": why}."""
     binary = request.get("binary")
     executable = kimi_executable(binary)
     if executable is None:
         if binary in KIMI_BINARIES:
             return {"events": None, "error": "%s is not on PATH" % binary}
         return {"events": None, "error": "not a Kimi-family binary"}
-    try:
-        ids = doctor_identity(executable)
-    except (OSError, KeyError) as error:
-        return {"events": None, "error": "cannot tell who owns it: %s" % error_text(error)}
-    home = ids.pop("home", None)
+    home = request.get("home")
+    homes = dict((os.path.realpath(h), h) for h in home_dirs())
+    if not isinstance(home, str) or "\x00" in home or os.path.realpath(home) not in homes:
+        return {"events": None, "error": "not a home"}
+    home = homes[os.path.realpath(home)]
+    ids = doctor_identity(home, executable)
+    if ids is None:
+        return {"events": None, "error": "will not run %s for %s" % (executable, home)}
     temp = tempfile.mkdtemp(prefix="swarmbar-kimi-")
     try:
         config = os.path.join(temp, "config.toml")
@@ -2619,12 +2848,13 @@ def kimi_events(request):
             # nothing else, so there is nothing in it to keep private.
             os.chmod(temp, 0o755)
             os.chmod(config, 0o644)
-        env = dict(os.environ, KIMI_CODE_HOME=temp)
-        if home:
-            env["HOME"] = home
+        env = {"PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin",
+               "HOME": os.path.realpath(home), "KIMI_CODE_HOME": temp}
+        if os.environ.get("LANG"):
+            env["LANG"] = os.environ["LANG"]
         try:
             done = run_command([executable, "doctor"], timeout=KIMI_DOCTOR_SECONDS,
-                               env=env, cwd=temp, **ids)
+                               env=env, cwd=temp, start_new_session=True, **ids)
         except subprocess.TimeoutExpired:
             return {"events": None, "error": "doctor timed out"}
         except (OSError, subprocess.SubprocessError, ValueError) as error:
@@ -3330,6 +3560,43 @@ SUDOERS_PATH = "/etc/sudoers.d/swarmbar"
 SUDOERS_USER = re.compile(r"[a-z_][a-z0-9_-]*[$]?")
 SUDOERS_USER_MAX = 32
 VISUDO_PATHS = ("/usr/sbin/visudo",)
+# A blob is a few configs and maybe the helper's own source. Bounded, so a
+# small blob cannot expand into gigabytes.
+MAX_OPERATIONS_BYTES = 8 * 1024 * 1024
+
+
+def narrow_rule_run():
+    """Whether this is the installed root helper run by a login user through
+    the narrow sudo rule. That rule lets the user run the helper with any
+    arguments, so the operations that set the rule up, and the pasted
+    command that carries them, must not work through it: the user could
+    otherwise widen the rule or replace the program it names."""
+    path = globals().get("__file__")
+    if not path or os.geteuid() != 0:
+        return False
+    if os.path.realpath(path) != os.path.realpath(HELPER_PATHS[0]):
+        return False
+    return os.environ.get("SUDO_UID", "0") not in ("", "0")
+
+
+NARROW_RULE_REFUSAL = {"ok": False, "error": "refused under the SwarmBar sudo rule; "
+                       "run the setup command with sudo instead"}
+
+
+def fsync_directory(directory):
+    """Makes a rename in `directory` durable. Best effort: the file is in
+    place either way, and a filesystem that cannot sync a directory is not
+    a reason to report the install as failed."""
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def visudo_path():
@@ -3356,22 +3623,35 @@ def own_bytes():
 
 
 def install_helper(request, source=None):
-    """{dest}: this file, installed atomically (a temp file beside it, then
-    a rename) at helper_destination(), mode 700. It is SwarmBar's own file,
-    so replacing the inode is right, unlike an agent's config.
+    """{dest, expect_sha256}: this file, installed atomically (a temp file
+    beside it, then a rename) at helper_destination(), mode 700. It is
+    SwarmBar's own file, so replacing the inode is right, unlike an agent's
+    config. The bytes are read once, hashed and written as read, so
+    expect_sha256, when given, checks exactly what is installed.
 
     As root the directory must be root's and writable by nobody else: the
     sudo rule runs whatever sits at that path as root, so a directory
     another user can write would let them choose it. The user's own copy
     goes in ~/.swarmbar, which must be theirs and not a link.
     """
+    if narrow_rule_run():
+        return NARROW_RULE_REFUSAL
     dest = request.get("dest")
     if not isinstance(dest, str) or dest != helper_destination():
         return {"ok": False, "error": "not allowed"}
+    expect = request.get("expect_sha256")
+    if expect is not None and (not isinstance(expect, str) or not SHA256_HEX.fullmatch(expect)):
+        return {"ok": False, "error": "malformed request"}
     if source is None:
-        source = own_bytes()
+        try:
+            source = own_bytes()
+        except OSError:
+            source = None
     if source is None:
         return {"ok": False, "error": "cannot read the helper itself"}
+    digest = hashlib.sha256(source).hexdigest()
+    if expect is not None and digest != expect:
+        return {"ok": False, "error": "changed"}
     directory = os.path.dirname(dest)
     try:
         if os.geteuid() == 0:
@@ -3399,12 +3679,13 @@ def install_helper(request, source=None):
             handle.flush()
             os.fsync(fd)
         os.replace(temp, dest)
+        fsync_directory(directory)
     except OSError as error:
         return {"ok": False, "error": "cannot install: %s" % error_text(error)}
     finally:
         if os.path.lexists(temp):
             os.unlink(temp)
-    return {"ok": True, "installed": dest, "sha256": hashlib.sha256(source).hexdigest()}
+    return {"ok": True, "installed": dest, "sha256": digest}
 
 
 def install_sudoers(request):
@@ -3412,9 +3693,13 @@ def install_sudoers(request):
     and nothing else without a password. Root only. The rule is written
     to a temp file, checked by visudo, and only then renamed into place,
     mode 440. The temp name has a dot in it, which sudo's includedir skips,
-    so an unchecked rule is never live."""
+    so an unchecked rule is never live. Once in place the whole
+    configuration is checked again, and a failure takes the rule back out:
+    a sudoers that does not parse locks everyone out of sudo."""
     if os.geteuid() != 0:
         return {"ok": False, "error": "needs root"}
+    if narrow_rule_run():
+        return NARROW_RULE_REFUSAL
     user = request.get("user")
     if not isinstance(user, str) or len(user) > SUDOERS_USER_MAX \
             or not SUDOERS_USER.fullmatch(user):
@@ -3444,11 +3729,27 @@ def install_sudoers(request):
             said = (checked.stderr or checked.stdout or b"").decode("utf-8", "replace").strip()
             return {"ok": False, "error": "visudo rejected the rule: %s" % said}
         os.replace(temp, SUDOERS_PATH)
+        fsync_directory(os.path.dirname(SUDOERS_PATH))
     except OSError as error:
         return {"ok": False, "error": "cannot install the rule: %s" % error_text(error)}
     finally:
         if temp is not None and os.path.lexists(temp):
             os.unlink(temp)
+    try:
+        whole = run_command([visudo, "-c"], timeout=10)
+        failed = whole.returncode != 0
+        said = (whole.stderr or whole.stdout or b"").decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        failed, said = True, error_text(error)
+    if failed:
+        try:
+            os.unlink(SUDOERS_PATH)
+            fsync_directory(os.path.dirname(SUDOERS_PATH))
+            undone = "the rule was removed"
+        except OSError as error:
+            undone = "and removing it failed: %s" % error_text(error)
+        return {"ok": False, "error": "sudo configuration did not check with the rule in "
+                "place (%s); %s" % (said, undone)}
     return {"ok": True, "installed": SUDOERS_PATH}
 
 
@@ -3489,11 +3790,16 @@ def decode_operations(blob):
         return None
     data = None
     for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        unpacker = zlib.decompressobj(wbits)
         try:
-            data = zlib.decompress(packed, wbits)
-            break
+            data = unpacker.decompress(packed, MAX_OPERATIONS_BYTES)
         except zlib.error:
             continue
+        # Output left unread means past the bound, and a stream with no end
+        # was cut short. Neither is a blob to act on.
+        if unpacker.unconsumed_tail or not unpacker.eof:
+            return None
+        break
     if data is None:
         return None
     try:
@@ -3508,6 +3814,10 @@ def decode_operations(blob):
 def apply_main(args):
     """Runs every operation in order, printing a line for each, and stops at
     the first failure. Returns the exit status."""
+    if narrow_rule_run():
+        sys.stdout.write("failed: %s\n" % NARROW_RULE_REFUSAL["error"])
+        sys.stdout.flush()
+        return 2
     operations = decode_operations(args[0]) if len(args) == 1 else None
     if not operations:
         sys.stdout.write("failed: cannot read the setup operations\n")

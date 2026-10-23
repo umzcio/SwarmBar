@@ -2419,6 +2419,33 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["python"], helper.platform.python_version())
         self.assertIn("boom", result["error"])
 
+    def test_probe_refuses_configs_not_the_home_owners_own(self):
+        open_dir = self.put(".kimi-code/config.toml", "[hooks]\n")
+        os.chmod(os.path.dirname(open_dir), 0o777)
+        outside = os.path.join(self.root, "planted.json")
+        with open(outside, "w") as handle:
+            handle.write("PLANTED-BYTES\n")
+        os.makedirs(os.path.join(self.home, ".config", "opencode"))
+        os.symlink(outside, os.path.join(self.home, ".config", "opencode", "opencode.json"))
+        theirs = os.path.realpath(self.put(".bearcode/config.toml", "PLANTED-BYTES\n"))
+        real_lstat = os.lstat
+
+        def owned_by_another(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if path != theirs:
+                return info
+            values = list(tuple(info))
+            values[4] = info.st_uid + 1
+            return os.stat_result(values)
+        with mock.patch.object(os, "lstat", owned_by_another):
+            result = self.probe()
+        by_tool = dict((c["tool"], c) for c in result["configs"][self.home])
+        for tool in ("kimi", "opencode", "bearcode"):
+            self.assertIsNone(by_tool[tool]["sha256"], tool)
+            self.assertIsNone(by_tool[tool]["text"], tool)
+        self.assertEqual(sum("refusing" in w for w in result["warnings"]), 3, result["warnings"])
+        self.assertNotIn("PLANTED", json.dumps(result["configs"]))
+
     def test_allowed_patterns(self):
         self.assertEqual(helper.ALLOWED, (
             ".claude*/settings.json",
@@ -2646,13 +2673,104 @@ class SetupWriteTests(unittest.TestCase):
                          {"ok": False, "error": "not allowed"})
         self.assertTrue(os.path.exists(settings))
 
+    def test_mode_1777_dir_is_not_a_home(self):
+        shared = os.path.join(self.root, "Shared")
+        os.makedirs(shared)
+        os.chmod(shared, 0o1777)
+        sibling = os.path.join(self.root, "v")
+        os.makedirs(sibling)
+        entry = mock.Mock(pw_dir=self.home)
+        env = dict(os.environ)
+        env.pop("SWARMBAR_HELPER_HOMES")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "home_candidates",
+                                  return_value=[shared, sibling, self.home]):
+            # Shared is writable by all; the sibling is this user's but not
+            # the home passwd names.
+            self.assertEqual(helper.home_dirs(), [self.home])
+            os.chmod(self.home, 0o775)
+            self.assertEqual(helper.home_dirs(), [])
+        os.chmod(self.home, 0o755)
+
+    def test_intermediate_symlink_is_refused(self):
+        real = self.put("elsewhere/opencode/opencode.json", "{}\n")
+        os.symlink(os.path.join(self.home, "elsewhere"), os.path.join(self.home, ".config"))
+        linked = os.path.join(self.home, ".config", "opencode", "opencode.json")
+        self.assertEqual(self.write(linked, "x\n", sha("{}\n")),
+                         {"ok": False, "error": "not allowed"})
+        # The child's own walk refuses it too, as it would a link swapped in
+        # after the parent resolved the path.
+        job = {"home": self.home, "target": linked}
+        with self.assertRaises(helper._STEPS["Refused"]):
+            helper._STEPS["walk_to_parent"](job, False)
+        self.assertEqual(self.read(real), "{}\n")
+
+    def test_claude_dir_symlinked_out_of_home_is_refused(self):
+        outside = os.path.join(self.root, "outside-claude")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "settings.json"), "w") as handle:
+            handle.write("{}\n")
+        os.symlink(outside, os.path.join(self.home, ".claude"))
+        path = os.path.join(self.home, ".claude", "settings.json")
+        self.assertIsNone(helper.allowed_target(path))
+        self.assertEqual(self.write(path, "x\n", sha("{}\n")), {"ok": False, "error": "not allowed"})
+        self.assertEqual(self.read(os.path.join(outside, "settings.json")), "{}\n")
+
+    def test_writable_directory_on_the_way_is_refused(self):
+        path = self.put(".kimi-code/config.toml", "old\n")
+        os.chmod(os.path.dirname(path), 0o777)
+        self.assertEqual(self.write(path, "new\n", sha("old\n")),
+                         {"ok": False, "error": "not allowed"})
+        self.assertEqual(self.read(path), "old\n")
+
+    def test_hardlink_to_another_owners_file_is_refused(self):
+        theirs = os.path.join(self.root, "someone-elses")
+        with open(theirs, "w") as handle:
+            handle.write("theirs\n")
+        os.makedirs(os.path.join(self.home, ".kimi-code"))
+        path = os.path.join(self.home, ".kimi-code", "config.toml")
+        os.link(theirs, path)
+        inode = os.stat(theirs).st_ino
+        real_fstat = os.fstat
+
+        def owned_by_another(fd):
+            info = real_fstat(fd)
+            if info.st_ino != inode:
+                return info
+            values = list(tuple(info))
+            values[4] = info.st_uid + 1
+            return os.stat_result(values)
+        with mock.patch.object(os, "fstat", owned_by_another):
+            self.assertEqual(self.write(path, "mine\n", sha("theirs\n")),
+                             {"ok": False, "error": "not allowed"})
+        self.assertEqual(self.read(theirs), "theirs\n")
+        self.assertFalse(os.path.lexists(path + ".backup-swarmbar"))
+
+    def test_preplanted_backup_symlink_is_refused(self):
+        path = self.put(".kimi-code/config.toml", "old\n")
+        decoy = os.path.join(self.root, "decoy")
+        with open(decoy, "w") as handle:
+            handle.write("decoy\n")
+        os.symlink(decoy, path + ".backup-swarmbar")
+        self.assertEqual(self.write(path, "new\n", sha("old\n")),
+                         {"ok": False, "error": "backup path is not a file"})
+        self.assertEqual(self.read(path), "old\n")
+        self.assertEqual(self.read(decoy), "decoy\n")
+        # A directory there is no backup either.
+        os.unlink(path + ".backup-swarmbar")
+        os.mkdir(path + ".backup-swarmbar")
+        self.assertEqual(self.write(path, "new\n", sha("old\n"))["error"],
+                         "backup path is not a file")
+
     def test_requests_reach_the_writers(self):
         path = self.put(".claude/settings.json", "{}\n")
         stdin = io.StringIO(json.dumps({"id": 1, "cmd": "write_file", "path": path,
                                         "content_b64": encoded("x\n"),
                                         "expect_sha256": sha("{}\n"), "mode": 0o644}) + "\n"
                             + json.dumps({"id": 2, "cmd": "remove_file", "path": path}) + "\n"
-                            + json.dumps({"id": 3, "cmd": "kimi_events", "binary": "kimi; true"})
+                            + json.dumps({"id": 3, "cmd": "kimi_events", "binary": "kimi; true",
+                                          "home": self.home})
                             + "\n")
         stdout = io.StringIO()
         helper.main(stdin, stdout)
@@ -2681,27 +2799,74 @@ DOCTOR_ERROR = (
 class KimiEventsTests(unittest.TestCase):
     """kimi_events asks a Kimi-family build which hook events it accepts."""
 
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbk-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home = os.path.join(self.root, "u")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.home)
+        os.makedirs(self.bin)
+        self.kimi = self.executable(os.path.join(self.bin, "kimi"), "#!/bin/sh\nexit 1\n")
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home,
+                                           "PATH": self.bin + os.pathsep + "/usr/bin:/bin",
+                                           "SBK_SECRET": "must not reach doctor"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def executable(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, 0o755)
+        return path
+
+    def events(self, binary="kimi", home=None):
+        return helper.kimi_events({"binary": binary, "home": home or self.home})
+
+    def recording(self, seen, text=DOCTOR_ERROR):
+        def doctor(argv, timeout=5, input=None, **options):
+            seen["argv"], seen["timeout"], seen["options"] = list(argv), timeout, options
+            seen["home"] = options["env"]["KIMI_CODE_HOME"]
+            with open(os.path.join(seen["home"], "config.toml")) as handle:
+                seen["config"] = handle.read()
+            return completed(argv, 1, text)
+        return doctor
+
     def test_kimi_events_parses_accepted_list(self):
         seen = {}
-
-        def doctor(argv, timeout=5, input=None, **options):
-            seen["argv"], seen["timeout"] = list(argv), timeout
-            home = options["env"]["KIMI_CODE_HOME"]
-            seen["home"] = home
-            with open(os.path.join(home, "config.toml")) as handle:
-                seen["config"] = handle.read()
-            return completed(argv, 1, DOCTOR_ERROR)
-        with mock.patch.object(helper, "run_command", doctor):
-            result = helper.kimi_events({"binary": "kimi"})
+        with mock.patch.object(helper, "run_command", self.recording(seen)):
+            result = self.events()
         self.assertEqual(result, {"events": [
             "PreToolUse", "PostToolUse", "PermissionRequest", "PermissionResult",
             "UserPromptSubmit", "Stop", "SessionStart", "SessionEnd", "Notification"]})
-        self.assertEqual(seen["argv"][1:], ["doctor"])
-        self.assertEqual(os.path.basename(seen["argv"][0]), "kimi")
+        self.assertEqual(seen["argv"], [self.kimi, "doctor"])
         self.assertEqual(seen["timeout"], 15)
         self.assertIn('event = "SwarmBarProbeEvent"', seen["config"])
         self.assertEqual(seen["config"].count("[[hooks]]"), 1)
         self.assertFalse(os.path.exists(seen["home"]))
+
+    def test_doctor_runs_the_vetted_realpath_in_a_scrubbed_environment(self):
+        real = self.executable(os.path.join(self.root, "dist", "kimi-code"), "#!/bin/sh\n")
+        os.symlink(real, os.path.join(self.bin, "kimi-code"))
+        seen = {}
+        with mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events(os.path.join(self.bin, "kimi-code"))["events"])
+        self.assertEqual(seen["argv"][0], real)
+        env = seen["options"]["env"]
+        self.assertEqual(set(env) - {"LANG"}, {"PATH", "HOME", "KIMI_CODE_HOME"})
+        self.assertEqual(env["HOME"], self.home)
+        self.assertTrue(seen["options"]["start_new_session"])
+        self.assertNotIn("user", seen["options"])
+
+    def test_bearcode_bundle_is_a_family_build(self):
+        bundle = self.executable(os.path.join(
+            self.root, "bearcode-cli", "apps", "kimi-code", "dist", "main.mjs"), "#!/bin/sh\n")
+        link = os.path.join(self.bin, "bc")
+        os.symlink(bundle, link)
+        seen = {}
+        with mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events(link)["events"])
+        self.assertEqual(seen["argv"][0], bundle)
 
     def test_parser_takes_other_quoting_and_separators(self):
         self.assertEqual(helper.accepted_events(
@@ -2719,51 +2884,94 @@ class KimiEventsTests(unittest.TestCase):
     def test_kimi_events_reports_what_it_could_not_learn(self):
         quiet = lambda argv, timeout=5, input=None, **options: completed(argv, 0, "No issues.\n")
         with mock.patch.object(helper, "run_command", quiet):
-            result = helper.kimi_events({"binary": "kimi"})
+            result = self.events()
         self.assertIsNone(result["events"])
         self.assertTrue(result["error"])
 
         def slow(argv, timeout=5, input=None, **options):
             raise subprocess.TimeoutExpired(argv, timeout)
         with mock.patch.object(helper, "run_command", slow):
-            result = helper.kimi_events({"binary": "kimi"})
+            result = self.events()
         self.assertIsNone(result["events"])
         self.assertIn("time", result["error"])
 
     def test_kimi_events_rejects_bad_binary(self):
-        root = tempfile.mkdtemp(dir="/tmp", prefix="sbk-")
-        self.addCleanup(shutil.rmtree, root, True)
-        plain = os.path.join(root, "kimi")
+        plain = os.path.join(self.root, "other", "kimi")
+        os.makedirs(os.path.dirname(plain))
         with open(plain, "w") as handle:
             handle.write("#!/bin/sh\n")
         os.chmod(plain, 0o644)
         runner = mock.Mock(side_effect=AssertionError("ran"))
         with mock.patch.object(helper, "run_command", runner):
             for bad in ("kimi; true", "../kimi", "bin/kimi", "python3", "/nonexistent/kimi",
-                        plain, "", None, ["kimi"]):
-                result = helper.kimi_events({"binary": bad})
+                        plain, "/bin/sh", "", None, ["kimi"]):
+                result = self.events(bad)
                 self.assertIsNone(result["events"], bad)
                 self.assertTrue(result["error"], bad)
+            # And a home that is not one.
+            for home in (self.root, "/", os.path.join(self.home, "missing")):
+                self.assertEqual(self.events(home=home)["error"], "not a home")
         runner.assert_not_called()
+
+    def test_root_runs_doctor_as_the_home_owner(self):
+        seen = {}
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events()["events"])
+        self.assertEqual(seen["options"]["user"], os.stat(self.home).st_uid)
+        self.assertEqual(seen["options"]["group"], helper.home_owner(self.home)[2])
+
+    def test_root_home_runs_only_a_build_only_root_can_change(self):
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("root", 0, 0)), \
+                mock.patch.object(helper, "run_command", runner):
+            # The build here is this test's, not root's alone.
+            self.assertIsNone(self.events()["events"])
+        runner.assert_not_called()
+        seen = {}
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("root", 0, 0)), \
+                mock.patch.object(helper, "root_only_path", return_value=True), \
+                mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events()["events"])
+        self.assertNotIn("user", seen["options"])
+        self.assertFalse(helper.root_only_path(self.kimi))
 
     def test_kimi_events_against_a_fake_build(self):
         # The real run_command against a script standing in for kimi, which
         # answers only when it finds the probe config where it was told to.
-        root = tempfile.mkdtemp(dir="/tmp", prefix="sbk-")
-        self.addCleanup(shutil.rmtree, root, True)
-        fake = os.path.join(root, "kimi-code")
-        with open(fake, "w") as handle:
-            handle.write(
-                "#!/bin/sh\n"
-                '[ "$1" = doctor ] || exit 2\n'
-                'grep -q \'event = "SwarmBarProbeEvent"\' "$KIMI_CODE_HOME/config.toml" || exit 3\n'
-                'echo "$KIMI_CODE_HOME" > "%s/home-was"\n'
-                "echo 'hooks[0].event: Invalid option: expected one of \"Stop\"|\"SessionEnd\"'\n"
-                "exit 1\n" % root)
-        os.chmod(fake, 0o755)
-        self.assertEqual(helper.kimi_events({"binary": fake}), {"events": ["Stop", "SessionEnd"]})
-        with open(os.path.join(root, "home-was")) as handle:
+        fake = self.executable(os.path.join(self.root, "dist", "kimi-code"),
+            "#!/bin/sh\n"
+            '[ "$1" = doctor ] || exit 2\n'
+            '[ -z "$SBK_SECRET" ] || exit 4\n'
+            'grep -q \'event = "SwarmBarProbeEvent"\' "$KIMI_CODE_HOME/config.toml" || exit 3\n'
+            'echo "$KIMI_CODE_HOME" > "%s/home-was"\n'
+            "echo 'hooks[0].event: Invalid option: expected one of \"Stop\"|\"SessionEnd\"'\n"
+            "exit 1\n" % self.root)
+        self.assertEqual(self.events(fake), {"events": ["Stop", "SessionEnd"]})
+        with open(os.path.join(self.root, "home-was")) as handle:
             self.assertFalse(os.path.exists(handle.read().strip()))
+
+    def test_timeout_kills_the_whole_process_group(self):
+        pidfile = os.path.join(self.root, "grandchild")
+        script = self.executable(os.path.join(self.root, "slow"),
+                                 "#!/bin/sh\nsleep 30 &\necho $! > %s\nwait\n" % pidfile)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            helper.run_command([script], timeout=1, start_new_session=True)
+        with open(pidfile) as handle:
+            grandchild = int(handle.read())
+
+        def gone():
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return True
+            # A zombie until init reaps it still counts as killed.
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(grandchild)],
+                                   stdout=subprocess.PIPE).stdout.strip()
+            return state.startswith(b"Z") or not state
+        self.assertTrue(wait_until(gone, 5))
 
 
 class ApplyTests(unittest.TestCase):
@@ -2833,6 +3041,34 @@ class ApplyTests(unittest.TestCase):
             code, lines = self.apply(bad)
             self.assertNotEqual(code, 0, bad)
             self.assertTrue(lines and lines[0].startswith("failed"), lines)
+
+    def test_decompression_is_bounded(self):
+        path = os.path.join(self.home, ".kimi-code", "config.toml")
+        os.makedirs(os.path.dirname(path))
+        bomb = json.dumps([self.write_op(path, "x\n", "absent")]) + " " * (9 * 1024 * 1024)
+        packed = base64.b64encode(zlib.compress(bomb.encode())).decode()
+        self.assertLess(len(packed), 64 * 1024)
+        code, lines = self.apply(packed)
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.lexists(path))
+        # A stream cut short is refused too.
+        whole = base64.b64decode(apply_blob([self.write_op(path, "x\n", "absent")]))
+        code, lines = self.apply(base64.b64encode(whole[:-6]).decode())
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.lexists(path))
+
+    def test_install_helper_checks_the_bytes_it_copies(self):
+        dest = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        with open(helper.__file__, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            result = helper.install_helper({"dest": dest, "expect_sha256": "0" * 64})
+            self.assertEqual(result, {"ok": False, "error": "changed"})
+            self.assertFalse(os.path.lexists(dest))
+            result = helper.install_helper({"dest": dest, "expect_sha256": digest})
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["sha256"], digest)
+            self.assertFalse(helper.install_helper({"dest": dest, "expect_sha256": digest + "\n"})["ok"])
 
     def test_unknown_operation_stops(self):
         path = os.path.join(self.home, ".kimi-code", "config.toml")
@@ -2924,10 +3160,12 @@ class SudoersTests(unittest.TestCase):
         checked = {}
 
         def visudo(argv, timeout=5, input=None, **options):
-            checked["argv"] = list(argv)
-            with open(argv[-1]) as handle:
-                checked["text"] = handle.read()
-            checked["mode"] = stat.S_IMODE(os.stat(argv[-1]).st_mode)
+            checked.setdefault("calls", []).append(list(argv))
+            if argv[1] == "-cf":
+                checked["argv"] = list(argv)
+                with open(argv[-1]) as handle:
+                    checked["text"] = handle.read()
+                checked["mode"] = stat.S_IMODE(os.stat(argv[-1]).st_mode)
             return completed(argv, 0, "parsed OK\n")
         with mock.patch.object(os, "geteuid", return_value=0), \
                 mock.patch.object(helper, "run_command", visudo):
@@ -2943,6 +3181,45 @@ class SudoersTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.dir), ["swarmbar"])
         self.assertEqual(self.read(), rule)
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o440)
+        # Then the whole configuration, with the rule in place.
+        self.assertEqual(checked["calls"][-1], ["/usr/sbin/visudo", "-c"])
+
+    def test_rule_that_breaks_the_whole_configuration_is_taken_out(self):
+        def visudo(argv, timeout=5, input=None, **options):
+            return completed(argv, 0 if argv[1] == "-cf" else 1, "")
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "run_command", visudo):
+            result = helper.install_sudoers({"user": "nobody"})
+        self.assertFalse(result["ok"])
+        self.assertIn("removed", result["error"])
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_narrow_rule_cannot_set_itself_up(self):
+        installed = os.path.join(self.dir, "swarmbar-helper")
+        shutil.copy(helper.__file__, installed)
+        with mock.patch.object(helper, "__file__", installed), \
+                mock.patch.object(helper, "HELPER_PATHS", (installed,)), \
+                mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.dict(os.environ, {"SUDO_UID": "1000"}), \
+                mock.patch.object(helper, "run_command", mock.Mock(side_effect=AssertionError)):
+            self.assertTrue(helper.narrow_rule_run())
+            self.assertIn("sudo rule", helper.install_sudoers({"user": "nobody"})["error"])
+            self.assertIn("sudo rule", helper.install_helper({"dest": installed})["error"])
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                code = helper.apply_main([apply_blob([{"op": "sudoers", "user": "nobody"}])])
+            self.assertNotEqual(code, 0)
+            self.assertIn("sudo rule", out.getvalue())
+        self.assertFalse(os.path.lexists(self.path))
+        # Root itself (sudo from root, or no sudo) is not the narrow rule,
+        # and neither is a copy run from anywhere else.
+        for env, path in (({"SUDO_UID": "0"}, installed), ({"SUDO_UID": ""}, installed),
+                          ({"SUDO_UID": "1000"}, helper.__file__)):
+            with mock.patch.object(helper, "__file__", path), \
+                    mock.patch.object(helper, "HELPER_PATHS", (installed,)), \
+                    mock.patch.object(os, "geteuid", return_value=0), \
+                    mock.patch.dict(os.environ, env):
+                self.assertFalse(helper.narrow_rule_run(), (env, path))
 
     def test_rule_visudo_rejects_is_never_installed(self):
         failing = lambda argv, timeout=5, input=None, **options: completed(argv, 1, "syntax error")
