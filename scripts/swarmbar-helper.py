@@ -11,23 +11,31 @@ Constraints that are not negotiable:
   * No GNU-only userland. `ps --no-headers` and `find -printf` fail on
     Darwin, and a failed `ps` piped into a filter yields an empty list
     that reads exactly like "no sessions".
-  * Read-only. This never writes to any agent's state.
+  * Read-only. This never writes to any agent's state. Its own files
+    under ~/.swarmbar/ (the hook sockets and their lock) are the exception.
 """
 
 import base64
 import collections
 import errno
+import fcntl
 import fnmatch
 import hashlib
+import http.server
 import json
 import os
 import platform
 import re
+import select
+import socket
+import socketserver
 import stat as stat_module
+import struct
 import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # 2 added "created" to every session record. Additive: an older Mac
 # ignores the field and an older helper simply omits it.
@@ -729,10 +737,6 @@ def home_entries(warnings, omitted=None):
     Such a home also goes into `omitted` when a list is passed. The warning
     is free text for a person; the omission is what tells the Mac not to
     sweep its mirror of that home empty."""
-    try:
-        import pwd
-    except ImportError:
-        pwd = None
     entries = []
     for home in home_dirs():
         try:
@@ -741,14 +745,28 @@ def home_entries(warnings, omitted=None):
             warnings.append("cannot list home %s: %s" % (home, error))
             if omitted is not None:
                 omitted.append({"path": home, "reason": "cannot list: %s" % error.strerror})
-        user = os.path.basename(home)
-        try:
-            if pwd is not None:
-                user = pwd.getpwuid(os.stat(home).st_uid).pw_name
-        except (OSError, KeyError):
-            pass
-        entries.append({"path": home, "user": user})
+        entries.append({"path": home, "user": home_owner(home)[0]})
     return entries
+
+
+def home_owner(home):
+    """(user, uid, gid) of a home. The user is the owner's name, or the
+    home's basename when there is none; hook events carry the same name as
+    the snapshot's homes. uid and gid are None when the home cannot be
+    examined."""
+    user, uid, gid = os.path.basename(home), None, None
+    try:
+        info = os.stat(home)
+        uid, gid = info.st_uid, info.st_gid
+    except OSError:
+        return user, uid, gid
+    try:
+        import pwd
+        entry = pwd.getpwuid(uid)
+        user, gid = entry.pw_name, entry.pw_gid
+    except (ImportError, KeyError):
+        pass
+    return user, uid, gid
 
 
 def run_command(argv, timeout=5, input=None):
@@ -1240,10 +1258,803 @@ def handle_tmux(request):
     return {"sent": True}
 
 
+# The hook relay. Remote bridge scripts post each hook to a Unix socket in
+# the agent user's own home, ~/.swarmbar/hook.sock, and this relays it to
+# every connected Mac over the ssh channel. File permissions replace the
+# loopback token: the directory is 700 and the sockets 600, owned by the
+# home's owner, so only that user and root can post or listen.
+#
+# Several helpers can run on one host, one per connected Mac, but a bridge
+# connects to one socket. So per home the helper holding hook.lock is the
+# owner: it serves hook.sock and broker.sock. Every other helper is a
+# follower: it connects to broker.sock, relays what the owner sends it to
+# its own Mac, and keeps trying the lock so it takes over when the owner
+# exits.
+#
+# Broker protocol, newline-delimited JSON over broker.sock:
+#   owner -> follower: a Mac event, verbatim, which the follower writes to
+#     its own Mac unchanged: {"event": "hook", ...} or
+#     {"event": "hook_resolved", "rid": ...}.
+#   follower -> owner: {"type": "reply", "rid": str, "body": {...}}, its
+#     Mac's hook_reply. The first reply for a rid, from any Mac, answers it.
+# Connecting is registering. There is no handshake and no other message.
+HOOK_DIR = ".swarmbar"
+HOOK_SOCKET = "hook.sock"
+BROKER_SOCKET = "broker.sock"
+HOOK_LOCK = "hook.lock"
+
+# A home with any of these installed is a hook home and gets a socket.
+HOOK_MARKERS = (
+    HOOK_DIR + "/swarmbar-remote-hook.sh",
+    HOOK_DIR + "/swarmbar-remote-kimi-hook.sh",
+    ".config/opencode/plugins/swarmbar-remote.js",
+)
+
+# Larger bodies are answered {} and never forwarded. A hook payload is a
+# tool call; this is far past any real one.
+MAX_HOOK_BODY = 256 * 1024
+# An oversized body up to this is read and discarded, so its client gets the
+# {} rather than a broken pipe mid-send. Past it the connection just closes.
+MAX_HOOK_DRAIN = 4 * 1024 * 1024
+# A held request gives up just inside the bridge's own curl -m 350, so the
+# agent hears {} rather than a dropped connection.
+HOLD_SECONDS = 345
+# How often a hold checks that its client is still there.
+HOLD_POLL_SECONDS = 0.5
+# How often a follower whose owner has gone tries the lock.
+LOCK_RETRY_SECONDS = 2.0
+# How long a server's loop can take to notice it was shut down.
+SERVE_POLL_SECONDS = 0.5
+# The peer and its ancestors, at most this many names.
+PEER_DEPTH = 8
+# ps runs before a PermissionRequest is answered. Grok counts a hook that
+# takes about 3 seconds as consent, so a slow ps must fail, not stall.
+PEER_PS_TIMEOUT = 1
+# Reading the request itself. A client that connects and says nothing must
+# not hold a thread forever.
+HOOK_READ_TIMEOUT = 10
+# A follower that stops reading is dropped rather than allowed to stall
+# the owner's broadcasts.
+BROKER_SEND_TIMEOUT = 2
+MAX_BROKER_LINE = 8 * 1024 * 1024
+# sun_path is 104 bytes on Darwin and 108 on Linux, NUL included.
+MAX_SOCKET_PATH = 103
+
+HOOK_PATH = re.compile(r"^/hook/([A-Za-z0-9_]+)$")
+
+# os.umask is process-wide. Binding under a tight umask creates each socket
+# 600 from the start, with no chmod-by-path afterwards: as root that path is
+# inside a directory the user owns, who could swap it for a symlink to a
+# file root would then chmod.
+_UMASK_LOCK = threading.Lock()
+
+
+def is_holdable(event, peer):
+    """Whether a hook may be held for a decision from a Mac.
+
+    Only Claude Code answers through its hook response, so only its
+    PermissionRequest is held. Grok imports Claude-compatible hooks and
+    reaches this same socket with the same script, but Grok 0.2.118 treats
+    a hook that times out as consent, so a held Grok prompt is an approved
+    one. Any chain containing grok is answered at once, and so is one that
+    does not prove claude, since an unknown peer could be Grok. OpenCode's
+    event comes only from SwarmBar's own plugin, which holds on purpose.
+    """
+    if event == "OpenCodePermission":
+        return True
+    return event == "PermissionRequest" and "claude" in peer and "grok" not in peer
+
+
+def peer_pid(sock):
+    """The pid of the process on the other end of a Unix socket, or None."""
+    try:
+        if hasattr(socket, "SO_PEERCRED"):
+            size = struct.calcsize("3i")
+            pid, _, _ = struct.unpack(
+                "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))
+            return pid or None
+        if platform.system() == "Darwin":
+            # SOL_LOCAL is 0 and LOCAL_PEERPID 0x002; python names neither.
+            return struct.unpack("i", sock.getsockopt(0, 0x002, 4))[0] or None
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def peer_chain(sock):
+    """Names of the peer process and its ancestors, nearest first.
+
+    Each name is resolved the way the process table resolves one, so an
+    agent started by absolute path on Darwin, whose comm is truncated, still
+    reads as the agent. Anything else keeps its raw comm. One ps lists the
+    whole table, so the walk costs one subprocess however deep it goes. Any
+    failure is an empty list, which is never held. Tests replace this.
+    """
+    pid = peer_pid(sock)
+    if not pid:
+        return []
+    try:
+        done = run_command(["ps", "-axo", "pid=,ppid=,comm=,args="],
+                           timeout=PEER_PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    table = {}
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            row_pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        table[row_pid] = {"ppid": ppid, "raw": parts[2], "comm": parts[2].split("/")[-1],
+                          "args": parts[3].strip() if len(parts) > 3 else ""}
+    names = []
+    seen = set()
+    current = pid
+    while current in table and current not in seen and len(names) < PEER_DEPTH:
+        seen.add(current)
+        names.append(process_label(table[current]))
+        current = table[current]["ppid"]
+    return names
+
+
+def process_label(row):
+    """An agent's resolved name, else the comm basename. Darwin cuts comm,
+    a full path, to 16 characters, so a comm that is a strict prefix of
+    argv0 is a truncated one and argv0's basename names it instead."""
+    name = agent_name(row)
+    if name:
+        return name
+    argv0 = row["args"].split(None, 1)[0] if row["args"] else ""
+    if argv0 != row["raw"] and argv0.startswith(row["raw"]):
+        return argv0.split("/")[-1]
+    return row["comm"].lstrip("-") or "?"
+
+
+def hook_homes():
+    """Homes with a remote bridge installed, in home_dirs order."""
+    return [home for home in home_dirs()
+            if any(os.path.isfile(os.path.join(home, marker)) for marker in HOOK_MARKERS)]
+
+
+class HookHomeError(Exception):
+    """A home whose hook socket cannot be served, with the reason."""
+
+
+def read_lines(sock, stopping):
+    """Lines from a socket that has a timeout, until EOF or `stopping()`.
+
+    The broker's sockets carry a send timeout, which python applies to
+    reads as well, so a quiet connection times out on every read and is
+    simply read again."""
+    buffered = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            if stopping():
+                return
+            continue
+        except OSError:
+            return
+        if not chunk:
+            return
+        buffered += chunk
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            yield line
+        if len(buffered) > MAX_BROKER_LINE:
+            return
+
+
+def parse_line(line):
+    try:
+        message = json.loads(line.decode("utf-8"))
+    except ValueError:
+        return None
+    return message if isinstance(message, dict) else None
+
+
+def client_gone(sock):
+    """Whether a held client has hung up. A bridge sends nothing after its
+    request, so a readable socket that peeks empty is one at EOF. poll, not
+    select, because select fails outright on a descriptor past 1024, and a
+    check that cannot be made keeps holding: the deadline still bounds it."""
+    try:
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+        if not poller.poll(0):
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (socket.timeout, BlockingIOError, InterruptedError, ValueError):
+        return False
+    except OSError:
+        return True
+
+
+def drop_connection(sock):
+    """Closes a connection so its peer sees EOF, never an answer."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def read_hook_body(handler):
+    """The request body, or None when it is too large or malformed."""
+    if "chunked" in handler.headers.get("Transfer-Encoding", "").lower():
+        # node's http.request sends chunked unless told a length, and the
+        # OpenCode plugin posts through it.
+        data = b""
+        while True:
+            line = handler.rfile.readline(1024)
+            try:
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                return None
+            if size == 0:
+                while handler.rfile.readline(1024).strip():
+                    pass
+                return data
+            if size < 0 or len(data) + size > MAX_HOOK_BODY:
+                return None
+            chunk = handler.rfile.read(size)
+            if len(chunk) != size:
+                return None
+            data += chunk
+            handler.rfile.readline(1024)
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        return None
+    if length < 0:
+        return None
+    if length > MAX_HOOK_BODY:
+        while 0 < length <= MAX_HOOK_DRAIN:
+            chunk = handler.rfile.read(min(length, 65536))
+            if not chunk:
+                break
+            length -= len(chunk)
+        return None
+    data = handler.rfile.read(length) if length else b""
+    return data if len(data) == length else None
+
+
+class _QuietServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    hub = None
+
+    def handle_error(self, request, client_address):
+        # A held client dropped at exit fails its final flush. socketserver
+        # would print a traceback to stderr, which is the ssh channel's.
+        pass
+
+
+class HookHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = HOOK_READ_TIMEOUT
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        self.close_connection = True
+        self.server.hub.handle_post(self)
+
+    def answer(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            self.wfile.flush()
+        except OSError:
+            pass
+
+
+class BrokerHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        hub = self.server.hub
+        conn = self.request
+        conn.settimeout(BROKER_SEND_TIMEOUT)
+        if not hub.add_follower(conn):
+            return
+        try:
+            for line in read_lines(conn, lambda: hub.closing):
+                message = parse_line(line)
+                if message and message.get("type") == "reply":
+                    hub.resolve(message.get("rid"), message.get("body"))
+        finally:
+            hub.remove_follower(conn)
+
+
+class Held(object):
+    """One request waiting for a Mac's decision."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.done = threading.Event()
+        self.body = None
+        self.dropped = False
+
+
+class HookHome(object):
+    """The hook socket for one home, as its owner or as a follower."""
+
+    def __init__(self, relay, home):
+        self.relay = relay
+        self.home = home
+        self.user, self.uid, self.gid = home_owner(home)
+        self.directory = os.path.join(home, HOOK_DIR)
+        self.lock = threading.Lock()
+        # Held across taking ownership and across giving it up, so close()
+        # can never release the descriptors a takeover is using.
+        self.transition = threading.Lock()
+        self.stopped = threading.Event()
+        self.closing = False
+        self.role = None
+        self.dir_fd = None
+        self.lock_fd = None
+        self.servers = []
+        self.followers = {}
+        self.pending = {}
+        self.broker = None
+        self.broker_send = threading.Lock()
+        self.relayed = set()
+        self.error = None
+
+    # Setup
+
+    def start(self):
+        for name in (HOOK_SOCKET, BROKER_SOCKET):
+            if len(os.path.join(self.directory, name).encode("utf-8")) > MAX_SOCKET_PATH:
+                raise HookHomeError("socket path too long")
+        try:
+            self.open_directory()
+            self.lock_fd = os.open(HOOK_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                                   0o600, dir_fd=self.dir_fd)
+            info = os.fstat(self.lock_fd)
+            if not stat_module.S_ISREG(info.st_mode):
+                raise HookHomeError("hook.lock is not a regular file")
+            if os.geteuid() == 0 and self.uid is not None and info.st_uid != self.uid:
+                os.fchown(self.lock_fd, self.uid, self.gid)
+        except OSError as error:
+            self.release()
+            raise HookHomeError(error.strerror or str(error))
+        except HookHomeError:
+            self.release()
+            raise
+        with self.transition:
+            if self.try_lock():
+                try:
+                    self.become_owner()
+                except (OSError, HookHomeError) as error:
+                    self.release()
+                    raise HookHomeError(getattr(error, "strerror", None) or str(error))
+                return
+        self.role = "follower"
+        thread = threading.Thread(target=self.follow, name="swarmbar-follower")
+        thread.daemon = True
+        thread.start()
+
+    def open_directory(self):
+        """Opens ~/.swarmbar without following a link, owned by the home's
+        owner and mode 700. Everything after goes through this descriptor,
+        so a directory swapped out by name later cannot redirect it."""
+        if self.uid is None:
+            raise HookHomeError("cannot examine home")
+        try:
+            os.mkdir(self.directory, 0o700)
+        except FileExistsError:
+            pass
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+        self.dir_fd = os.open(self.directory, flags)
+        info = os.fstat(self.dir_fd)
+        if not stat_module.S_ISDIR(info.st_mode):
+            raise HookHomeError("%s is not a directory" % HOOK_DIR)
+        root = os.geteuid() == 0
+        expected = self.uid if root else os.geteuid()
+        if info.st_uid != expected:
+            if not (root and info.st_uid == 0):
+                raise HookHomeError("%s has another owner" % HOOK_DIR)
+            os.fchown(self.dir_fd, self.uid, self.gid)
+        if stat_module.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(self.dir_fd, 0o700)
+
+    def try_lock(self):
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def become_owner(self):
+        """Unlinks whatever a crashed owner left and serves both sockets.
+        Only the lock holder ever gets here, so it never removes a live
+        owner's socket. The caller holds `transition`."""
+        if self.closing:
+            return
+        for name in (HOOK_SOCKET, BROKER_SOCKET):
+            try:
+                os.unlink(name, dir_fd=self.dir_fd)
+            except FileNotFoundError:
+                pass
+        servers = []
+        try:
+            for name, handler in ((HOOK_SOCKET, HookHandler), (BROKER_SOCKET, BrokerHandler)):
+                with _UMASK_LOCK:
+                    previous = os.umask(0o177)
+                    try:
+                        server = _QuietServer(os.path.join(self.directory, name), handler)
+                    finally:
+                        os.umask(previous)
+                server.hub = self
+                servers.append(server)
+                if os.geteuid() == 0:
+                    os.chown(name, self.uid, self.gid, dir_fd=self.dir_fd,
+                             follow_symlinks=False)
+        except Exception:
+            for server in servers:
+                server.server_close()
+            raise
+        with self.lock:
+            self.servers = servers
+            self.role = "owner"
+            self.error = None
+        # Started inside `transition`: shutdown() waits on a serve loop, so
+        # close() must never see a server whose loop was not started.
+        for server in servers:
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": SERVE_POLL_SECONDS},
+                name="swarmbar-hook-server")
+            thread.daemon = True
+            thread.start()
+
+    # Follower
+
+    def follow(self):
+        """Relays the owner's events until it goes, then tries the lock.
+
+        The first attempt comes straight after the connection drops, so a
+        clean exit hands over at once; after that, every LOCK_RETRY_SECONDS.
+        """
+        while not self.closing:
+            with self.transition:
+                if self.closing:
+                    return
+                locked = self.try_lock()
+                if locked:
+                    try:
+                        self.become_owner()
+                        return
+                    except (OSError, HookHomeError) as error:
+                        self.error = getattr(error, "strerror", None) or str(error)
+                        fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            if not locked and self.connect_broker():
+                self.read_broker()
+                continue
+            self.stopped.wait(LOCK_RETRY_SECONDS)
+
+    def connect_broker(self):
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.connect(os.path.join(self.directory, BROKER_SOCKET))
+        except OSError:
+            conn.close()
+            return False
+        conn.settimeout(BROKER_SEND_TIMEOUT)
+        with self.lock:
+            if self.closing:
+                conn.close()
+                return False
+            self.broker = conn
+        return True
+
+    def read_broker(self):
+        conn = self.broker
+        try:
+            for line in read_lines(conn, lambda: self.closing):
+                message = parse_line(line)
+                if message is None or "event" not in message:
+                    continue
+                rid = message.get("rid")
+                peer = message.get("peer")
+                if message["event"] == "hook" and isinstance(rid, str) and is_holdable(
+                        str(message.get("path", "")).rsplit("/", 1)[-1],
+                        peer if isinstance(peer, list) else []):
+                    self.relayed.add(rid)
+                elif message["event"] == "hook_resolved":
+                    self.relayed.discard(rid)
+                self.relay.emit(message)
+        finally:
+            with self.lock:
+                self.broker = None
+            conn.close()
+        # Whatever the owner was holding died with it, and the agent has
+        # fallen back to its own prompt. Clear those rows on this Mac.
+        lost, self.relayed = self.relayed, set()
+        if not self.closing:
+            for rid in sorted(lost):
+                self.relay.emit({"event": "hook_resolved", "rid": rid})
+
+    def forward_reply(self, rid, body):
+        conn = self.broker
+        if conn is None:
+            return
+        line = (json.dumps({"type": "reply", "rid": rid, "body": body}) + "\n").encode("utf-8")
+        with self.broker_send:
+            try:
+                conn.sendall(line)
+            except OSError:
+                drop_connection(conn)
+
+    # Owner
+
+    def add_follower(self, conn):
+        with self.lock:
+            if self.closing:
+                return False
+            self.followers[conn] = threading.Lock()
+            return True
+
+    def remove_follower(self, conn):
+        with self.lock:
+            self.followers.pop(conn, None)
+
+    def follower_count(self):
+        with self.lock:
+            return len(self.followers)
+
+    def broadcast(self, message):
+        """Sends a Mac event to every follower. One that cannot take it in
+        BROKER_SEND_TIMEOUT is dropped, and will reconnect."""
+        line = (json.dumps(message) + "\n").encode("utf-8")
+        with self.lock:
+            followers = list(self.followers.items())
+        for conn, send_lock in followers:
+            with send_lock:
+                try:
+                    conn.sendall(line)
+                except OSError:
+                    drop_connection(conn)
+                    self.remove_follower(conn)
+
+    def publish(self, message):
+        """To this helper's Mac and to every follower's."""
+        self.relay.emit(message)
+        self.broadcast(message)
+
+    def resolve(self, rid, body):
+        """Answers a held request with the first reply to reach it. True
+        when this home was holding that rid, answered or not."""
+        if not isinstance(rid, str) or not isinstance(body, dict):
+            return False
+        with self.lock:
+            held = self.pending.get(rid)
+            if held is None:
+                return False
+            if not held.done.is_set():
+                held.body = body
+                held.done.set()
+        return True
+
+    def handle_post(self, handler):
+        match = HOOK_PATH.match(handler.path)
+        try:
+            body = read_hook_body(handler)
+        except OSError:
+            body = None
+        payload = parse_line(body) if body is not None else None
+        if match is None or payload is None or self.closing:
+            handler.answer({})
+            return
+        event = match.group(1)
+        try:
+            peer = peer_chain(handler.connection)
+        except Exception:
+            peer = []
+        if not isinstance(peer, list):
+            peer = []
+        account = handler.headers.get("X-Claude-Account", "").strip() or None
+        message = {
+            "event": "hook",
+            "rid": uuid.uuid4().hex,
+            "home": self.home,
+            "user": self.user,
+            "path": "/hook/" + event,
+            "account": account,
+            "peer": peer,
+            "body": payload,
+        }
+        if not is_holdable(event, peer):
+            # Answered before anything else happens, Grok above all: the
+            # Mac is only told afterwards, for status.
+            handler.answer({})
+            self.publish(message)
+            return
+        self.hold(handler, message)
+
+    def hold(self, handler, message):
+        rid = message["rid"]
+        held = Held(handler.connection)
+        with self.lock:
+            if self.closing:
+                drop_connection(held.conn)
+                return
+            self.pending[rid] = held
+        self.publish(message)
+        deadline = time.monotonic() + HOLD_SECONDS
+        gone = False
+        while not held.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if held.done.wait(min(HOLD_POLL_SECONDS, remaining)):
+                break
+            if client_gone(held.conn):
+                gone = True
+                break
+        with self.lock:
+            self.pending.pop(rid, None)
+            dropped, body = held.dropped, held.body
+        if dropped:
+            # The helper is exiting. The connection was shut with no answer,
+            # so the agent falls back to its own prompt.
+            return
+        if not gone:
+            handler.answer(body if body is not None else {})
+        self.publish({"event": "hook_resolved", "rid": rid})
+
+    # Shutdown
+
+    def release(self):
+        for name in ("lock_fd", "dir_fd"):
+            fd = getattr(self, name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, None)
+
+    def close(self):
+        """Drops every held request with no answer, then gives up the
+        sockets and the lock, in that order, so the next helper can take
+        over the moment its broker connection closes."""
+        with self.lock:
+            self.closing = True
+            dropped = list(self.pending.items())
+            for _, held in dropped:
+                held.dropped = True
+                held.done.set()
+                drop_connection(held.conn)
+            broker = self.broker
+        self.stopped.set()
+        for rid, _ in dropped:
+            self.broadcast({"event": "hook_resolved", "rid": rid})
+        with self.transition:
+            with self.lock:
+                servers, self.servers = self.servers, []
+                followers = list(self.followers)
+            if servers:
+                for name in (HOOK_SOCKET, BROKER_SOCKET):
+                    try:
+                        os.unlink(name, dir_fd=self.dir_fd)
+                    except OSError:
+                        pass
+            self.release()
+        for conn in followers:
+            drop_connection(conn)
+        if broker is not None:
+            drop_connection(broker)
+        # Each shutdown waits out its loop's poll, so they run side by side.
+        stoppers = [threading.Thread(target=server.shutdown) for server in servers]
+        for stopper in stoppers:
+            stopper.start()
+        for stopper in stoppers:
+            stopper.join()
+        for server in servers:
+            server.server_close()
+
+
+class HookRelay(object):
+    """Every hook home this helper serves or follows. `emit` sends one event
+    to this helper's Mac; it is write_line except in tests."""
+
+    def __init__(self, emit=None):
+        self.emit_line = emit if emit is not None else write_line
+        self.hubs = {}
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def emit(self, message):
+        try:
+            self.emit_line(message)
+        except Exception:
+            # The Mac is gone or going. Its helper exits on stdin EOF.
+            pass
+
+    def refresh(self):
+        """Starts a hub for every newly qualifying home and keeps the rest.
+        Returns warnings for homes that cannot be served, which are retried
+        on the next refresh."""
+        warnings = []
+        for home in hook_homes():
+            with self.lock:
+                if self.closed:
+                    return warnings
+                hub = self.hubs.get(home)
+            if hub is not None:
+                if hub.error:
+                    warnings.append("hook socket for %s: %s" % (home, hub.error))
+                continue
+            hub = HookHome(self, home)
+            try:
+                hub.start()
+            except HookHomeError as error:
+                warnings.append("hook socket unavailable for %s: %s" % (home, error))
+                continue
+            with self.lock:
+                if self.closed:
+                    hub.close()
+                    return warnings
+                self.hubs[home] = hub
+        return warnings
+
+    def handle_reply(self, request):
+        """The hook_reply request. The rid is answered here when this helper
+        holds it, and otherwise passed to each owner it follows."""
+        rid, body = request.get("rid"), request.get("body")
+        if not isinstance(rid, str) or not isinstance(body, dict):
+            return {"ok": False, "error": "bad reply"}
+        with self.lock:
+            hubs = list(self.hubs.values())
+        if not any(hub.resolve(rid, body) for hub in hubs):
+            for hub in hubs:
+                hub.forward_reply(rid, body)
+        return {"ok": True}
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            hubs = list(self.hubs.values())
+        for hub in hubs:
+            hub.close()
+
+
 def main(stdin=None, stdout=None):
     global _OUT
     stdin = stdin if stdin is not None else sys.stdin
     _OUT = stdout if stdout is not None else sys.stdout
+    relay = HookRelay()
+    try:
+        relay.refresh()
+    except Exception:
+        # Hook homes are checked again on every snapshot, which reports why.
+        pass
+    try:
+        serve_requests(stdin, relay)
+    finally:
+        # stdin EOF: the Mac is gone. Held requests drop with no answer and
+        # the sockets and lock go with them, so the agent falls back to its
+        # own prompt and the next helper can take over.
+        relay.close()
+
+
+def refresh_hooks(relay):
+    try:
+        return relay.refresh()
+    except Exception as error:
+        return ["hook relay: %s" % error]
+
+
+def serve_requests(stdin, relay):
     for line in stdin:
         line = line.strip()
         if not line:
@@ -1259,7 +2070,11 @@ def main(stdin=None, stdout=None):
         command = request.get("cmd")
         try:
             if command == "snapshot":
+                hook_warnings = refresh_hooks(relay)
                 response = snapshot()
+                response["warnings"] = response["warnings"] + hook_warnings
+            elif command == "hook_reply":
+                response = relay.handle_reply(request)
             elif command == "ping":
                 response = ping()
             elif command in ("capture", "keys", "paste"):

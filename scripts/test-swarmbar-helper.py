@@ -11,6 +11,7 @@ bigger than the read window) is only reproducible against a real file.
 python 3.9 compatible, like the helper itself.
 """
 
+import atexit
 import base64
 import hashlib
 import importlib.util
@@ -18,7 +19,10 @@ import io
 import json
 import os
 import random
+import select
 import shutil
+import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -32,6 +36,12 @@ _spec = importlib.util.spec_from_file_location(
 )
 helper = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(helper)
+
+# main() looks for hook homes as it starts. Every test that does not choose
+# its own homes gets an empty one, so none of them ever looks at a real home.
+_EMPTY_HOME = tempfile.mkdtemp(prefix="swarmbar-empty-home-")
+os.environ.setdefault("SWARMBAR_HELPER_HOMES", _EMPTY_HOME)
+atexit.register(shutil.rmtree, _EMPTY_HOME, True)
 
 
 def record(text):
@@ -1184,6 +1194,427 @@ class TmuxCommandTests(unittest.TestCase):
         helper.main(stdin=io.StringIO(req), stdout=out)
         self.assertEqual(json.loads(out.getvalue()),
                          {"ok": False, "error": "bad pane", "id": 9})
+
+
+
+class EventSink(object):
+    """Collects what a relay sends its Mac, from any thread.
+
+    Works as an emit callable for HookRelay and as a stdout stream for main.
+    While `gate` is an unset Event, every emit blocks on it, which proves an
+    answer reached the client before anything was forwarded.
+    """
+
+    def __init__(self):
+        self.events = []
+        self.cond = threading.Condition()
+        self.gate = None
+        self.partial = ""
+
+    def __call__(self, obj):
+        gate = self.gate
+        if gate is not None:
+            gate.wait(5)
+        with self.cond:
+            self.events.append(obj)
+            self.cond.notify_all()
+
+    def write(self, text):
+        with self.cond:
+            self.partial += text
+            while "\n" in self.partial:
+                line, self.partial = self.partial.split("\n", 1)
+                if line.strip():
+                    self.events.append(json.loads(line))
+            self.cond.notify_all()
+
+    def flush(self):
+        pass
+
+    def wait_for(self, predicate, timeout=3):
+        with self.cond:
+            self.cond.wait_for(
+                lambda: any(predicate(e) for e in self.events), timeout)
+            for event in self.events:
+                if predicate(event):
+                    return event
+        return None
+
+    def matching(self, predicate):
+        with self.cond:
+            return [e for e in self.events if predicate(e)]
+
+
+def is_hook(path):
+    return lambda e: e.get("event") == "hook" and e.get("path") == path
+
+
+def is_resolved(rid):
+    return lambda e: e.get("event") == "hook_resolved" and e.get("rid") == rid
+
+
+def wait_until(predicate, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def post_hook(home, event, body=None, account=None, raw=None):
+    """Opens a hook request the way the bridge's curl does, and returns the
+    socket with the request sent, so a test can decide when to read."""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5)
+    client.connect(os.path.join(home, ".swarmbar", "hook.sock"))
+    data = raw if raw is not None else json.dumps(body or {}).encode("utf-8")
+    head = ("POST /hook/%s HTTP/1.1\r\nHost: swarmbar\r\n"
+            "Content-Type: application/json\r\nContent-Length: %d\r\n"
+            % (event, len(data)))
+    if account is not None:
+        head += "X-Claude-Account: %s\r\n" % account
+    client.sendall(head.encode("ascii") + b"\r\n" + data)
+    return client
+
+
+def read_response(client, timeout=3):
+    """(status line, headers, parsed body) by Content-Length, so it never
+    waits for the server to close; or None when the connection closed with
+    no response at all."""
+    client.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = client.recv(65536)
+        if not chunk:
+            return None if not data else ("partial", {}, None)
+        data += chunk
+    head, rest = data.split(b"\r\n\r\n", 1)
+    lines = head.decode("latin-1").split("\r\n")
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    while len(rest) < length:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        rest += chunk
+    return lines[0], headers, json.loads(rest[:length].decode("utf-8"))
+
+
+def answered_within(client, seconds):
+    readable, _, _ = select.select([client], [], [], seconds)
+    return bool(readable)
+
+
+def connection_dropped(client, timeout=3):
+    """True when the server closed the connection without a byte of answer."""
+    client.settimeout(timeout)
+    try:
+        return client.recv(65536) == b""
+    except ConnectionResetError:
+        return True
+
+
+class HookRelayTests(unittest.TestCase):
+    """The per-user hook socket, the broker and the Grok interlock.
+
+    Each test runs real servers in-process on a temp home under /tmp (macOS
+    caps a socket path near 104 bytes) and replaces peer_chain, so no real
+    process is ever inspected.
+    """
+
+    DECISION = {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                       "decision": {"behavior": "allow"}}}
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbh-"))
+        self.bridge_dir = os.path.join(self.home, ".swarmbar")
+        os.makedirs(self.bridge_dir)
+        open(os.path.join(self.bridge_dir, "swarmbar-remote-hook.sh"), "w").close()
+        self.sock_path = os.path.join(self.bridge_dir, "hook.sock")
+        self.peer = ["curl", "bash", "claude"]
+        self.patches = [
+            mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home}),
+            mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.05),
+            mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
+            mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
+            mock.patch.object(helper, "peer_chain", side_effect=self.fake_peer),
+            mock.patch.object(helper, "agent_processes", return_value=[]),
+        ]
+        self.addCleanup(shutil.rmtree, self.home, True)
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.relays = []
+        self.clients = []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.close()
+        for relay in self.relays:
+            relay.close()
+
+    def fake_peer(self, sock):
+        if isinstance(self.peer, Exception):
+            raise self.peer
+        return list(self.peer)
+
+    def relay(self, sink=None):
+        sink = sink if sink is not None else EventSink()
+        relay = helper.HookRelay(emit=sink)
+        self.relays.append(relay)
+        relay.refresh()
+        return relay, sink
+
+    def post(self, event, body=None, **kwargs):
+        client = post_hook(self.home, event, body, **kwargs)
+        self.clients.append(client)
+        return client
+
+    def hub(self, relay):
+        return relay.hubs[self.home]
+
+    def test_non_held_event_answers_immediately(self):
+        relay, sink = self.relay()
+        sink.gate = threading.Event()
+        client = self.post("Stop", {"session_id": "s1"}, account="work")
+        # The emit is blocked, so the answer cannot be waiting on the Mac.
+        status, headers, body = read_response(client, timeout=2)
+        self.assertEqual(status, "HTTP/1.1 200 OK")
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(body, {})
+        sink.gate.set()
+        event = sink.wait_for(is_hook("/hook/Stop"))
+        self.assertIsNotNone(event)
+        self.assertRegex(event["rid"], r"^[0-9a-f]{32}$")
+        self.assertEqual(event["home"], self.home)
+        self.assertEqual(event["account"], "work")
+        self.assertEqual(event["peer"], ["curl", "bash", "claude"])
+        self.assertEqual(event["body"], {"session_id": "s1"})
+        self.assertIn("user", event)
+        self.assertEqual(sink.matching(lambda e: e.get("event") == "hook_resolved"), [])
+
+    def test_empty_account_header_is_null(self):
+        relay, sink = self.relay()
+        read_response(self.post("Stop", {}, account=""))
+        self.assertIsNone(sink.wait_for(is_hook("/hook/Stop"))["account"])
+
+    def test_claude_permission_is_held_until_reply(self):
+        relay, sink = self.relay()
+        client = self.post("PermissionRequest", {"session_id": "s1", "tool_name": "Bash"})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertIsNotNone(event)
+        self.assertFalse(answered_within(client, 0.2))
+        self.assertEqual(relay.handle_reply({"rid": event["rid"], "body": self.DECISION}),
+                         {"ok": True})
+        _, _, body = read_response(client)
+        self.assertEqual(body, self.DECISION)
+        self.assertIsNotNone(sink.wait_for(is_resolved(event["rid"])))
+
+    def test_open_code_permission_is_held_whatever_the_peer(self):
+        self.peer = []
+        relay, sink = self.relay()
+        client = self.post("OpenCodePermission", {"id": "per_1"})
+        event = sink.wait_for(is_hook("/hook/OpenCodePermission"))
+        self.assertFalse(answered_within(client, 0.2))
+        relay.handle_reply({"rid": event["rid"], "body": {"reply": "once"}})
+        self.assertEqual(read_response(client)[2], {"reply": "once"})
+
+    def test_grok_peer_is_answered_immediately(self):
+        # Grok 0.2.118 treats a hook timeout as consent, so a held Grok
+        # request is an approved one. Grok nested inside a Claude session
+        # is the case most likely to slip through, so it is pinned too.
+        relay, sink = self.relay()
+        for peer in (["curl", "bash", "grok"],
+                     ["curl", "sh", "grok", "bash", "claude", "tmux: server"]):
+            self.peer = peer
+            sink.gate = threading.Event()
+            client = self.post("PermissionRequest", {"session_id": "g1"})
+            self.assertEqual(read_response(client, timeout=1)[2], {})
+            sink.gate.set()
+            event = sink.wait_for(lambda e: e.get("event") == "hook" and e["peer"] == peer)
+            self.assertIsNotNone(event)
+            self.assertEqual(sink.matching(is_resolved(event["rid"])), [])
+            self.assertEqual(self.hub(relay).pending, {})
+
+    def test_unknown_peer_is_answered_immediately(self):
+        relay, sink = self.relay()
+        for peer in ([], ["curl", "bash"], ["curl", "bash", "codex"],
+                     ["curl", "bash", "Claude"], OSError("no peer")):
+            self.peer = peer
+            sink.gate = threading.Event()
+            client = self.post("PermissionRequest", {"session_id": "u1"})
+            self.assertEqual(read_response(client, timeout=1)[2], {}, peer)
+            sink.gate.set()
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_oversized_body_is_answered_and_not_forwarded(self):
+        relay, sink = self.relay()
+        raw = json.dumps({"marker": "big", "pad": "x" * helper.MAX_HOOK_BODY}).encode()
+        self.assertEqual(read_response(self.post("PermissionRequest", raw=raw))[2], {})
+        self.assertEqual(read_response(self.post("Stop", {"marker": "small"}))[2], {})
+        self.assertIsNotNone(sink.wait_for(is_hook("/hook/Stop")))
+        self.assertEqual(len(sink.matching(lambda e: e.get("event") == "hook")), 1)
+
+    def test_hold_times_out_with_an_empty_answer(self):
+        relay, sink = self.relay()
+        with mock.patch.object(helper, "HOLD_SECONDS", 0.3):
+            client = self.post("PermissionRequest", {"session_id": "s1"})
+            event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+            self.assertEqual(read_response(client)[2], {})
+            self.assertIsNotNone(sink.wait_for(is_resolved(event["rid"])))
+
+    def test_client_that_leaves_resolves_the_hold(self):
+        relay, sink = self.relay()
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        client.close()
+        self.assertIsNotNone(sink.wait_for(is_resolved(event["rid"])))
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_follower_receives_and_first_reply_wins(self):
+        owner, owner_sink = self.relay()
+        follower, follower_sink = self.relay()
+        self.assertEqual(self.hub(owner).role, "owner")
+        self.assertEqual(self.hub(follower).role, "follower")
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        first = owner_sink.wait_for(is_hook("/hook/PermissionRequest"))
+        relayed = follower_sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertIsNotNone(relayed)
+        self.assertEqual(relayed, first)
+        decision = {"hookSpecificOutput": {"decision": {"behavior": "deny"}}}
+        self.assertEqual(follower.handle_reply({"rid": first["rid"], "body": decision}),
+                         {"ok": True})
+        self.assertEqual(read_response(client)[2], decision)
+        # The slower Mac's answer arrives after the first one won.
+        self.assertEqual(owner.handle_reply({"rid": first["rid"], "body": self.DECISION}),
+                         {"ok": True})
+        self.assertIsNotNone(owner_sink.wait_for(is_resolved(first["rid"])))
+        self.assertIsNotNone(follower_sink.wait_for(is_resolved(first["rid"])))
+
+    def test_follower_takes_over_when_owner_exits(self):
+        owner, owner_sink = self.relay()
+        follower, follower_sink = self.relay()
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        held = self.post("PermissionRequest", {"session_id": "s1"})
+        event = follower_sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertIsNotNone(event)
+        owner.close()
+        # The held request is lost: no decision, and the follower's Mac is
+        # told so its row does not wait on a request nobody can answer.
+        self.assertTrue(connection_dropped(held))
+        self.assertIsNotNone(follower_sink.wait_for(is_resolved(event["rid"])))
+        self.assertTrue(wait_until(lambda: self.hub(follower).role == "owner"))
+        self.assertEqual(read_response(self.post("Stop", {"after": 1}))[2], {})
+        self.assertIsNotNone(follower_sink.wait_for(is_hook("/hook/Stop")))
+        self.assertEqual(owner_sink.matching(is_hook("/hook/Stop")), [])
+
+    def test_stdin_eof_drops_held_request(self):
+        read_fd, write_fd = os.pipe()
+        stdin = os.fdopen(read_fd, "r")
+        writer = os.fdopen(write_fd, "w")
+        sink = EventSink()
+        previous = helper._OUT
+        thread = threading.Thread(target=helper.main, args=(stdin, sink))
+        thread.start()
+        try:
+            self.assertTrue(wait_until(lambda: os.path.exists(self.sock_path)))
+            client = self.post("PermissionRequest", {"session_id": "s1"})
+            self.assertIsNotNone(sink.wait_for(is_hook("/hook/PermissionRequest")))
+            writer.write(json.dumps({"id": 5, "cmd": "hook_reply", "rid": "elsewhere",
+                                     "body": {}}) + "\n")
+            writer.flush()
+            self.assertEqual(sink.wait_for(lambda e: e.get("id") == 5),
+                             {"ok": True, "id": 5})
+            writer.close()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(connection_dropped(client))
+            self.assertFalse(os.path.exists(self.sock_path))
+            # The lock is free for the next helper.
+            import fcntl
+            fd = os.open(os.path.join(self.bridge_dir, "hook.lock"), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        finally:
+            if not writer.closed:
+                writer.close()
+            thread.join(3)
+            stdin.close()
+            helper._OUT = previous
+
+    def test_snapshot_starts_servers_for_new_hook_homes(self):
+        os.remove(os.path.join(self.bridge_dir, "swarmbar-remote-hook.sh"))
+        read_fd, write_fd = os.pipe()
+        stdin = os.fdopen(read_fd, "r")
+        writer = os.fdopen(write_fd, "w")
+        sink = EventSink()
+        previous = helper._OUT
+        thread = threading.Thread(target=helper.main, args=(stdin, sink))
+        thread.start()
+        try:
+            writer.write(json.dumps({"id": 1, "cmd": "ping"}) + "\n")
+            writer.flush()
+            self.assertIsNotNone(sink.wait_for(lambda e: e.get("id") == 1))
+            self.assertFalse(os.path.exists(self.sock_path))
+            plugins = os.path.join(self.home, ".config", "opencode", "plugins")
+            os.makedirs(plugins)
+            open(os.path.join(plugins, "swarmbar-remote.js"), "w").close()
+            writer.write(json.dumps({"id": 2, "cmd": "snapshot"}) + "\n")
+            writer.flush()
+            self.assertIsNotNone(sink.wait_for(lambda e: e.get("id") == 2))
+            self.assertTrue(os.path.exists(self.sock_path))
+        finally:
+            writer.close()
+            thread.join(3)
+            stdin.close()
+            helper._OUT = previous
+
+    def test_socket_mode_is_600(self):
+        relay, _ = self.relay()
+        for name in ("hook.sock", "broker.sock"):
+            info = os.lstat(os.path.join(self.bridge_dir, name))
+            self.assertTrue(stat.S_ISSOCK(info.st_mode), name)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600, name)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.bridge_dir).st_mode), 0o700)
+
+
+
+class PeerChainTests(unittest.TestCase):
+    """peer_chain itself, against a fake process table."""
+
+    def test_peer_chain_names_the_peer_and_its_ancestors(self):
+        table = (
+            "  900   800 curl            curl -s --unix-socket x\n"
+            "  800   700 swarmbar-remote /bin/bash /home/u/.swarmbar/swarmbar-remote-hook.sh Stop\n"
+            "  700   600 /Users/u/.loc   /Users/u/.local/bin/claude --resume\n"
+            "  600   500 -bash           -bash\n"
+            "  500   400 tmux: server    tmux\n"
+            "  400   400 /Applications/Te /Applications/Terminal.app/Contents/MacOS/Terminal\n"
+        )
+        runner = FakeRunner(ps=table)
+        with mock.patch.object(helper, "run_command", side_effect=runner), \
+                mock.patch.object(helper, "peer_pid", return_value=900):
+            chain = helper.peer_chain(None)
+        self.assertEqual(chain, ["curl", "swarmbar-remote", "claude", "bash", "tmux:", "Terminal"])
+        self.assertEqual(runner.calls[0][:2], ["ps", "-axo"])
+
+    def test_peer_chain_is_bounded_and_fails_empty(self):
+        rows = "".join("%5d %5d sh sh\n" % (pid, pid + 1) for pid in range(100, 130))
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps=rows)), \
+                mock.patch.object(helper, "peer_pid", return_value=100):
+            self.assertEqual(len(helper.peer_chain(None)), helper.PEER_DEPTH)
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps_code=1)), \
+                mock.patch.object(helper, "peer_pid", return_value=100):
+            self.assertEqual(helper.peer_chain(None), [])
+        with mock.patch.object(helper, "peer_pid", return_value=None):
+            self.assertEqual(helper.peer_chain(None), [])
 
 
 if __name__ == "__main__":
