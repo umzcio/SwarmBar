@@ -11,13 +11,17 @@ bigger than the read window) is only reproducible against a real file.
 python 3.9 compatible, like the helper itself.
 """
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 _spec = importlib.util.spec_from_file_location(
     "swarmbar_helper",
@@ -190,6 +194,74 @@ class SessionRecordTests(unittest.TestCase):
             time.time(), warnings, [self.root])
         self.assertEqual(sessions, [])
         self.assertTrue(any("fresh.jsonl" in w for w in warnings), warnings)
+
+
+class ProtocolTests(unittest.TestCase):
+    def run_main(self, *requests):
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+        stdout = io.StringIO()
+        helper.main(stdin, stdout)
+        return [json.loads(l) for l in stdout.getvalue().splitlines()]
+
+    def test_ping_echoes_id(self):
+        (reply,) = self.run_main({"id": 7, "cmd": "ping"})
+        self.assertEqual(reply["id"], 7)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["protocol"], 3)
+        self.assertRegex(reply["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(reply["euid"], os.geteuid())
+        self.assertEqual(reply["stream"], helper.STREAM_ID)
+
+    def test_ping_sha256_is_the_hash_of_the_helper_file(self):
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        with open(path, "rb") as handle:
+            expected = hashlib.sha256(handle.read()).hexdigest()
+        (reply,) = self.run_main({"id": 1, "cmd": "ping"})
+        self.assertEqual(reply["sha256"], expected)
+
+    def test_unknown_command_keeps_id(self):
+        (reply,) = self.run_main({"id": 12, "cmd": "nope"})
+        self.assertEqual(reply["id"], 12)
+        self.assertFalse(reply["ok"])
+
+    def test_concurrent_writes_do_not_interleave(self):
+        sink = io.StringIO()
+        previous = helper._OUT
+        helper._OUT = sink
+        try:
+            def work(n):
+                for i in range(200):
+                    helper.write_line({"event": "t", "n": n, "i": i, "pad": "x" * 500})
+            threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            helper._OUT = previous
+        lines = sink.getvalue().splitlines()
+        self.assertEqual(len(lines), 1600)
+        for line in lines:
+            json.loads(line)
+
+    def test_homes_override(self):
+        a = tempfile.mkdtemp(prefix="swarmbar-home-a-")
+        b = tempfile.mkdtemp(prefix="swarmbar-home-b-")
+        try:
+            with mock.patch.dict(os.environ, {
+                    "SWARMBAR_HELPER_HOMES": a + ":" + b + ":/nonexistent-home"}):
+                self.assertEqual(helper.home_dirs(), [a, b])
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+            shutil.rmtree(b, ignore_errors=True)
+
+    def test_non_root_sees_only_own_home(self):
+        env = dict(os.environ)
+        env.pop("SWARMBAR_HELPER_HOMES", None)
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(os, "geteuid", return_value=1000):
+            self.assertEqual(helper.home_dirs(), [os.path.expanduser("~")])
 
 
 if __name__ == "__main__":

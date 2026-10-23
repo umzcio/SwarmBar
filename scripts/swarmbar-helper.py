@@ -13,16 +13,38 @@ Constraints that are not negotiable:
   * Read-only. This never writes to any agent's state.
 """
 
+import hashlib
 import json
 import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 
 # 2 added "created" to every session record. Additive: an older Mac
 # ignores the field and an older helper simply omits it.
-PROTOCOL_VERSION = 2
+# 3 frames every request with an "id" that the response echoes, and lets the
+# helper push unsolicited {"event": ...} lines that carry no id.
+PROTOCOL_VERSION = 3
+
+# Fixed for the life of the process. A Mac that sees it change knows the
+# helper restarted underneath it and that anything cached is stale.
+STREAM_ID = os.urandom(8).hex()
+
+# The stream main was given, and the lock that keeps lines whole. Socket
+# threads push events while the request loop answers, so every write goes
+# through write_line or two JSON objects could interleave mid-line.
+_OUT = sys.stdout
+_WRITE_LOCK = threading.Lock()
+
+
+def write_line(obj):
+    """The only function that writes to the output stream."""
+    text = json.dumps(obj) + "\n"
+    with _WRITE_LOCK:
+        _OUT.write(text)
+        _OUT.flush()
 
 # Only files touched inside this window are worth shipping. Matches
 # ClaudeCodeMonitor.discoveryWindow on the Mac.
@@ -66,7 +88,19 @@ def is_backup_name(name):
 
 
 def home_dirs():
-    """Every home on this host, root's included. Darwin and Linux differ."""
+    """The homes to scan. Darwin and Linux differ.
+
+    SWARMBAR_HELPER_HOMES (colon-separated) replaces discovery so tests never
+    read a real home. Without it, root sees every home, while any other user
+    sees only its own: listing /home as an unprivileged user would offer
+    directories it cannot read.
+    """
+    override = os.environ.get("SWARMBAR_HELPER_HOMES")
+    if override:
+        return [h for h in override.split(":") if h and os.path.isdir(h)]
+    if os.geteuid() != 0:
+        home = os.path.expanduser("~")
+        return [home] if os.path.isdir(home) else []
     homes = []
     if platform.system() == "Darwin":
         homes.append("/var/root")
@@ -336,23 +370,48 @@ def snapshot():
     return payload
 
 
-def main():
-    for line in sys.stdin:
+def ping():
+    try:
+        import pwd
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        user = ""
+    with open(os.path.abspath(__file__), "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    return {
+        "ok": True,
+        "protocol": PROTOCOL_VERSION,
+        "sha256": digest,
+        "euid": os.geteuid(),
+        "user": user,
+        "system": platform.system(),
+        "python": platform.python_version(),
+        "stream": STREAM_ID,
+    }
+
+
+def main(stdin=None, stdout=None):
+    global _OUT
+    stdin = stdin if stdin is not None else sys.stdin
+    _OUT = stdout if stdout is not None else sys.stdout
+    for line in stdin:
         line = line.strip()
         if not line:
             continue
         try:
             request = json.loads(line)
         except ValueError:
-            sys.stdout.write(json.dumps({"ok": False, "error": "malformed request"}) + "\n")
-            sys.stdout.flush()
+            write_line({"ok": False, "error": "malformed request"})
+            continue
+        if not isinstance(request, dict):
+            write_line({"ok": False, "error": "malformed request"})
             continue
         command = request.get("cmd")
         try:
             if command == "snapshot":
                 response = snapshot()
             elif command == "ping":
-                response = {"ok": True, "protocol": PROTOCOL_VERSION}
+                response = ping()
             else:
                 response = {"ok": False, "error": "unknown command: %s" % command}
         except Exception as error:
@@ -362,8 +421,9 @@ def main():
             # breaks for the rest of the stdin stream. Keep the message
             # short; no traceback in the JSON.
             response = {"ok": False, "error": "internal error: %s" % error}
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        if "id" in request:
+            response["id"] = request["id"]
+        write_line(response)
 
 
 if __name__ == "__main__":
