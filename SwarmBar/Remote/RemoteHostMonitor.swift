@@ -43,6 +43,11 @@ struct RemoteHostMonitor: SessionMonitor {
                 if !installed {
                     let outcome = await Self.installHelper(alias: host.alias)
                     installed = outcome.ok
+                    // Cancel is only a request, and the supervisor clears
+                    // this host's rows right after asking. Every store
+                    // write below is gated on it so an in-flight poll
+                    // cannot bring the cleared rows back.
+                    if Task.isCancelled { break }
                     if !outcome.ok {
                         // The snapshot below still runs: the helper may
                         // already be installed from an earlier session, and
@@ -63,6 +68,7 @@ struct RemoteHostMonitor: SessionMonitor {
                     let sessions = await Task.detached {
                         RemoteSnapshot.sessions(from: snapshot, host: name, now: now)
                     }.value
+                    if Task.isCancelled { break }
                     store.sync(tool: .claudeCode, host: name, sessions: sessions)
                     store.noteRemoteReachability(host: name, .reachable)
                     if snapshot.processesFailed {
@@ -93,6 +99,7 @@ struct RemoteHostMonitor: SessionMonitor {
                     // second call here would double-count and double the
                     // backoff on every failure. This block only mirrors the
                     // state into the store for the UI.
+                    if Task.isCancelled { break }
                     store.noteRemoteReachability(host: name, .unreachable("\(error)"))
                     let backoff = await channel.currentBackoff
                     if Self.shouldReinstall(afterBackoff: backoff) {

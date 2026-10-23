@@ -39,8 +39,10 @@ final class RemoteMonitorSupervisor {
             } else {
                 entry.task.cancel()
                 running.removeValue(forKey: id)
-                // A disabled host keeps its rows; a removed one must not.
-                if current == nil { store.clearHost(entry.host.displayName) }
+                // Disabled or removed, the stopped monitor's rows can no
+                // longer be trusted, and clearing now also keeps a later
+                // removal from finding nothing left to clear.
+                store.clearHost(entry.host.displayName)
             }
         }
 
