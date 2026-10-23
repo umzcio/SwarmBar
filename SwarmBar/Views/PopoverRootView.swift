@@ -11,6 +11,11 @@ struct PopoverRootView: View {
     // collapses a ScrollView to zero; measure the content instead.
     @State private var contentHeight: CGFloat = 100
 
+    // Nil under --mock, which never shows the remote hosts hint.
+    @Environment(RemoteHostRegistry.self) private var registry: RemoteHostRegistry?
+    @Environment(\.openRemoteWizard) private var openRemoteWizard
+    @State private var candidateAliases = 0
+
     var body: some View {
         // Drilling in replaces the list rather than opening a second window.
         // The target lives on the store because the rows that open it are two
@@ -25,6 +30,10 @@ struct PopoverRootView: View {
             }
         }
         .environment(\.swarmScale, scale)
+        .task {
+            guard registry != nil else { return }
+            candidateAliases = await RemoteHostCandidateCache.shared.count()
+        }
     }
 
     private var sessionList: some View {
@@ -35,11 +44,26 @@ struct PopoverRootView: View {
             ScrollView {
                 VStack(spacing: 0) {
                     if store.visibleCount == 0 {
-                        Text("No agent sessions")
-                            .swarmFont(.body)
-                            .foregroundStyle(.tertiary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 24)
+                        VStack(spacing: 6) {
+                            Text("No agent sessions")
+                                .swarmFont(.body)
+                                .foregroundStyle(.tertiary)
+                            if let registry, RemoteHostHint.shouldShow(
+                                visibleSessions: store.visibleCount,
+                                configuredHosts: registry.hosts.count,
+                                candidateAliases: candidateAliases) {
+                                VStack(spacing: 2) {
+                                    Text("Running agents on other machines?")
+                                        .swarmFont(.body)
+                                        .foregroundStyle(.tertiary)
+                                    Button("Set up remote hosts") { openRemoteWizard(.fresh) }
+                                        .buttonStyle(.link)
+                                        .swarmFont(.body)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
                     } else {
                         if !store.attention.isEmpty {
                             SessionSection(

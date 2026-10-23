@@ -407,3 +407,47 @@ struct RemoteHostHintTests {
         #expect(rig.supervisor.checkingAll == false)
     }
 }
+
+/// The empty popover's remote hosts hint: when it shows, which aliases count,
+/// and the 60 second cache. Synthetic aliases and temp directories only.
+@Suite("Remote host popover hint")
+struct RemoteHostPopoverHintTests {
+    @Test func hintOnlyWhenEmptyUnconfiguredAndCandidatesExist() {
+        for sessions in [0, 3] {
+            for hosts in [0, 2] {
+                for candidates in [0, 4] {
+                    let expected = sessions == 0 && hosts == 0 && candidates > 0
+                    #expect(RemoteHostHint.shouldShow(
+                        visibleSessions: sessions, configuredHosts: hosts,
+                        candidateAliases: candidates) == expected)
+                }
+            }
+        }
+    }
+
+    @Test func gitForgesByNameDoNotCount() {
+        #expect(RemoteHostHint.countCandidates(in: ["github.com", "GitLab.com", "bitbucket.org"]) == 0)
+        #expect(RemoteHostHint.countCandidates(in: ["github.com", "devbox", "lab"]) == 2)
+    }
+
+    @Test func unreadableConfigCountsAsZero() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hint-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(RemoteHostHint.readCandidateCount(home: dir) == 0)
+
+        let ssh = dir.appendingPathComponent(".ssh")
+        try FileManager.default.createDirectory(at: ssh, withIntermediateDirectories: true)
+        try "Host github.com\n  User git\nHost devbox\n  HostName 10.0.0.1\n"
+            .write(to: ssh.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+        #expect(RemoteHostHint.readCandidateCount(home: dir) == 1)
+    }
+
+    @Test func cacheHoldsForAMinute() async {
+        let cache = RemoteHostCandidateCache()
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(await cache.count(now: t0, compute: { 2 }) == 2)
+        #expect(await cache.count(now: t0.addingTimeInterval(59), compute: { 5 }) == 2)
+        #expect(await cache.count(now: t0.addingTimeInterval(61), compute: { 5 }) == 5)
+    }
+}

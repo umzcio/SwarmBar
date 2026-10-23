@@ -113,6 +113,7 @@ struct SwarmBarApp: App {
         MenuBarExtra {
             PopoverRootView()
                 .environment(store)
+                .environment(remoteRegistry)
                 .remoteWizardLauncher(remoteWizard)
         } label: {
             MenuBarLabel()
