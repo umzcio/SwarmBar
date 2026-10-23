@@ -49,12 +49,20 @@ struct RemoteAnswerTests {
         let command = RemoteAnswerPlan.command(
             route: .numberedSelector, screen: screen,
             choose: TuiPromptLayout.approveOnceOption(in:))
-        #expect(command == RemoteKeyCommand(keys: ["1"], expect: ["Approve once"]))
+        #expect(command == RemoteKeyCommand(keys: ["1"], expect: ["1. Approve once"]))
 
         let deny = RemoteAnswerPlan.command(
             route: .numberedSelector, screen: screen,
             choose: TuiPromptLayout.rejectOption(in:))
-        #expect(deny == RemoteKeyCommand(keys: ["3"], expect: ["Reject"]))
+        #expect(deny == RemoteKeyCommand(keys: ["3"], expect: ["3. Reject"]))
+
+        // What is confirmed is the label at that digit, not the label
+        // anywhere: a prompt redrawn with Reject at 2 no longer holds it,
+        // and neither does one with something else at 3. A cursor marker
+        // in front of the line does not get in the way.
+        #expect(!"1. Approve once\n2. Reject".contains("3. Reject"))
+        #expect(!"1. Approve once\n2. Reject\n3. Approve always".contains("3. Reject"))
+        #expect("1. Approve once\n2. Approve for session\n> 3. Reject".contains("3. Reject"))
     }
 
     @Test func navigatePlanWalksFromCursor() {
@@ -268,6 +276,36 @@ struct RemoteAnswerTests {
         #expect(rig.store.sessions.first?.status == .waitingApproval(command: "rm -rf build"))
     }
 
+    /// Two sessions in one directory both resolve to the newest process
+    /// there, so a pid they share cannot say whose pane it is. Neither gets
+    /// keys or a reply: both fall back to the terminal on the host.
+    @Test func aPidSharedByTwoRowsTakesNoKeys() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"1. Approve once\n2. Reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let older = kimi(), newer = kimi()
+        rig.store.upsert(older)
+        #expect(rig.supervisor.answerability(for: older) == .keystrokes)
+        rig.store.upsert(newer)
+        for session in [older, newer] {
+            #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+            #expect(!rig.supervisor.canReply(session))
+            #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+            let reply = await rig.supervisor.performReply(session, text: "go on")
+            #expect(reply == .failed("Another session on devbox runs in the same folder, so SwarmBar can't "
+                + "tell their terminals apart. Reply in its terminal."))
+        }
+        #expect(await rig.helper.commands.isEmpty)
+
+        // The same pid on another tool's row, or another host's, is not a clash.
+        rig.store.remove(id: newer.id)
+        rig.store.upsert(AgentSession(tool: .codex, projectName: "proj", status: .working(activity: "x"), pid: 4242, host: "devbox"))
+        rig.store.upsert(AgentSession(tool: .kimiCode, projectName: "proj", status: .working(activity: "x"), pid: 4242, host: "other"))
+        #expect(rig.supervisor.answerability(for: older) == .keystrokes)
+    }
+
     @Test func approvalsOffMeansTerminalOnly() async throws {
         let rig = Rig(approvalsOff: [.kimiCode], replies: ["keys": #"{"sent":true}"#])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
@@ -334,7 +372,7 @@ struct RemoteAnswerTests {
         #expect(calls[0].arguments == ["pane": paneValue])
         #expect(calls[1].arguments["pane"] == paneValue)
         #expect(calls[1].arguments["keys"] == .array([.string("1")]))
-        #expect(calls[1].arguments["expect"] == .array([.string("Approve once")]))
+        #expect(calls[1].arguments["expect"] == .array([.string("1. Approve once")]))
         // And with the process it was meant for, so the helper can refuse
         // if that pid is gone, is another agent, or has left the pane.
         #expect(calls[1].arguments["pid"] == .int(4242))
@@ -494,8 +532,9 @@ struct RemoteAnswerTests {
     @Test func captureFailureSendsNothing() async throws {
         let refused = Rig(replies: ["capture": #"{"ok":false,"error":"capture failed"}"#, "keys": #"{"sent":true}"#])
         refused.land(try Self.snapshot(pid: 4242, pane: Self.pane))
-        refused.store.upsert(kimi())
-        #expect(await refused.supervisor.performAnswer(kimi(), allow: true) == false)
+        let session = kimi()
+        refused.store.upsert(session)
+        #expect(await refused.supervisor.performAnswer(session, allow: true) == false)
         #expect(await refused.helper.commands == ["capture"])
 
         // No answer at all: the fake throws, as a timed out request does.

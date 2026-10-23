@@ -33,11 +33,14 @@ enum RemoteAnswerPlan {
             return RemoteKeyCommand(keys: keys, expect: [])
 
         case .numberedSelector:
-            // The digit is read off the screen, never assumed, and its label
-            // is what the helper re-confirms, as TerminalFocuser.answerNumbered
-            // does locally.
+            // The digit is read off the screen, never assumed, and the helper
+            // re-confirms the label is still AT that digit, not merely
+            // somewhere on screen: between the capture and the press the
+            // prompt can be answered at the terminal and redrawn, with
+            // "Reject" still showing at another number. The visible line
+            // holds "N. Label" with or without a cursor marker in front.
             guard let screen, let option = choose(screen) else { return nil }
-            return RemoteKeyCommand(keys: ["\(option.number)"], expect: [option.label])
+            return RemoteKeyCommand(keys: ["\(option.number)"], expect: ["\(option.number). \(option.label)"])
 
         case .navigateSelector:
             // Walked by label from the marked line, only ever the distance

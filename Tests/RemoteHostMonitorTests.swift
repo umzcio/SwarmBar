@@ -330,6 +330,37 @@ struct RemoteHostMonitorTests {
             == "SwarmBar was updated. Run the setup command again to update its helper.")
     }
 
+    /// A host that needs setup and then goes dark reads Cannot reach, not
+    /// Needs setup: setup can only be asked of a host that answers, and the
+    /// rows' "Cannot reach" note depends on it.
+    @Test("a host needing setup that goes dark reads unreachable", .enabled(if: pythonAvailable))
+    func needsSetupHostGoingDarkIsUnreachable() async throws {
+        let rig = try MonitorRig(
+            watchAs: .everyUser,
+            launch: { try scriptedHelper(in: $0, pingReply: stalePing) },
+            installRunner: { _, _, _ in
+                throw HelperInstaller.InstallFailure(
+                    message: "helper install exited 1: sudo: a password is required",
+                    stderr: "sudo: a password is required\n")
+            })
+        defer { rig.remove() }
+        rig.start()
+        await settle { rig.store.remoteReachability["devbox"] == .needsSetup(HelperInstaller.updateNeedsSetupMessage) }
+        #expect(rig.store.remoteReachability["devbox"] == .needsSetup(HelperInstaller.updateNeedsSetupMessage))
+
+        try FileManager.default.removeItem(at: rig.base.appendingPathComponent("scripted-helper.py"))
+        await rig.connection.channel.shutdown()
+        await settle {
+            if case .unreachable = rig.store.remoteReachability["devbox"] { return true }
+            return false
+        }
+        await rig.stop()
+        guard case .unreachable = rig.store.remoteReachability["devbox"] else {
+            Issue.record("expected unreachable, got \(String(describing: rig.store.remoteReachability["devbox"]))")
+            return
+        }
+    }
+
     /// A push that fails for some reason other than sudo leaves the host
     /// reading reachable while the old helper keeps answering. That helper
     /// ignores the press-time pid and comm check, so it must not be trusted

@@ -47,6 +47,9 @@ private enum ReplyMessage {
     static func noPane(_ host: String) -> String {
         "This session isn't in tmux on \(host), so reply in its terminal."
     }
+    static func sharedPid(_ host: String) -> String {
+        "Another session on \(host) runs in the same folder, so SwarmBar can't tell their terminals apart. Reply in its terminal."
+    }
     static func pasteUncertain(_ host: String) -> String {
         "The reply may have been partly pasted into the session on \(host), so it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."
     }
@@ -113,7 +116,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         let host = session.host ?? "?"
         guard let target = paneTarget(for: session) else {
             remoteAnswerLog.notice("reply: \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public) has no pane, nothing sent")
-            return .failed(ReplyMessage.noPane(host))
+            return .failed(sharesPid(session) ? ReplyMessage.sharedPid(host) : ReplyMessage.noPane(host))
         }
         // The helper strips these anyway. Stripping first means the probe
         // looked for on screen is cut from what actually lands.
@@ -326,7 +329,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// checked before any request, so a click on a dark host's row never
     /// starts ssh, and a pane map from before a gap never aims a key.
     private func paneTarget(for session: AgentSession) -> PaneTarget? {
-        guard let hostName = session.host, let pid = session.pid,
+        guard let hostName = session.host, let pid = session.pid, !sharesPid(session),
               store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
               connection.helperIsCurrent,
@@ -334,6 +337,19 @@ extension RemoteMonitorSupervisor: RemoteActing {
               let pane = process.pane
         else { return nil }
         return (process, pane, connection)
+    }
+
+    /// Whether another row of the same host and tool carries this row's
+    /// pid. Kimi, BearCode and OpenCode rows take theirs from the newest
+    /// process in their directory, so two sessions in one repo both point
+    /// at the newer one's pane, and keys meant for one would answer, or a
+    /// reply would land in, the other. Neither can be told apart, so
+    /// neither is typed into.
+    private func sharesPid(_ session: AgentSession) -> Bool {
+        guard let pid = session.pid else { return false }
+        return store.sessions.contains {
+            $0.id != session.id && $0.host == session.host && $0.tool == session.tool && $0.pid == pid
+        }
     }
 
     /// `paneTarget`, for an approval: also nil when approvals are off for

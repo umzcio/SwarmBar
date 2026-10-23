@@ -83,8 +83,14 @@ struct RemoteHostMonitor: SessionMonitor {
         /// than every ten seconds.
         var lastWarnings: [String] = []
 
-        func reachability(failing reason: String) -> RemoteReachability {
-            setupNeeded.map { .needsSetup($0) } ?? .unreachable(reason)
+        /// Setup can only be asked of a host that answers. When the ping,
+        /// the push or the snapshot itself failed, the host reads
+        /// unreachable whatever it needed before, or its rows would lose
+        /// their "Cannot reach" note and Settings would ask for a setup
+        /// command on a machine that is down.
+        func reachability(failing reason: String, hostAnswered: Bool) -> RemoteReachability {
+            guard hostAnswered, let setupNeeded else { return .unreachable(reason) }
+            return .needsSetup(setupNeeded)
         }
     }
 
@@ -151,17 +157,18 @@ struct RemoteHostMonitor: SessionMonitor {
             // only way to tell, and after that only once the backoff says
             // the failure is not transient.
             guard state.lastPush == nil || Self.shouldReinstall(afterBackoff: backoff) else {
-                return await failed(reason, store: store, state: &state)
+                return await failed(reason, hostAnswered: false, store: store, state: &state)
             }
             state.lastPush = ContinuousClock.now
             switch await push(host, channel) {
             case .current, .installed:
                 state.setupNeeded = nil
             case .needsSetup(let message):
+                // sudo answered, so the host did.
                 state.setupNeeded = message
-                return await failed(message, store: store, state: &state)
+                return await failed(message, hostAnswered: true, store: store, state: &state)
             case .failed(let message):
-                return await failed(message, store: store, state: &state)
+                return await failed(message, hostAnswered: false, store: store, state: &state)
             }
         }
         if Task.isCancelled { return pollInterval }
@@ -181,7 +188,7 @@ struct RemoteHostMonitor: SessionMonitor {
             // next request starts a fresh stream. A cancelled poll is ended
             // by the shutdown when the loop exits.
             if Task.isCancelled { return pollInterval }
-            return await failed("\(error)", store: store, state: &state)
+            return await failed("\(error)", hostAnswered: false, store: store, state: &state)
         }
 
         // A new stream means a new helper process, which ships every file
@@ -204,7 +211,8 @@ struct RemoteHostMonitor: SessionMonitor {
             state.stream = nil
             await channel.noteFailure("mirror: \(error)")
             if Task.isCancelled { return pollInterval }
-            return await failed("\(error)", store: store, state: &state)
+            // The host answered; it is this Mac's disk that refused.
+            return await failed("\(error)", hostAnswered: true, store: store, state: &state)
         }
         state.stream = snapshot.stream
 
@@ -251,7 +259,7 @@ struct RemoteHostMonitor: SessionMonitor {
     /// work finished. Nor does it clear the mirror: the next helper process
     /// is a new stream, and that is what resets it.
     private func failed(
-        _ reason: String, store: SessionStore, state: inout PollState
+        _ reason: String, hostAnswered: Bool, store: SessionStore, state: inout PollState
     ) async -> Duration {
         state.stream = nil
         // Unlike the rows, the pane map is not kept: keys aimed by it after
@@ -259,7 +267,8 @@ struct RemoteHostMonitor: SessionMonitor {
         if connection.noteLost() { store.noteRemotePanesChanged() }
         let backoff = await connection.channel.currentBackoff
         if Task.isCancelled { return pollInterval }
-        store.noteRemoteReachability(host: connection.host.displayName, state.reachability(failing: reason))
+        store.noteRemoteReachability(
+            host: connection.host.displayName, state.reachability(failing: reason, hostAnswered: hostAnswered))
         return .seconds(backoff)
     }
 }
