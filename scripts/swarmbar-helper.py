@@ -16,7 +16,8 @@ Constraints that are not negotiable:
 
 import base64
 import collections
-import glob
+import errno
+import fnmatch
 import hashlib
 import json
 import os
@@ -246,7 +247,7 @@ def tail_of(path, size):
 
 
 def tail_chunk(path, size, start=TAIL_BYTES):
-    """The tail as one chunk, (offset, bytes), at its true offset.
+    """The tail as one chunk at its true offset: ((offset, bytes), covered).
 
     Unlike tail_of, the chunk runs through `size`, partial last line
     included, so the next poll's growth chunk starts exactly where this one
@@ -256,6 +257,10 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     without that newline the zeros and the first shipped record would read
     as one line, and a reader that drops a partial first line would drop
     a real record with it.
+
+    `covered` is where the read window began. No newline lies between it
+    and the chunk, so a tail reader whose window starts anywhere from
+    `covered` on sees the same lines in the mirror as in the file.
     """
     found = tail_window(path, size, start)
     if not isinstance(found, tuple):
@@ -263,7 +268,7 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     offset, data, first = found
     if first > 0:
         first -= 1
-    return offset + first, data[first:]
+    return (offset + first, data[first:]), offset
 
 
 def head_chunk(path, size):
@@ -332,8 +337,7 @@ def has_presence_lock(path):
     ships the databases of running conversations and none of the ended
     ones, which can be many and large.
     """
-    name = os.path.basename(path)
-    conversation = name.rsplit(".db", 1)[0]
+    conversation = os.path.basename(path).rsplit(".db", 1)[0]
     agy = os.path.dirname(os.path.dirname(path))
     return os.path.exists(os.path.join(agy, "presence", conversation + ".lock"))
 
@@ -351,21 +355,26 @@ _AGY = ".gemini/antigravity-cli/"
 # What each tool's monitor reads, relative to a home. Kimi session dirs are
 # <root>/sessions/wd_<name>_<hash>/session_<uuid>, so two fixed levels
 # stand in for a ** walk through whatever else lives under sessions/.
+#
+# sqlite databases ship with their -wal but never their -shm. The files
+# are read at different instants, and a -shm index left over from an older
+# -wal can steer a reader to the wrong frames; without one, the Mac's
+# SQLiteSnapshot copies the pair and lets sqlite rebuild the index.
 SPECS = (
     [
         Spec("claude", CLAUDE_PREFIX + "projects/*/*.jsonl", "head_tail", True),
         Spec("claude", CLAUDE_PREFIX + "sessions/*.json", "whole", False),
-        # CodexMonitor reads its tail from 1 MB first, so a smaller window
-        # would hand the mirror less than the local monitor expects.
+        # CodexMonitor.parsedStatus falls back from 64 KB to 1 MB to 4 MB
+        # when the newest records are ones its parser skips, so the mirror
+        # has to hold the widest of those windows from the first ship.
         Spec("codex", ".codex/sessions/**/rollout-*.jsonl", "head_tail", True,
-             1024 * 1024),
+             MAX_TAIL_BYTES),
     ]
     + _kimi_family("kimi", ".kimi-code")
     + _kimi_family("bearcode", ".bearcode")
     + [
         Spec("opencode", ".local/share/opencode/opencode.db", "whole", False),
         Spec("opencode", ".local/share/opencode/opencode.db-wal", "whole", False),
-        Spec("opencode", ".local/share/opencode/opencode.db-shm", "whole", False),
         Spec("grok", ".grok/active_sessions.json", "whole", False),
         Spec("grok", ".grok/sessions/*/*/summary.json", "whole", True),
         Spec("grok", ".grok/sessions/*/*/events.jsonl", "tail", True),
@@ -375,23 +384,24 @@ SPECS = (
         Spec("antigravity", _AGY + "history.jsonl", "tail", False),
         Spec("antigravity", _AGY + "conversation_summaries.db", "whole", False),
         Spec("antigravity", _AGY + "conversation_summaries.db-wal", "whole", False),
-        Spec("antigravity", _AGY + "conversation_summaries.db-shm", "whole", False),
         Spec("antigravity", _AGY + "brain/*/.system_generated/logs/transcript.jsonl",
              "tail", True),
         Spec("antigravity", _AGY + "conversations/*.db", "whole", False,
              gate=has_presence_lock),
         Spec("antigravity", _AGY + "conversations/*.db-wal", "whole", False,
              gate=has_presence_lock),
-        Spec("antigravity", _AGY + "conversations/*.db-shm", "whole", False,
-             gate=has_presence_lock),
     ]
 )
 
-# {path: (size, mtime)} of what this process has shipped. Per process on
-# purpose: a new helper has a new STREAM_ID, the Mac discards its mirror on
-# seeing one, and everything ships fresh. A path that leaves the manifest
-# leaves this too, so if it comes back it ships fresh rather than as growth
-# against bytes the Mac no longer holds.
+# What this process has shipped, per path: Shipped(size, mtime, covered,
+# last_newline). `covered` is where the mirror's tail begins and
+# `last_newline` the offset of the last newline shipped; both are None for
+# whole files. Per process on purpose: a new helper has a new STREAM_ID, the
+# Mac discards its mirror on seeing one, and everything ships fresh. A path
+# that leaves the manifest leaves this too, so if it comes back it ships
+# fresh rather than as growth against bytes the Mac no longer holds. Only
+# snapshot() replaces it, and only once the response is fully built.
+Shipped = collections.namedtuple("Shipped", "size mtime covered last_newline")
 SHIPPED = {}
 
 
@@ -410,6 +420,35 @@ def ship_decision(prev_size, prev_mtime, size, mtime):
     if prev_size < size <= prev_size + MAX_TAIL_BYTES:
         return "growth"
     return "fresh"
+
+
+def reader_offset(size, last_break, start):
+    """Where ClaudeCodeMonitor.tail(of:startingAt:) starts its last window.
+
+    It doubles from `start` until the window holds a newline with at least
+    one byte after it, so all it needs to know is where the last such
+    newline is (`last_break`, or -1 for none). It gives up at the ceiling.
+    """
+    window = min(start, MAX_TAIL_BYTES)
+    while True:
+        offset = size - window if size > window else 0
+        if offset == 0 or offset <= last_break or window >= MAX_TAIL_BYTES:
+            return offset
+        window = min(window * 2, MAX_TAIL_BYTES)
+
+
+def growth_is_mirrored(prev, size, data, start):
+    """Whether appending `data` keeps the mirror's tail equal to the file's.
+
+    A growth chunk holding one record bigger than the reader's window makes
+    the reader double back past it, and if that reaches ahead of
+    prev.covered the mirror answers from its hole. The widest reader the
+    Mac runs on this file starts at `start`, and any narrower one lands
+    later, so checking that one covers them all.
+    """
+    inner = data.rfind(b"\n", 0, len(data) - 1)
+    last_break = prev.size + inner if inner != -1 else prev.last_newline
+    return reader_offset(size, last_break, start) >= prev.covered
 
 
 def growth_chunk(path, start, size):
@@ -432,37 +471,116 @@ def omission_reason(found):
     return None
 
 
-def file_chunks(spec, path, size, mtime):
-    """(reset, [(offset, bytes)]) for one file, or a reason string to omit it."""
+def last_newline_in(chunks, fallback):
+    """Offset of the last newline across chunks, later chunks winning."""
+    found = fallback
+    for offset, data in chunks:
+        index = data.rfind(b"\n")
+        if index != -1:
+            found = offset + index
+    return found
+
+
+def file_chunks(spec, path, size, mtime, prev):
+    """(reset, [(offset, bytes)], Shipped or None) for one file, or a
+    reason string to omit it. `prev` is SHIPPED's entry, or None."""
     if spec.mode == "listing":
-        return False, []
+        return False, [], None
     if spec.mode == "whole" and size > WHOLE_MAX_BYTES:
         return "too large"
-    prev = SHIPPED.get(path, (None, None))
-    decision = ship_decision(prev[0], prev[1], size, mtime)
+    decision = ship_decision(prev.size if prev else None,
+                             prev.mtime if prev else None, size, mtime)
     if decision == "none":
-        return False, []
+        return False, [], prev
     if spec.mode == "whole":
         found = whole_chunk(path, size)
-        return omission_reason(found) or (True, [found])
+        return omission_reason(found) or (
+            True, [found], Shipped(size, mtime, None, None))
     if decision == "growth":
-        found = growth_chunk(path, prev[0], size)
-        return omission_reason(found) or (False, [found])
+        found = growth_chunk(path, prev.size, size)
+        reason = omission_reason(found)
+        if reason:
+            return reason
+        if growth_is_mirrored(prev, size, found[1], spec.tail_start):
+            return False, [found], Shipped(
+                size, mtime, prev.covered, last_newline_in([found], prev.last_newline))
     tail = tail_chunk(path, size, spec.tail_start)
     reason = omission_reason(tail)
     if reason:
         return reason
-    if spec.mode != "head_tail":
-        return True, [tail]
-    head = head_chunk(path, size)
-    return omission_reason(head) or (True, [head, tail])
+    chunk, covered = tail
+    chunks = [chunk]
+    if spec.mode == "head_tail":
+        head = head_chunk(path, size)
+        reason = omission_reason(head)
+        if reason:
+            return reason
+        chunks = [head, chunk]
+    return True, chunks, Shipped(size, mtime, covered, last_newline_in([chunk], -1))
 
 
-def expand(spec, homes, claude_dirs):
-    """(home, path) for every match of one spec, in a stable order.
+def has_magic(part):
+    return any(character in part for character in "*?[")
 
-    The glob runs here, inside the privileged process, never in a calling
-    shell that cannot read the homes it names.
+
+def list_dir(directory, unreadable):
+    """Names in a directory. A directory that is not there is empty; one
+    that is there but cannot be read is recorded, never read as empty."""
+    try:
+        return sorted(os.listdir(directory))
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+            unreadable[directory] = "cannot list: %s" % error.strerror
+        return []
+
+
+def matching(directory, part, unreadable):
+    """Entries of `directory` matching one pattern component. Like glob, a
+    wildcard never matches a hidden name unless the component asks for one."""
+    hidden = part.startswith(".")
+    return [os.path.join(directory, name)
+            for name in list_dir(directory, unreadable)
+            if (hidden or not name.startswith("."))
+            and fnmatch.fnmatchcase(name, part)]
+
+
+def subdirectories(directory, unreadable):
+    """`directory` and every directory beneath it, for "**". Symlinked
+    directories are not followed, so a link loop cannot run forever."""
+    found = [directory]
+    for path in matching(directory, "*", unreadable):
+        if os.path.isdir(path) and not os.path.islink(path):
+            found.extend(subdirectories(path, unreadable))
+    return found
+
+
+def expand_pattern(base, pattern, unreadable):
+    """Candidate paths for a glob pattern under `base`.
+
+    glob.glob would do, except that it reads a directory it may not open
+    as an empty one, and "found nothing" must never look like "could not
+    look". This records such directories in `unreadable` instead. Literal
+    components are joined without a check; the caller's stat decides.
+    """
+    paths = [base]
+    for part in pattern.split("/"):
+        following = []
+        for current in paths:
+            if part == "**":
+                following.extend(subdirectories(current, unreadable))
+            elif has_magic(part):
+                following.extend(matching(current, part, unreadable))
+            else:
+                following.append(os.path.join(current, part))
+        paths = following
+    return paths
+
+
+def expand(spec, homes, claude_dirs, unreadable):
+    """(home, path) for every candidate of one spec, in a stable order.
+
+    The expansion runs here, inside the privileged process, never in a
+    calling shell that cannot read the homes it names.
     """
     if spec.pattern.startswith(CLAUDE_PREFIX):
         rest = spec.pattern[len(CLAUDE_PREFIX):]
@@ -471,9 +589,19 @@ def expand(spec, homes, claude_dirs):
         rest = spec.pattern
         bases = [(home, home) for home in homes]
     for home, base in bases:
-        for path in sorted(glob.glob(os.path.join(glob.escape(base), rest),
-                                     recursive=True)):
+        for path in expand_pattern(base, rest, unreadable):
             yield home, path
+
+
+def stat_or_note(path, unreadable):
+    """os.stat, or None. A path that is simply gone stays silent; one that
+    exists but cannot be examined is recorded in `unreadable`."""
+    try:
+        return os.stat(path)
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+            unreadable[path] = "cannot stat: %s" % error.strerror
+        return None
 
 
 def ancestors(home, path):
@@ -491,22 +619,23 @@ def stat_entry(path, info):
     return {"path": path, "mtime": info.st_mtime, "created": created_time(info)}
 
 
-def manifest(now, warnings):
-    """files, dirs and omitted for every spec in every home."""
+def manifest(now, warnings, shipped_before):
+    """files, dirs, omitted, and the SHIPPED map to commit if the snapshot
+    that asked for them completes. It never touches SHIPPED itself."""
     homes = home_dirs()
     claude_dirs = [(os.path.dirname(os.path.dirname(projects)),
                     os.path.dirname(projects))
                    for projects in claude_roots(warnings)]
     files, dirs, omitted = [], {}, []
+    unreadable = {}
     seen = set()
     shipped = {}
     for spec in SPECS:
-        for home, path in expand(spec, homes, claude_dirs):
+        for home, path in expand(spec, homes, claude_dirs, unreadable):
             if path in seen:
                 continue
-            try:
-                info = os.stat(path)
-            except OSError:
+            info = stat_or_note(path, unreadable)
+            if info is None:
                 continue
             is_dir = stat_module.S_ISDIR(info.st_mode)
             if (spec.mode == "dir") != is_dir:
@@ -521,14 +650,15 @@ def manifest(now, warnings):
             if is_dir:
                 dirs[path] = stat_entry(path, info)
             else:
-                result = file_chunks(spec, path, info.st_size, info.st_mtime)
+                result = file_chunks(spec, path, info.st_size, info.st_mtime,
+                                     shipped_before.get(path))
                 # Omitting the file says nothing about the session, which is
                 # recoverable on the next poll. Shipping it empty would wipe
                 # the Mac's copy and delete its row, which is not.
                 if not isinstance(result, tuple):
                     omitted.append({"path": path, "reason": result})
                     continue
-                reset, chunks = result
+                reset, chunks, record = result
                 item = stat_entry(path, info)
                 item.update({
                     "size": info.st_size,
@@ -537,18 +667,17 @@ def manifest(now, warnings):
                                for offset, data in chunks],
                 })
                 files.append(item)
-                if spec.mode != "listing":
-                    shipped[path] = (info.st_size, info.st_mtime)
+                if record is not None:
+                    shipped[path] = record
             for parent in ancestors(home, path):
                 if parent in dirs:
                     continue
-                try:
-                    dirs[parent] = stat_entry(parent, os.stat(parent))
-                except OSError:
-                    continue
-    SHIPPED.clear()
-    SHIPPED.update(shipped)
-    return files, [dirs[path] for path in sorted(dirs)], omitted
+                parent_info = stat_or_note(parent, unreadable)
+                if parent_info is not None:
+                    dirs[parent] = stat_entry(parent, parent_info)
+    omitted.extend({"path": path, "reason": unreadable[path]}
+                   for path in sorted(unreadable))
+    return files, [dirs[path] for path in sorted(dirs)], omitted, shipped
 
 
 def home_entries(warnings):
@@ -638,7 +767,7 @@ def snapshot():
     now = time.time()
     warnings = []
     homes = home_entries(warnings)
-    files, dirs, omitted = manifest(now, warnings)
+    files, dirs, omitted, shipped = manifest(now, warnings, SHIPPED)
     processes = agent_processes(warnings)
     payload = {
         "ok": True,
@@ -662,6 +791,11 @@ def snapshot():
     else:
         payload["processes"] = processes
         payload["processes_failed"] = False
+    # Last, after everything that can raise. A snapshot that fails never
+    # reaches the Mac, so it must not count its chunks as shipped either, or
+    # the next one would send growth on top of bytes the mirror never got.
+    SHIPPED.clear()
+    SHIPPED.update(shipped)
     return payload
 
 

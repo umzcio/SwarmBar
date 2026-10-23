@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import random
 import shutil
 import tempfile
 import threading
@@ -388,6 +389,66 @@ class ManifestTests(unittest.TestCase):
             self.assertIn("mtime", item)
             self.assertIn("created", item)
 
+    def test_sqlite_shm_sidecars_are_not_shipped(self):
+        opencode = ".local/share/opencode/"
+        agy = ".gemini/antigravity-cli/"
+        self.put(agy + "presence/conv-a.lock", "")
+        kept = [self.put(opencode + "opencode.db", b"db"),
+                self.put(opencode + "opencode.db-wal", b"wal"),
+                self.put(agy + "conversation_summaries.db", b"db"),
+                self.put(agy + "conversation_summaries.db-wal", b"wal"),
+                self.put(agy + "conversations/conv-a.db", b"db"),
+                self.put(agy + "conversations/conv-a.db-wal", b"wal")]
+        dropped = [self.put(opencode + "opencode.db-shm", b"shm"),
+                   self.put(agy + "conversation_summaries.db-shm", b"shm"),
+                   self.put(agy + "conversations/conv-a.db-shm", b"shm")]
+        snap = helper.snapshot()
+        for path in kept:
+            self.assertIsNotNone(self.entry(snap, path), path)
+        for path in dropped:
+            self.assertIsNone(self.entry(snap, path), path)
+
+    def test_codex_first_ship_covers_the_widest_fallback_window(self):
+        spec = [s for s in helper.SPECS if s.tool == "codex"][0]
+        self.assertEqual(spec.tail_start, helper.MAX_TAIL_BYTES)
+
+    def test_failed_snapshot_does_not_advance_shipped(self):
+        path = self.put(self.EVENTS, self.many_records(10))
+        old_size = os.stat(path).st_size
+        helper.snapshot()
+        appended = record('{"added":true}')
+        self.put(self.EVENTS, appended, mode="ab")
+        with mock.patch.object(helper, "agent_processes",
+                               side_effect=RuntimeError("synthetic")):
+            with self.assertRaises(RuntimeError):
+                helper.snapshot()
+        # The growth the failed snapshot built is shipped again, not lost.
+        item = self.entry(helper.snapshot(), path)
+        self.assertEqual(decode_chunks(item), [(old_size, appended.encode("utf-8"))])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a chmod 000 directory anyway")
+    def test_unreadable_directory_is_omitted_not_silent(self):
+        session = os.path.join(self.home, ".kimi-code/sessions/wd_demo_0a1b/session_1234")
+        self.put(session + "/state.json", '{"status":"idle"}')
+        grok = os.path.join(self.home, ".grok/sessions/s1")
+        self.put(self.EVENTS, record('{"t":1}'))
+        os.chmod(session, 0)
+        os.chmod(grok, 0)
+        try:
+            snap = helper.snapshot()
+        finally:
+            os.chmod(session, 0o755)
+            os.chmod(grok, 0o755)
+        reasons = {o["path"]: o["reason"] for o in snap["omitted"]}
+        # Inside a directory it may list but not search, the file is a
+        # candidate whose stat fails; a directory it may not list at all is
+        # reported itself. Neither reads as an empty result.
+        self.assertIn(session + "/state.json", reasons)
+        self.assertIn(grok, reasons)
+        # Paths that simply do not exist stay out of omitted.
+        for path in reasons:
+            self.assertTrue(path.startswith(session) or path == grok, path)
+
     def test_homes_and_shape(self):
         snap = helper.snapshot()
         self.assertEqual([h["path"] for h in snap["homes"]], [self.home])
@@ -395,6 +456,149 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("sessions", snap)
         self.assertEqual(snap["processes"], [])
         self.assertFalse(snap["processes_failed"])
+
+
+def reader_tail(data, start):
+    """A port of ClaudeCodeMonitor.tail(of:startingAt:) over bytes.
+
+    It doubles from `start` until the window holds a newline with at least
+    one byte after it, returns everything after that newline, reads from 0
+    as complete, and gives up (None) at the ceiling.
+    """
+    size = len(data)
+    window = min(start, helper.MAX_TAIL_BYTES)
+    while True:
+        offset = size - window if size > window else 0
+        text = data[offset:]
+        if offset == 0:
+            return text
+        newline = text.find(b"\n")
+        if newline != -1 and text[newline + 1:]:
+            return text[newline + 1:]
+        if window >= helper.MAX_TAIL_BYTES:
+            return None
+        window = min(window * 2, helper.MAX_TAIL_BYTES)
+
+
+class MirrorEquivalenceTests(unittest.TestCase):
+    """The property this protocol exists for: a sparse mirror built only
+    from snapshot chunks reads, through the Mac's own tail reader, exactly
+    as the real file does, poll after poll."""
+
+    GROK = ".grok/sessions/s1/abc/events.jsonl"
+    CODEX = ".codex/sessions/2026/10/22/rollout-demo.jsonl"
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-mirror-"))
+        self.env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home})
+        self.env.start()
+        self.ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        self.ps.start()
+        helper.SHIPPED.clear()
+        self.mirrors = {}
+
+    def tearDown(self):
+        self.ps.stop()
+        self.env.stop()
+        helper.SHIPPED.clear()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def apply(self, snap):
+        """What the Mac does: reset discards, the file takes the manifest's
+        size (holes read as zeros), and chunks land at their offsets."""
+        for item in snap["files"]:
+            mirror = self.mirrors.get(item["path"])
+            if item["reset"] or mirror is None:
+                mirror = bytearray()
+            size = item["size"]
+            mirror = mirror[:size] + bytearray(max(0, size - len(mirror)))
+            for offset, data in decode_chunks(item):
+                mirror[offset:offset + len(data)] = data
+            self.mirrors[item["path"]] = mirror
+
+    def records(self, rng, step):
+        count, width = rng.choice([
+            (1, 10), (5, 200), (50, 200), (3, 30000), (1, 90000),
+            (1, 150000), (1, 300000)])
+        return b"".join(b'{"s":%d,"p":"%s"}\n' % (step, b"x" * rng.randint(1, width))
+                        for _ in range(count))
+
+    def test_mirror_reads_like_the_file(self):
+        rng = random.Random(20261022)
+        paths = {}
+        for relative, starts in ((self.GROK, (helper.TAIL_BYTES,)),
+                                 (self.CODEX, (helper.TAIL_BYTES, 1 << 20,
+                                               helper.MAX_TAIL_BYTES))):
+            path = os.path.join(self.home, relative)
+            os.makedirs(os.path.dirname(path))
+            with open(path, "wb") as handle:
+                handle.write(b'{"type":"session_meta","s":0}\n')
+            paths[path] = starts
+        compared = 0
+        for step in range(40):
+            for path in paths:
+                if step == 8:
+                    # A shrink: the file is replaced by something shorter.
+                    data, mode = b'{"type":"session_meta","s":8}\n', "wb"
+                elif step == 12:
+                    # Growth past the 4 MB ceiling, in ordinary records.
+                    # The fresh tail it forces leaves a hole ahead of it.
+                    data, mode = b"".join(
+                        b'{"s":12,"i":%d,"p":"%s"}\n' % (i, b"y" * 1000)
+                        for i in range(5000)), "ab"
+                elif step in (14, 20):
+                    # One record far wider than the first window, so the
+                    # reader doubles back past where the mirror begins.
+                    width = 200000 if step == 14 else 1500000
+                    data, mode = b'{"s":%d,"p":"%s"}\n' % (step, b"z" * width), "ab"
+                else:
+                    data, mode = self.records(rng, step), "ab"
+                    if rng.random() < 0.3:
+                        data += b'{"partial'
+                with open(path, mode) as handle:
+                    handle.write(data)
+            snap = helper.snapshot()
+            self.apply(snap)
+            for path, starts in paths.items():
+                with open(path, "rb") as handle:
+                    real = handle.read()
+                item = [f for f in snap["files"] if f["path"] == path][0]
+                tail_offset, tail = decode_chunks(item)[-1] if item["chunks"] else (0, b"")
+                if item["reset"] and tail_offset > 0:
+                    # The tail opens on the newline ending the record before.
+                    self.assertEqual(tail[:1], b"\n")
+                    self.assertEqual(real[tail_offset:tail_offset + 1], b"\n")
+                mirror = bytes(self.mirrors[path])
+                self.assertEqual(len(mirror), len(real))
+                for start in starts:
+                    self.assertEqual(reader_tail(mirror, start), reader_tail(real, start),
+                                     "step %d, %s, start %d" % (step, path, start))
+                    compared += 1
+                if path.endswith(self.CODEX):
+                    first = real[:real.index(b"\n") + 1]
+                    self.assertEqual(mirror[:len(first)], first)
+        self.assertEqual(compared, 40 * 4)
+
+
+class ReaderOffsetTests(unittest.TestCase):
+    def test_small_file_reads_from_zero(self):
+        self.assertEqual(helper.reader_offset(100, 50, helper.TAIL_BYTES), 0)
+
+    def test_break_inside_first_window(self):
+        size = 10 * helper.TAIL_BYTES
+        self.assertEqual(helper.reader_offset(size, size - 10, helper.TAIL_BYTES),
+                         size - helper.TAIL_BYTES)
+
+    def test_window_doubles_back_to_the_break(self):
+        size = 10 * helper.TAIL_BYTES
+        last_break = size - helper.TAIL_BYTES - 1
+        self.assertEqual(helper.reader_offset(size, last_break, helper.TAIL_BYTES),
+                         size - 2 * helper.TAIL_BYTES)
+
+    def test_gives_up_at_the_ceiling(self):
+        size = 4 * helper.MAX_TAIL_BYTES
+        self.assertEqual(helper.reader_offset(size, -1, helper.TAIL_BYTES),
+                         size - helper.MAX_TAIL_BYTES)
 
 
 class ShipDecisionTests(unittest.TestCase):
