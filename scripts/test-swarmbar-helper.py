@@ -1397,6 +1397,7 @@ class HookRelayTests(unittest.TestCase):
         self.assertEqual(event["account"], "work")
         self.assertEqual(event["peer"], [])
         self.assertEqual(event["body"], {"session_id": "s1"})
+        self.assertIs(event["held"], False)
         self.assertIn("user", event)
         self.assertEqual(sink.matching(lambda e: e.get("event") == "hook_resolved"), [])
 
@@ -1410,6 +1411,7 @@ class HookRelayTests(unittest.TestCase):
         client = self.post("PermissionRequest", {"session_id": "s1", "tool_name": "Bash"})
         event = sink.wait_for(is_hook("/hook/PermissionRequest"))
         self.assertIsNotNone(event)
+        self.assertIs(event["held"], True)
         self.assertFalse(answered_within(client, 0.2))
         self.assertEqual(relay.handle_reply({"rid": event["rid"], "body": self.DECISION}),
                          {"ok": True})
@@ -1440,6 +1442,7 @@ class HookRelayTests(unittest.TestCase):
             sink.gate.set()
             event = sink.wait_for(lambda e: e.get("event") == "hook" and e["peer"] == peer)
             self.assertIsNotNone(event)
+            self.assertIs(event["held"], False)
             self.assertEqual(sink.matching(is_resolved(event["rid"])), [])
             self.assertEqual(self.hub(relay).pending, {})
 
@@ -1733,6 +1736,7 @@ class HookRelayTests(unittest.TestCase):
         os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))
         relay, sink = self.relay()
         self.assert_answered_at_once(relay, sink, {"session_id": "g-dir"})
+        self.assertIs(sink.wait_for(is_hook("/hook/PermissionRequest"))["held"], False)
 
     def test_unreadable_or_missing_session_id_is_never_held(self):
         relay, sink = self.relay()
@@ -1784,6 +1788,7 @@ class HookRelayTests(unittest.TestCase):
         follower, follower_sink = self.relay()
         replayed = follower_sink.wait_for(is_hook("/hook/PermissionRequest"))
         self.assertEqual(replayed, event)
+        self.assertIs(replayed["held"], True)
         follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
         self.assertEqual(read_response(client)[2], self.DECISION)
         self.assertIsNotNone(follower_sink.wait_for(is_resolved(event["rid"])))
@@ -1829,8 +1834,12 @@ class HookRelayTests(unittest.TestCase):
             first, _ = self.hold_one(relay, sink, {"session_id": "s1"})
             second = self.post("PermissionRequest", {"session_id": "s2"})
             self.assertEqual(read_response(second, timeout=2)[2], {})
-            self.assertIsNotNone(sink.wait_for(
-                lambda e: e.get("event") == "hook" and e["body"].get("session_id") == "s2"))
+            overflow = sink.wait_for(
+                lambda e: e.get("event") == "hook" and e["body"].get("session_id") == "s2")
+            self.assertIs(overflow["held"], False)
+            self.assertIs(sink.wait_for(
+                lambda e: e.get("event") == "hook" and e["body"].get("session_id") == "s1")["held"],
+                True)
             self.assertFalse(answered_within(first, 0.1))
 
     def test_non_object_bodies_are_answered_and_not_forwarded(self):

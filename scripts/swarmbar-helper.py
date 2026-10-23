@@ -1294,6 +1294,11 @@ def handle_tmux(request):
 #     {"type": "reply", "rid": str, "body": {...}}, its Mac's hook_reply. The
 #       first reply for a rid, from any Mac, answers it.
 # Connecting is registering. There is no other handshake.
+#
+# Every hook event carries "held": true while the owner is holding that
+# request for a decision, so a Mac shows Approve only when an answer can
+# still land, and false when it was already answered {} (not holdable, a
+# Grok refusal, unreadable Grok state, the hold cap). Replays carry true.
 HOOK_DIR = ".swarmbar"
 HOOK_SOCKET = "hook.sock"
 BROKER_SOCKET = "broker.sock"
@@ -2198,6 +2203,7 @@ class HookHome(object):
             "account": account,
             "peer": peer,
             "body": payload,
+            "held": holdable,
         }
         if holdable:
             self.hold(handler, message)
@@ -2219,6 +2225,7 @@ class HookHome(object):
             if not full:
                 self.pending[rid] = held
         if full:
+            message["held"] = False
             handler.answer({})
             self.publish(message)
             return
