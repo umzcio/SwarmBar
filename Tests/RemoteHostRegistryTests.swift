@@ -27,6 +27,14 @@ struct RemoteHostRegistryTests {
         #expect(reloaded.host(id: host.id) == host)
     }
 
+    @Test func upsertRefusesAliasesThatReadAsSSHOptions() {
+        let registry = RemoteHostRegistry(defaults: defaults)
+        #expect(registry.upsert(RemoteHost(alias: "-v")) == false)
+        #expect(registry.upsert(RemoteHost(alias: "")) == false)
+        #expect(registry.hosts.isEmpty)
+        #expect(registry.upsert(RemoteHost(alias: "devbox")) == true)
+    }
+
     @Test func removeForgetsHost() {
         let registry = RemoteHostRegistry(defaults: defaults)
         let host = RemoteHost(alias: "devbox.ts")

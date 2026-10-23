@@ -22,7 +22,12 @@ final class RemoteHostRegistry {
 
     /// Adds or replaces a host by id. Display names are how hosts are told
     /// apart in the UI, so a name another host already holds gets " 2", " 3"...
-    func upsert(_ host: RemoteHost) {
+    /// Returns false, changing nothing, when the alias could be read as an ssh
+    /// option (leading dash) or is empty or has whitespace: every ssh argv in
+    /// the app takes `host.alias`, so one bad entry would be an injection point.
+    @discardableResult
+    func upsert(_ host: RemoteHost) -> Bool {
+        guard SSHConfigParser.isSafeAlias(host.alias) else { return false }
         var host = host
         let taken = Set(hosts.filter { $0.id != host.id }.map(\.displayName))
         if taken.contains(host.displayName) {
@@ -37,6 +42,7 @@ final class RemoteHostRegistry {
             hosts.append(host)
         }
         commit()
+        return true
     }
 
     func remove(id: UUID) {

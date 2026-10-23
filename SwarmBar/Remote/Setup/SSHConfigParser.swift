@@ -22,15 +22,16 @@ enum SSHConfigParser {
     ) -> [String] {
         var result: [String] = []
         var seen = Set<String>()
+        var stack = Set<String>()
         collect(text, depth: 0, base: baseDirectory, home: home, read: read, list: list,
-                result: &result, seen: &seen)
+                stack: &stack, result: &result, seen: &seen)
         return result
     }
 
     private static func collect(
         _ text: String, depth: Int, base: URL, home: URL,
         read: (URL) -> String?, list: (String) -> [String],
-        result: inout [String], seen: inout Set<String>
+        stack: inout Set<String>, result: inout [String], seen: inout Set<String>
     ) {
         // A Match line ends any Host block and its contents are conditional,
         // so nothing under it (an Include included) is followed. A later Host
@@ -44,21 +45,36 @@ enum SSHConfigParser {
             case "host":
                 inMatch = false
                 for name in tokens(value) where !name.hasPrefix("!")
-                    && !name.contains("*") && !name.contains("?") {
+                    && !name.contains("*") && !name.contains("?") && isSafeAlias(name) {
                     if seen.insert(name).inserted { result.append(name) }
                 }
             case "include":
                 guard !inMatch, depth < maxIncludeDepth else { continue }
                 for pattern in tokens(value) {
                     for url in expand(pattern, base: base, home: home, list: list) {
-                        guard let body = read(url) else { continue }
+                        // A file already on the include stack is a cycle, which
+                        // the depth limit alone would walk eight times over.
+                        guard !stack.contains(url.path), let body = read(url) else { continue }
+                        stack.insert(url.path)
                         collect(body, depth: depth + 1, base: base, home: home, read: read,
-                                list: list, result: &result, seen: &seen)
+                                list: list, stack: &stack, result: &result, seen: &seen)
+                        stack.remove(url.path)
                     }
                 }
             default:
                 break
             }
+        }
+    }
+
+    /// Whether a name is safe to hand to ssh as its destination argument.
+    /// A leading dash would be read as an option (`-oProxyCommand=...` runs a
+    /// command), and whitespace or control characters cannot be an alias. The
+    /// registry applies the same test, because every ssh argv in the app
+    /// carries `host.alias`.
+    static func isSafeAlias(_ name: String) -> Bool {
+        !name.isEmpty && !name.hasPrefix("-") && !name.unicodeScalars.contains {
+            $0.properties.isWhitespace || $0.properties.generalCategory == .control
         }
     }
 

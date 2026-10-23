@@ -57,7 +57,31 @@ import Testing
           Include nothere
         Host gamma
         """
-        #expect(aliases(text) == ["alpha", "gamma"])
+        let files = ["/home/u/.ssh/nothere": "Host leaked\n"]
+        #expect(aliases(text, files: files) == ["alpha", "gamma"])
+    }
+
+    @Test func optionLikeAndBlankAliasesAreDropped() {
+        #expect(aliases("Host -oProxyCommand=x \"\" \"a b\"\n") == [])
+        #expect(aliases("Host -v alpha\n") == ["alpha"])
+    }
+
+    @Test func resolveArgumentsEndOptionParsing() {
+        #expect(HostCandidates.resolveArguments(alias: "alpha") == ["-G", "--", "alpha"])
+    }
+
+    @Test func includeCyclesTerminateWithoutDuplicates() {
+        let files = [
+            "/home/u/.ssh/config": "Include conf.d/*\nHost alpha\n",
+            "/home/u/.ssh/conf.d/a": "Host beta\nInclude b\n",
+            "/home/u/.ssh/conf.d/b": "Host gamma\nInclude a\n",
+            "/home/u/.ssh/b": "Host gamma\nInclude conf.d/a\n",
+        ]
+        let listing = ["/home/u/.ssh/conf.d/*": [
+            "/home/u/.ssh/config", "/home/u/.ssh/conf.d/a", "/home/u/.ssh/conf.d/b"]]
+        let out = aliases(files["/home/u/.ssh/config"]!, files: files, listing: listing)
+        #expect(out == ["beta", "gamma", "alpha"])
+        #expect(Set(out).count == out.count)
     }
 
     @Test func duplicatesKeepFirstSeenOrder() {
