@@ -260,6 +260,21 @@ struct RemoteHostHintTests {
         #expect(rig.supervisor.checking.isEmpty)
     }
 
+    @Test func wizardLookIsAdoptedForTheHostItNames() {
+        let rig = Rig()
+        let host = RemoteHost(alias: "devbox", watchAs: .loginUser)
+        rig.registry.upsert(host)
+        let user = Self.probe(
+            processes: [Self.process("claude", user: "dev")], tools: ["claude"], installed: ["claude"])
+
+        rig.supervisor.adopt((user, nil, nil), alias: "devbox")
+        rig.supervisor.adopt((user, nil, nil), alias: "elsewhere")
+
+        let expected = HostAssessment.assess(user: user, root: nil, failure: nil, watchAs: .loginUser)
+        #expect(rig.supervisor.assessments == [host.id: expected])
+        #expect(rig.supervisor.checks[host.id]?.tools == [.claudeCode])
+    }
+
     @Test func checkIsForgottenWhenItNoLongerApplies() async {
         let rig = Rig()
         let host = RemoteHost(alias: "devbox", watchAs: .loginUser)

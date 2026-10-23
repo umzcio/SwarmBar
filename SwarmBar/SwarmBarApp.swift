@@ -104,7 +104,11 @@ struct SwarmBarApp: App {
             remoteRegistry = registry
             remoteSupervisor = supervisor
             _remoteWizard = State(initialValue: RemoteWizardLauncher {
-                RemoteWizardModel(services: LiveRemoteWizardServices(), registry: registry)
+                let model = RemoteWizardModel(services: LiveRemoteWizardServices(), registry: registry)
+                model.publishCheck = { [weak supervisor] alias, outcome in
+                    supervisor?.adopt(outcome, alias: alias)
+                }
+                return model
             })
         }
     }

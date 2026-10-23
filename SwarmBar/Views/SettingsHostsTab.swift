@@ -247,22 +247,25 @@ private struct HostSettingsRow: View {
                         .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .accessibilityHidden(true)
-                    Text(verbatim: host.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(minWidth: 84, maxWidth: 140, alignment: .leading)
-                        .layoutPriority(1)
-                        .help(host.displayName)
-                    Text(verbatim: HostRowText.status(
-                        host: host, reachability: reachability, sessions: sessions.count,
-                        assessment: check?.assessment, loginUser: check?.loginUser,
-                        hiddenUsers: check?.hiddenUsers ?? [],
-                        unreachableSince: store.remoteUnreachableSince[host.displayName], now: now))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .fixedSize(horizontal: false, vertical: true)
+                    // Status under the name rather than beside it: at the
+                    // Settings window's width a status column beside the
+                    // name and pill wrapped to three lines.
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(verbatim: host.displayName)
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(host.displayName)
+                        Text(verbatim: HostRowText.status(
+                            host: host, reachability: reachability, sessions: sessions.count,
+                            assessment: check?.assessment, loginUser: check?.loginUser,
+                            hiddenUsers: check?.hiddenUsers ?? [],
+                            unreachableSince: store.remoteUnreachableSince[host.displayName], now: now))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     if supervisor.checking.contains(host.id) {
                         ProgressView()
                             .controlSize(.mini)

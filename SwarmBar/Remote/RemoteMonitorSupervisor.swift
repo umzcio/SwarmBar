@@ -219,6 +219,13 @@ final class RemoteMonitorSupervisor {
         }
     }
 
+    /// The wizard's last look at a host it just finished with, taken the
+    /// same way a check is, so there is no reason to look again.
+    func adopt(_ outcome: ProbeRunner.Outcome, alias: String) {
+        guard let host = registry.hosts.first(where: { $0.alias == alias }) else { return }
+        checks[host.id] = Self.check(outcome, alias: host.alias, watchAs: host.watchAs)
+    }
+
     /// Drops a host's check, for when the wizard is about to change the
     /// host and the old verdict would outlive what it describes.
     func forgetCheck(hostID id: UUID) {

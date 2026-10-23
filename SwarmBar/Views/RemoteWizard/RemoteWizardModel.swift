@@ -232,6 +232,11 @@ final class RemoteWizardModel {
         var prompt: SetupCommand.Prompt
     }
 
+    /// Where each registered host's latest look goes when a run ends, so
+    /// Settings › Hosts says what the done step said instead of "Not
+    /// checked yet". Nil in tests that don't watch for it.
+    @ObservationIgnored var publishCheck: (@MainActor (String, HostAssessmentInput) -> Void)?
+
     init(services: any RemoteWizardServices, registry: RemoteHostRegistry) {
         self.services = services
         self.registry = registry
@@ -357,7 +362,7 @@ final class RemoteWizardModel {
         progress = [:]
         appliedPlan = nil
         if queue.isEmpty {
-            step = .done
+            finish()
         } else {
             step = .setup(hostIndex: 0)
             prepare(queue[0])
@@ -969,11 +974,18 @@ final class RemoteWizardModel {
         appliedPlan = nil
         let next = index + 1
         guard setupAliases.indices.contains(next) else {
-            step = .done
+            finish()
             return
         }
         step = .setup(hostIndex: next)
         prepare(setupAliases[next])
+    }
+
+    private func finish() {
+        step = .done
+        for alias in registered.sorted() {
+            if let input = inputs[alias] { publishCheck?(alias, input) }
+        }
     }
 }
 

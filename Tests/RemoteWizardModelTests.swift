@@ -398,6 +398,32 @@ struct RemoteWizardModelTests {
         #expect(hosts.map(\.displayName) == ["alpha", "beta"])
     }
 
+    @Test func finishingHandsEachHostsLastLookToSettings() async {
+        services.aliases = ["alpha", "beta", "devbox"]
+        services.outcomes = [
+            "alpha": [Self.ready("alpha")],
+            "beta": [Self.needsSetup("beta"), Self.ready("beta")],
+            "devbox": [Self.idle("devbox")],
+        ]
+        let (model, _) = model()
+        var published: [String: HostAssessmentInput] = [:]
+        model.publishCheck = { alias, outcome in published[alias] = outcome }
+        await model.lookForHosts()
+        await model.continueFromPick()
+        // Nothing until the run is over: beta's first look is about to be
+        // made stale by setting it up.
+        #expect(published.isEmpty)
+        await model.makeChanges()
+        #expect(model.step == .done)
+        // Only the hosts this run registered, each with its latest look,
+        // which for beta is the one taken after its changes.
+        #expect(Set(published.keys) == ["alpha", "beta"])
+        let status = published.mapValues {
+            HostAssessment.assess(user: $0.user, root: $0.root, failure: $0.failure, watchAs: .loginUser).status
+        }
+        #expect(status == ["alpha": .ready, "beta": .ready])
+    }
+
     // MARK: Controller rulings
 
     @Test func duplicateHostnamesCollapse() async {
