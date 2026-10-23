@@ -29,6 +29,27 @@ struct AgentSession: Identifiable, Equatable, Sendable {
     /// Nil for providers that only expose a status snapshot.
     var attentionEventID: String?
 
+    /// This session under another id and host. `id` is a constant, so the
+    /// copy is rebuilt field by field, and it lives here beside the stored
+    /// properties so a field added above is added below in the same edit.
+    /// Remote discovery uses it to scope a tool's own id to its host.
+    func withID(_ id: UUID, host: String?) -> AgentSession {
+        AgentSession(
+            id: id,
+            tool: tool,
+            projectName: projectName,
+            projectPath: projectPath,
+            status: status,
+            startedAt: startedAt,
+            lastActivityAt: lastActivityAt,
+            pid: pid,
+            accountLabel: accountLabel,
+            title: title,
+            processAlive: processAlive,
+            host: host,
+            attentionEventID: attentionEventID)
+    }
+
     init(
         id: UUID = UUID(),
         tool: AgentTool,

@@ -119,8 +119,12 @@ struct CodexMonitor: SessionMonitor {
                 attentionEventID: parsed.attentionEventID
             ))
         }
-        tailCache.retain(paths: seenPaths)
-        headCache.retain(paths: seenPaths)
+        // The enumerator hands back resolved paths (/private/var for /var),
+        // so the root is offered in both spellings or a temp-dir root would
+        // never match its own entries.
+        let scanned = [root.path, root.resolvingSymlinksInPath().path]
+        tailCache.retain(paths: seenPaths, under: scanned)
+        headCache.retain(paths: seenPaths, under: scanned)
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 

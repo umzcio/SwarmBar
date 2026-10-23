@@ -25,13 +25,28 @@ private struct Rig {
     static let grokPid = 4106
     static let agyPid = 4107
 
+    let base: URL
     let home: String
     let mirror: RemoteMirror
     let snapshot: RemoteSnapshot
 
+    /// The temp home and its mirror, both under `base`.
+    func remove() {
+        try? FileManager.default.removeItem(at: base)
+    }
+
     static func make() async throws -> Rig {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-discovery-\(UUID().uuidString)")
+        do {
+            return try await make(base: base)
+        } catch {
+            try? FileManager.default.removeItem(at: base)
+            throw error
+        }
+    }
+
+    private static func make(base: URL) async throws -> Rig {
         let home = base.appendingPathComponent("home/u")
         try writeHome(home)
 
@@ -50,7 +65,7 @@ private struct Rig {
         let mirror = RemoteMirror(root: base.appendingPathComponent("mirror"))
         try mirror.apply(shipped)
         return Rig(
-            home: home.path, mirror: mirror,
+            base: base, home: home.path, mirror: mirror,
             snapshot: shipped.replacingProcesses(processes(home: home.path), failed: false))
     }
 
@@ -157,10 +172,14 @@ private struct Rig {
 }
 
 private extension RemoteSnapshot {
+    /// The synthetic table belongs to user `u`, so every home is handed to
+    /// `u` as well. The helper names the temp home's real owner, which is
+    /// whoever runs the tests on this Mac.
     func replacingProcesses(_ processes: [RemoteProcessRecord], failed: Bool) -> RemoteSnapshot {
         RemoteSnapshot(
             ok: ok, protocolVersion: protocolVersion, stream: stream, hostname: hostname,
-            system: system, now: now, homes: homes, files: files, dirs: dirs, omitted: omitted,
+            system: system, now: now, homes: homes.map { RemoteHome(path: $0.path, user: "u") },
+            files: files, dirs: dirs, omitted: omitted,
             warnings: warnings, processes: processes, processesFailed: failed)
     }
 }
@@ -172,6 +191,7 @@ struct RemoteDiscoveryTests {
     @Test("every tool produces a row tagged with its host", .enabled(if: pythonAvailable))
     func everyToolProducesARowWithHost() async throws {
         let rig = try await Rig.make()
+        defer { rig.remove() }
         let result = RemoteDiscovery.sessions(
             snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
         for tool in AgentTool.allCases {
@@ -195,6 +215,7 @@ struct RemoteDiscoveryTests {
     @Test("session ids are scoped to the host", .enabled(if: pythonAvailable))
     func idsAreHostScoped() async throws {
         let rig = try await Rig.make()
+        defer { rig.remove() }
         let result = RemoteDiscovery.sessions(
             snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
         let claude = try #require(result[.claudeCode]?.first)
@@ -208,6 +229,7 @@ struct RemoteDiscoveryTests {
     @Test("the Claude status is what the local parser reads", .enabled(if: pythonAvailable))
     func claudeStatusMatchesLocalParser() async throws {
         let rig = try await Rig.make()
+        defer { rig.remove() }
         let now = Date.now
         let result = RemoteDiscovery.sessions(
             snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: now)
@@ -233,6 +255,7 @@ struct RemoteDiscoveryTests {
     @Test("a failed process list marks nothing alive", .enabled(if: pythonAvailable))
     func failedProcessListMarksNothingAlive() async throws {
         let rig = try await Rig.make()
+        defer { rig.remove() }
         let failed = rig.snapshot.replacingProcesses(Rig.processes(home: rig.home), failed: true)
         let result = RemoteDiscovery.discover(
             snapshot: failed, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
@@ -241,6 +264,17 @@ struct RemoteDiscoveryTests {
         #expect(rows.allSatisfy { !$0.processAlive && $0.pid == nil })
         #expect(result.processesFailed)
         #expect(result.warnings.contains { $0.contains("process list") })
+        #expect(result.unverifiedTools == Set(AgentTool.allCases))
+    }
+
+    @Test("a readable process table verifies every tool", .enabled(if: pythonAvailable))
+    func readableTableVerifiesEveryTool() async throws {
+        let rig = try await Rig.make()
+        defer { rig.remove() }
+        let result = RemoteDiscovery.discover(
+            snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
+        #expect(result.unverifiedTools.isEmpty)
+        #expect(result.warnings.isEmpty)
     }
 
     @Test("a home the mirror cannot hold is skipped with a warning")
@@ -255,6 +289,140 @@ struct RemoteDiscoveryTests {
             snapshot: snapshot, mirror: mirror, hostID: hostID, hostName: "devbox", now: .now)
         #expect(result.warnings.contains { $0.contains("/home/../etc") })
         #expect(result.sessions.values.allSatisfy { $0.isEmpty })
+    }
+}
+
+/// Discovery over a mirror written by hand rather than by the helper, for
+/// the cases that turn on the process table and not on what was shipped.
+@Suite("Remote discovery against a hand-built mirror")
+struct RemoteDiscoveryMirrorTests {
+    let hostID = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
+    let mirror = RemoteMirror(root: FileManager.default.temporaryDirectory
+        .appendingPathComponent("remote-discovery-\(UUID().uuidString)"))
+
+    private func write(_ text: String, remote path: String) throws {
+        let url = try #require(mirror.local(path))
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func snapshot(
+        homes: [RemoteHome], processes: [RemoteProcessRecord]
+    ) -> RemoteSnapshot {
+        RemoteSnapshot(
+            ok: true, protocolVersion: 3, stream: "s", hostname: "devbox", system: "Linux", now: 0,
+            homes: homes, files: [], dirs: [], omitted: [], warnings: [], processes: processes,
+            processesFailed: false)
+    }
+
+    private func discover(_ snapshot: RemoteSnapshot) -> RemoteDiscovery.Result {
+        RemoteDiscovery.discover(
+            snapshot: snapshot, mirror: mirror, hostID: hostID, hostName: "devbox", now: .now)
+    }
+
+    /// One Kimi session under /home/u, working in /home/u/proj.
+    private func writeKimiSession(sessionDir: String = "/home/u/.kimi-code/sessions/wd_proj_ab12/session_a") throws {
+        try write(
+            "{\"sessionId\":\"session_a\",\"sessionDir\":\"\(sessionDir)\",\"workDir\":\"/home/u/proj\"}\n",
+            remote: "/home/u/.kimi-code/session_index.jsonl")
+        let iso = ISO8601DateFormatter().string(from: .now)
+        try write(
+            "{\"workDir\":\"/home/u/proj\",\"updatedAt\":\"\(iso)\"}",
+            remote: "/home/u/.kimi-code/sessions/wd_proj_ab12/session_a/state.json")
+    }
+
+    @Test func anotherUsersProcessNeverMarksASessionAlive() throws {
+        defer { try? FileManager.default.removeItem(at: mirror.root) }
+        try writeKimiSession()
+        let homes = [RemoteHome(path: "/home/u", user: "u"), RemoteHome(path: "/root", user: "root")]
+        // root runs kimi in u's project directory, under a higher pid.
+        let rootKimi = Rig.record(900, "kimi-code", cwd: "/home/u/proj")
+        let rootOwned = RemoteProcessRecord(
+            pid: rootKimi.pid, ppid: 1, user: "root", comm: rootKimi.comm, args: rootKimi.args,
+            cwd: rootKimi.cwd, tty: "", pane: nil, open: [], openFailed: false, screen: nil)
+
+        let onlyRoot = discover(snapshot(homes: homes, processes: [rootOwned]))
+        let unseen = try #require(onlyRoot.sessions[.kimiCode]?.first)
+        #expect(!unseen.processAlive)
+        #expect(unseen.pid == nil)
+
+        let both = discover(snapshot(
+            homes: homes, processes: [rootOwned, Rig.record(300, "kimi-code", cwd: "/home/u/proj")]))
+        let seen = try #require(both.sessions[.kimiCode]?.first)
+        #expect(seen.processAlive)
+        #expect(seen.pid == 300)
+    }
+
+    @Test func unreadableCodexLeavesOnlyCodexUnverified() {
+        let result = discover(snapshot(
+            homes: [RemoteHome(path: "/home/u", user: "u")],
+            processes: [Rig.record(10, "codex", cwd: "/home/u/a", openFailed: true)]))
+        #expect(result.unverifiedTools == [.codex])
+        #expect(result.warnings.contains { $0.contains("pid 10") })
+    }
+
+    @Test func unreadableAgyLeavesOnlyAntigravityUnverified() {
+        let result = discover(snapshot(
+            homes: [RemoteHome(path: "/home/u", user: "u")],
+            processes: [Rig.record(11, "agy", cwd: "/home/u/a", openFailed: true)]))
+        #expect(result.unverifiedTools == [.antigravity])
+    }
+
+    /// Only Codex and Antigravity read liveness from held files, so no
+    /// other tool is put in doubt by an unreadable process.
+    @Test func unreadableProcessOfAnotherToolVerifiesEverything() {
+        let result = discover(snapshot(
+            homes: [RemoteHome(path: "/home/u", user: "u")],
+            processes: [Rig.record(12, "claude", cwd: "/home/u/a", openFailed: true)]))
+        #expect(result.unverifiedTools.isEmpty)
+    }
+
+    /// A user with no scanned home has no sessions to doubt, and its
+    /// processes are not worth a warning.
+    @Test func unreadableProcessOfAnUnscannedUserIsIgnored() {
+        let foreign = RemoteProcessRecord(
+            pid: 13, ppid: 1, user: "root", comm: "codex", args: "codex", cwd: "/root",
+            tty: "", pane: nil, open: [], openFailed: true, screen: nil)
+        let result = discover(snapshot(homes: [RemoteHome(path: "/home/u", user: "u")], processes: [foreign]))
+        #expect(result.unverifiedTools.isEmpty)
+        #expect(result.warnings.isEmpty)
+    }
+
+    @Test func refusedKimiSessionDirIsReported() throws {
+        defer { try? FileManager.default.removeItem(at: mirror.root) }
+        try writeKimiSession(sessionDir: "/home/u/../../etc/session_a")
+        let result = discover(snapshot(homes: [RemoteHome(path: "/home/u", user: "u")], processes: []))
+        #expect(result.sessions[.kimiCode]?.isEmpty == true)
+        #expect(result.warnings.contains { $0.contains("/home/u/../../etc/session_a") })
+    }
+
+    /// One shared tail cache serves this Mac and every remote home. A
+    /// remote pass must evict only beneath the roots it scanned, or it
+    /// would throw away the local monitor's tails on every poll.
+    @Test func remoteDiscoveryLeavesOtherRootsCached() throws {
+        let elsewhere = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cache-elsewhere-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: mirror.root)
+            try? FileManager.default.removeItem(at: elsewhere)
+        }
+        let cached = elsewhere.appendingPathComponent(".claude/projects/-home-x/\(UUID().uuidString).jsonl")
+        let modified = Date()
+        _ = ClaudeCodeMonitor.tailCache.value(for: cached, size: 1, modified: modified) { "seeded" }
+
+        try write(
+            try fixture("claude-working"),
+            remote: "/home/u/.claude/projects/-home-u-demo/\(UUID().uuidString.lowercased()).jsonl")
+        let result = discover(snapshot(homes: [RemoteHome(path: "/home/u", user: "u")], processes: []))
+        #expect(result.sessions[.claudeCode]?.count == 1)
+
+        var recomputed = false
+        let value = ClaudeCodeMonitor.tailCache.value(for: cached, size: 1, modified: modified) {
+            recomputed = true; return "again"
+        }
+        #expect(!recomputed)
+        #expect(value == "seeded")
     }
 }
 
@@ -328,7 +496,7 @@ struct RemoteProcessFactsTests {
         ])
         #expect(table.heldFiles(processName: "agy", inDirectory: local(presence))
             == ["\(presence)/conv-9.lock": 51])
-        #expect(table.warnings.contains { $0.contains("50") })
+        #expect(table.unreadablePids == [50])
         // Liveness by working directory does not need open files.
         #expect(table.directoryCounts(processNames: ["agy"]) == ["/home/u/a": 1, "/home/u/b": 1])
         #expect(table.isAlive(50))

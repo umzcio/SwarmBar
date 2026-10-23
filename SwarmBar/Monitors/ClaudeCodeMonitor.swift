@@ -48,7 +48,9 @@ struct ClaudeCodeMonitor: SessionMonitor {
     /// cached parse would freeze that time-dependent verdict and the row
     /// would stop updating even though the file itself is fine. Re-parsing
     /// a cached tail is cheap; re-reading the file is the expensive part.
-    private nonisolated static let tailCache = TailCache<String>()
+    /// Internal rather than private so a test can show that one home's
+    /// discovery leaves another root's entries alone.
+    nonisolated static let tailCache = TailCache<String>()
 
     nonisolated static func discover(
         now: Date, context: DiscoveryContext = .local()
@@ -58,7 +60,8 @@ struct ClaudeCodeMonitor: SessionMonitor {
         var seenPaths = Set<String>()
         let livePids = TerminalFocuser.claudePidsBySession(
             home: context.home, isAlive: { context.processes.isAlive($0) })
-        for root in roots(home: context.home) {
+        let scanned = roots(home: context.home)
+        for root in scanned {
             let projectDirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
             for projectDir in projectDirs {
                 let files = (try? fm.contentsOfDirectory(
@@ -96,7 +99,7 @@ struct ClaudeCodeMonitor: SessionMonitor {
                 }
             }
         }
-        tailCache.retain(paths: seenPaths)
+        tailCache.retain(paths: seenPaths, under: scanned.map(\.path))
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 

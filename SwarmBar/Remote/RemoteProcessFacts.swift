@@ -11,35 +11,21 @@ import Foundation
 /// rules for which files count stay in one place.
 struct RemoteProcessFacts: ProcessFacts {
     private let processes: [RemoteProcessRecord]
-    private let failed: Bool
     private let mirror: RemoteMirror
 
     /// Pids whose open files the helper could not read. Their `open` is
-    /// empty because it is unknown, not because they hold nothing.
+    /// empty because it is unknown, not because they hold nothing, so
+    /// RemoteDiscovery reports them rather than letting the gap pass.
     let unreadablePids: [Int]
 
     nonisolated init(processes: [RemoteProcessRecord], failed: Bool, mirror: RemoteMirror) {
-        // When ps itself failed there is no table at all, so nothing in it
-        // can vouch for anything. Answering from a partial or empty list
-        // would read every session as ended.
+        // When ps itself failed there is no table at all, so nothing can be
+        // vouched for and every question gets an empty answer. RemoteDiscovery
+        // marks every tool unverified in that case, so those answers are
+        // never synced as sessions having ended.
         self.processes = failed ? [] : processes
-        self.failed = failed
         self.mirror = mirror
         self.unreadablePids = failed ? [] : processes.filter(\.openFailed).map(\.pid)
-    }
-
-    /// What discovery could not see, for the monitor to log. A held-file
-    /// query that skipped a process is incomplete rather than empty, and
-    /// the difference matters when a session's row goes missing.
-    nonisolated var warnings: [String] {
-        var notes: [String] = []
-        if failed {
-            notes.append("process list unavailable, so no remote session can be confirmed alive")
-        }
-        for pid in unreadablePids {
-            notes.append("open files of pid \(pid) unknown, so sessions it holds may read as ended")
-        }
-        return notes
     }
 
     nonisolated func isAlive(_ pid: Int) -> Bool {
