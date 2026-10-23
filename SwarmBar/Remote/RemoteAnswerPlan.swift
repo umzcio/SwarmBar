@@ -142,7 +142,28 @@ enum RemoteAnswerPlan {
         }
         if object["sent"] as? Bool == true { return .pasted }
         let reason = object["reason"] as? String ?? "not sent"
-        return reason == "changed" ? .refused(reason) : .uncertain(reason)
+        // "changed" refused before loading anything, and "load failed" means
+        // the text never reached tmux. Anything later may have typed some.
+        return reason == "changed" || reason == "load failed" ? .refused(reason) : .uncertain(reason)
+    }
+
+    /// How many times `needle` occurs in `screen`, without overlap, counted
+    /// by unicode scalar as the helper's str.count counts code points, so
+    /// the number the Mac sends is the number the helper compares against.
+    /// Zero for an empty needle, which the probe never is.
+    static func occurrences(of needle: String, in screen: String) -> Int {
+        let needle = Array(needle.unicodeScalars), haystack = Array(screen.unicodeScalars)
+        guard !needle.isEmpty, haystack.count >= needle.count else { return 0 }
+        var count = 0, index = 0
+        while index + needle.count <= haystack.count {
+            if haystack[index..<index + needle.count].elementsEqual(needle) {
+                count += 1
+                index += needle.count
+            } else {
+                index += 1
+            }
+        }
+        return count
     }
 
     enum KeysOutcome: Equatable {

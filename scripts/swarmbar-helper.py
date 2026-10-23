@@ -1116,7 +1116,6 @@ def ping():
 PANE_ID = re.compile(r"^%[0-9]+$")
 KEY_GAP_DEFAULT = 0.08
 KEY_GAP_MAX = 0.5
-PASTE_BUFFER = "swarmbar"
 # ESC[200~ and ESC[201~ as send-keys -H hex, the bracketed paste markers.
 PASTE_START = ["1b", "5b", "32", "30", "30", "7e"]
 PASTE_END = ["1b", "5b", "32", "30", "31", "7e"]
@@ -1124,6 +1123,28 @@ NAMED_KEYS = {"UP": "Up", "DOWN": "Down", "ESC": "Escape", "\n": "Enter"}
 # C0 controls other than newline and tab, plus DEL. ESC is the one that
 # matters: it could close the bracketed paste early or open a sequence.
 PASTE_STRIP = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def paste_buffer_name():
+    """A buffer of this request's own. Two Macs share a helper's tmux server,
+    and a shared name lets one paste the other's text."""
+    return "swarmbar-%d-%s" % (os.getpid(), uuid.uuid4().hex)
+
+
+def valid_expect_more(entries):
+    """Whether `entries` is a list of {"text": non-empty str, "before": int
+    of at least 0}."""
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        text, before = entry.get("text"), entry.get("before")
+        if not isinstance(text, str) or not text:
+            return False
+        if isinstance(before, bool) or not isinstance(before, int) or before < 0:
+            return False
+    return True
 
 
 def tmux_key_args(key):
@@ -1254,9 +1275,11 @@ def handle_tmux(request):
     Response shapes the Mac decodes (the request id is added by main):
       capture: {"text": str}, or {"ok": false, "error": "capture failed"}
       keys and paste: {"sent": true}, or {"sent": false, "reason": r} with r
-        "changed" (an expect string was absent), "capture failed" (the
-        confirming read failed), or "send failed" (plus "sent_count" for
-        keys, how many keys landed first).
+        "changed" (an expect string was absent, or an expect_more count did
+        not rise), "capture failed" (the confirming read failed), "load
+        failed" (paste only: the text never reached tmux, so nothing was
+        typed), or "send failed" (plus "sent_count" for keys, how many keys
+        landed first; for paste, some of the text may be in the pane).
       any command: {"ok": false, "error": "bad pane" | "bad keys" | "bad text"
         | "bad target"}
 
@@ -1265,6 +1288,12 @@ def handle_tmux(request):
     is gone, is another agent, or no longer sits in this pane answers
     "changed". A malformed pair answers "bad keys" for keys and "bad target"
     for paste.
+
+    keys may also carry `expect_more`, a list of {"text": str, "before":
+    int}: each text must occur more times on the press-time screen than
+    `before`, the count the Mac read before it pasted. A short reply such
+    as "ok" is usually on screen already, so presence alone would confirm a
+    paste that never landed. A malformed list answers "bad keys".
     """
     pane = valid_pane(request.get("pane"))
     if pane is None:
@@ -1299,22 +1328,34 @@ def handle_tmux(request):
             done = tmux_run(pane, args, input=data)
             return done is not None and done.returncode == 0
 
+        buffer = paste_buffer_name()
         close = ["send-keys", "-t", pane["id"], "-H"] + PASTE_END
-        if not step(["load-buffer", "-b", PASTE_BUFFER, "-"], text.encode("utf-8")) \
-                or not step(["send-keys", "-t", pane["id"], "-H"] + PASTE_START):
+        # Nothing has reached the pane yet, so this one says so: the Mac
+        # reports it as nothing sent, where every later failure may have
+        # left text in the composer.
+        if not step(["load-buffer", "-b", buffer, "-"], text.encode("utf-8")):
+            return {"sent": False, "reason": "load failed"}
+
+        def failed():
+            # Best effort: the paste has already failed, and a buffer left
+            # behind holds the reply's text on the server.
+            step(["delete-buffer", "-b", buffer])
             return {"sent": False, "reason": "send failed"}
-        if not step(["paste-buffer", "-r", "-d", "-b", PASTE_BUFFER, "-t", pane["id"]]):
+        if not step(["send-keys", "-t", pane["id"], "-H"] + PASTE_START):
+            return failed()
+        if not step(["paste-buffer", "-r", "-d", "-b", buffer, "-t", pane["id"]]):
             # ESC[200~ is out, so close it whatever happened, or the pane's
-            # app stays in paste mode and takes the next keys as text. Best
-            # effort: the paste has already failed either way.
+            # app stays in paste mode and takes the next keys as text.
             step(close)
-            return {"sent": False, "reason": "send failed"}
+            return failed()
         if not step(close):
-            return {"sent": False, "reason": "send failed"}
+            return failed()
         return {"sent": True}
     keys, expect = request.get("keys"), request.get("expect") or []
+    expect_more = request.get("expect_more", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
-            or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect):
+            or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect) \
+            or not valid_expect_more(expect_more):
         return {"ok": False, "error": "bad keys"}
     refused = target_refusal(request, "bad keys")
     if refused is not None:
@@ -1323,11 +1364,14 @@ def handle_tmux(request):
     if not isinstance(gap, (int, float)) or isinstance(gap, bool) or gap < 0:
         gap = KEY_GAP_DEFAULT
     gap = min(gap, KEY_GAP_MAX)
-    if expect:
+    if expect or expect_more:
         screen = pane_text(pane)
         if screen is None:
             return {"sent": False, "reason": "capture failed"}
         if any(e not in screen for e in expect):
+            return {"sent": False, "reason": "changed"}
+        # str.count is non-overlapping, as the Mac counts.
+        if any(screen.count(m["text"]) <= m["before"] for m in expect_more):
             return {"sent": False, "reason": "changed"}
     for index, key in enumerate(keys):
         if index:

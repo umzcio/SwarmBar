@@ -19,6 +19,7 @@ import io
 import json
 import os
 import random
+import re
 import select
 import shutil
 import socket
@@ -1184,18 +1185,59 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad keys"}, extra)
             self.assertEqual(rec.sent(), [])
 
+    def test_expect_more_needs_the_count_to_rise(self):
+        # "ok" was on screen twice before the paste. Twice is not enough.
+        for screen, sent in (("ok\n> ok", False), ("ok\n> x", False), ("ok\nok\n> ok", True)):
+            rec = TmuxRecorder(screen=screen)
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect_more": [{"text": "ok", "before": 2}]}, rec)
+            expected = {"sent": True} if sent else {"sent": False, "reason": "changed"}
+            self.assertEqual(out, expected, screen)
+            self.assertEqual(len(rec.sent()), 1 if sent else 0, screen)
+
+    def test_expect_more_counts_without_overlap(self):
+        # "aa" occurs once in "aaa" as python counts it, not twice.
+        rec = TmuxRecorder(screen="aaa")
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                         "expect_more": [{"text": "aa", "before": 1}]}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+
+    def test_expect_more_works_beside_expect_and_target(self):
+        rec = self.target_recorder()
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                         "expect": ["Approve once"], "pid": 700, "comm": "claude",
+                         "expect_more": [{"text": "Approve", "before": 0}]}, rec)
+        self.assertEqual(out, {"sent": True})
+        rec = self.target_recorder()
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                         "expect": ["Missing"], "pid": 700, "comm": "claude",
+                         "expect_more": [{"text": "Approve", "before": 0}]}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+
+    def test_malformed_expect_more_is_bad_keys(self):
+        for bad in ("ok", {"text": "ok", "before": 0}, [{"text": "ok"}], [{"before": 0}],
+                    [{"text": 3, "before": 0}], [{"text": "ok", "before": "0"}],
+                    [{"text": "ok", "before": True}], [{"text": "ok", "before": -1}],
+                    [{"text": "", "before": 0}], ["ok"]):
+            rec = TmuxRecorder(screen="ok ok ok")
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect_more": bad}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
+            self.assertEqual(rec.sent(), [], bad)
+
     def test_paste_brackets_itself_and_never_sends_enter(self):
         # The local reply's form, verified live on every tool: the markers
         # are sent whatever mode the app is in, and -r keeps LF as LF where
         # plain paste-buffer would turn each one into a CR, an Enter.
         rec = TmuxRecorder()
-        out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi\nthere"}, rec)
+        with mock.patch.object(helper, "paste_buffer_name", return_value="swarmbar-1-ab"):
+            out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi\nthere"}, rec)
         self.assertEqual(out, {"sent": True})
         base = ["tmux", "-S", self.sock]
         self.assertEqual(rec.calls, [
-            base + ["load-buffer", "-b", "swarmbar", "-"],
+            base + ["load-buffer", "-b", "swarmbar-1-ab", "-"],
             base + ["send-keys", "-t", "%3", "-H", "1b", "5b", "32", "30", "30", "7e"],
-            base + ["paste-buffer", "-r", "-d", "-b", "swarmbar", "-t", "%3"],
+            base + ["paste-buffer", "-r", "-d", "-b", "swarmbar-1-ab", "-t", "%3"],
             base + ["send-keys", "-t", "%3", "-H", "1b", "5b", "32", "30", "31", "7e"],
         ])
         self.assertEqual(rec.inputs[0], b"hi\nthere")
@@ -1203,38 +1245,57 @@ class TmuxCommandTests(unittest.TestCase):
 
     def paste_failing(self, *steps):
         """A paste whose tmux calls for the named steps exit 1. A step is
-        "load-buffer", "paste-buffer", or "200"/"201" for the markers."""
+        "load-buffer", "paste-buffer", "delete-buffer", or "200"/"201" for
+        the markers."""
         def fails(argv):
             if "send-keys" in argv:
                 return {"30": "200", "31": "201"}[argv[-2]] in steps
             return any(step in argv for step in steps)
         rec = TmuxRecorder(fail_when=fails)
-        out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi"}, rec)
+        with mock.patch.object(helper, "paste_buffer_name", return_value="swarmbar-1-ab"):
+            out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi"}, rec)
         return out, rec
 
-    def test_paste_before_the_opening_marker_sends_nothing_else(self):
-        # A failed load or a failed ESC[200~ leaves no paste open to close.
-        for step, count in (("load-buffer", 1), ("200", 2)):
-            out, rec = self.paste_failing(step)
-            self.assertEqual(out, {"sent": False, "reason": "send failed"}, step)
-            self.assertEqual(len(rec.calls), count, step)
-            self.assertFalse(any("paste-buffer" in c for c in rec.calls), step)
+    def tail(self, rec, count):
+        return [c[3:] for c in rec.calls[-count:]]
+
+    DELETE = ["delete-buffer", "-b", "swarmbar-1-ab"]
+    CLOSE = ["send-keys", "-t", "%3", "-H", "1b", "5b", "32", "30", "31", "7e"]
+
+    def test_failed_load_is_its_own_reason_and_sends_nothing_else(self):
+        # Nothing reached the pane, which the Mac reports as nothing sent.
+        out, rec = self.paste_failing("load-buffer")
+        self.assertEqual(out, {"sent": False, "reason": "load failed"})
+        self.assertEqual(len(rec.calls), 1)
+
+    def test_failed_opening_marker_drops_the_buffer_only(self):
+        out, rec = self.paste_failing("200")
+        self.assertEqual(out, {"sent": False, "reason": "send failed"})
+        self.assertEqual(len(rec.calls), 3)
+        self.assertEqual(self.tail(rec, 1), [self.DELETE])
+        self.assertFalse(any("paste-buffer" in c for c in rec.calls))
 
     def test_failed_paste_still_closes_the_bracket(self):
         # ESC[200~ went out, so ESC[201~ follows even when the paste fails,
-        # or the pane is left in paste mode. Its own failure changes nothing.
-        end = ["tmux", "-S", self.sock, "send-keys", "-t", "%3", "-H",
-               "1b", "5b", "32", "30", "31", "7e"]
-        for steps in (("paste-buffer",), ("paste-buffer", "201")):
+        # or the pane is left in paste mode. Its own failure changes nothing,
+        # and nor does a failed cleanup.
+        for steps in (("paste-buffer",), ("paste-buffer", "201"),
+                      ("paste-buffer", "201", "delete-buffer")):
             out, rec = self.paste_failing(*steps)
             self.assertEqual(out, {"sent": False, "reason": "send failed"}, steps)
-            self.assertEqual(len(rec.calls), 4, steps)
-            self.assertEqual(rec.calls[-1], end, steps)
+            self.assertEqual(len(rec.calls), 5, steps)
+            self.assertEqual(self.tail(rec, 2), [self.CLOSE, self.DELETE], steps)
 
     def test_failed_closing_marker_reports_send_failed(self):
         out, rec = self.paste_failing("201")
         self.assertEqual(out, {"sent": False, "reason": "send failed"})
-        self.assertEqual(len(rec.calls), 4)
+        self.assertEqual(len(rec.calls), 5)
+        self.assertEqual(self.tail(rec, 1), [self.DELETE])
+
+    def test_paste_buffer_names_are_per_request(self):
+        first, second = helper.paste_buffer_name(), helper.paste_buffer_name()
+        self.assertNotEqual(first, second)
+        self.assertTrue(re.match(r"^swarmbar-%d-[0-9a-f]{32}$" % os.getpid(), first), first)
 
     def test_paste_sent_when_target_still_matches(self):
         rec = self.target_recorder()

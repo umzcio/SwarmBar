@@ -47,9 +47,6 @@ private enum ReplyMessage {
     static func noPane(_ host: String) -> String {
         "This session isn't in tmux on \(host), so reply in its terminal."
     }
-    static func alreadyOnScreen(_ host: String) -> String {
-        "That text is already on screen in the session on \(host), so nothing was pasted. It may already be in the composer. Check the terminal."
-    }
     static func pasteUncertain(_ host: String) -> String {
         "The reply may have been partly pasted into the session on \(host), so it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."
     }
@@ -101,11 +98,13 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// submitted half-delivered is not, so `.sent` means only that the
     /// helper confirmed it pressed Enter.
     ///
-    /// The screen is read before the paste as well. A probe already on it
-    /// would confirm a paste that never landed, and is most likely a retry
-    /// whose first paste is still in the composer, so nothing is pasted.
-    /// Every failure once a paste has landed, or may have, says so, because
-    /// sending again would paste the text a second time.
+    /// The screen is read before the paste as well, to count the probe. A
+    /// short reply ("ok", "1", "main") is usually on screen already, so
+    /// presence alone would confirm a paste that never landed: the count
+    /// has to rise, on the Mac's read after the paste and again on the
+    /// helper's at press time. Every failure once a paste has landed, or
+    /// may have, says so, because sending again would paste the text a
+    /// second time.
     ///
     /// The approval switches do not gate this. A reply is not an answer,
     /// and the local reply goes through whatever the keystroke switches
@@ -157,10 +156,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
             remoteAnswerLog.notice("reply: capture on \(host, privacy: .public) failed, nothing sent")
             return .failed("Could not read the screen on \(host), so nothing was sent.")
         }
-        guard !before.contains(probe) else {
-            remoteAnswerLog.notice("reply: probe already on screen on \(host, privacy: .public), nothing pasted")
-            return .failed(ReplyMessage.alreadyOnScreen(host))
-        }
+        let seen = RemoteAnswerPlan.occurrences(of: probe, in: before)
         guard targetHeld() else {
             remoteAnswerLog.notice("reply: \(host, privacy: .public) changed while reading the screen, nothing sent")
             return .failed("The session on \(host) changed while reading its screen, so nothing was sent.")
@@ -191,7 +187,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
             remoteAnswerLog.notice("reply: capture on \(host, privacy: .public) failed, Enter not sent")
             return .failed(ReplyMessage.pastedNotSubmitted(host))
         }
-        guard after.contains(probe) else {
+        guard RemoteAnswerPlan.occurrences(of: probe, in: after) > seen else {
             return .failed(ReplyMessage.notVisible(host))
         }
         guard targetHeld() else {
@@ -200,11 +196,13 @@ extension RemoteMonitorSupervisor: RemoteActing {
         }
 
         do {
-            // The probe goes along so the helper re-confirms the paste is
-            // still on screen at the moment it presses Enter.
+            // The probe and its count before the paste go along, so the
+            // helper re-confirms the paste is still on screen at the moment
+            // it presses Enter.
+            let more: JSONValue = .array([.object(["text": .string(probe), "before": .int(seen)])])
             let reply = try await requester.request(
                 "keys", process.merging([
-                    "pane": pane, "keys": .array([.string("\n")]), "expect": .array([.string(probe)]),
+                    "pane": pane, "keys": .array([.string("\n")]), "expect_more": more,
                 ]) { $1 },
                 timeout: .seconds(30))
             switch RemoteAnswerPlan.keysOutcome(from: reply) {
