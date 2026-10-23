@@ -1451,6 +1451,22 @@ class EventSink(object):
             return [e for e in self.events if predicate(e)]
 
 
+class FakeClock(object):
+    """A monotonic clock a test moves by hand, from any thread."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            return self.now
+
+    def advance(self, seconds):
+        with self.lock:
+            self.now += seconds
+
+
 def is_hook(path):
     return lambda e: e.get("event") == "hook" and e.get("path") == path
 
@@ -1571,9 +1587,9 @@ class HookRelayTests(unittest.TestCase):
             raise self.peer
         return list(self.peer)
 
-    def relay(self, sink=None):
+    def relay(self, sink=None, clock=None):
         sink = sink if sink is not None else EventSink()
-        relay = helper.HookRelay(emit=sink)
+        relay = helper.HookRelay(emit=sink, clock=clock)
         self.relays.append(relay)
         relay.refresh()
         return relay, sink
@@ -2105,6 +2121,85 @@ class HookRelayTests(unittest.TestCase):
             owner.handle_reply({"rid": event["rid"], "body": self.DECISION})
             self.assertEqual(read_response(client)[2], self.DECISION)
             self.assertIsNotNone(follower_sink.wait_for(is_resolved(event["rid"])))
+
+    # A Mac that has gone quiet: asleep, or its connection half open. sshd
+    # keeps such a session for hours, so stdin EOF never comes, and a hold
+    # would stall every Claude prompt on the host for the full hold time.
+
+    def quiet_relay(self):
+        clock = FakeClock()
+        relay, sink = self.relay(clock=clock)
+        return relay, sink, clock
+
+    def test_quiet_mac_hold_is_answered_at_once(self):
+        relay, sink, clock = self.quiet_relay()
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        started = time.monotonic()
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        self.assertEqual(read_response(client, timeout=2)[2], {})
+        self.assertLess(time.monotonic() - started, 1.5)
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertIsNotNone(sink.wait_for(is_resolved(event["rid"])))
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_mac_going_quiet_mid_hold_releases_it(self):
+        relay, sink, clock = self.quiet_relay()
+        client, event = self.hold_one(relay, sink)
+        self.assertFalse(answered_within(client, 0.2))
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        self.assertEqual(read_response(client, timeout=2)[2], {})
+        self.assertIsNotNone(sink.wait_for(is_resolved(event["rid"])))
+        self.assertEqual(self.hub(relay).pending, {})
+
+    def test_hearing_from_the_mac_keeps_it_live(self):
+        relay, sink, clock = self.quiet_relay()
+        clock.advance(helper.MAC_QUIET_SECONDS - 5)
+        relay.heard()
+        clock.advance(helper.MAC_QUIET_SECONDS - 5)
+        client, event = self.hold_one(relay, sink)
+        self.assertFalse(answered_within(client, 0.3))
+        relay.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client)[2], self.DECISION)
+
+    def test_follower_answers_for_a_quiet_owner(self):
+        owner, owner_sink, clock = self.quiet_relay()
+        follower, follower_sink = self.relay()
+        self.assertTrue(wait_until(lambda: self.hub(owner).follower_count() == 1))
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        client, event = self.hold_one(owner, owner_sink)
+        self.assertFalse(answered_within(client, 0.3))
+        self.assertIsNotNone(follower_sink.wait_for(is_hook("/hook/PermissionRequest")))
+        follower.handle_reply({"rid": event["rid"], "body": self.DECISION})
+        self.assertEqual(read_response(client)[2], self.DECISION)
+
+    def test_quiet_mac_still_hears_events(self):
+        # Answering at once is about the agent; the event still goes out,
+        # so a Mac that wakes sees what happened.
+        relay, sink, clock = self.quiet_relay()
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        read_response(self.post("Stop", {"session_id": "s1"}))
+        self.assertIsNotNone(sink.wait_for(is_hook("/hook/Stop")))
+
+    def test_every_request_counts_as_hearing_from_the_mac(self):
+        clock = FakeClock()
+        relay = helper.HookRelay(emit=EventSink(), clock=clock)
+        self.relays.append(relay)
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        self.assertFalse(relay.mac_live())
+        out = EventSink()
+        with mock.patch.object(helper, "_OUT", out):
+            helper.serve_requests(io.StringIO('{"cmd": "echo", "value": 1, "id": 1}\n'), relay)
+        self.assertTrue(relay.mac_live())
+        clock.advance(helper.MAC_QUIET_SECONDS + 1)
+        with mock.patch.object(helper, "_OUT", out):
+            helper.serve_requests(io.StringIO("not json\n"), relay)
+        self.assertTrue(relay.mac_live())
+
+    def test_quiet_window_outlasts_several_polls(self):
+        # The Mac polls every 10 s. Three missed polls and some slack, so a
+        # slow snapshot or one dropped poll never reads as a Mac gone away.
+        self.assertGreaterEqual(helper.MAC_QUIET_SECONDS, 30)
+        self.assertLess(helper.MAC_QUIET_SECONDS, helper.HOLD_SECONDS)
 
     def test_holds_are_capped_per_home(self):
         with mock.patch.object(helper, "MAX_HOLDS", 1):

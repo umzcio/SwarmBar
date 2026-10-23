@@ -2342,6 +2342,16 @@ MAX_HOOK_DRAIN = 4 * 1024 * 1024
 # A held request gives up just inside the bridge's own curl -m 350, so the
 # agent hears {} rather than a dropped connection.
 HOLD_SECONDS = 345
+# How long this helper's Mac may go unheard before it no longer counts as
+# able to answer. The Mac polls every 10 s, so this is three missed polls
+# and some slack for a slow snapshot. Only stdin EOF says a Mac is gone,
+# and a sleeping laptop or a changed network never sends one: sshd keeps
+# the session until TCP keepalive gives up, about two hours by default.
+# Until then every hold would wait out HOLD_SECONDS with nobody to answer
+# it, stalling each Claude Code and OpenCode prompt on the host for six
+# minutes. A Mac that is wrongly taken for quiet costs nothing worse than
+# the agent showing its own prompt.
+MAC_QUIET_SECONDS = 45
 # Holds per home at once. Past it a request is answered {} at once.
 MAX_HOLDS = 32
 # How often a hold checks that its client is still there.
@@ -3497,6 +3507,11 @@ class HookHome(object):
         handler.answer({})
         self.publish(message)
 
+    def can_answer(self):
+        """Whether any Mac could answer a hold here: this helper's own, if
+        it has been heard from lately, or one behind a follower."""
+        return self.relay.mac_live() or self.follower_count() > 0
+
     def hold(self, handler, message):
         rid = message["rid"]
         held = Held(handler.connection, message)
@@ -3513,9 +3528,9 @@ class HookHome(object):
             handler.answer({})
             self.publish(message)
             return
-        if not self.publish(message, held=True):
-            # No Mac will ever see this request, so none can answer it, and
-            # waiting out the hold would only stall the agent.
+        if not self.publish(message, held=True) or not self.can_answer():
+            # No Mac will see this request, or none is awake to answer it,
+            # and waiting out the hold would only stall the agent.
             self.resolve(rid, {})
         gone = False
         while not held.done.is_set():
@@ -3527,6 +3542,10 @@ class HookHome(object):
             if client_gone(held.conn):
                 gone = True
                 break
+            if not self.can_answer():
+                # The Mac went quiet mid-hold, and no follower is there to
+                # answer instead: let the agent show its own prompt.
+                self.resolve(rid, {})
         with self.lock:
             self.pending.pop(rid, None)
             dropped, body = held.dropped, held.body
@@ -3598,8 +3617,12 @@ class HookRelay(object):
     through a bounded queue and one writer thread, so a Mac that stops
     reading never stalls a request or another Mac."""
 
-    def __init__(self, emit=None):
+    def __init__(self, emit=None, clock=None):
         self.emit_line = emit if emit is not None else write_line
+        # Monotonic, and injectable so tests can let a Mac go quiet.
+        self.clock = clock if clock is not None else time.monotonic
+        # The helper was started by its Mac a moment ago.
+        self.last_heard = self.clock()
         self.hubs = {}
         self.lock = threading.Lock()
         self.closed = False
@@ -3608,6 +3631,19 @@ class HookRelay(object):
         writer = threading.Thread(target=self.drain, name="swarmbar-emit")
         writer.daemon = True
         writer.start()
+
+    def heard(self):
+        """Notes a request from this helper's Mac, which proves it is awake
+        and reading."""
+        with self.lock:
+            self.last_heard = self.clock()
+
+    def mac_live(self):
+        """Whether this helper's Mac was heard from recently enough to
+        answer a hold. See MAC_QUIET_SECONDS."""
+        with self.lock:
+            last = self.last_heard
+        return self.clock() - last <= MAC_QUIET_SECONDS
 
     def emit(self, message):
         """Queues an event for this helper's Mac. False when it was dropped."""
@@ -4012,6 +4048,9 @@ def serve_requests(stdin, relay):
         line = line.strip()
         if not line:
             continue
+        # Any line at all, even a malformed one, is the Mac awake and
+        # writing, which is all a hold needs to know.
+        relay.heard()
         try:
             request = json.loads(line)
         except ValueError:
