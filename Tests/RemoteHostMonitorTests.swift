@@ -184,6 +184,9 @@ struct RemoteHostMonitorTests {
         #expect(rig.rows.allSatisfy { $0.tool == .claudeCode })
         #expect(rig.store.remoteReachability["devbox"] == .reachable)
         #expect(rig.connection.lastSnapshot != nil)
+        // The bundled helper is the one running, so its press-time checks
+        // can be relied on.
+        #expect(rig.connection.helperIsCurrent)
         // The mirror holds the host's files at their own paths.
         let mirrored = try #require(rig.connection.mirror.local(
             MonitorRig.transcript(MonitorRig.first, in: rig.home).path))
@@ -325,6 +328,28 @@ struct RemoteHostMonitorTests {
         #expect(rig.store.remoteReachability["devbox"] == .needsSetup(HelperInstaller.updateNeedsSetupMessage))
         #expect(HelperInstaller.updateNeedsSetupMessage
             == "SwarmBar was updated. Run the setup command again to update its helper.")
+    }
+
+    /// A push that fails for some reason other than sudo leaves the host
+    /// reading reachable while the old helper keeps answering. That helper
+    /// ignores the press-time pid and comm check, so it must not be trusted
+    /// with keys.
+    @Test("a stale helper on a reachable host is not current", .enabled(if: pythonAvailable))
+    func staleHelperOnReachableHostIsNotCurrent() async throws {
+        let rig = try MonitorRig(
+            launch: { try scriptedHelper(in: $0, pingReply: stalePing) },
+            installRunner: { _, _, _ in
+                throw HelperInstaller.InstallFailure(
+                    message: "helper install exited 255: connection reset", stderr: "connection reset\n")
+            })
+        defer { rig.remove() }
+        rig.start()
+        await settle { rig.connection.lastSnapshot != nil && rig.store.remoteReachability["devbox"] == .reachable }
+        await rig.stop()
+
+        #expect(rig.store.remoteReachability["devbox"] == .reachable)
+        #expect(rig.connection.lastSnapshot?.stream == "old-helper")
+        #expect(!rig.connection.helperIsCurrent)
     }
 }
 

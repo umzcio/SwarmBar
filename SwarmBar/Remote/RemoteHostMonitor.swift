@@ -165,6 +165,13 @@ struct RemoteHostMonitor: SessionMonitor {
             }
         }
         if Task.isCancelled { return pollInterval }
+        // Set before the snapshot, so a helper that is still the old one
+        // (its push failed, or the next push is not due yet) never has keys
+        // aimed through it, though its snapshot keeps the rows current.
+        // Every path that leaves runningStale false has either confirmed
+        // the running helper or shut the channel down so the next request
+        // starts the bundled one.
+        if connection.noteHelperCurrent(!state.runningStale) { store.noteRemotePanesChanged() }
 
         let snapshot: RemoteSnapshot
         do {

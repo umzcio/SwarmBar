@@ -13,6 +13,13 @@ final class RemoteHostConnection {
     /// Only ever a snapshot whose bytes are all in the mirror, so whatever
     /// it names (a pid, a pane, a path) can be found there too.
     private(set) var lastSnapshot: RemoteSnapshot?
+    /// Whether the helper answering on this channel is known to run the
+    /// bundled code. A host reads reachable while an out-of-date helper
+    /// still answers: a push that failed for a reason other than sudo, or
+    /// the wait before the next push. An old helper ignores the press-time
+    /// pid and comm check on `keys`, so keystroke answers wait for this.
+    /// False until a poll proves otherwise, and again after any gap.
+    private(set) var helperIsCurrent = false
 
     init(host: RemoteHost, channel: SSHChannel, mirror: RemoteMirror) {
         self.host = host
@@ -35,10 +42,23 @@ final class RemoteHostConnection {
     /// reused or handed to another program while nobody is looking, so no
     /// key is aimed by it until a fresh snapshot lands. Returns whether
     /// there was a snapshot to forget.
+    /// The helper that comes back after a gap is unknown until the next
+    /// ping, so it is no longer taken to be current either. Returns whether
+    /// anything was forgotten.
     @discardableResult
     func noteLost() -> Bool {
-        guard lastSnapshot != nil else { return false }
+        let changed = lastSnapshot != nil || helperIsCurrent
         lastSnapshot = nil
+        helperIsCurrent = false
+        return changed
+    }
+
+    /// Returns whether the flag flipped, so the caller can redraw the rows
+    /// whose buttons depend on it.
+    @discardableResult
+    func noteHelperCurrent(_ current: Bool) -> Bool {
+        guard helperIsCurrent != current else { return false }
+        helperIsCurrent = current
         return true
     }
 

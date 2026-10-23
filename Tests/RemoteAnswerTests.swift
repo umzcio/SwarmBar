@@ -173,6 +173,7 @@ struct RemoteAnswerTests {
         /// A snapshot applied in full by a poll that also found the host
         /// reachable, which is what a keystroke answer needs both of.
         func land(_ snapshot: RemoteSnapshot) {
+            connection?.noteHelperCurrent(true)
             connection?.noteApplied(snapshot)
             store.noteRemoteReachability(host: "devbox", .reachable)
         }
@@ -358,6 +359,33 @@ struct RemoteAnswerTests {
         // A fresh snapshot lands and the row is answerable again.
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
         #expect(rig.supervisor.answerability(for: session) == .keystrokes)
+    }
+
+    /// A host can read reachable while an out-of-date helper still runs
+    /// (a push that failed for a reason other than sudo, or the minute
+    /// before the next push). That helper ignores pid and comm, so keys
+    /// would go unconfirmed by them.
+    @Test func staleHelperSendsNoKeys() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"1. Approve once\n2. Reject"}"#, "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+        let connection = try #require(rig.connection)
+
+        let before = rig.store.remotePaneRevision
+        #expect(connection.noteHelperCurrent(false))
+        #expect(!connection.noteHelperCurrent(false))
+        rig.store.noteRemotePanesChanged()
+        #expect(rig.store.remotePaneRevision != before)
+        #expect(rig.store.remoteReachability["devbox"] == .reachable)
+        #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+
+        // A gap makes the helper unknown again, as well as the panes.
+        #expect(connection.noteHelperCurrent(true))
+        connection.noteLost()
+        #expect(!connection.helperIsCurrent)
     }
 
     @Test func helperExitForgetsThePanes() async throws {

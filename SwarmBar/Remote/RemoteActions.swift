@@ -157,8 +157,9 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// started inside a claude), which is fine: the keys are chosen and
     /// confirmed against what that pane shows.
     ///
-    /// Only while the host is reachable and a snapshot has landed since the
-    /// last gap. Both are checked before any request, so a click on a dark
+    /// Only while the host is reachable, its helper is known to be the
+    /// bundled one (an old helper ignores the press-time pid and comm
+    /// check), and a snapshot has landed since the last gap. Both are checked before any request, so a click on a dark
     /// host's row never starts ssh, and a pane map from before a gap never
     /// aims a key.
     private func keystrokeTarget(
@@ -167,6 +168,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         guard let hostName = session.host, let pid = session.pid,
               store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
+              connection.helperIsCurrent,
               let process = connection.lastSnapshot?.processes.first(where: { $0.pid == Int(pid) }),
               let pane = process.pane
         else { return nil }
