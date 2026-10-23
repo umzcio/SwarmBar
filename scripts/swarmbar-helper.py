@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """SwarmBar remote helper.
 
 Ships bytes, never verdicts. It lists agent state files for all seven tools
@@ -7,7 +7,7 @@ sparse mirror and runs the same monitors it runs locally, so every parser
 stays a single implementation.
 
 Constraints that are not negotiable:
-  * python 3.9 compatible. umzmac ships stock Apple 3.9.6.
+  * python 3.9 compatible. macOS hosts ship stock Apple 3.9.6.
   * No GNU-only userland. `ps --no-headers` and `find -printf` fail on
     Darwin, and a failed `ps` piped into a filter yields an empty list
     that reads exactly like "no sessions".
@@ -115,8 +115,8 @@ OVERSIZED = _Sentinel("OVERSIZED")
 INCOMPLETE = _Sentinel("INCOMPLETE")
 
 # A backup directory is shape-identical to a live root: it is prefixed
-# .claude and it contains projects/. On umzcaio,
-# /root/.claude-cio.pre-symlink-backup/projects holds 344 transcripts.
+# .claude and it contains projects/. On one real host,
+# /root/.claude-work.pre-symlink-backup/projects held hundreds of transcripts.
 # Only a stale mtime keeps it out today, and that protection disappears
 # the moment a backup is taken recently. So exclude by name, explicitly.
 BACKUP_MARKERS = ("backup", ".bak", "-bak", ".pre-", ".old", "-old", ".copy", "~")
@@ -1038,7 +1038,7 @@ def agent_name(row):
     """The agent a ps row is, or None.
 
     On Darwin `comm` is a full path truncated to 16 characters
-    (/Users/zach/.loc), so its basename can be garbage and an agent started by
+    (/Users/u/.local/), so its basename can be garbage and an agent started by
     absolute path would silently vanish from the table. When comm's basename
     is not an agent, argv[0] (the first token of args) is tried instead.
     BearCode is a bare node process and is recognised by its script path.

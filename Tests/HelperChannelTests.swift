@@ -71,10 +71,10 @@ struct HelperChannelTests {
     @Test("watching the login user runs the helper from its home with no sudo")
     func loginUserLaunchHasNoSudo() {
         let launch = HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser)
-        #expect(launch.arguments.last == #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#)
+        #expect(launch.arguments.last == #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#)
         #expect(!launch.arguments.contains { $0.contains("sudo") })
         #expect(launch.arguments == HelperLaunch.sshOptions
-            + ["--", "devbox", #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#])
+            + ["--", "devbox", #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#])
     }
 
     @Test("the install argv ends option parsing before the alias")
@@ -119,11 +119,79 @@ struct HelperChannelTests {
     @Test("the every user install pushes over the same channel, never scp")
     func everyUserInstallUsesStdin() {
         let command = HelperLaunch.installCommand(for: .everyUser)
-        #expect(command == "sudo -n sh -c 'umask 077; cat > /usr/local/lib/swarmbar-helper.tmp && chmod 700 /usr/local/lib/swarmbar-helper.tmp && mv -f /usr/local/lib/swarmbar-helper.tmp /usr/local/lib/swarmbar-helper'")
+        #expect(command == "sudo -n sh -c '\(HelperLaunch.rootInstallScript(directory: "/usr/local/lib", owner: 0))'")
         #expect(command.hasPrefix("sudo -n "))
         #expect(command.contains("/usr/local/lib/swarmbar-helper"))
         #expect(!command.contains("/dev/stdin"))
         #expect(!command.contains("scp"))
+        // One single-quoted argument: nothing inside may close it.
+        #expect(!HelperLaunch.rootInstallScript(directory: "/usr/local/lib", owner: 0).contains("'"))
+    }
+
+    /// Runs the root install script against a scratch directory, owned by
+    /// this test's user standing in for root.
+    private func runRootInstall(directory: String, bytes: Data) throws -> (status: Int32, stderr: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", HelperLaunch.rootInstallScript(directory: directory, owner: Int(getuid()))]
+        task.environment = ["PATH": "/usr/bin:/bin"]
+        let stdin = Pipe(), stderr = Pipe()
+        task.standardInput = stdin
+        task.standardError = stderr
+        try task.run()
+        try stdin.fileHandleForWriting.write(contentsOf: bytes)
+        try stdin.fileHandleForWriting.close()
+        task.waitUntilExit()
+        let message = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return (task.terminationStatus, message)
+    }
+
+    @Test("the root install makes a missing directory and refuses one others can write")
+    func rootInstallChecksItsDirectory() throws {
+        let base = try freshHome()
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        let bytes = Data("#!/usr/bin/env python3\nprint('synthetic helper')\n".utf8)
+
+        // A fresh macOS may have no /usr/local/lib at all.
+        let missing = base + "/usr/local/lib"
+        let made = try runRootInstall(directory: missing, bytes: bytes)
+        #expect(made.status == 0, "\(made.stderr)")
+        #expect(FileManager.default.contents(atPath: missing + "/swarmbar-helper") == bytes)
+        let mode = try FileManager.default.attributesOfItem(atPath: missing)[.posixPermissions] as? NSNumber
+        #expect(mode?.intValue == 0o755)
+        let parentMode = try FileManager.default.attributesOfItem(atPath: base + "/usr/local")[.posixPermissions] as? NSNumber
+        #expect(parentMode?.intValue == 0o755)
+        let helperMode = try FileManager.default.attributesOfItem(atPath: missing + "/swarmbar-helper")[.posixPermissions] as? NSNumber
+        #expect(helperMode?.intValue == 0o700)
+
+        for loose in [0o775, 0o757, 0o777] {
+            let dir = base + "/loose-\(String(loose, radix: 8))"
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: loose], ofItemAtPath: dir)
+            let refused = try runRootInstall(directory: dir, bytes: bytes)
+            #expect(refused.status != 0)
+            #expect(refused.stderr.contains("writable by another user"), "\(refused.stderr)")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: dir).isEmpty)
+        }
+
+        // Owned by anyone but the owner it must have, it is refused too.
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", HelperLaunch.rootInstallScript(directory: missing, owner: Int(getuid()) + 4242)]
+        task.standardInput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try task.run()
+        task.waitUntilExit()
+        #expect(task.terminationStatus != 0)
+    }
+
+    @Test("the helper runs isolated, so a writable directory beside it is never on its path")
+    func helperRunsIsolated() throws {
+        let script = try #require(Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"))
+        let source = try String(contentsOf: script, encoding: .utf8)
+        #expect(source.hasPrefix("#!/usr/bin/env -S python3 -I\n"))
+        #expect(HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser).arguments.last
+            == #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#)
     }
 
     @Test("a local launch runs the script with the homes override")

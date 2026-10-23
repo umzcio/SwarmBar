@@ -99,6 +99,9 @@ enum SetupPlanner {
     }
 
     static let absent = "absent"
+    /// Why an OpenCode config is a hand edit: comments a JSON round trip
+    /// would eat, or a plugin list SwarmBar cannot keep as it is.
+    static let openCodeRefusal = "has comments or a plugin list that isn't plain names"
     /// Agent configs can hold provider keys, so a new one is private.
     static let configMode = 0o600
     static let scriptMode = 0o700
@@ -227,7 +230,7 @@ enum SetupPlanner {
                     tool: .openCode, file: file, path: path, seed: "{}\n", seen: &seen,
                     description: "Add the SwarmBar plugin to \(path)",
                     instruction: "Add \"\(spec)\" to its \"plugin\" list.",
-                    refusal: "has comments"
+                    refusal: openCodeRefusal
                 ) { try OpenCodeConfigTransform.install($0, pluginSpec: spec, family: .remote) }
                 if let change { configs.append(Pending(change: change, needs: [pluginPath])) }
                 if let change = bridgeChange(.openCode, pluginPath, bundled.openCodePlugin, pluginMode,
@@ -314,7 +317,7 @@ enum SetupPlanner {
                      "Remove the hooks that run \(bridge).", "isn't valid JSON")
                 case .openCode:
                     ("Remove the SwarmBar plugin from \(file.path)",
-                     "Remove \"file://\(bridge)\" from its \"plugin\" list.", "has comments")
+                     "Remove \"file://\(bridge)\" from its \"plugin\" list.", openCodeRefusal)
                 default:
                     ("Remove SwarmBar's hook entries from \(file.path)",
                      "Remove the [[hooks]] entries that run \(bridge).", "can't be edited")

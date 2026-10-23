@@ -59,6 +59,31 @@ struct RemoteMirror: Sendable {
             .appendingPathComponent("remote", isDirectory: true)
     }
 
+    /// Discards every mirror at launch without holding up the menu bar
+    /// item. A multi-host mirror can be thousands of files, so the
+    /// directory is only renamed aside here, which is one call whatever it
+    /// holds, and the renamed copy is deleted off the main thread, along
+    /// with any an earlier launch moved aside and never finished. A rename
+    /// of a directory that is not there fails and creates nothing, so a
+    /// user with no hosts still never gets one. Returns the deletion, for
+    /// tests to wait on.
+    @discardableResult
+    nonisolated static func discard(_ root: URL = hostsRoot) -> Task<Void, Never>? {
+        let manager = FileManager.default
+        let parent = root.deletingLastPathComponent()
+        let prefix = root.lastPathComponent + ".discarded-"
+        let aside = parent.appendingPathComponent(prefix + UUID().uuidString, isDirectory: true)
+        let moved = (try? manager.moveItem(at: root, to: aside)) != nil
+        let leftovers = ((try? manager.contentsOfDirectory(atPath: parent.path)) ?? [])
+            .filter { $0.hasPrefix(prefix) }
+        guard moved || !leftovers.isEmpty else { return nil }
+        return Task.detached(priority: .utility) {
+            for name in leftovers {
+                try? FileManager.default.removeItem(at: parent.appendingPathComponent(name))
+            }
+        }
+    }
+
     /// The mirror path for a remote absolute path, or nil for anything that
     /// could land outside `root`. The paths come from a remote host and are
     /// not trusted: a `..` component would let `/root/../../etc/x` climb

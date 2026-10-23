@@ -141,6 +141,34 @@ struct OpenCodeConfigTransformTests {
         #expect(removed.contains("some-other-plugin"))
     }
 
+    /// A "plugin" list holding anything but plain names (a [name, options]
+    /// pair, say) is a hand edit. Reading it as [String] used to fail and
+    /// fall back to an empty list, so install replaced the user's plugins
+    /// with SwarmBar's and uninstall deleted them all.
+    @Test func pluginListThatIsNotPlainNamesIsRefused() throws {
+        let tuple = #"{"plugin": ["some-plugin", ["other-plugin", {"opt": true}]]}"#
+        let withOurs = #"{"plugin": ["file:///x/swarmbar.js", ["other-plugin", {"opt": true}]]}"#
+        for family in [BridgeFamily.local, .remote] {
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.install(tuple, pluginSpec: "file:///x/swarmbar.js", family: family)
+            }
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.uninstall(withOurs, family: family)
+            }
+        }
+        for odd in [#"{"plugin": "file:///x/swarmbar.js"}"#, #"{"plugin": [1, 2]}"#, #"{"plugin": {"a": 1}}"#] {
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.install(odd, pluginSpec: "file:///x/swarmbar.js")
+            }
+            #expect(throws: IntegrationTransformError.self) { _ = try OpenCodeConfigTransform.uninstall(odd) }
+        }
+        // Ours still reads as installed beside a pair.
+        #expect(OpenCodeConfigTransform.isInstalled(withOurs))
+        // A null list is no list.
+        let fromNull = try OpenCodeConfigTransform.install(#"{"plugin": null}"#, pluginSpec: "file:///x/swarmbar.js")
+        #expect(OpenCodeConfigTransform.isInstalled(fromNull))
+    }
+
     @Test func commentedJsoncThrows() {
         #expect(throws: IntegrationTransformError.self) {
             _ = try OpenCodeConfigTransform.install(

@@ -41,7 +41,10 @@ enum HelperLaunch: Sendable, Equatable {
             // One string on purpose: ssh hands it to the remote login shell,
             // which is what expands $HOME. Split into separate arguments, the
             // quotes would arrive literally.
-            Self.sshOptions + ["--", alias, #"exec python3 "$HOME/.swarmbar/swarmbar-helper""#]
+            // -I, as the helper's own shebang says for root: nothing beside
+            // the script, in the user site or in PYTHON* variables is on its
+            // path.
+            Self.sshOptions + ["--", alias, #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#]
         case .local(_, let script, _):
             [script]
         }
@@ -76,10 +79,31 @@ enum HelperLaunch: Sendable, Equatable {
     static func installCommand(for watchAs: WatchAs) -> String {
         switch watchAs {
         case .everyUser:
-            "sudo -n sh -c 'umask 077; cat > \(rootHelperPath).tmp && chmod 700 \(rootHelperPath).tmp && mv -f \(rootHelperPath).tmp \(rootHelperPath)'"
+            "sudo -n sh -c '\(rootInstallScript(directory: (rootHelperPath as NSString).deletingLastPathComponent, owner: 0))'"
         case .loginUser:
             #"mkdir -p "$HOME/.swarmbar" && chmod 700 "$HOME/.swarmbar" && umask 077 && cat > "$HOME/.swarmbar/swarmbar-helper.tmp" && chmod 700 "$HOME/.swarmbar/swarmbar-helper.tmp" && mv -f "$HOME/.swarmbar/swarmbar-helper.tmp" "$HOME/.swarmbar/swarmbar-helper""#
         }
+    }
+}
+
+extension HelperLaunch {
+    /// The root install, as one sh script with no single quote in it, so
+    /// it rides inside `sh -c '...'`. Root writes a predictable temporary
+    /// name in the directory, so the directory must be one nobody else can
+    /// change: owned by `owner` (root, or a test's own user standing in for
+    /// it) and writable by neither group nor others, or another user could
+    /// put a link where the temporary file goes. A fresh macOS may have no
+    /// /usr/local/lib, so it is made, 0755 like the rest of /usr/local.
+    /// `ls -ldn` rather than stat, whose flags differ between GNU and BSD.
+    static func rootInstallScript(directory: String, owner: Int) -> String {
+        let helper = directory + "/" + (rootHelperPath as NSString).lastPathComponent
+        return "d=\(directory); "
+            + #"if [ ! -e "$d" ]; then (umask 022 && mkdir -p "$d") || exit 1; fi; "#
+            + #"set -- $(ls -ldn "$d") || exit 1; "#
+            + #"case "$1" in d????w*|d???????w*) echo "swarmbar: $d is writable by another user" >&2; exit 1;; "#
+            + #"d*) ;; *) echo "swarmbar: $d is not a directory" >&2; exit 1;; esac; "#
+            + #"[ "$3" = \#(owner) ] || { echo "swarmbar: $d is not owned by the right user" >&2; exit 1; }; "#
+            + "umask 077; cat > \(helper).tmp && chmod 700 \(helper).tmp && mv -f \(helper).tmp \(helper)"
     }
 }
 

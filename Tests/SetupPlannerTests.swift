@@ -361,7 +361,8 @@ import Testing
         let plan = try Self.plan(probe)
         let opencode = try #require(Self.change(plan, at: "/root/.config/opencode/opencode.jsonc"))
         #expect(opencode.action == .byHand)
-        #expect(opencode.description.hasPrefix("Edit by hand: /root/.config/opencode/opencode.jsonc has comments"))
+        #expect(opencode.description.hasPrefix(
+            "Edit by hand: /root/.config/opencode/opencode.jsonc has comments or a plugin list that isn't plain names"))
         #expect(opencode.description.contains("file:///root/.config/opencode/plugins/swarmbar-remote.js"))
         // Everything else is still planned.
         #expect(Self.text(plan, at: "/root/.claude/settings.json") != nil)

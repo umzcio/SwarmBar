@@ -23,7 +23,7 @@ func shellQuoted(_ path: String) -> String {
 }
 
 /// Which set of SwarmBar bridge entries a transform manages. One Mac can be
-/// both a local machine and a remote host (the fleet's umzmac is), so the two
+/// both a local machine and a remote host (a Mac in the fleet is), so the two
 /// families can land in the very same config file. Each must install, replace
 /// and remove only its own entries, or toggling a remote host off would
 /// silently strip the local bridge, and the reverse. Every remote command,
@@ -250,7 +250,9 @@ enum TomlHooksTransform {
 /// OpenCode's opencode.json(c): a "plugin" array of module specs. The
 /// plugin file itself lives in ~/.config/opencode/plugins/. Files with
 /// comments are refused rather than rewritten, since a JSON round-trip
-/// would eat them.
+/// would eat them, and so is a "plugin" value that is not a list of plain
+/// names: SwarmBar cannot keep what it does not understand, and reading
+/// such a list as empty replaced or wiped the user's own plugins.
 enum OpenCodeConfigTransform {
     static func isInstalled(_ text: String, family: BridgeFamily = .local) -> Bool {
         guard let data = text.data(using: .utf8),
@@ -258,12 +260,12 @@ enum OpenCodeConfigTransform {
         else {
             return text.components(separatedBy: "\n").contains { family.owns($0) }
         }
-        return (root["plugin"] as? [String] ?? []).contains(where: family.owns)
+        return ((root["plugin"] as? [Any]) ?? []).contains { ($0 as? String).map(family.owns) ?? false }
     }
 
     static func install(_ text: String, pluginSpec: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
-        var plugins = (root["plugin"] as? [String] ?? []).filter { !family.owns($0) }
+        var plugins = try pluginList(root).filter { !family.owns($0) }
         plugins.append(pluginSpec)
         root["plugin"] = plugins
         return try serialize(root)
@@ -271,9 +273,20 @@ enum OpenCodeConfigTransform {
 
     static func uninstall(_ text: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
-        let plugins = (root["plugin"] as? [String] ?? []).filter { !family.owns($0) }
+        let plugins = try pluginList(root).filter { !family.owns($0) }
         root["plugin"] = plugins.isEmpty ? nil : plugins
         return try serialize(root)
+    }
+
+    /// The "plugin" list, which must be plain names. Absent or null is an
+    /// empty list; anything else is a hand edit.
+    private static func pluginList(_ root: [String: Any]) throws -> [String] {
+        guard let value = root["plugin"], !(value is NSNull) else { return [] }
+        guard let list = value as? [Any], let names = list as? [String], names.count == list.count else {
+            throw IntegrationTransformError.unparseable(
+                "opencode config's \"plugin\" list holds something other than plain names; edit it by hand")
+        }
+        return names
     }
 
     private static func parse(_ text: String) throws -> [String: Any] {

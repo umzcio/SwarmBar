@@ -85,9 +85,9 @@ struct SwarmBarApp: App {
             // Every mirror from the previous run is meaningless now: each
             // was filled from a helper stream that ended with that run, so
             // its files would only be reset by the first snapshot anyway.
-            // Removing a directory that is not there creates nothing, so a
-            // user with no hosts still never gets one.
-            try? FileManager.default.removeItem(at: RemoteMirror.hostsRoot)
+            // Moved aside at once and deleted in the background; with no
+            // mirror there, nothing is created.
+            RemoteMirror.discard()
             Task { await ClaudeCodeMonitor().start(into: store) }
             Task { await CodexMonitor().start(into: store) }
             Task { await KimiMonitor().start(into: store) }

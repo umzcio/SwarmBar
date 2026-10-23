@@ -301,8 +301,9 @@ struct WizardSetupStep: View {
         } else {
             switch model.path[alias] ?? .swarmBar {
             case .swarmBar:
+                // No Return default here: the step before has one too, so
+                // two presses of Return would write to a host.
                 Button("Make these changes") { Task { await model.makeChanges() } }
-                    .keyboardShortcut(.defaultAction)
                     .disabled(!model.canLetSwarmBarDoIt(alias) || model.isBusy)
             case .paste:
                 Button("I've pasted it, check now") { Task { await model.confirmPastedOrRan() } }

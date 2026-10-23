@@ -49,6 +49,38 @@ struct RemoteMirrorTests {
 
     // MARK: Chunks
 
+    @Test("the launch discard moves the mirrors aside at once and deletes them later")
+    func discardMovesAsideThenDeletes() async throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mirror-parent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("remote", isDirectory: true)
+        let deep = root.appendingPathComponent("host/home/u/.claude/projects/p", isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        for index in 0..<50 {
+            try Data("x".utf8).write(to: deep.appendingPathComponent("\(index).jsonl"))
+        }
+        // A copy an earlier launch moved aside and never finished deleting.
+        let leftover = parent.appendingPathComponent("remote.discarded-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+
+        let deletion = RemoteMirror.discard(root)
+        // Gone from its own name before the call returns, so the first poll
+        // never sees the old bytes.
+        #expect(!FileManager.default.fileExists(atPath: root.path))
+        await deletion?.value
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("the launch discard creates nothing when there is no mirror")
+    func discardWithoutAMirrorCreatesNothing() async throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mirror-parent-\(UUID().uuidString)", isDirectory: true)
+        let root = parent.appendingPathComponent("remote", isDirectory: true)
+        await RemoteMirror.discard(root)?.value
+        #expect(!FileManager.default.fileExists(atPath: parent.path))
+    }
+
     @Test("a chunk lands at its true offset in a sparse file, and tail(of:) reads its records")
     func chunkLandsAtTrueOffsetInSparseFile() throws {
         let mirror = makeMirror()
