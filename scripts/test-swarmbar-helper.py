@@ -702,5 +702,173 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(helper.home_dirs(), [os.path.expanduser("~")])
 
 
+PS_SAMPLE = (
+    "    1     0 root     ?        systemd         /sbin/init splash\n"
+    "  500     1 zach     pts/1    tmux: server    tmux new -s work\n"
+    "  610   500 zach     pts/2    bash            -bash\n"
+    "  700   610 zach     pts/2    claude          claude --resume abc --model x\n"
+    "  800     1 zach     ?        node            node /home/z/bearcode-cli/apps/kimi-code/dist/main.mjs --yolo\n"
+)
+
+
+def completed(argv, code, out):
+    import subprocess
+    return subprocess.CompletedProcess(argv, code, out.encode("utf-8"), b"")
+
+
+class FakeRunner(object):
+    """Stands in for helper.run_command so no test touches a real process."""
+
+    def __init__(self, ps=None, panes=None, capture="", lsof="", ps_code=0):
+        self.ps, self.panes, self.capture = ps, panes or {}, capture
+        self.lsof, self.ps_code = lsof, ps_code
+        self.calls = []
+
+    def __call__(self, argv, timeout=5):
+        self.calls.append(list(argv))
+        if argv[0] == "ps":
+            return completed(argv, self.ps_code, self.ps if self.ps is not None else PS_SAMPLE)
+        if argv[0] == "tmux":
+            socket = argv[2]
+            if "list-panes" in argv:
+                if socket not in self.panes:
+                    return completed(argv, 1, "")
+                return completed(argv, 0, self.panes[socket])
+            if "capture-pane" in argv:
+                return completed(argv, 0, self.capture)
+        if argv[0] == "lsof":
+            return completed(argv, 0, self.lsof)
+        return completed(argv, 1, "")
+
+
+class ProcessTableTests(unittest.TestCase):
+    def setUp(self):
+        patches = [
+            mock.patch.object(helper, "process_cwd", return_value="/work"),
+            mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_table(self, runner):
+        with mock.patch.object(helper, "run_command", runner):
+            warnings = []
+            return helper.agent_processes(warnings), warnings
+
+    def test_parse_ps_keeps_args_with_spaces(self):
+        rows = helper.parse_ps(PS_SAMPLE)
+        claude = [r for r in rows if r["pid"] == 700][0]
+        self.assertEqual(claude["args"], "claude --resume abc --model x")
+        self.assertEqual(claude["ppid"], 610)
+        self.assertEqual(claude["tty"], "pts/2")
+        self.assertEqual(claude["comm"], "claude")
+        self.assertEqual([r for r in rows if r["pid"] == 1][0]["tty"], "")
+
+    def test_parse_ps_takes_basename_of_a_path_comm(self):
+        rows = helper.parse_ps("  9  1 zach ttys001 /opt/bin/codex codex exec go\n")
+        self.assertEqual(rows[0]["comm"], "codex")
+        self.assertEqual(rows[0]["args"], "codex exec go")
+
+    def test_parse_ps_skips_malformed_lines(self):
+        self.assertEqual(helper.parse_ps("garbage\n  x 1 u t c a\n"), [])
+
+    def test_bearcode_found_by_args(self):
+        table, _ = self.run_table(FakeRunner())
+        pids = sorted(p["pid"] for p in table)
+        self.assertEqual(pids, [700, 800])
+        bear = [p for p in table if p["pid"] == 800][0]
+        self.assertEqual(bear["comm"], "node")
+        self.assertIn("bearcode-cli/apps/kimi-code/dist/main.mjs", bear["args"])
+
+    def test_pane_found_through_ancestry(self):
+        runner = FakeRunner(panes={"/tmp/tmux-1000/default": "%3 500\n%4 999\n"})
+        table, _ = self.run_table(runner)
+        claude = [p for p in table if p["pid"] == 700][0]
+        self.assertEqual(claude["pane"], {"socket": "/tmp/tmux-1000/default", "id": "%3"})
+        self.assertIsNone([p for p in table if p["pid"] == 800][0]["pane"])
+
+    def test_bare_tty_agent_has_no_pane(self):
+        runner = FakeRunner(panes={"/tmp/tmux-1000/default": "%4 999\n"})
+        table, _ = self.run_table(runner)
+        self.assertTrue(all(p["pane"] is None for p in table))
+
+    def test_missing_tmux_means_null_panes_not_failure(self):
+        fake = FakeRunner()
+
+        def runner(argv, timeout=5):
+            if argv[0] == "tmux":
+                raise OSError("no tmux")
+            return fake(argv, timeout)
+        table, _ = self.run_table(runner)
+        self.assertIsNotNone(table)
+        self.assertTrue(all(p["pane"] is None for p in table))
+
+    def test_failing_socket_is_skipped_others_still_work(self):
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=["/tmp/tmux-0/default", "/tmp/tmux-1000/default"]):
+            runner = FakeRunner(panes={"/tmp/tmux-1000/default": "%3 500\n"})
+            table, _ = self.run_table(runner)
+        claude = [p for p in table if p["pid"] == 700][0]
+        self.assertEqual(claude["pane"]["id"], "%3")
+
+    def test_ancestry_walk_is_bounded(self):
+        parents = {1: 2, 2: 3, 3: 1}
+        self.assertIsNone(helper.pane_for(1, parents, {99: {"socket": "s", "id": "%1"}}))
+        chain = dict((n, n + 1) for n in range(1, 100))
+        self.assertIsNone(helper.pane_for(1, chain, {40: {"socket": "s", "id": "%1"}}))
+        self.assertEqual(helper.pane_for(1, chain, {20: {"socket": "s", "id": "%1"}})["id"], "%1")
+
+    def test_ps_failure_sets_processes_failed(self):
+        table, warnings = self.run_table(FakeRunner(ps_code=1))
+        self.assertIsNone(table)
+        self.assertTrue(warnings)
+        with mock.patch.object(helper, "run_command", FakeRunner(ps_code=1)), \
+                mock.patch.object(helper, "manifest", return_value=([], [], [], {})), \
+                mock.patch.object(helper, "home_entries", return_value=[]):
+            snap = helper.snapshot()
+        self.assertTrue(snap["processes_failed"])
+        self.assertEqual(snap["processes"], [])
+
+    def test_ps_oserror_returns_none(self):
+        def boom(argv, timeout=5):
+            raise OSError("no ps")
+        with mock.patch.object(helper, "run_command", boom):
+            self.assertIsNone(helper.agent_processes([]))
+
+    def test_held_files_only_for_codex_and_agy(self):
+        ps = ("  10  1 z ttys001 codex codex\n  11  1 z ttys002 agy agy\n"
+              "  12  1 z ttys003 claude claude\n")
+        lsof = "p10\nn/h/.codex/sessions/2026/a.jsonl\nn/etc/hosts\nn/h/presence/x.lock\n"
+        with mock.patch.object(helper.platform, "system", return_value="Darwin"):
+            table, _ = self.run_table(FakeRunner(ps=ps, lsof=lsof))
+        by = dict((p["comm"], p) for p in table)
+        self.assertEqual(by["codex"]["open"], ["/h/.codex/sessions/2026/a.jsonl"])
+        self.assertEqual(by["agy"]["open"], ["/h/presence/x.lock"])
+        self.assertEqual(by["claude"]["open"], [])
+
+    def test_held_files_read_proc_on_linux(self):
+        ps = "  10  1 z pts/1 codex codex\n"
+        links = ["/h/.codex/sessions/r.jsonl", "/dev/null", "/h/.codex/other.jsonl"]
+        with mock.patch.object(helper.platform, "system", return_value="Linux"), \
+                mock.patch.object(helper, "proc_fd_links", return_value=links):
+            table, _ = self.run_table(FakeRunner(ps=ps))
+        self.assertEqual(table[0]["open"], ["/h/.codex/sessions/r.jsonl"])
+
+    def test_screen_only_for_agy_with_a_pane_and_last_60_lines(self):
+        ps = ("  10  1 z pts/1 agy agy\n  11  1 z pts/2 claude claude\n"
+              "  500 1 z pts/3 tmux tmux\n  20 500 z pts/4 agy agy\n")
+        capture = "\n".join("line%d" % n for n in range(100)) + "\n"
+        runner = FakeRunner(ps=ps, panes={"/tmp/tmux-1000/default": "%7 500\n"}, capture=capture)
+        with mock.patch.object(helper.platform, "system", return_value="Darwin"):
+            table, _ = self.run_table(runner)
+        by = dict((p["pid"], p) for p in table)
+        self.assertIsNone(by[10]["screen"])
+        self.assertIsNone(by[11]["screen"])
+        lines = by[20]["screen"].splitlines()
+        self.assertEqual(len(lines), 60)
+        self.assertEqual(lines[-1], "line99")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

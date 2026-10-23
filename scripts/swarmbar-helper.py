@@ -704,6 +704,18 @@ def home_entries(warnings):
     return entries
 
 
+def run_command(argv, timeout=5):
+    """The one place the helper starts a subprocess (ps, tmux, lsof).
+
+    Tests replace this so no unit test ever inspects a real process. It
+    raises OSError or SubprocessError like subprocess.run, and callers decide
+    whether a failure matters.
+    """
+    return subprocess.run(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+    )
+
+
 def process_cwd(pid):
     """Portable enough for both fleets. /proc is Linux only."""
     if platform.system() != "Darwin":
@@ -712,9 +724,8 @@ def process_cwd(pid):
         except OSError:
             return ""
     try:
-        out = subprocess.run(
+        out = run_command(
             ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
         ).stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -724,15 +735,171 @@ def process_cwd(pid):
     return ""
 
 
-AGENT_COMMANDS = ("claude", "codex", "kimi", "kimi-code", "opencode", "grok", "agy")
+AGENT_COMMANDS = ("claude", "codex", "kimi", "kimi-code", "opencode", "grok", "agy",
+                  "bearcode")
+# BearCode runs as a bare node process, so its comm says nothing. Its command
+# line is the only thing that identifies it.
+BEARCODE_ARGS = "bearcode-cli/apps/kimi-code/dist/main.mjs"
+ANCESTRY_LIMIT = 32
+SCREEN_LINES = 60
+
+
+def parse_ps(text):
+    """Rows of `ps -axo pid=,ppid=,user=,tty=,comm=,args=`, args kept whole.
+
+    The first five fields never contain whitespace except that comm might
+    (a Linux kernel thread name, say), so this splits on the first five runs
+    and treats everything after as args. A comm with a space therefore bleeds
+    its tail into args; no agent's comm has one. comm may be a full path on
+    Darwin, so only its basename is kept. A tty of ? or ?? means none.
+    """
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        tty = parts[3]
+        rows.append({
+            "pid": pid, "ppid": ppid, "user": parts[2],
+            "tty": "" if tty in ("?", "??", "-") else tty,
+            "comm": parts[4].split("/")[-1],
+            "args": parts[5].strip() if len(parts) > 5 else "",
+        })
+    return rows
+
+
+def is_agent(row):
+    return row["comm"] in AGENT_COMMANDS or BEARCODE_ARGS in row["args"]
+
+
+def tmux_sockets():
+    """Every tmux server socket this user can name, root's view included."""
+    roots = ["/tmp"]
+    custom = os.environ.get("TMUX_TMPDIR")
+    if custom:
+        roots.append(custom)
+    found = []
+    for root in roots:
+        try:
+            directories = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in directories:
+            if not name.startswith("tmux-"):
+                continue
+            directory = os.path.join(root, name)
+            try:
+                for entry in sorted(os.listdir(directory)):
+                    path = os.path.join(directory, entry)
+                    if path not in found:
+                        found.append(path)
+            except OSError:
+                continue
+    return found
+
+
+def tmux_panes():
+    """pane shell pid -> {"socket", "id"} across every reachable server.
+
+    tmux missing, a dead socket and another user's server (unreadable unless
+    root) all just contribute nothing. Panes being null is a normal state,
+    never processes_failed.
+    """
+    panes = {}
+    for socket in tmux_sockets():
+        try:
+            done = run_command(
+                ["tmux", "-S", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode != 0:
+            continue
+        for line in done.stdout.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            try:
+                panes[int(fields[1])] = {"socket": socket, "id": fields[0]}
+            except ValueError:
+                continue
+    return panes
+
+
+def pane_for(pid, parents, panes):
+    """The pane an agent lives in, found by walking up its parents.
+
+    Bounded so a ppid cycle (or a pathological chain) terminates.
+    """
+    current = pid
+    for _ in range(ANCESTRY_LIMIT):
+        if current in panes:
+            return panes[current]
+        current = parents.get(current)
+        if current is None:
+            return None
+    return None
+
+
+def proc_fd_links(pid):
+    links = []
+    base = "/proc/%d/fd" % pid
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return links
+    for name in names:
+        try:
+            links.append(os.readlink(os.path.join(base, name)))
+        except OSError:
+            continue
+    return links
+
+
+def held_files(comm, pid):
+    """Files a codex or agy process holds open, which name its session."""
+    if comm == "codex":
+        def wanted(path):
+            return path.endswith(".jsonl") and "/.codex/sessions/" in path
+    elif comm == "agy":
+        def wanted(path):
+            return path.endswith(".lock") and "/presence/" in path
+    else:
+        return []
+    if platform.system() == "Darwin":
+        try:
+            out = run_command(["lsof", "-n", "-P", "-a", "-p", str(pid), "-Fn"])
+        except (OSError, subprocess.SubprocessError):
+            return []
+        text = out.stdout.decode("utf-8", "replace")
+        links = [line[1:] for line in text.splitlines() if line.startswith("n")]
+    else:
+        links = proc_fd_links(pid)
+    return [path for path in links if wanted(path)]
+
+
+def pane_screen(pane):
+    try:
+        done = run_command(
+            ["tmux", "-S", pane["socket"], "capture-pane", "-p", "-t", pane["id"]],
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    lines = done.stdout.decode("utf-8", "replace").splitlines()
+    return "\n".join(lines[-SCREEN_LINES:])
 
 
 def agent_processes(warnings):
     """Live agent processes. `ps -axo` is portable; GNU long flags are not."""
     try:
-        completed = subprocess.run(
-            ["ps", "-axo", "pid=,user=,comm="],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+        completed = run_command(
+            ["ps", "-axo", "pid=,ppid=,user=,tty=,comm=,args="], timeout=15,
         )
     except (OSError, subprocess.SubprocessError) as error:
         warnings.append("ps failed: %s" % error)
@@ -744,22 +911,22 @@ def agent_processes(warnings):
         ))
         return None
 
+    rows = parse_ps(completed.stdout.decode("utf-8", "replace"))
+    agents = [row for row in rows if is_agent(row)]
+    panes = tmux_panes() if agents else {}
+    parents = dict((row["pid"], row["ppid"]) for row in rows)
     processes = []
-    for line in completed.stdout.decode("utf-8", "replace").splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid_text, user, comm = parts
-        comm = comm.strip().split("/")[-1]
-        if comm not in AGENT_COMMANDS:
-            continue
-        try:
-            pid = int(pid_text)
-        except ValueError:
-            continue
-        processes.append({
-            "pid": pid, "user": user, "comm": comm, "cwd": process_cwd(pid),
+    for row in agents:
+        pid = row["pid"]
+        pane = pane_for(pid, parents, panes)
+        entry = dict(row)
+        entry.update({
+            "cwd": process_cwd(pid),
+            "pane": pane,
+            "open": held_files(row["comm"], pid),
+            "screen": pane_screen(pane) if pane and row["comm"] == "agy" else None,
         })
+        processes.append(entry)
     return processes
 
 
