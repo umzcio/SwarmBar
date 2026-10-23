@@ -78,6 +78,12 @@ struct SwarmBarApp: App {
             remoteSupervisor = nil
             Task { await MockSessionMonitor().start(into: store) }
         } else {
+            // Every mirror from the previous run is meaningless now: each
+            // was filled from a helper stream that ended with that run, so
+            // its files would only be reset by the first snapshot anyway.
+            // Removing a directory that is not there creates nothing, so a
+            // user with no hosts still never gets one.
+            try? FileManager.default.removeItem(at: RemoteMirror.hostsRoot)
             Task { await ClaudeCodeMonitor().start(into: store) }
             Task { await CodexMonitor().start(into: store) }
             Task { await KimiMonitor().start(into: store) }
@@ -86,9 +92,7 @@ struct SwarmBarApp: App {
             Task { await GrokBuildMonitor().start(into: store) }
             Task { await AntigravityMonitor().start(into: store) }
             let registry = RemoteHostRegistry(defaults: .standard)
-            let supervisor = RemoteMonitorSupervisor(store: store, registry: registry) {
-                RemoteHostMonitor(host: $0)
-            }
+            let supervisor = RemoteMonitorSupervisor(store: store, registry: registry)
             registry.onChange = { [supervisor] in supervisor.reconcile() }
             supervisor.reconcile()
             remoteRegistry = registry

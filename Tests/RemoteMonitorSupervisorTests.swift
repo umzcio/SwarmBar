@@ -42,7 +42,7 @@ struct RemoteMonitorSupervisorTests {
             self.factoryCalls = counter
             supervisor = RemoteMonitorSupervisor(store: store, registry: registry) { host in
                 counter.count += 1
-                return FakeMonitor(id: host.id, log: log)
+                return (FakeMonitor(id: host.id, log: log), nil)
             }
         }
     }

@@ -6,20 +6,56 @@ import Foundation
 /// monitor is cancelled and will never sync again to delete them itself.
 @MainActor
 final class RemoteMonitorSupervisor {
-    typealias Factory = @MainActor (RemoteHost) -> any SessionMonitor
+    /// Builds a host's monitor and, for a real host, the connection it polls
+    /// through. Tests that only watch the supervisor's bookkeeping return a
+    /// nil connection.
+    typealias Factory = @MainActor (RemoteHost) -> (monitor: any SessionMonitor, connection: RemoteHostConnection?)
+
+    private struct Running {
+        let host: RemoteHost
+        let task: Task<Void, Never>
+        let connection: RemoteHostConnection?
+    }
 
     private let store: SessionStore
     private let registry: RemoteHostRegistry
     private let factory: Factory
-    private var running: [UUID: (host: RemoteHost, task: Task<Void, Never>)] = [:]
+    private var running: [UUID: Running] = [:]
+    /// A stopped monitor until it has actually finished, and its mirror is
+    /// deleted where that was asked for. Cancel is only a request: a poll in
+    /// flight can still be writing the mirror, so a monitor started again
+    /// for the same host waits on this rather than sharing the directory
+    /// with its predecessor, and a deletion never races a write.
+    private var stopping: [UUID: Task<Void, Never>] = [:]
 
-    init(store: SessionStore, registry: RemoteHostRegistry, factory: @escaping Factory) {
+    init(store: SessionStore, registry: RemoteHostRegistry, factory: @escaping Factory = defaultFactory) {
         self.store = store
         self.registry = registry
         self.factory = factory
     }
 
+    /// One ssh helper per host, and a mirror in Caches keyed by the host's
+    /// id, which outlives renames and alias changes.
+    static let defaultFactory: Factory = { host in
+        let connection = RemoteHostConnection(
+            host: host,
+            channel: SSHChannel(launch: .ssh(alias: host.alias, watchAs: host.watchAs)),
+            mirror: RemoteMirror(root: RemoteMirror.root(forHost: host.id)))
+        return (RemoteHostMonitor(connection: connection), connection)
+    }
+
     var runningHostIDs: Set<UUID> { Set(running.keys) }
+
+    /// The connection a running host polls through, for answering and
+    /// relaying over the same helper.
+    func connection(forHostID id: UUID) -> RemoteHostConnection? {
+        running[id]?.connection
+    }
+
+    /// Rows carry their host's display name, which is unique among hosts.
+    func connection(forHostName name: String) -> RemoteHostConnection? {
+        running.values.first { $0.host.displayName == name }?.connection
+    }
 
     func reconcile() {
         let wanted = Dictionary(uniqueKeysWithValues: registry.hosts.map { ($0.id, $0) })
@@ -33,24 +69,48 @@ final class RemoteMonitorSupervisor {
                     || current.watchAs != entry.host.watchAs
                     || current.displayName != entry.host.displayName
                 guard changed else { continue }
-                entry.task.cancel()
-                running.removeValue(forKey: id)
-                store.clearHost(entry.host.displayName)
+                // The mirror is kept: the new monitor's first snapshot comes
+                // from a new helper stream, which resets it anyway.
+                stop(id, deletingMirror: false)
             } else {
-                entry.task.cancel()
-                running.removeValue(forKey: id)
                 // Disabled or removed, the stopped monitor's rows can no
                 // longer be trusted, and clearing now also keeps a later
-                // removal from finding nothing left to clear.
-                store.clearHost(entry.host.displayName)
+                // removal from finding nothing left to clear. The mirror
+                // goes too: it can hold other users' transcripts, and
+                // nothing will read it again before a fresh stream would
+                // reset it.
+                stop(id, deletingMirror: true)
             }
         }
+        // Hosts gone from the registry never start again, so nothing will
+        // wait on their stopping tasks. Dropping the reference does not
+        // cancel the task; the deletion still runs.
+        stopping = stopping.filter { wanted[$0.key] != nil }
 
         for host in registry.hosts where host.isEnabled && running[host.id] == nil {
-            let monitor = factory(host)
+            let (monitor, connection) = factory(host)
             let store = store
-            let task = Task { await monitor.start(into: store) }
-            running[host.id] = (host, task)
+            let previous = stopping.removeValue(forKey: host.id)
+            let task = Task {
+                await previous?.value
+                await monitor.start(into: store)
+            }
+            running[host.id] = Running(host: host, task: task, connection: connection)
+        }
+    }
+
+    private func stop(_ id: UUID, deletingMirror: Bool) {
+        guard let entry = running.removeValue(forKey: id) else { return }
+        entry.task.cancel()
+        store.clearHost(entry.host.displayName)
+        let mirrorRoot = deletingMirror ? entry.connection?.mirror.root : nil
+        let previous = stopping[id]
+        stopping[id] = Task {
+            await previous?.value
+            await entry.task.value
+            guard let mirrorRoot else { return }
+            // Off the main actor: a mirror can hold thousands of files.
+            await Task.detached { try? FileManager.default.removeItem(at: mirrorRoot) }.value
         }
     }
 }

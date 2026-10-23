@@ -90,7 +90,9 @@ final class StderrTail: Sendable {
 /// routes them: a line with an id resumes the request waiting on it, and a
 /// line with an event and no id goes to `events`.
 actor SSHChannel {
-    private let launch: HelperLaunch
+    /// Readable from outside so the installer can tell a local helper,
+    /// which is never pushed over ssh, from a remote one.
+    nonisolated let launch: HelperLaunch
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?

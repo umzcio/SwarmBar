@@ -46,11 +46,17 @@ struct RemoteMirror: Sendable {
     /// directory appears on the first `apply`, so a user with no hosts
     /// configured never gets one.
     static func root(forHost id: UUID) -> URL {
+        hostsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    /// The directory every host's mirror lives under. Discarded whole at
+    /// launch: a mirror only means anything to the helper stream that
+    /// filled it, and that stream ended with the previous run.
+    static var hostsRoot: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return caches
             .appendingPathComponent("app.swarmbar.SwarmBar", isDirectory: true)
             .appendingPathComponent("remote", isDirectory: true)
-            .appendingPathComponent(id.uuidString, isDirectory: true)
     }
 
     /// The mirror path for a remote absolute path, or nil for anything that
