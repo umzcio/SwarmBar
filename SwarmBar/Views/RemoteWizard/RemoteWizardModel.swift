@@ -5,17 +5,41 @@ import Observation
 /// and why the probe failed when it did. Exactly what ProbeRunner returns.
 typealias HostAssessmentInput = ProbeRunner.Outcome
 
+/// What ssh config offered the wizard. A config that is not there gives an
+/// empty list with no problems; one that is there but could not be read
+/// says so, because "found nothing" and "could not look" must never render
+/// the same.
+struct HostCandidateList: Equatable, Sendable {
+    var aliases: [String] = []
+    /// Aliases left out because they name a git forge or log in as `git`.
+    var skippedGitHosts: [String] = []
+    /// One sentence per file that is there but could not be read: the
+    /// config itself, or a file it includes.
+    var readProblems: [String] = []
+}
+
+/// The wizard's own failures, in words the row can show.
+enum RemoteWizardError: LocalizedError, Equatable {
+    case bridgesMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .bridgesMissing: "SwarmBar's bridge scripts are missing from the app."
+        }
+    }
+}
+
 /// Everything the wizard does that leaves this process: reading ssh config,
 /// probing hosts, planning against the bundled bridges, and making changes
 /// over ssh. A protocol so the model's tests run on fakes and never start
 /// ssh.
 @MainActor
 protocol RemoteWizardServices: AnyObject {
-    /// The aliases worth offering, from ~/.ssh/config, git forges dropped.
-    func candidates() async -> [String]
+    func candidates() async -> HostCandidateList
     func probe(_ alias: String) async -> HostAssessmentInput
     /// Probes several hosts at once and yields each as it finishes, so
-    /// each row can stop its spinner on its own.
+    /// each row can stop its spinner on its own. Ending the stream early
+    /// stops the probes still running.
     func probeAll(_ aliases: [String]) -> AsyncStream<(String, HostAssessmentInput)>
     /// `loginEUID` and `loginUser` always come from the login user's own
     /// probe, since `probe` may be root's view, which says nothing about
@@ -41,6 +65,10 @@ protocol RemoteWizardServices: AnyObject {
 /// Nothing touches the network until `lookForHosts`, `addHost`,
 /// `startSetUp` or `startUndo` is called: the wizard never opens by itself,
 /// and opening it must not reach out to anything either.
+///
+/// One thing happens at a time. While a probe runs (`isProbing`) or changes
+/// are being made (`isWorking`), every action is ignored, so a plan is never
+/// built from a look that is about to be replaced.
 @MainActor @Observable
 final class RemoteWizardModel {
     enum Step: Equatable {
@@ -70,7 +98,8 @@ final class RemoteWizardModel {
     }
 
     static let unusableAlias = "This host name can't be used."
-    static let planFailed = "SwarmBar couldn't work out the changes for this host."
+    /// A row whose probe was stopped before it answered.
+    static let notChecked = "Not checked"
 
     static func noHomeMessage(user: String) -> String {
         "Couldn't find a home folder for \(user) on this host."
@@ -81,13 +110,18 @@ final class RemoteWizardModel {
     private(set) var mode: Mode = .setUp
     /// Per alias. Starts from each host's suggestion, and stays empty for a
     /// host where the user has to pick. A change reassesses the host from
-    /// the probe already taken, and updates the registry once the host is
-    /// registered.
+    /// the probe already taken, updates the registry once the host is
+    /// registered, and replans it in step 3. Ignored while changes are
+    /// being made, since the plan being applied was made for the old pick.
     var watchAs: [String: WatchAs] = [:] {
         didSet {
             guard !seeding else { return }
+            if isWorking {
+                seed { watchAs = oldValue }
+                return
+            }
             for alias in Set(oldValue.keys).union(watchAs.keys) where oldValue[alias] != watchAs[alias] {
-                watchAsChanged(alias)
+                watchAsChanged(alias, byUser: true)
             }
         }
     }
@@ -101,9 +135,17 @@ final class RemoteWizardModel {
     /// that turns Ready on the way does not shift the count.
     private(set) var setupAliases: [String] = []
     private(set) var plans: [String: SetupPlan] = [:]
+    /// For the pick screen's "Skipped: github.com, bitbucket.org (git hosts)."
+    private(set) var skippedGitHosts: [String] = []
+    /// ssh config files that are there but could not be read.
+    private(set) var configProblems: [String] = []
     /// True while changes are being made or a host is being checked again
-    /// from step 3, when the step actions are ignored.
+    /// from step 3.
     private(set) var isWorking = false
+    /// True while hosts are being looked for or checked again.
+    private(set) var isProbing = false
+    /// Root's view being taken in the background after a pick.
+    private var rootChecks: [UUID: Task<Void, Never>] = [:]
 
     @ObservationIgnored private let services: any RemoteWizardServices
     @ObservationIgnored private let registry: RemoteHostRegistry
@@ -113,53 +155,78 @@ final class RemoteWizardModel {
     /// The path last chosen for a host by default, so a replan may change
     /// a default but never a path the user picked.
     @ObservationIgnored private var defaultPaths: [String: SetupPath] = [:]
-    /// Set while the model fills in suggestions itself, which are not a
-    /// pick and need no reaction.
+    /// The command and the prompt for each host's current plan, built once
+    /// per plan rather than on every read.
+    @ObservationIgnored private var artifacts: [String: Artifacts] = [:]
+    /// Set while the model writes `watchAs` itself, which is not a pick.
     @ObservationIgnored private var seeding = false
-    @ObservationIgnored private var checks: [Task<Void, Never>] = []
+    @ObservationIgnored private var probeTask: Task<Void, Never>?
+    /// Bumped by every fresh start, so work left over from an earlier run
+    /// never lands in this one.
+    @ObservationIgnored private var generation = 0
+    /// Opened at step 3 from Settings, where there is no pick to go back to.
+    @ObservationIgnored private var openedAtSetup = false
+
+    private struct Artifacts {
+        var command: Result<String, SetupCommand.Unavailable>
+        var prompt: SetupCommand.Prompt
+    }
 
     init(services: any RemoteWizardServices, registry: RemoteHostRegistry) {
         self.services = services
         self.registry = registry
     }
 
+    /// Something is in flight, so actions wait.
+    var isBusy: Bool { isWorking || isProbing || !rootChecks.isEmpty }
+
+    var skippedLine: String? {
+        skippedGitHosts.isEmpty ? nil : "Skipped: \(skippedGitHosts.joined(separator: ", ")) (git hosts)."
+    }
+
     // MARK: Steps 1 and 2
 
     /// Reads ssh config, probes every candidate, and lands on the pick.
     func lookForHosts() async {
-        guard !isWorking else { return }
+        guard !isBusy else { return }
         reset()
         step = .checking
-        let aliases = await services.candidates()
-        rows = aliases.map {
-            Row(id: $0, displayName: RemoteHost.defaultDisplayName(for: $0), assessment: nil,
-                isChecked: false, isChecking: true)
+        await probing { [self] in
+            let found = await services.candidates()
+            guard !Task.isCancelled else { return }
+            skippedGitHosts = found.skippedGitHosts
+            configProblems = found.readProblems
+            rows = found.aliases.map {
+                Row(id: $0, displayName: RemoteHost.defaultDisplayName(for: $0), assessment: nil,
+                    isChecked: false, isChecking: true)
+            }
+            await probe(found.aliases, setDefaultCheck: Set(found.aliases))
         }
-        await probe(aliases, setDefaultCheck: Set(aliases))
+        if step == .checking { step = .pick }
         collapseRows()
-        step = .pick
     }
 
     /// "Add a host by name". A name ssh could read as an option is never
     /// probed.
     func addHost(alias: String) async {
+        guard step == .pick, !isBusy else { return }
         let alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !alias.isEmpty, !rows.contains(where: { $0.id == alias }) else { return }
         let safe = SSHConfigParser.isSafeAlias(alias)
         rows.append(Row(id: alias, displayName: RemoteHost.defaultDisplayName(for: alias), assessment: nil,
                         isChecked: false, isChecking: safe, problem: safe ? nil : Self.unusableAlias))
         guard safe else { return }
-        await probe([alias], setDefaultCheck: [alias])
+        await probing { [self] in await probe([alias], setDefaultCheck: [alias]) }
         collapseRows()
     }
 
     /// Probes every row again. The user's ticks stay, except that a host
     /// which could not be checked before gets the default tick now.
     func checkAgain() async {
-        guard !isWorking else { return }
+        guard step == .pick, !isBusy else { return }
         let aliases = rows.filter { $0.problem != Self.unusableAlias }.map(\.id)
         let uncheckable = Set(rows.filter { !Self.canCheck($0) }.map(\.id))
-        await probe(aliases, setDefaultCheck: uncheckable)
+        await probing { [self] in await probe(aliases, setDefaultCheck: uncheckable) }
         collapseRows()
     }
 
@@ -185,9 +252,12 @@ final class RemoteWizardModel {
     }
 
     /// Registers every checked host with its watch-as, so its sessions show
-    /// at once, then opens step 3 on the first host that needs it.
+    /// at once, then opens step 3 on the first host that needs it. A root
+    /// view still being taken for a pick is dropped: the pick stands, and
+    /// step 3 checks the host again before it is called done.
     func continueFromPick() async {
-        guard step == .pick, !isWorking else { return }
+        guard step == .pick, !isWorking, !isProbing else { return }
+        cancelRootChecks()
         mode = .setUp
         var queue: [String] = []
         for row in rows where row.isChecked && Self.canCheck(row) {
@@ -207,6 +277,33 @@ final class RemoteWizardModel {
         }
     }
 
+    /// Back from the pick to the intro, stopping any probe, or from step 3
+    /// to the pick while nothing is being applied. Hosts already registered
+    /// stay registered. Opened from Settings there is no pick to return to,
+    /// so the view closes the window instead.
+    func back() {
+        switch step {
+        case .checking, .pick:
+            guard !openedAtSetup, !isWorking else { return }
+            stopProbing()
+            step = .intro
+        case .setup, .applying:
+            guard !openedAtSetup, !isWorking else { return }
+            cancelRootChecks()
+            progress = [:]
+            setupAliases = []
+            step = .pick
+        case .intro, .done:
+            break
+        }
+    }
+
+    /// The window closed: stop every probe. Changes already being made run
+    /// to their end, since each one is guarded on the host by its own hash.
+    func cancel() {
+        stopProbing()
+    }
+
     // MARK: Entry points from Settings
 
     /// "Set up again": step 3 for one registered host, after probing it.
@@ -221,9 +318,11 @@ final class RemoteWizardModel {
     }
 
     private func start(_ alias: String, mode: Mode) async {
-        guard !isWorking else { return }
+        guard !isBusy else { return }
         reset()
+        let run = generation
         self.mode = mode
+        openedAtSetup = true
         let host = registry.hosts.first { $0.alias == alias }
         let safe = SSHConfigParser.isSafeAlias(alias)
         rows = [Row(id: alias, displayName: host?.displayName ?? RemoteHost.defaultDisplayName(for: alias),
@@ -235,8 +334,13 @@ final class RemoteWizardModel {
         setupAliases = [alias]
         if safe {
             step = .checking
-            record(alias, await services.probe(alias), setDefaultCheck: false)
+            await probing { [self] in
+                let outcome = await services.probe(alias)
+                guard !Task.isCancelled else { return }
+                record(alias, outcome, setDefaultCheck: false)
+            }
         }
+        guard generation == run else { return }
         step = .setup(hostIndex: 0)
         prepare(alias)
     }
@@ -297,28 +401,24 @@ final class RemoteWizardModel {
 
     /// The setup command, or why there is none. nil before there is a plan.
     func command(for alias: String) -> Result<String, SetupCommand.Unavailable>? {
-        guard let plan = plans[alias] else { return nil }
-        guard let sha = services.helperSHA256 else { return .failure(.couldNotEncode) }
-        return SetupCommand.command(plan: plan, system: plan.system, version: services.helperVersion,
-                                    helperSHA256: sha)
+        artifacts[alias]?.command
     }
 
     func prompt(for alias: String) -> SetupCommand.Prompt? {
-        guard let plan = plans[alias] else { return nil }
-        let name = rows.first { $0.id == alias }?.displayName ?? alias
-        return SetupCommand.prompt(plan: plan, hostName: name)
+        artifacts[alias]?.prompt
     }
 
     /// Changes the paste prompt leaves out, to be made another way.
     func pasteOmissions(for alias: String) -> [String] {
-        guard let plan = plans[alias], let prompt = prompt(for: alias) else { return [] }
+        guard let plan = plans[alias], let prompt = artifacts[alias]?.prompt else { return [] }
         return prompt.omitted.map { plan.changes[$0].description }
     }
 
     /// "Make these changes": applies the current host's plan, checks the
-    /// host again, and moves on only if it is really done.
+    /// host again, and moves on only if it is really done. Never while a
+    /// root view is still being taken, since the plan is about to change.
     func makeChanges() async {
-        guard !isWorking, let index = currentIndex, let alias = currentAlias, let plan = plans[alias],
+        guard !isBusy, let index = currentIndex, let alias = currentAlias, let plan = plans[alias],
               canLetSwarmBarDoIt(alias)
         else { return }
         isWorking = true
@@ -337,7 +437,7 @@ final class RemoteWizardModel {
     /// how a narrow-rule host's other homes come into the plan once the
     /// rule is in place.
     func confirmPastedOrRan() async {
-        guard !isWorking, let index = currentIndex, let alias = currentAlias else { return }
+        guard !isBusy, let index = currentIndex, let alias = currentAlias else { return }
         isWorking = true
         defer { isWorking = false }
         await recheck(alias, index: index)
@@ -350,29 +450,86 @@ final class RemoteWizardModel {
         advance(from: index)
     }
 
-    /// Waits for any check a pick started. The view never needs it; tests
-    /// and callers that must see the result do.
+    /// Waits for any root view a pick started taking. The view never needs
+    /// it; tests and callers that must see the result do.
     func waitForChecks() async {
-        let running = checks
-        checks = []
-        for check in running { await check.value }
+        for check in Array(rootChecks.values) { await check.value }
+    }
+
+    // MARK: Probing
+
+    /// Runs a probe in a task the model owns, so `back` and `cancel` can
+    /// stop it, and so the caller's own cancellation stops it too. Rows the
+    /// probe never reached say so rather than spin.
+    private func probing(_ body: @escaping @MainActor () async -> Void) async {
+        isProbing = true
+        let run = generation
+        let task = Task { @MainActor in await body() }
+        probeTask = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard generation == run, probeTask == task else { return }
+        probeTask = nil
+        isProbing = false
+        markUnprobed()
+    }
+
+    private func stopProbing() {
+        probeTask?.cancel()
+        probeTask = nil
+        isProbing = false
+        cancelRootChecks()
+        markUnprobed()
+    }
+
+    private func cancelRootChecks() {
+        for check in rootChecks.values { check.cancel() }
+        rootChecks = [:]
+        markUnprobed()
+    }
+
+    private func markUnprobed() {
+        guard !isProbing, rootChecks.isEmpty else { return }
+        for index in rows.indices where rows[index].isChecking {
+            rows[index].isChecking = false
+            // A host that answered before keeps that answer, which is the
+            // last thing known about it.
+            if rows[index].assessment == nil && rows[index].problem == nil {
+                rows[index].problem = Self.notChecked
+            }
+        }
+    }
+
+    private func probe(_ aliases: [String], setDefaultCheck: Set<String>) async {
+        guard !aliases.isEmpty else { return }
+        for alias in aliases { setRow(alias) { $0.isChecking = true } }
+        for await (alias, outcome) in services.probeAll(aliases) {
+            if Task.isCancelled { break }
+            record(alias, outcome, setDefaultCheck: setDefaultCheck.contains(alias))
+        }
     }
 
     // MARK: Internals
 
     private func reset() {
-        for check in checks { check.cancel() }
-        checks = []
+        generation += 1
+        stopProbing()
         seed { watchAs = [:] }
         rows = []
         inputs = [:]
-        plans = [:]
+        setPlans([:])
         path = [:]
         defaultPaths = [:]
         progress = [:]
         setupAliases = []
         registered = []
+        skippedGitHosts = []
+        configProblems = []
         mode = .setUp
+        openedAtSetup = false
     }
 
     private func seed(_ body: () -> Void) {
@@ -381,7 +538,7 @@ final class RemoteWizardModel {
         seeding = false
     }
 
-    /// A cantConnect row can't be ticked, nor can one whose name is unusable.
+    /// A cantConnect row can't be ticked, nor can one with a problem.
     private static func canCheck(_ row: Row) -> Bool {
         guard row.problem == nil, let assessment = row.assessment else { return false }
         if case .cantConnect = assessment.status { return false }
@@ -393,28 +550,27 @@ final class RemoteWizardModel {
         change(&rows[index])
     }
 
-    private func probe(_ aliases: [String], setDefaultCheck: Set<String>) async {
-        guard !aliases.isEmpty else { return }
-        for alias in aliases { setRow(alias) { $0.isChecking = true } }
-        for await (alias, outcome) in services.probeAll(aliases) {
-            record(alias, outcome, setDefaultCheck: setDefaultCheck.contains(alias))
-        }
-    }
-
-    /// Stores a probe and assesses it. The suggestion fills in a host's
-    /// watch-as only when it has none yet, so a pick survives a re-check.
+    /// Stores a probe and assesses it. A suggestion fills in a host's
+    /// watch-as only when it has none yet, so a pick survives a re-check,
+    /// and it lands exactly as a pick would, short of a second probe.
     private func record(_ alias: String, _ outcome: HostAssessmentInput, setDefaultCheck: Bool) {
         inputs[alias] = outcome
-        if watchAs[alias] == nil {
-            let suggested = HostAssessment.assess(
-                user: outcome.user, root: outcome.root, failure: outcome.failure, watchAs: nil
-            ).suggestedWatchAs
-            if let suggested { seed { watchAs[alias] = suggested } }
-        }
-        reassess(alias)
         setRow(alias) { row in
             row.isChecking = false
-            if setDefaultCheck { row.isChecked = Self.canCheck(row) && Self.hasAgents(outcome) }
+            if row.problem == Self.notChecked { row.problem = nil }
+        }
+        let suggested = watchAs[alias] != nil ? nil : HostAssessment.assess(
+            user: outcome.user, root: outcome.root, failure: outcome.failure, watchAs: nil
+        ).suggestedWatchAs
+        if let suggested {
+            seed { watchAs[alias] = suggested }
+            watchAsChanged(alias, byUser: false)
+        } else {
+            reassess(alias)
+            if needsReplan(alias) { prepare(alias) }
+        }
+        if setDefaultCheck {
+            setRow(alias) { row in row.isChecked = Self.canCheck(row) && Self.hasAgents(outcome) }
         }
     }
 
@@ -433,9 +589,19 @@ final class RemoteWizardModel {
         }
     }
 
+    /// A host in step 3 is replanned whenever what it is judged on changes,
+    /// except while its plan is being applied: that run reports against the
+    /// plan it started with, and replans when it is done.
+    private func needsReplan(_ alias: String) -> Bool {
+        guard currentIndex != nil, setupAliases.contains(alias) else { return false }
+        return !(isWorking && currentAlias == alias)
+    }
+
     /// Same machine under two aliases (`devbox` and `devbox.ts`): one row,
-    /// the one that connected.
+    /// the one that connected. Only on the pick, so the host step 3 is on
+    /// can never lose its row.
     private func collapseRows() {
+        guard step == .checking || step == .pick else { return }
         rows = HostCandidates.collapse(
             rows, hostname: { inputs[$0.id]?.user?.hostname }, connected: { inputs[$0.id]?.user != nil })
     }
@@ -454,54 +620,78 @@ final class RemoteWizardModel {
         return true
     }
 
-    private func watchAsChanged(_ alias: String) {
+    private func watchAsChanged(_ alias: String, byUser: Bool) {
         reassess(alias)
         if registered.contains(alias) { register(alias) }
-        if currentAlias == alias { prepare(alias) }
-        // Root's view is only probed for when it could be had: sudo works,
-        // or root's helper is there for the narrow rule. Without either,
-        // asking again would only say the same thing.
-        guard watchAs[alias] == .everyUser, let input = inputs[alias], input.root == nil, let user = input.user,
-              user.sudoOK || user.helper.contains(where: { $0.path == HelperLaunch.rootHelperPath })
+        if needsReplan(alias) { prepare(alias) }
+        // Root's view is only probed for when the user picks every user
+        // and it could be had: sudo works, or root's helper is there for
+        // the narrow rule. Without either, asking again would only say the
+        // same thing, and a suggestion never probes twice.
+        guard byUser, watchAs[alias] == .everyUser, let input = inputs[alias], input.root == nil,
+              let user = input.user,
+              user.sudoOK || user.helper.contains(where: { $0.path == HelperLaunch.rootHelperPath }),
+              rows.first(where: { $0.id == alias })?.isChecking == false
         else { return }
         setRow(alias) { $0.isChecking = true }
-        checks.append(Task { [weak self] in
+        let id = UUID()
+        let run = generation
+        rootChecks[id] = Task { [weak self] in
             guard let self else { return }
             let outcome = await self.services.probe(alias)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self.generation == run, self.rootChecks[id] != nil else { return }
+            self.rootChecks[id] = nil
             self.record(alias, outcome, setDefaultCheck: false)
-            if self.currentAlias == alias { self.prepare(alias) }
-        })
+        }
     }
 
     /// Plans the host from the view it is watched with: root's for every
     /// user when there is one, the login user's otherwise, which the plan
     /// marks partial. No plan while the user still has to pick.
     private func prepare(_ alias: String) {
-        plans[alias] = nil
+        setPlan(nil, for: alias)
         if rows.first(where: { $0.id == alias })?.problem != Self.unusableAlias {
             setRow(alias) { $0.problem = nil }
         }
         guard let chosen = watchAs[alias], let input = inputs[alias], let user = input.user else { return }
         let probe = chosen == .everyUser ? (input.root ?? user) : user
         do {
-            plans[alias] = switch mode {
+            let plan: SetupPlan = switch mode {
             case .setUp:
                 try services.plan(probe: probe, watchAs: chosen, loginEUID: user.euid, loginUser: user.user)
             case .undo:
                 try services.undoPlan(probe: probe, watchAs: chosen, loginEUID: user.euid, loginUser: user.user)
             }
+            setPlan(plan, for: alias)
         } catch SetupPlanner.PlanError.noHome(let who) {
             setRow(alias) { $0.problem = Self.noHomeMessage(user: who) }
             return
         } catch {
-            setRow(alias) { $0.problem = Self.planFailed }
+            setRow(alias) { $0.problem = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription }
             return
         }
         let fallback = defaultPath(alias)
         let kept = path[alias].flatMap { $0 != defaultPaths[alias] && isAvailable($0, alias) ? $0 : nil }
         path[alias] = kept ?? fallback
         defaultPaths[alias] = fallback
+    }
+
+    private func setPlan(_ plan: SetupPlan?, for alias: String) {
+        plans[alias] = plan
+        artifacts[alias] = plan.map { plan in
+            let command: Result<String, SetupCommand.Unavailable> = services.helperSHA256.map {
+                SetupCommand.command(plan: plan, system: plan.system, version: services.helperVersion,
+                                     helperSHA256: $0)
+            } ?? .failure(.helperMissing)
+            let name = rows.first { $0.id == alias }?.displayName ?? alias
+            return Artifacts(command: command, prompt: SetupCommand.prompt(plan: plan, hostName: name))
+        }
+    }
+
+    private func setPlans(_ all: [String: SetupPlan]) {
+        plans = [:]
+        artifacts = [:]
+        for (alias, plan) in all { setPlan(plan, for: alias) }
     }
 
     private func defaultPath(_ alias: String) -> SetupPath {
@@ -551,55 +741,114 @@ final class RemoteWizardModel {
 /// The real thing: ssh config, ProbeRunner, SetupPlanner and SetupApplier.
 @MainActor
 final class LiveRemoteWizardServices: RemoteWizardServices {
-    enum Failure: Error {
-        /// The bridge files are missing from the app bundle.
-        case bridgesMissing
-    }
-
     /// `ssh -G` runs at once, at most this many.
     static let maxResolves = 8
+    static let helperMissing = HostProblem.other("SwarmBar's helper is missing from the app.")
 
     private let runner: ProbeRunner?
     private let bundled: BundledBridges?
     private let sshDirectory: URL
+    private let home: URL
     let helperVersion: String
     let helperSHA256: String?
 
-    init(
-        sshDirectory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh"),
-        bundle: Bundle = .main
-    ) {
-        self.sshDirectory = sshDirectory
-        runner = HelperInstaller.bundledHelper.map { ProbeRunner(helperSource: $0) }
+    /// The helper, its digest and the bridges all come from `bundle`, so
+    /// the command never vouches for a helper other than the one probed.
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, bundle: Bundle = .main) {
+        self.home = home
+        sshDirectory = home.appendingPathComponent(".ssh")
+        let helper = bundle.url(forResource: "swarmbar-helper", withExtension: "py")
+            .flatMap { try? Data(contentsOf: $0) }
+        runner = helper.map { ProbeRunner(helperSource: $0) }
+        helperSHA256 = helper.map(HelperInstaller.sha256)
         bundled = BundledBridges.load(from: bundle)
         helperVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        helperSHA256 = HelperInstaller.bundledDigest
     }
 
-    func candidates() async -> [String] {
-        let config = sshDirectory.appendingPathComponent("config")
-        guard let text = try? String(contentsOf: config, encoding: .utf8) else { return [] }
-        let aliases = SSHConfigParser.aliases(in: text, baseDirectory: sshDirectory) {
-            try? String(contentsOf: $0, encoding: .utf8)
+    func candidates() async -> HostCandidateList {
+        await Self.readCandidates(sshDirectory: sshDirectory, home: home) {
+            await HostCandidates.resolve(alias: $0)
         }
+    }
+
+    /// Reads the config and the files it includes, resolves every alias
+    /// with `resolve` (at most `maxResolves` at once), and drops git hosts
+    /// and duplicates. A file that is not there is ssh's own business and
+    /// says nothing; one that is there and can't be read is reported.
+    static func readCandidates(
+        sshDirectory: URL, home: URL, resolve: @escaping @Sendable (String) async -> SSHResolved?
+    ) async -> HostCandidateList {
+        var list = HostCandidateList()
+        let config = sshDirectory.appendingPathComponent("config")
+        let text: String
+        switch read(config) {
+        case .missing: return list
+        case .failed(let reason):
+            list.readProblems.append(problem(config, home: home, reason))
+            return list
+        case .text(let contents): text = contents
+        }
+        var problems: [String] = []
+        let aliases = SSHConfigParser.aliases(in: text, baseDirectory: sshDirectory, home: home) { url in
+            switch read(url) {
+            case .text(let contents): return contents
+            case .missing: return nil
+            case .failed(let reason):
+                problems.append(problem(url, home: home, reason))
+                return nil
+            }
+        }
+        list.readProblems = problems
+
         var resolved: [String: SSHResolved] = [:]
         await withTaskGroup(of: (String, SSHResolved?).self) { group in
             var pending = aliases[...]
-            for _ in 0..<min(Self.maxResolves, pending.count) {
+            for _ in 0..<min(maxResolves, pending.count) {
                 let alias = pending.removeFirst()
-                group.addTask { (alias, await HostCandidates.resolve(alias: alias)) }
+                group.addTask { (alias, await resolve(alias)) }
             }
             while let (alias, result) = await group.next() {
                 if let result { resolved[alias] = result }
                 if let alias = pending.popFirst() {
-                    group.addTask { (alias, await HostCandidates.resolve(alias: alias)) }
+                    group.addTask { (alias, await resolve(alias)) }
                 }
             }
         }
-        return HostCandidates.filter(aliases, resolved: resolved)
+        list.aliases = HostCandidates.filter(aliases, resolved: resolved)
+        list.skippedGitHosts = aliases.filter { resolved[$0].map(HostCandidates.isGitHost) ?? false }
+        return list
     }
 
-    private static let helperMissing = HostProblem.other("The helper is missing from SwarmBar's app bundle")
+    private enum Read {
+        case text(String)
+        case missing
+        case failed(String)
+    }
+
+    private static func read(_ url: URL) -> Read {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let ns = error as NSError
+            let posix = (ns.userInfo[NSUnderlyingErrorKey] as? NSError).flatMap {
+                $0.domain == NSPOSIXErrorDomain ? Int32($0.code) : nil
+            }
+            if (ns.domain == NSCocoaErrorDomain && ns.code == NSFileReadNoSuchFileError)
+                || posix == ENOENT || posix == ENOTDIR {
+                return .missing
+            }
+            return .failed(posix.map { String(cString: strerror($0)) } ?? ns.localizedDescription)
+        }
+        guard let text = String(data: data, encoding: .utf8) else { return .failed("it isn't UTF-8 text") }
+        return .text(text)
+    }
+
+    private static func problem(_ url: URL, home: URL, _ reason: String) -> String {
+        let path = url.path
+        let shown = path.hasPrefix(home.path + "/") ? "~" + path.dropFirst(home.path.count) : path
+        return "Couldn't read \(shown): \(reason)"
+    }
 
     func probe(_ alias: String) async -> HostAssessmentInput {
         guard let runner else { return (nil, nil, Self.helperMissing) }
@@ -619,7 +868,7 @@ final class LiveRemoteWizardServices: RemoteWizardServices {
     /// every Kimi and BearCode build, and every name in it is in both
     /// engines' enums.
     func plan(probe: ProbeResult, watchAs: WatchAs, loginEUID: Int, loginUser: String) throws -> SetupPlan {
-        guard let bundled else { throw Failure.bridgesMissing }
+        guard let bundled else { throw RemoteWizardError.bridgesMissing }
         return try SetupPlanner.plan(probe: probe, watchAs: watchAs, bundled: bundled, kimiEvents: [:],
                                      loginEUID: loginEUID, loginUser: loginUser)
     }

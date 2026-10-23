@@ -13,9 +13,13 @@ enum SetupCommand {
         case nothingToRun
         case couldNotEncode
         case tooLarge(bytes: Int)
+        /// The app bundle has no helper, so there is nothing to check a
+        /// download against.
+        case helperMissing
 
         var reason: String {
             switch self {
+            case .helperMissing: "SwarmBar's helper is missing from the app."
             case .nothingToRun: "There's nothing for the setup command to change on this host."
             case .couldNotEncode: "SwarmBar couldn't build the setup command."
             case .tooLarge: "The setup command would be too long to paste. Let SwarmBar make the changes instead."
@@ -113,7 +117,9 @@ enum SetupCommand {
     /// The files of a plan run under sudo belong to other users, so an
     /// agent working as the login user would fail on them, or worse, make
     /// them its own. The agent is never given a password: sudo either works
-    /// without one or the agent stops.
+    /// without one or the agent stops. Not for a plan that sets up the
+    /// narrow sudo rule: without passwordless sudo the plan only reaches
+    /// files the login user can write, and the line would dead-end it.
     static let runAsRoot = "Every command below must run as root, because some of these files belong to "
         + "other users. Run each one as root, for example by saving it exactly as written to a file and "
         + "running sudo sh on that file. If sudo asks for a password, stop and report it rather than "
@@ -151,7 +157,7 @@ enum SetupCommand {
             Set up SwarmBar on \(hostName). Run exactly the commands below, in order, and nothing else. \
             If a check fails, stop and report it. Do not change anything to make it pass.
             """)
-        if plan.useSudo {
+        if plan.useSudo && plan.sudoersUser == nil {
             out.append(runAsRoot)
         }
         if let user = plan.sudoersUser {

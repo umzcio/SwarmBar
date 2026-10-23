@@ -2,15 +2,45 @@ import Foundation
 import Testing
 @testable import SwarmBar
 
+/// Holds a fake's work until the test lets it go, so a test can act while
+/// a probe is in flight.
+@MainActor
+final class Gate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+    var waiting: Int { waiters.count }
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        for waiter in waiters { waiter.resume() }
+        waiters = []
+    }
+
+    /// Lets the main actor run until something is held here.
+    func held(count: Int = 1) async {
+        while waiting < count { await Task.yield() }
+    }
+}
+
 /// Stands in for ssh, the probe and the helper. Every host, user and path
 /// here is made up. Plans come from the real SetupPlanner, so the model is
 /// tested against the plans it will really get.
 @MainActor
 final class FakeWizardServices: RemoteWizardServices {
     var aliases: [String] = []
+    var skippedGitHosts: [String] = []
+    var readProblems: [String] = []
     /// Successive probe answers per alias. The last one repeats.
     var outcomes: [String: [HostAssessmentInput]] = [:]
+    /// When set, probes wait here before answering.
+    var probeGate: Gate?
     private(set) var candidateCalls = 0
+    private(set) var probeAllCalls = 0
     private(set) var probeCalls: [String] = []
     struct PlanCall: Equatable {
         var probeUser: String
@@ -20,15 +50,19 @@ final class FakeWizardServices: RemoteWizardServices {
         var undo: Bool
     }
     private(set) var planCalls: [PlanCall] = []
-    /// What apply reports for each sent change, by index. Default done.
-    var applyOutcomes: [Int: SetupApplier.StepOutcome] = [:]
+    /// What the helper says about a sent change, by path. Default done.
+    var applyOutcomes: [String: SetupApplier.StepOutcome] = [:]
+    /// Runs after the first change is reported, while the apply is still going.
+    var duringApply: (@MainActor () -> Void)?
     private(set) var applied: [(alias: String, plan: SetupPlan)] = []
     let helperVersion = "0.2.0"
-    let helperSHA256: String? = String(repeating: "ab", count: 32)
+    var helperSHA256: String? = String(repeating: "ab", count: 32)
+    /// Thrown by plan when set, standing in for a planning failure.
+    var planError: (any Error)?
 
-    func candidates() async -> [String] {
+    func candidates() async -> HostCandidateList {
         candidateCalls += 1
-        return aliases
+        return HostCandidateList(aliases: aliases, skippedGitHosts: skippedGitHosts, readProblems: readProblems)
     }
 
     private func next(_ alias: String) -> HostAssessmentInput {
@@ -44,23 +78,28 @@ final class FakeWizardServices: RemoteWizardServices {
 
     func probe(_ alias: String) async -> HostAssessmentInput {
         probeCalls.append(alias)
+        if let probeGate { await probeGate.wait() }
         return next(alias)
     }
 
     func probeAll(_ aliases: [String]) -> AsyncStream<(String, HostAssessmentInput)> {
-        let results = aliases.map { alias in
-            probeCalls.append(alias)
-            return (alias, next(alias))
-        }
+        probeAllCalls += 1
+        probeCalls += aliases
+        let gate = probeGate
         return AsyncStream { continuation in
-            for result in results { continuation.yield(result) }
-            continuation.finish()
+            let task = Task { @MainActor in
+                if let gate { await gate.wait() }
+                for alias in aliases { continuation.yield((alias, self.next(alias))) }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
     func plan(probe: ProbeResult, watchAs: WatchAs, loginEUID: Int, loginUser: String) throws -> SetupPlan {
         planCalls.append(PlanCall(probeUser: probe.user, watchAs: watchAs, loginEUID: loginEUID,
                                   loginUser: loginUser, undo: false))
+        if let planError { throw planError }
         return try SetupPlanner.plan(probe: probe, watchAs: watchAs, bundled: SetupPlannerTests.bridges,
                                      kimiEvents: [:], loginEUID: loginEUID, loginUser: loginUser)
     }
@@ -71,16 +110,29 @@ final class FakeWizardServices: RemoteWizardServices {
         return try SetupPlanner.undoPlan(probe: probe, watchAs: watchAs, loginEUID: loginEUID, loginUser: loginUser)
     }
 
+    /// Behaves like SetupApplier: unsent changes report themselves, and a
+    /// change whose dependency did not end done is not made.
     func apply(
         _ plan: SetupPlan, alias: String, progress: @escaping @MainActor (Int, SetupApplier.StepOutcome) -> Void
     ) async {
         applied.append((alias, plan))
-        for (index, change) in plan.changes.enumerated() {
+        var outcomes: [SetupApplier.StepOutcome] = []
+        for change in plan.changes {
+            let outcome: SetupApplier.StepOutcome
             switch change.action {
-            case .byHand: progress(index, .byHand)
-            case .skipped: progress(index, .skipped)
-            case .write, .remove: progress(index, applyOutcomes[index] ?? .done)
+            case .byHand: outcome = .byHand
+            case .skipped: outcome = .skipped
+            case .write, .remove:
+                if change.dependsOn.contains(where: { outcomes[$0] != .done }) {
+                    outcome = .failed(SetupApplier.dependencyFailed)
+                } else {
+                    outcome = applyOutcomes[change.path] ?? .done
+                }
             }
+            outcomes.append(outcome)
+            progress(outcomes.count - 1, outcome)
+            if outcomes.count == 1 { duringApply?() }
+            await Task.yield()
         }
     }
 }
@@ -265,20 +317,39 @@ struct RemoteWizardModelTests {
     }
 
     @Test func changedFileStopsOnlyThatFile() async throws {
+        let kimi = "/home/u/.kimi-code/config.toml"
+        let opencode = "/home/u/.config/opencode/opencode.json"
+        let kimiScript = SetupPlanner.kimiScript(home: "/home/u")
         services.aliases = ["alpha"]
-        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
-        services.applyOutcomes = [1: .changed]
+        services.outcomes = ["alpha": [(Self.probe(
+            "alpha", processes: [Self.process("claude")], tools: ["claude", "kimi", "opencode"],
+            configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, "{}\n"),
+                                  SetupPlannerTests.config("kimi", kimi, "[providers]\n"),
+                                  SetupPlannerTests.config("opencode", opencode, "{}\n")]]), nil, nil)]]
+        // The Kimi hook script changed on the host since the probe read it.
+        services.applyOutcomes = [kimiScript: .changed]
         let (model, _) = model()
         await model.lookForHosts()
         await model.continueFromPick()
         let plan = try #require(model.plan(for: "alpha"))
-        #expect(plan.changes.count == 2)
+        func index(_ path: String) throws -> Int { try #require(plan.changes.firstIndex { $0.path == path }) }
+        #expect(plan.changes.count == 6)
+        #expect(plan.changes[try index(kimi)].dependsOn == [try index(kimiScript)])
+
         await model.makeChanges()
         #expect(services.applied.map(\.alias) == ["alpha"])
-        #expect(model.progress == [0: .done, 1: .changed])
-        // Checked again, and still not Ready, so the host stays put.
+        // Only the changed file, and the config that would name it, are left.
+        var expected = Dictionary(uniqueKeysWithValues: plan.changes.indices.map {
+            ($0, SetupApplier.StepOutcome.done)
+        })
+        expected[try index(kimiScript)] = .changed
+        expected[try index(kimi)] = .failed(SetupApplier.dependencyFailed)
+        #expect(model.progress == expected)
+        // Checked again, and still not Ready, so the host stays put with its
+        // progress on show.
         #expect(services.probeCalls == ["alpha", "alpha"])
-        #expect(try row(model, "alpha").assessment?.status == .needsSetup(["Claude Code approvals not set up"]))
+        let status = try #require(try row(model, "alpha").assessment?.status)
+        #expect(status != .ready)
         #expect(model.step == .applying(hostIndex: 0))
         #expect(model.currentAlias == "alpha")
     }
@@ -495,8 +566,24 @@ struct RemoteWizardModelTests {
         #expect(command.contains("sudo python3 -B"))
         #expect(command.contains("/v0.2.0/swarmbar-helper.py"))
         let prompt = try #require(model.prompt(for: "devbox"))
-        #expect(prompt.text.contains(SetupCommand.runAsRoot))
+        // The narrow rule's plan only reaches the login user's own files,
+        // and there is no passwordless sudo to run anything as root.
+        #expect(!prompt.text.contains(SetupCommand.runAsRoot))
         #expect(model.pasteOmissions(for: "devbox").isEmpty)
+    }
+
+    @Test func promptRunsAsRootOnlyWithPasswordlessSudo() async throws {
+        services.aliases = ["alpha"]
+        let user = Self.probe("alpha", sudo: true, processes: [Self.process("claude", user: "root")])
+        let root = Self.probe("alpha", user: "root", sudo: true, homes: ["/root": "root"],
+                              processes: [Self.process("claude", user: "root")], tools: ["claude"])
+        services.outcomes = ["alpha": [(user, root, nil)]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        let plan = try #require(model.plan(for: "alpha"))
+        #expect(plan.useSudo && plan.sudoersUser == nil)
+        #expect(try #require(model.prompt(for: "alpha")).text.contains(SetupCommand.runAsRoot))
     }
 
     @Test func addHostProbesJustThatOne() async throws {
@@ -511,5 +598,346 @@ struct RemoteWizardModelTests {
         await model.addHost(alias: "-bad")
         #expect(try row(model, "-bad").problem == "This host name can't be used.")
         #expect(services.probeCalls == ["alpha", "beta"])
+    }
+
+    // MARK: Review round 1
+
+    @Test func checkAgainKeepsTicksAndRetriesWhatCouldNotBeChecked() async throws {
+        services.aliases = ["alpha", "beta"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")],
+                             "beta": [(nil, nil, .timedOut), Self.needsSetup("beta")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        #expect(try !row(model, "beta").isChecked)
+        model.setChecked("alpha", false)
+        await model.checkAgain()
+        #expect(services.probeAllCalls == 2)
+        #expect(try row(model, "beta").assessment?.status == .needsSetup(["Claude Code approvals not set up"]))
+        #expect(try row(model, "beta").isChecked)
+        #expect(try !row(model, "alpha").isChecked)
+        #expect(model.step == .pick)
+    }
+
+    @Test func doubleTapOnLookForHostsStartsOneStream() async {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let gate = Gate()
+        services.probeGate = gate
+        let (model, _) = model()
+        let first = Task { await model.lookForHosts() }
+        await gate.held()
+        #expect(model.isProbing)
+        await model.lookForHosts()
+        #expect(services.candidateCalls == 1)
+        #expect(services.probeAllCalls == 1)
+        gate.open()
+        await first.value
+        #expect(model.step == .pick)
+        #expect(!model.isProbing)
+        #expect(model.rows.map(\.id) == ["alpha"])
+    }
+
+    @Test func actionsWaitWhileHostsAreBeingChecked() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")], "beta": [Self.needsSetup("beta")]]
+        let (model, registry) = model()
+        await model.lookForHosts()
+        let gate = Gate()
+        services.probeGate = gate
+        let again = Task { await model.checkAgain() }
+        await gate.held()
+        await model.continueFromPick()
+        #expect(model.step == .pick)
+        #expect(registry.hosts.isEmpty)
+        await model.addHost(alias: "beta")
+        #expect(model.rows.map(\.id) == ["alpha"])
+        await model.makeChanges()
+        #expect(services.applied.isEmpty)
+        gate.open()
+        await again.value
+        await model.continueFromPick()
+        #expect(model.step == .setup(hostIndex: 0))
+        #expect(registry.hosts.map(\.alias) == ["alpha"])
+    }
+
+    @Test func backFromThePickStopsTheProbe() async throws {
+        services.aliases = ["alpha", "beta"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")], "beta": [Self.needsSetup("beta")]]
+        let gate = Gate()
+        services.probeGate = gate
+        let (model, _) = model()
+        let look = Task { await model.lookForHosts() }
+        await gate.held()
+        model.back()
+        #expect(model.step == .intro)
+        #expect(!model.isProbing)
+        await look.value
+        #expect(model.step == .intro)
+        gate.open()
+        await Task.yield()
+        #expect(model.rows.allSatisfy { !$0.isChecking && $0.assessment == nil })
+    }
+
+    @Test func cancellingMarksHostsNotChecked() async throws {
+        services.aliases = ["alpha", "beta"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")], "beta": [Self.needsSetup("beta")]]
+        let gate = Gate()
+        services.probeGate = gate
+        let (model, _) = model()
+        let look = Task { await model.lookForHosts() }
+        await gate.held()
+        model.cancel()
+        await look.value
+        #expect(model.rows.map(\.problem) == [RemoteWizardModel.notChecked, RemoteWizardModel.notChecked])
+        #expect(model.rows.allSatisfy { !$0.isChecking && !$0.isChecked })
+        #expect(!model.isProbing)
+        gate.open()
+    }
+
+    @Test func callerCancellationStopsTheProbeToo() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let gate = Gate()
+        services.probeGate = gate
+        let (model, _) = model()
+        let look = Task { await model.lookForHosts() }
+        await gate.held()
+        look.cancel()
+        await look.value
+        #expect(!model.isProbing)
+        #expect(try row(model, "alpha").problem == RemoteWizardModel.notChecked)
+        gate.open()
+    }
+
+    @Test func backFromSetupReturnsToThePickButNotMidApply() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let (model, registry) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        services.duringApply = { model.back() }
+        await model.makeChanges()
+        #expect(model.step == .applying(hostIndex: 0))
+        model.back()
+        #expect(model.step == .pick)
+        #expect(model.setupAliases.isEmpty)
+        #expect(model.progress.isEmpty)
+        // Already watched, and going back does not undo that.
+        #expect(registry.hosts.map(\.alias) == ["alpha"])
+        await model.continueFromPick()
+        #expect(model.step == .setup(hostIndex: 0))
+    }
+
+    @Test func backDoesNothingWhenOpenedFromSettings() async {
+        let (model, registry) = model()
+        registry.upsert(RemoteHost(alias: "beta", watchAs: .loginUser))
+        services.outcomes = ["beta": [Self.needsSetup("beta")]]
+        await model.startSetUp(alias: "beta")
+        model.back()
+        #expect(model.step == .setup(hostIndex: 0))
+    }
+
+    @Test func watchAsChangesAreIgnoredWhileApplying() async throws {
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")]]
+        let (model, registry) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        services.duringApply = { model.watchAs["alpha"] = .everyUser }
+        await model.makeChanges()
+        #expect(model.watchAs["alpha"] == .loginUser)
+        #expect(registry.hosts.first?.watchAs == .loginUser)
+        #expect(model.plan(for: "alpha")?.watchAs == .loginUser)
+    }
+
+    @Test func pickedPathSurvivesAReplanAndADefaultFollowsIt() async throws {
+        services.aliases = ["alpha", "devbox"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha")], "devbox": [Self.rootAgents("devbox")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        model.watchAs["devbox"] = .everyUser
+        await model.continueFromPick()
+        #expect(model.path["alpha"] == .swarmBar)
+        model.path["alpha"] = .paste
+        await model.confirmPastedOrRan()
+        #expect(model.currentAlias == "alpha")
+        #expect(model.path["alpha"] == .paste)
+
+        model.skipHost()
+        #expect(model.path["devbox"] == .command)
+        // Nothing picked here, so the default moves with the plan.
+        model.watchAs["devbox"] = .loginUser
+        #expect(model.path["devbox"] == .swarmBar)
+    }
+
+    @Test func confirmingMovesToTheNextHostOnceReady() async throws {
+        services.aliases = ["alpha", "beta"]
+        services.outcomes = ["alpha": [Self.needsSetup("alpha"), Self.ready("alpha")],
+                             "beta": [Self.needsSetup("beta")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        #expect(model.currentAlias == "alpha")
+        await model.confirmPastedOrRan()
+        #expect(model.step == .setup(hostIndex: 1))
+        #expect(model.currentAlias == "beta")
+        #expect(try row(model, "alpha").assessment?.status == .ready)
+        #expect(model.plan(for: "beta") != nil)
+    }
+
+    @Test func aPendingRootViewHoldsChangesAndContinueDropsIt() async throws {
+        let (model, registry) = model()
+        registry.upsert(RemoteHost(alias: "alpha", watchAs: .loginUser))
+        let user = Self.probe("alpha", sudo: true, processes: [Self.process("claude")], tools: ["claude"],
+                              configs: ["/home/u": [SetupPlannerTests.config("claude", Self.settings, "{}\n")]])
+        let root = Self.probe("alpha", user: "root", sudo: true, homes: ["/root": "root", "/home/u": "u"],
+                              processes: [Self.process("claude")], tools: ["claude"])
+        services.outcomes = ["alpha": [(user, nil, .timedOut), (user, root, nil)]]
+        await model.startSetUp(alias: "alpha")
+        #expect(model.canLetSwarmBarDoIt("alpha"))
+        let gate = Gate()
+        services.probeGate = gate
+        model.watchAs["alpha"] = .everyUser
+        await gate.held()
+        #expect(model.isBusy)
+        await model.makeChanges()
+        #expect(services.applied.isEmpty)
+        gate.open()
+        await model.waitForChecks()
+        #expect(!model.isBusy)
+        #expect(model.plan(for: "alpha")?.changes.contains { $0.path.hasPrefix("/root/") } == true)
+
+        // On the pick, a root view still pending is dropped by Continue.
+        services.aliases = ["alpha"]
+        services.outcomes = ["alpha": [(user, nil, .timedOut), (user, root, nil)]]
+        services.probeGate = nil
+        await model.lookForHosts()
+        model.watchAs["alpha"] = .loginUser
+        let second = Gate()
+        services.probeGate = second
+        model.watchAs["alpha"] = .everyUser
+        await second.held()
+        await model.continueFromPick()
+        #expect(!model.isBusy)
+        #expect(try !row(model, "alpha").isChecking)
+        second.open()
+        await Task.yield()
+        #expect(try row(model, "alpha").assessment?.status == .cantConnect(.timedOut))
+    }
+
+    @Test func aSuggestionLandsLikeAPick() async throws {
+        services.aliases = ["devbox"]
+        let user = Self.probe("devbox", sudo: true, processes: [Self.process("codex", user: "root")])
+        let root = Self.probe("devbox", user: "root", sudo: true, homes: ["/root": "root"],
+                              processes: [Self.process("codex", user: "root")], tools: ["claude"])
+        services.outcomes = ["devbox": [Self.rootAgents("devbox"), (user, root, nil)]]
+        let (model, registry) = model()
+        await model.lookForHosts()
+        await model.continueFromPick()
+        #expect(registry.hosts.first?.watchAs == .loginUser)
+        #expect(model.plan(for: "devbox") == nil)
+        // Passwordless sudo appeared, so every user is suggested and taken.
+        await model.confirmPastedOrRan()
+        #expect(model.watchAs["devbox"] == .everyUser)
+        #expect(registry.hosts.first?.watchAs == .everyUser)
+        #expect(model.plan(for: "devbox")?.watchAs == .everyUser)
+    }
+
+    @Test func candidateListDetailsReachTheModel() async {
+        services.aliases = ["alpha"]
+        services.skippedGitHosts = ["github.com", "bitbucket.org"]
+        services.readProblems = ["Couldn't read ~/.ssh/extra: Permission denied"]
+        services.outcomes = ["alpha": [Self.idle("alpha")]]
+        let (model, _) = model()
+        #expect(model.skippedLine == nil)
+        await model.lookForHosts()
+        #expect(model.skippedLine == "Skipped: github.com, bitbucket.org (git hosts).")
+        #expect(model.configProblems == ["Couldn't read ~/.ssh/extra: Permission denied"])
+    }
+
+    @Test func missingHelperAndBridgesSaySo() async throws {
+        services.aliases = ["devbox", "alpha"]
+        services.helperSHA256 = nil
+        services.outcomes = ["devbox": [Self.rootAgents("devbox")], "alpha": [Self.needsSetup("alpha")]]
+        let (model, _) = model()
+        await model.lookForHosts()
+        model.watchAs["devbox"] = .everyUser
+        await model.continueFromPick()
+        #expect(model.command(for: "devbox") == Result<String, SetupCommand.Unavailable>.failure(.helperMissing))
+        #expect(SetupCommand.Unavailable.helperMissing.reason == "SwarmBar's helper is missing from the app.")
+        #expect(model.path["devbox"] == .paste)
+
+        services.planError = RemoteWizardError.bridgesMissing
+        model.skipHost()
+        #expect(model.currentAlias == "alpha")
+        #expect(try row(model, "alpha").problem == "SwarmBar's bridge scripts are missing from the app.")
+    }
+}
+
+/// The live service's reading of ssh config, on files in a temporary home.
+@Suite("Remote wizard candidates")
+@MainActor
+struct RemoteWizardCandidatesTests {
+    private static func resolve(_ alias: String) async -> SSHResolved? {
+        switch alias {
+        case "github.com": SSHResolved(hostname: "github.com", user: "git", port: 22)
+        case "forge": SSHResolved(hostname: "git.example.invalid", user: "git", port: 22)
+        default: SSHResolved(hostname: alias + ".example.invalid", user: "u", port: 22)
+        }
+    }
+
+    private func home() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("swarmbar-wizard-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+        return url
+    }
+
+    private func read(_ home: URL) async -> HostCandidateList {
+        await LiveRemoteWizardServices.readCandidates(
+            sshDirectory: home.appendingPathComponent(".ssh"), home: home, resolve: Self.resolve)
+    }
+
+    @Test func missingConfigIsNoHostsAndNoProblem() async throws {
+        let home = try home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        #expect(await read(home) == HostCandidateList())
+    }
+
+    @Test func gitHostsAreSkippedByName() async throws {
+        let home = try home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try "Host alpha github.com forge beta\n".write(
+            to: home.appendingPathComponent(".ssh/config"), atomically: true, encoding: .utf8)
+        let list = await read(home)
+        #expect(list.aliases == ["alpha", "beta"])
+        #expect(list.skippedGitHosts == ["github.com", "forge"])
+        #expect(list.readProblems.isEmpty)
+    }
+
+    @Test func configThatIsNotUTF8IsAProblem() async throws {
+        let home = try home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try Data([0x48, 0x6f, 0xff, 0xfe, 0x0a]).write(to: home.appendingPathComponent(".ssh/config"))
+        let list = await read(home)
+        #expect(list.aliases.isEmpty)
+        #expect(list.readProblems == ["Couldn't read ~/.ssh/config: it isn't UTF-8 text"])
+    }
+
+    @Test func unreadableIncludeIsAProblemAndTheRestStillCounts() async throws {
+        let home = try home()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                   ofItemAtPath: home.appendingPathComponent(".ssh/extra").path)
+            try? FileManager.default.removeItem(at: home)
+        }
+        try "Include extra\nInclude absent\nHost alpha\n".write(
+            to: home.appendingPathComponent(".ssh/config"), atomically: true, encoding: .utf8)
+        let extra = home.appendingPathComponent(".ssh/extra")
+        try "Host beta\n".write(to: extra, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: extra.path)
+        let list = await read(home)
+        #expect(list.aliases == ["alpha"])
+        // An Include of a file that is not there is ssh's own business.
+        #expect(list.readProblems == ["Couldn't read ~/.ssh/extra: Permission denied"])
     }
 }

@@ -15,11 +15,16 @@ enum HostCandidates {
         var out: [String] = []
         for alias in aliases {
             guard let r = resolved[alias] else { out.append(alias); continue }
-            if gitHosts.contains(r.hostname.lowercased()) || r.user == "git" { continue }
+            if isGitHost(r) { continue }
             guard seen.insert(Endpoint(hostname: r.hostname, port: r.port)).inserted else { continue }
             out.append(alias)
         }
         return out
+    }
+
+    /// A git forge, or any host logged into as `git`.
+    static func isGitHost(_ resolved: SSHResolved) -> Bool {
+        gitHosts.contains(resolved.hostname.lowercased()) || resolved.user == "git"
     }
 
     /// Merges results that report the same hostname from the probe, keeping

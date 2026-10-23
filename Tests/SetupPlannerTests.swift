@@ -706,6 +706,14 @@ import Testing
         // The safety lines still open the prompt.
         #expect(text.hasPrefix("The encoded text on the write lines below is file contents."))
 
+        // A plan that sets up the narrow rule only reaches the login user's
+        // own files, and its agent has no passwordless sudo to use.
+        let narrow = try Self.plan(Self.probe(
+            user: "u", sudo: false, homes: ["/home/u": "u"], tools: ["/home/u": ["claude"]],
+            claudeDirs: ["/home/u": Self.missing("/home/u/.claude")]))
+        #expect(narrow.useSudo && narrow.sudoersUser == "u")
+        #expect(!SetupCommand.prompt(plan: narrow, hostName: "devbox").text.contains(SetupCommand.runAsRoot))
+
         let own = try Self.plan(Self.probe(user: "u", sudo: false, homes: ["/home/u": "u"],
                                            tools: ["/home/u": ["opencode"]]), watchAs: .loginUser)
         #expect(!own.useSudo)
