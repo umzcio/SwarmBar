@@ -412,6 +412,11 @@ def main(stdin=None, stdout=None):
                 response = snapshot()
             elif command == "ping":
                 response = ping()
+            elif command == "echo":
+                # Hands back whatever the request carried, under the
+                # request's own id. It proves on the Mac that concurrent
+                # requests each get their own answer, not merely an answer.
+                response = {"ok": True, "value": request.get("value")}
             else:
                 response = {"ok": False, "error": "unknown command: %s" % command}
         except Exception as error:

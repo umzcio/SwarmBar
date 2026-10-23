@@ -220,6 +220,18 @@ class ProtocolTests(unittest.TestCase):
         (reply,) = self.run_main({"id": 1, "cmd": "ping"})
         self.assertEqual(reply["sha256"], expected)
 
+    def test_echo_returns_its_value_under_its_id(self):
+        replies = self.run_main(
+            {"id": 3, "cmd": "echo", "value": "first"},
+            {"id": 4, "cmd": "echo", "value": {"n": 2}},
+            {"id": 5, "cmd": "echo"},
+        )
+        self.assertEqual([r["id"] for r in replies], [3, 4, 5])
+        self.assertTrue(all(r["ok"] for r in replies))
+        self.assertEqual(replies[0]["value"], "first")
+        self.assertEqual(replies[1]["value"], {"n": 2})
+        self.assertIsNone(replies[2]["value"])
+
     def test_unknown_command_keeps_id(self):
         (reply,) = self.run_main({"id": 12, "cmd": "nope"})
         self.assertEqual(reply["id"], 12)

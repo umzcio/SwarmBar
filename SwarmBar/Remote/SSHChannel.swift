@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 enum RemoteReachability: Equatable, Sendable {
     case connecting
@@ -26,6 +27,58 @@ struct HelperEvent: Sendable {
     let payload: Data
 }
 
+/// The tail end of a helper's stderr, drained as it arrives. Draining keeps
+/// a long-lived ssh from stalling once the pipe's buffer fills, and the
+/// last line is the one worth showing: ssh's final word before it gives up
+/// is what separates a missing NOPASSWD rule from an unauthorized key from
+/// a host that is simply down.
+final class StderrTail: Sendable {
+    private struct State {
+        var partial = Data()
+        var last = ""
+        var finished = false
+    }
+
+    private let state = Mutex(State())
+
+    func append(_ chunk: Data) {
+        state.withLock { state in
+            state.partial.append(chunk)
+            while let line = SSHChannel.takeLine(from: &state.partial) {
+                let text = SSHChannel.firstLine(of: line)
+                if !text.isEmpty { state.last = text }
+            }
+            // A stream that never sends a newline must not grow forever.
+            if state.partial.count > 4096 {
+                state.partial = Data(state.partial.suffix(4096))
+            }
+        }
+    }
+
+    func finish() {
+        state.withLock { $0.finished = true }
+    }
+
+    /// The last non-empty line, at most 200 characters. An unterminated
+    /// line counts, since it is the newest thing said.
+    var hint: String {
+        state.withLock { state in
+            let pending = SSHChannel.firstLine(of: state.partial)
+            return pending.isEmpty ? state.last : pending
+        }
+    }
+
+    /// stdout and stderr close together when a process exits, but nothing
+    /// orders their handlers, so the stdout side waits briefly for stderr
+    /// to catch up before reading the hint.
+    func waitForEnd(limit: Duration) async {
+        let deadline = ContinuousClock.now + limit
+        while !state.withLock({ $0.finished }) && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
 /// One long-lived helper process per host, with the helper as the remote
 /// command. No listening ports anywhere: the ssh connection is the
 /// authentication, which removes the token, the port collision and the
@@ -46,6 +99,12 @@ actor SSHChannel {
     /// a genuinely down host all collapse into the same "connection closed"
     /// and the row just says the host cannot be reached.
     private var errorOutput: FileHandle?
+    private var stderrTail: StderrTail?
+    /// Writes happen here, in order, rather than on the actor. A request
+    /// that carries a large payload into a helper too busy to read it would
+    /// otherwise block the actor, and every other request with it, until
+    /// the pipe drained.
+    private nonisolated let writer = DispatchQueue(label: "app.swarmbar.SSHChannel.writer")
     /// Feeds the current process's reader. Finishing it is what stops that
     /// reader, so a torn-down process cannot keep routing lines.
     private var chunkSink: AsyncStream<Data>.Continuation?
@@ -55,7 +114,7 @@ actor SSHChannel {
     /// before it is resumed, and only on this actor, so a response, a
     /// timeout, a process exit and a shutdown can race freely: whichever
     /// arrives first takes the continuation and the rest find nothing.
-    private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
+    private var pending: [Int: CheckedContinuation<Reply, Error>] = [:]
     private var timers: [Int: Task<Void, Never>] = [:]
 
     /// Counts helper processes started. Anything a caller learned from the
@@ -105,6 +164,46 @@ actor SSHChannel {
         _ command: String, _ arguments: [String: JSONValue] = [:],
         timeout: Duration = .seconds(30)
     ) async throws -> Data {
+        let reply = try await exchange(command, arguments, timeout: timeout)
+        // Only `ok: true` is health. A helper that answers every request
+        // with an error is alive but not working, and counting its answers
+        // as success would pin the backoff low and keep the reinstall that
+        // waits for the cap from ever firing.
+        if reply.ok { noteSuccess(generation: reply.generation) }
+        return reply.line
+    }
+
+    func snapshot() async throws -> RemoteSnapshot {
+        let reply = try await exchange("snapshot", [:], timeout: .seconds(30))
+        let decoded: RemoteSnapshot
+        do {
+            decoded = try RemoteSnapshot.decode(reply.line)
+            guard decoded.ok else { throw SSHChannelError.badResponse("ok is false") }
+        } catch {
+            // A failed process is counted where it fails, once however many
+            // requests were waiting on it, so callers must not also call
+            // noteFailure for a request error or `failures` double-counts.
+            // A reply that does not decode is the one failure only this
+            // caller can see.
+            let failure = SSHChannelError.badResponse(String(decoding: reply.line.prefix(200), as: UTF8.self))
+            noteFailure(String(describing: failure))
+            throw failure
+        }
+        noteSuccess(generation: reply.generation)
+        return decoded
+    }
+
+    /// One answered request. `ok` is read by the reader, off the actor, so
+    /// a large reply is not parsed a second time here.
+    private struct Reply: Sendable {
+        let line: Data
+        let ok: Bool
+        let generation: Int
+    }
+
+    private func exchange(
+        _ command: String, _ arguments: [String: JSONValue], timeout: Duration
+    ) async throws -> Reply {
         try Task.checkCancellation()
         do {
             try start()
@@ -128,7 +227,7 @@ actor SSHChannel {
                     do { try await Task.sleep(for: timeout) } catch { return }
                     await self?.expire(id, generation: generation)
                 }
-                send(frame)
+                send(frame, id: id, generation: generation)
             }
         } onCancel: {
             // A cancelled caller stops waiting, but the helper is fine and
@@ -137,20 +236,13 @@ actor SSHChannel {
         }
     }
 
-    func snapshot() async throws -> RemoteSnapshot {
-        let line = try await request("snapshot")
-        do {
-            return try RemoteSnapshot.decode(line)
-        } catch {
-            // A failed process is counted where it fails, once however many
-            // requests were waiting on it, so callers must not also call
-            // noteFailure for a request error or `failures` double-counts.
-            // A reply that does not decode is the one failure only this
-            // caller can see.
-            let failure = SSHChannelError.badResponse(String(decoding: line.prefix(200), as: UTF8.self))
-            noteFailure(String(describing: failure))
-            throw failure
-        }
+    /// The helper answered properly, so the host is healthy. Ignored for a
+    /// process that has since been torn down or replaced, whose answer says
+    /// nothing about the one running now.
+    private func noteSuccess(generation: Int) {
+        guard generation == self.generation, process != nil else { return }
+        failures = 0
+        reachability = .reachable
     }
 
     /// Stops the helper on purpose. Every waiting request fails with
@@ -241,6 +333,17 @@ actor SSHChannel {
         // thread, and with a fleet of hosts each holding a quiet connection
         // open, parking one pool thread per host would starve the pool.
         // The stream keeps the chunks in order for the reader below.
+        let tail = StderrTail()
+        stderr.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                tail.finish()
+            } else {
+                tail.append(chunk)
+            }
+        }
+
         let (chunks, sink) = AsyncStream.makeStream(of: Data.self)
         stdout.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
@@ -259,6 +362,7 @@ actor SSHChannel {
         input = stdin.fileHandleForWriting
         output = stdout.fileHandleForReading
         errorOutput = stderr.fileHandleForReading
+        stderrTail = tail
         chunkSink = sink
 
         let generation = self.generation
@@ -276,9 +380,9 @@ actor SSHChannel {
                 guard chunk.contains(UInt8(ascii: "\n")) else { continue }
                 while let line = Self.takeLine(from: &buffer) {
                     switch Self.frame(of: line) {
-                    case .response(let id):
+                    case .response(let id, let ok):
                         guard let self else { return }
-                        await self.deliver(line, id: id, generation: generation)
+                        await self.deliver(Reply(line: line, ok: ok, generation: generation), id: id)
                     case .event(let name):
                         events.yield(HelperEvent(name: name, payload: line))
                     case .unrouted:
@@ -288,12 +392,13 @@ actor SSHChannel {
                     }
                 }
             }
+            await tail.waitForEnd(limit: .milliseconds(250))
             await self?.readerEnded(generation: generation)
         }
     }
 
     private enum Frame {
-        case response(Int)
+        case response(Int, ok: Bool)
         case event(String)
         case unrouted
     }
@@ -301,31 +406,24 @@ actor SSHChannel {
     private struct Envelope: Decodable {
         let id: Int?
         let event: String?
+        let ok: Bool?
     }
 
     private nonisolated static func frame(of line: Data) -> Frame {
         guard let envelope = try? JSONDecoder().decode(Envelope.self, from: line) else {
             return .unrouted
         }
-        if let id = envelope.id { return .response(id) }
+        if let id = envelope.id { return .response(id, ok: envelope.ok == true) }
         if let event = envelope.event { return .event(event) }
         return .unrouted
     }
 
-    private func deliver(_ line: Data, id: Int, generation: Int) {
-        guard generation == self.generation else { return }
-        failures = 0
-        reachability = .reachable
-        // Drained on every answer, not only on failure. A long-lived
-        // connection accumulates whatever ssh and the remote command write
-        // to stderr, and past roughly 64 KB the pipe fills and ssh stalls.
-        // The helper writes nothing there in normal operation, so this is
-        // usually a no-op, but it is the only thing keeping the buffer from
-        // ever filling on a connection that stays healthy for a long time.
-        if let errorOutput {
-            _ = Self.readAvailable(errorOutput)
-        }
-        settle(id, .success(line))
+    /// Hands an answer to whoever is waiting on it. Health is not judged
+    /// here: carrying an id only proves the helper is alive, and the caller
+    /// decides whether the answer was any good.
+    private func deliver(_ reply: Reply, id: Int) {
+        guard reply.generation == generation, process != nil else { return }
+        settle(id, .success(reply))
     }
 
     /// stdout reached EOF, which means the process is gone or going.
@@ -343,7 +441,7 @@ actor SSHChannel {
         noteFailure("\(label) stopped answering")
     }
 
-    private func settle(_ id: Int, _ result: Result<Data, Error>) {
+    private func settle(_ id: Int, _ result: Result<Reply, Error>) {
         guard let continuation = pending.removeValue(forKey: id) else { return }
         timers.removeValue(forKey: id)?.cancel()
         continuation.resume(with: result)
@@ -351,6 +449,7 @@ actor SSHChannel {
 
     private func tearDown(failing error: SSHChannelError) {
         output?.readabilityHandler = nil
+        errorOutput?.readabilityHandler = nil
         chunkSink?.finish()
         try? input?.close()
         process?.terminate()
@@ -358,30 +457,44 @@ actor SSHChannel {
         input = nil
         output = nil
         errorOutput = nil
+        stderrTail = nil
         chunkSink = nil
         for id in Array(pending.keys) {
             settle(id, .failure(error))
         }
     }
 
-    private func send(_ frame: Data) {
+    private func send(_ frame: Data, id: Int, generation: Int) {
         guard let input else {
-            tearDown(failing: .notRunning)
+            settle(id, .failure(SSHChannelError.notRunning))
             return
         }
-        do {
-            try input.write(contentsOf: frame)
-        } catch {
-            noteFailure(failureMessage(error.localizedDescription))
+        writer.async { [weak self] in
+            do {
+                try input.write(contentsOf: frame)
+            } catch {
+                let reason = error.localizedDescription
+                Task { await self?.writeFailed(id, generation: generation, reason: reason) }
+            }
         }
+    }
+
+    /// A write that fails means the pipe is gone, so the process is too.
+    /// The request fails here even if the reader has not noticed the exit
+    /// yet, and the process is counted once, by whichever path gets there
+    /// first.
+    private func writeFailed(_ id: Int, generation: Int, reason: String) {
+        let message = failureMessage(reason)
+        settle(id, .failure(SSHChannelError.closed(message)))
+        guard generation == self.generation, process != nil else { return }
+        noteFailure(message)
     }
 
     /// Appends whatever ssh said to a failure message, so the row's reason
     /// separates a missing NOPASSWD rule from an unauthorized key from a
     /// host key mismatch from a host that is simply down.
     private func failureMessage(_ reason: String) -> String {
-        guard let errorOutput else { return reason }
-        let hint = Self.firstLine(of: Self.readAvailable(errorOutput))
+        let hint = stderrTail?.hint ?? ""
         guard !hint.isEmpty else {
             NSLog("SwarmBar: \(label) failed with no stderr: \(reason)")
             return reason

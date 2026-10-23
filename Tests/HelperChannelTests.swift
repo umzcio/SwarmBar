@@ -21,13 +21,24 @@ private func localHelper() throws -> HelperLaunch {
 
 /// A stand-in helper whose timing the test controls. It answers every
 /// request after sleeping for the request's `delay`, and pushes one event
-/// first when asked to `emit`.
+/// first when asked to `emit`. It never answers `hang`, exits on `die`, and
+/// answers `snapshot` with `ok: false`.
 private func scriptedHelper() throws -> HelperLaunch {
     let source = """
     import json, sys, time
     for line in sys.stdin:
         request = json.loads(line)
-        if request.get("cmd") == "emit":
+        command = request.get("cmd")
+        if command == "hang":
+            continue
+        if command == "die":
+            sys.stderr.write("an earlier complaint\\nsynthetic last words\\n")
+            sys.stderr.flush()
+            sys.exit(3)
+        if command == "snapshot":
+            print(json.dumps({"ok": False, "error": "synthetic", "id": request["id"]}), flush=True)
+            continue
+        if command == "emit":
             print(json.dumps({"event": "hook", "detail": "synthetic"}), flush=True)
         time.sleep(request.get("delay", 0))
         print(json.dumps({"ok": True, "id": request["id"], "cmd": request.get("cmd")}), flush=True)
@@ -68,14 +79,41 @@ struct HelperChannelTests {
     func loginInstallStaysInHome() {
         let command = HelperLaunch.installCommand(for: .loginUser)
         #expect(command.contains("$HOME/.swarmbar"))
-        #expect(command.contains("/dev/stdin"))
         #expect(!command.contains("sudo"))
+        // BSD install refuses /dev/stdin, so a Darwin host would fail.
+        #expect(!command.contains("/dev/stdin"))
+    }
+
+    @Test("the login user install command really installs the helper from stdin")
+    func loginInstallRunsLocally() throws {
+        let home = try freshHome()
+        let bytes = Data("#!/usr/bin/env python3\nprint('synthetic helper')\n".utf8)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", HelperLaunch.installCommand(for: .loginUser)]
+        task.environment = ["HOME": home, "PATH": "/usr/bin:/bin"]
+        let stdin = Pipe()
+        task.standardInput = stdin
+        try task.run()
+        try stdin.fileHandleForWriting.write(contentsOf: bytes)
+        try stdin.fileHandleForWriting.close()
+        task.waitUntilExit()
+        #expect(task.terminationStatus == 0)
+
+        let installed = home + "/.swarmbar/swarmbar-helper"
+        #expect(FileManager.default.contents(atPath: installed) == bytes)
+        let attributes = try FileManager.default.attributesOfItem(atPath: installed)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+        #expect(!FileManager.default.fileExists(atPath: installed + ".tmp"))
     }
 
     @Test("the every user install pushes over the same channel, never scp")
     func everyUserInstallUsesStdin() {
         let command = HelperLaunch.installCommand(for: .everyUser)
-        #expect(command == "sudo -n install -m 700 -o root -g root /dev/stdin /usr/local/lib/swarmbar-helper")
+        #expect(command == "sudo -n sh -c 'umask 077; cat > /usr/local/lib/swarmbar-helper.tmp && chmod 700 /usr/local/lib/swarmbar-helper.tmp && mv -f /usr/local/lib/swarmbar-helper.tmp /usr/local/lib/swarmbar-helper'")
+        #expect(command.hasPrefix("sudo -n "))
+        #expect(command.contains("/usr/local/lib/swarmbar-helper"))
+        #expect(!command.contains("/dev/stdin"))
         #expect(!command.contains("scp"))
     }
 
@@ -100,33 +138,40 @@ struct HelperChannelTests {
     @Test("a ping round-trips through the real helper", .enabled(if: pythonAvailable))
     func pingRoundTrips() async throws {
         let channel = SSHChannel(launch: try localHelper())
-        defer { Task { await channel.shutdown() } }
         let data = try await channel.request("ping")
         let reply = try JSONDecoder().decode(PingReply.self, from: data)
         #expect(reply.ok)
         #expect(reply.protocol == 3)
         #expect(reply.sha256.count == 64)
         #expect(await channel.reachability == .reachable)
+        await channel.shutdown()
     }
 
-    @Test("concurrent requests each resolve to their own id", .enabled(if: pythonAvailable))
+    @Test("concurrent requests each resolve to their own caller", .enabled(if: pythonAvailable))
     func concurrentRequestsResolveToTheirOwnIDs() async throws {
+        struct EchoReply: Decodable { let id: Int; let value: String }
         let channel = SSHChannel(launch: try localHelper())
-        defer { Task { await channel.shutdown() } }
-        let ids = try await withThrowingTaskGroup(of: Int.self) { group in
-            for _ in 0..<2 {
+        let pairs = try await withThrowingTaskGroup(of: (String, String).self) { group in
+            for index in 0..<8 {
+                let sent = "caller-\(index)"
                 group.addTask {
-                    let data = try await channel.request("ping")
-                    return try JSONDecoder().decode(PingReply.self, from: data).id
+                    let data = try await channel.request("echo", ["value": .string(sent)])
+                    return (sent, try JSONDecoder().decode(EchoReply.self, from: data).value)
                 }
             }
-            var ids: [Int] = []
-            for try await id in group { ids.append(id) }
-            return ids
+            var pairs: [(String, String)] = []
+            for try await pair in group { pairs.append(pair) }
+            return pairs
         }
-        #expect(Set(ids).count == 2)
-        // Both answered by one process: concurrency must not spawn a second.
+        #expect(pairs.count == 8)
+        // An answer routed to the wrong caller would still decode; only the
+        // echoed value shows whose answer it was.
+        for (sent, received) in pairs {
+            #expect(sent == received)
+        }
+        // All answered by one process: concurrency must not spawn a second.
         #expect(await channel.generation == 1)
+        await channel.shutdown()
     }
 
     @Test("shutting down fails a request that is still waiting", .enabled(if: pythonAvailable))
@@ -160,18 +205,22 @@ struct HelperChannelTests {
     @Test("a request past its timeout throws and the next one gets a fresh helper", .enabled(if: pythonAvailable))
     func timeoutKillsTheHelper() async throws {
         let channel = SSHChannel(launch: try scriptedHelper())
-        defer { Task { await channel.shutdown() } }
         await #expect(throws: SSHChannelError.timedOut) {
             _ = try await channel.request("slow", ["delay": .double(5)], timeout: .milliseconds(300))
         }
+        guard case .unreachable = await channel.reachability else {
+            Issue.record("a timed out helper must leave the host unreachable")
+            return
+        }
         _ = try await channel.request("quick")
         #expect(await channel.generation == 2)
+        #expect(await channel.reachability == .reachable)
+        await channel.shutdown()
     }
 
     @Test("a timeout racing a late response resumes the request exactly once", .enabled(if: pythonAvailable))
     func timeoutRacingResponseDoesNotDoubleResume() async throws {
         let channel = SSHChannel(launch: try scriptedHelper())
-        defer { Task { await channel.shutdown() } }
         // The response is due at the same moment the timeout fires, so
         // across these rounds both orders happen. A double resume of the
         // continuation traps, which would crash the test host rather than
@@ -186,17 +235,66 @@ struct HelperChannelTests {
             }
         }
         _ = try await channel.request("after")
+        await channel.shutdown()
     }
 
     @Test("a pushed event reaches the events stream", .enabled(if: pythonAvailable))
     func pushedEventIsYielded() async throws {
         let channel = SSHChannel(launch: try scriptedHelper())
-        defer { Task { await channel.shutdown() } }
         _ = try await channel.request("emit")
         var events = channel.events.makeAsyncIterator()
         let event = try #require(await events.next())
         #expect(event.name == "hook")
         let object = try JSONSerialization.jsonObject(with: event.payload) as? [String: Any]
         #expect(object?["detail"] as? String == "synthetic")
+        await channel.shutdown()
+    }
+
+    @Test("a helper that keeps answering ok false backs off further each time", .enabled(if: pythonAvailable))
+    func refusedSnapshotsGrowTheBackoff() async throws {
+        let channel = SSHChannel(launch: try scriptedHelper())
+        var backoffs: [Int] = []
+        for _ in 0..<3 {
+            await #expect {
+                _ = try await channel.snapshot()
+            } throws: { error in
+                guard case SSHChannelError.badResponse = error else { return false }
+                return true
+            }
+            backoffs.append(await channel.currentBackoff)
+        }
+        // A reply that merely carries an id must not count as health, or
+        // the backoff never grows and the reinstall at the cap never fires.
+        #expect(backoffs == [2, 4, 8])
+        await channel.shutdown()
+    }
+
+    @Test("a helper that exits on its own fails every waiting request once", .enabled(if: pythonAvailable))
+    func helperExitFailsPendingRequests() async throws {
+        let channel = SSHChannel(launch: try scriptedHelper())
+        _ = try await channel.request("warm")
+        #expect(await channel.currentBackoff == 1)
+
+        let parked = Task { try await channel.request("hang") }
+        try await Task.sleep(for: .milliseconds(200))
+        let dying = Task { try await channel.request("die") }
+
+        for task in [parked, dying] {
+            await #expect {
+                _ = try await task.value
+            } throws: { error in
+                // The hint is stderr's LAST line, drained as it arrived.
+                guard case SSHChannelError.closed(let message) = error else { return false }
+                return message.hasSuffix(": synthetic last words")
+            }
+        }
+        // One process went away, so one failure, however many requests
+        // were waiting on it.
+        #expect(await channel.currentBackoff == 2)
+        guard case .unreachable = await channel.reachability else {
+            Issue.record("an exited helper must leave the host unreachable")
+            return
+        }
+        await channel.shutdown()
     }
 }

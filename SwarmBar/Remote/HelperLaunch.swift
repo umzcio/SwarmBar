@@ -59,14 +59,20 @@ enum HelperLaunch: Sendable, Equatable {
 
     /// The remote command that installs the helper from its stdin. Pushed
     /// over the same ssh connection rather than a separate scp step, so
-    /// there is only ever one channel to authorize. Idempotent: `install`
+    /// there is only ever one channel to authorize. Idempotent: the rename
     /// overwrites, so a redeploy is safe.
+    ///
+    /// `cat` into a temporary file and a rename, rather than `install` from
+    /// /dev/stdin, because BSD install refuses /dev/stdin ("Inappropriate
+    /// file type or format") and Darwin hosts are in the fleet. The umask
+    /// keeps the file private from its first byte, and the rename means a
+    /// helper that is running never sees a half-written copy of itself.
     static func installCommand(for watchAs: WatchAs) -> String {
         switch watchAs {
         case .everyUser:
-            "sudo -n install -m 700 -o root -g root /dev/stdin \(rootHelperPath)"
+            "sudo -n sh -c 'umask 077; cat > \(rootHelperPath).tmp && chmod 700 \(rootHelperPath).tmp && mv -f \(rootHelperPath).tmp \(rootHelperPath)'"
         case .loginUser:
-            #"mkdir -p "$HOME/.swarmbar" && chmod 700 "$HOME/.swarmbar" && install -m 700 /dev/stdin "$HOME/.swarmbar/swarmbar-helper""#
+            #"mkdir -p "$HOME/.swarmbar" && chmod 700 "$HOME/.swarmbar" && umask 077 && cat > "$HOME/.swarmbar/swarmbar-helper.tmp" && chmod 700 "$HOME/.swarmbar/swarmbar-helper.tmp" && mv -f "$HOME/.swarmbar/swarmbar-helper.tmp" "$HOME/.swarmbar/swarmbar-helper""#
         }
     }
 }
