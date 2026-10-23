@@ -29,6 +29,9 @@ struct PlannedChange: Equatable, Sendable {
     /// before this one is made: a config waits for the bridge file it
     /// names, and an undo's removal waits for the config that named it.
     var dependsOn: [Int] = []
+    /// The home the file is in. A file created there by root must be
+    /// handed to that home's owner.
+    var home: RemoteHome? = nil
 
     /// Whether the helper is asked to make this change at all.
     var isSent: Bool {
@@ -60,6 +63,8 @@ struct SetupPlan: Equatable, Sendable {
     /// every user is watched: the narrow sudo rule is not there yet, so the
     /// other homes were never looked at. Probe again once it is.
     var isPartial: Bool = false
+    /// The account that pastes the setup command or the prompt.
+    var loginUser: String? = nil
 }
 
 /// The three remote bridge files, as this build bundles them.
@@ -115,15 +120,17 @@ enum SetupPlanner {
     private struct Pending {
         var change: PlannedChange
         var needs: [String] = []
+        /// The bridge file an undo's config change named.
+        var names: String? = nil
     }
 
-    /// `loginEUID` is the euid of the login user's own probe, the account
-    /// that will paste the setup command. Pass it whenever `probe` is
-    /// root's view, whose euid says nothing about who logs in. nil means
-    /// `probe` is the login user's own.
+    /// `loginEUID` and `loginUser` are the euid and name from the login
+    /// user's own probe, the account that will paste the setup command.
+    /// Pass both whenever `probe` is root's view, whose euid and user say
+    /// nothing about who logs in. nil means `probe` is the login user's own.
     static func plan(
         probe: ProbeResult, watchAs: WatchAs, bundled: BundledBridges, kimiEvents: [String: [String]],
-        loginEUID: Int? = nil
+        loginEUID: Int? = nil, loginUser: String? = nil
     ) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
         let owners = fileOwners(probe, homes)
@@ -132,6 +139,11 @@ enum SetupPlanner {
         var seen = Seen()
 
         for home in homes {
+            let firstBridge = bridges.count, firstConfig = configs.count
+            defer {
+                for index in firstBridge..<bridges.count { bridges[index].change.home = home }
+                for index in firstConfig..<configs.count { configs[index].change.home = home }
+            }
             let tools = Set(toolList(probe.tools[home.path]))
             let reported = probe.bridges?[home.path] ?? []
             // A file several homes share is planned once, from the home
@@ -228,26 +240,42 @@ enum SetupPlanner {
         // Bridge files first, so no config is written before the file it names.
         var paths = Set<String>()
         let uniqueBridges = bridges.filter { paths.insert($0.change.path).inserted }
+        var all = uniqueBridges + configs
+        markUnwritablePaths(&all)
+        // Never wire a config to a bridge file SwarmBar could not check.
+        for index in all.indices where all[index].change.isSent {
+            guard let bridge = all.first(where: {
+                all[index].needs.contains($0.change.path) && $0.change.action == .byHand
+            })?.change.path else { continue }
+            all[index].change.action = .byHand
+            all[index].change.description = "Edit by hand: \(all[index].change.path) would run \(bridge), "
+                + "which SwarmBar couldn't check. Sort that file out first, then set this host up again."
+        }
         let narrow = watchAs == .everyUser && !probe.sudoOK
         let rootLogin = (loginEUID ?? probe.euid) == 0
+        // Root's view names root, never the login user.
+        let login = loginUser ?? (loginEUID == nil ? probe.user : nil)
         return SetupPlan(
-            changes: resolve(uniqueBridges + configs),
+            changes: linked(all),
             installHelper: narrow,
             // A root login has no use for a rule that lets it run its own
             // helper, and needs no sudo to run apply.
-            sudoersUser: narrow && !rootLogin ? probe.user : nil,
+            sudoersUser: narrow && !rootLogin ? login : nil,
             watchAs: watchAs,
             helperDestination: helperDestination(homes: homes, watchAs: watchAs),
             system: probe.system,
             useSudo: watchAs == .everyUser && !rootLogin,
-            isPartial: narrow && !rootLogin)
+            isPartial: narrow && !rootLogin,
+            loginUser: login)
     }
 
     /// The `.remote` uninstall for every config that names a remote bridge,
     /// then the bridge files themselves, each after the configs that named
     /// it. Local entries are never touched.
-    /// `loginEUID` as for `plan`.
-    static func undoPlan(probe: ProbeResult, watchAs: WatchAs, loginEUID: Int? = nil) throws -> SetupPlan {
+    /// `loginEUID` and `loginUser` as for `plan`.
+    static func undoPlan(
+        probe: ProbeResult, watchAs: WatchAs, loginEUID: Int? = nil, loginUser: String? = nil
+    ) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
         let owners = fileOwners(probe, homes)
         var configs: [Pending] = []
@@ -264,12 +292,6 @@ enum SetupPlanner {
                 (kimiScript(home: home.path), [.kimiCode, .bearCode]),
                 (plugin(home: home.path), [.openCode]),
             ]
-            // A bridge file stays while a config that names it needs a hand
-            // edit: OpenCode will not start with a plugin entry whose file
-            // is gone.
-            var keep = Set<String>()
-            var namedBy: [String: [String]] = [:]
-
             for file in probe.configs[home.path] ?? [] {
                 if let key = Seen.key(file), owners[key] != home.path { continue }
                 guard let tool = ProbeResult.tool(named: file.tool),
@@ -307,14 +329,13 @@ enum SetupPlanner {
                     default: TomlHooksTransform.uninstall(text, family: .remote)
                     }
                 }
-                guard let change else { continue }
-                if change.action == .byHand { keep.insert(bridge) }
-                namedBy[bridge, default: []].append(change.path)
-                configs.append(Pending(change: change))
+                guard var change else { continue }
+                change.home = home
+                configs.append(Pending(change: change, names: bridge))
             }
 
             let relevant = tools.union(installed).union(unknown)
-            for bridge in bridges where !keep.contains(bridge.path) {
+            for bridge in bridges {
                 // The probe says which bridge files are there. Without that
                 // report, any tool that could have used one counts.
                 let there: Bool
@@ -324,20 +345,29 @@ enum SetupPlanner {
                     there = !relevant.isDisjoint(with: bridge.users)
                 }
                 guard there else { continue }
-                removals.append(Pending(
-                    change: PlannedChange(
-                        tool: bridge.users.count == 1 ? bridge.users.first : .kimiCode, path: bridge.path,
-                        expectSHA256: "", action: .remove, description: "Remove \(bridge.path)"),
-                    needs: namedBy[bridge.path] ?? []))
+                removals.append(Pending(change: PlannedChange(
+                    tool: bridge.users.count == 1 ? bridge.users.first : .kimiCode, path: bridge.path,
+                    expectSHA256: "", action: .remove, description: "Remove \(bridge.path)", home: home)))
             }
         }
+        // A bridge file stays while a config that names it needs a hand
+        // edit, decided only once every hand edit is known: OpenCode will
+        // not start with a plugin entry whose file is gone.
+        markUnwritablePaths(&configs)
+        let keep = Set(configs.filter { $0.change.action == .byHand }.compactMap(\.names))
         var paths = Set<String>()
-        let uniqueRemovals = removals.filter { paths.insert($0.change.path).inserted }
+        var kept = removals.filter { !keep.contains($0.change.path) && paths.insert($0.change.path).inserted }
+        for index in kept.indices {
+            kept[index].needs = configs.filter { $0.names == kept[index].change.path }.map(\.change.path)
+        }
+        markUnwritablePaths(&kept)
+        let rootLogin = (loginEUID ?? probe.euid) == 0
         return SetupPlan(
-            changes: resolve(configs + uniqueRemovals), installHelper: false, sudoersUser: nil, watchAs: watchAs,
+            changes: linked(configs + kept), installHelper: false, sudoersUser: nil, watchAs: watchAs,
             helperDestination: helperDestination(homes: homes, watchAs: watchAs), system: probe.system,
-            useSudo: watchAs == .everyUser && (loginEUID ?? probe.euid) != 0,
-            isPartial: watchAs == .everyUser && !probe.sudoOK && (loginEUID ?? probe.euid) != 0)
+            useSudo: watchAs == .everyUser && !rootLogin,
+            isPartial: watchAs == .everyUser && !probe.sudoOK && !rootLogin,
+            loginUser: loginUser ?? (loginEUID == nil ? probe.user : nil))
     }
 
     /// The tool a kimi_events key names: its binary's path, or the BearCode
@@ -481,17 +511,21 @@ enum SetupPlanner {
                              action: .write(newText: text, mode: configMode), description: description)
     }
 
-    /// The final list: a path no one could read safely becomes a hand
-    /// edit, then each change's `needs` becomes the indexes of the planned
-    /// writes and removals at those paths.
-    private static func resolve(_ pending: [Pending]) -> [PlannedChange] {
-        var changes = pending.map(\.change)
-        for index in changes.indices where !isPrintable(changes[index].path) {
-            changes[index].action = .byHand
-            changes[index].expectSHA256 = ""
-            changes[index].description =
-                "Edit by hand: SwarmBar won't write a path with control characters: \(String(reflecting: changes[index].path))"
+    /// A path holding a control character becomes a hand edit: it would
+    /// turn the prompt's shell lines into something else.
+    private static func markUnwritablePaths(_ pending: inout [Pending]) {
+        for index in pending.indices where !isPrintable(pending[index].change.path) {
+            pending[index].change.action = .byHand
+            pending[index].change.expectSHA256 = ""
+            pending[index].change.description =
+                "Edit by hand: SwarmBar won't write a path with control characters: \(String(reflecting: pending[index].change.path))"
         }
+    }
+
+    /// The final list, each change's `needs` turned into the indexes of
+    /// the planned writes and removals at those paths.
+    private static func linked(_ pending: [Pending]) -> [PlannedChange] {
+        var changes = pending.map(\.change)
         for (index, item) in pending.enumerated() {
             // Only earlier changes: the applier goes in order, and a plan
             // is built with what a change waits for ahead of it.
