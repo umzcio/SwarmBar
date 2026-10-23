@@ -1294,16 +1294,23 @@ def handle_tmux(request):
         # Stripping controls means the text itself can never carry ESC, so
         # it cannot close the paste early or open a sequence of its own.
         text = PASTE_STRIP.sub("", text)
-        steps = (
-            (["load-buffer", "-b", PASTE_BUFFER, "-"], text.encode("utf-8")),
-            (["send-keys", "-t", pane["id"], "-H"] + PASTE_START, None),
-            (["paste-buffer", "-r", "-d", "-b", PASTE_BUFFER, "-t", pane["id"]], None),
-            (["send-keys", "-t", pane["id"], "-H"] + PASTE_END, None),
-        )
-        for args, data in steps:
+
+        def step(args, data=None):
             done = tmux_run(pane, args, input=data)
-            if done is None or done.returncode != 0:
-                return {"sent": False, "reason": "send failed"}
+            return done is not None and done.returncode == 0
+
+        close = ["send-keys", "-t", pane["id"], "-H"] + PASTE_END
+        if not step(["load-buffer", "-b", PASTE_BUFFER, "-"], text.encode("utf-8")) \
+                or not step(["send-keys", "-t", pane["id"], "-H"] + PASTE_START):
+            return {"sent": False, "reason": "send failed"}
+        if not step(["paste-buffer", "-r", "-d", "-b", PASTE_BUFFER, "-t", pane["id"]]):
+            # ESC[200~ is out, so close it whatever happened, or the pane's
+            # app stays in paste mode and takes the next keys as text. Best
+            # effort: the paste has already failed either way.
+            step(close)
+            return {"sent": False, "reason": "send failed"}
+        if not step(close):
+            return {"sent": False, "reason": "send failed"}
         return {"sent": True}
     keys, expect = request.get("keys"), request.get("expect") or []
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \

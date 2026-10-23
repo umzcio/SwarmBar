@@ -1201,18 +1201,40 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(rec.inputs[0], b"hi\nthere")
         self.assertFalse(any("Enter" in c or "-p" in c for c in rec.calls))
 
-    def test_paste_stops_at_the_first_failed_step(self):
-        steps = ("load-buffer", "200", "paste-buffer", "201")
+    def paste_failing(self, *steps):
+        """A paste whose tmux calls for the named steps exit 1. A step is
+        "load-buffer", "paste-buffer", or "200"/"201" for the markers."""
+        def fails(argv):
+            if "send-keys" in argv:
+                return {"30": "200", "31": "201"}[argv[-2]] in steps
+            return any(step in argv for step in steps)
+        rec = TmuxRecorder(fail_when=fails)
+        out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi"}, rec)
+        return out, rec
 
-        def matcher(step):
-            if step in ("200", "201"):
-                return lambda argv: "send-keys" in argv and argv[-2] == {"200": "30", "201": "31"}[step]
-            return lambda argv: step in argv
-        for index, step in enumerate(steps):
-            rec = TmuxRecorder(fail_when=matcher(step))
-            out = self.call({"cmd": "paste", "pane": self.pane, "text": "hi"}, rec)
+    def test_paste_before_the_opening_marker_sends_nothing_else(self):
+        # A failed load or a failed ESC[200~ leaves no paste open to close.
+        for step, count in (("load-buffer", 1), ("200", 2)):
+            out, rec = self.paste_failing(step)
             self.assertEqual(out, {"sent": False, "reason": "send failed"}, step)
-            self.assertEqual(len(rec.calls), index + 1, step)
+            self.assertEqual(len(rec.calls), count, step)
+            self.assertFalse(any("paste-buffer" in c for c in rec.calls), step)
+
+    def test_failed_paste_still_closes_the_bracket(self):
+        # ESC[200~ went out, so ESC[201~ follows even when the paste fails,
+        # or the pane is left in paste mode. Its own failure changes nothing.
+        end = ["tmux", "-S", self.sock, "send-keys", "-t", "%3", "-H",
+               "1b", "5b", "32", "30", "31", "7e"]
+        for steps in (("paste-buffer",), ("paste-buffer", "201")):
+            out, rec = self.paste_failing(*steps)
+            self.assertEqual(out, {"sent": False, "reason": "send failed"}, steps)
+            self.assertEqual(len(rec.calls), 4, steps)
+            self.assertEqual(rec.calls[-1], end, steps)
+
+    def test_failed_closing_marker_reports_send_failed(self):
+        out, rec = self.paste_failing("201")
+        self.assertEqual(out, {"sent": False, "reason": "send failed"})
+        self.assertEqual(len(rec.calls), 4)
 
     def test_paste_sent_when_target_still_matches(self):
         rec = self.target_recorder()
