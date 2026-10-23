@@ -97,7 +97,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         ])
 
         var screen: String?
-        if RemoteAnswerPlan.needsScreen(route) {
+        if RemoteAnswerPlan.needsScreen(tool: session.tool, route: route) {
             do {
                 screen = RemoteAnswerPlan.screen(
                     fromCapture: try await requester.request("capture", ["pane": pane], timeout: .seconds(30)))
@@ -107,17 +107,33 @@ extension RemoteMonitorSupervisor: RemoteActing {
             }
         }
         let choose = allow ? TuiPromptLayout.approveOnceOption(in:) : TuiPromptLayout.rejectOption(in:)
-        guard let command = RemoteAnswerPlan.command(route: route, screen: screen, choose: choose) else {
+        guard let command = RemoteAnswerPlan.command(
+            tool: session.tool, route: route, screen: screen, choose: choose)
+        else {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
+            return false
+        }
+        // The capture was a round trip, and the host may have gone dark or
+        // its helper restarted meanwhile. Sending now would start ssh again
+        // and aim by a pane map from before the gap.
+        guard let current = keystrokeTarget(for: session),
+              current.pane == target.pane, current.process.pid == target.process.pid
+        else {
+            remoteAnswerLog.notice("answer: \(host, privacy: .public) changed while reading the prompt, nothing sent")
             return false
         }
 
         let reply: Data
         do {
+            // pid and comm let the helper re-read its process table at press
+            // time and refuse if that pid is gone, is another agent, or no
+            // longer sits in this pane.
             reply = try await requester.request("keys", [
                 "pane": pane,
                 "keys": .array(command.keys.map(JSONValue.string)),
                 "expect": .array(command.expect.map(JSONValue.string)),
+                "pid": .int(target.process.pid),
+                "comm": .string(target.process.comm),
             ], timeout: .seconds(30))
         } catch {
             remoteAnswerLog.notice("answer: keys on \(host, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -133,20 +149,26 @@ extension RemoteMonitorSupervisor: RemoteActing {
         }
     }
 
-    /// The pane a session's keys go to and the connection that reaches it,
-    /// or nil when keystrokes may not or cannot answer it.
+    /// The process and pane a session's keys go to and the connection that
+    /// reaches them, or nil when keystrokes may not or cannot answer it.
     ///
     /// The pane is the one its own process runs in, matched by pid in the
     /// snapshot last applied in full. Two agents can share a pane (a codex
     /// started inside a claude), which is fine: the keys are chosen and
     /// confirmed against what that pane shows.
+    ///
+    /// Only while the host is reachable and a snapshot has landed since the
+    /// last gap. Both are checked before any request, so a click on a dark
+    /// host's row never starts ssh, and a pane map from before a gap never
+    /// aims a key.
     private func keystrokeTarget(
         for session: AgentSession
-    ) -> (pane: RemotePane, connection: RemoteHostConnection)? {
+    ) -> (process: RemoteProcessRecord, pane: RemotePane, connection: RemoteHostConnection)? {
         guard let hostName = session.host, let pid = session.pid,
+              store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
-              let pane = connection.lastSnapshot?.processes
-                .first(where: { $0.pid == Int(pid) })?.pane
+              let process = connection.lastSnapshot?.processes.first(where: { $0.pid == Int(pid) }),
+              let pane = process.pane
         else { return nil }
         // Read from the registry, not the connection's copy, so switching
         // approvals off in Settings applies at once without a restart.
@@ -156,7 +178,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         switch session.tool {
         case .grokBuild where !toggles.grok: return nil
         case .antigravity where !toggles.antigravity: return nil
-        default: return (pane, connection)
+        default: return (process, pane, connection)
         }
     }
 }

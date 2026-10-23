@@ -210,7 +210,7 @@ struct RemoteHostMonitor: SessionMonitor {
         }.value
         if Task.isCancelled { return pollInterval }
 
-        connection.noteApplied(snapshot)
+        if connection.noteApplied(snapshot) { store.noteRemotePanesChanged() }
         // A tool this pass cannot vouch for keeps its previous rows. Its
         // sessions may only be missing because the evidence could not be
         // read, and syncing would turn "could not look" into "nothing there".
@@ -237,7 +237,8 @@ struct RemoteHostMonitor: SessionMonitor {
             alias: host.alias, watchAs: host.watchAs, channel: channel, runner: installRunner)
     }
 
-    /// Deliberately does NOT clear this host's sessions. The work is still
+    /// Deliberately does NOT clear this host's sessions, though it does
+    /// forget the last snapshot's panes (see RemoteHostConnection.noteLost). The work is still
     /// running on the far side and SwarmBar has simply gone blind, so
     /// marking it ended would be a lie and dropping it would look like the
     /// work finished. Nor does it clear the mirror: the next helper process
@@ -246,6 +247,9 @@ struct RemoteHostMonitor: SessionMonitor {
         _ reason: String, store: SessionStore, state: inout PollState
     ) async -> Duration {
         state.stream = nil
+        // Unlike the rows, the pane map is not kept: keys aimed by it after
+        // a gap could land in whatever now owns the pane.
+        if connection.noteLost() { store.noteRemotePanesChanged() }
         let backoff = await connection.channel.currentBackoff
         if Task.isCancelled { return pollInterval }
         store.noteRemoteReachability(host: connection.host.displayName, state.reachability(failing: reason))

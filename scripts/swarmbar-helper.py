@@ -1193,6 +1193,38 @@ def pane_text(pane):
     return done.stdout.decode("utf-8", "replace")
 
 
+def target_still_there(pid, comm, pane):
+    """Whether `pid` is still the agent `comm`, running in `pane`.
+
+    Read fresh at press time. A pane the Mac learned from a snapshot can be
+    seconds old by the time a key goes to it: the agent may have exited and
+    left a shell, its pid may belong to something else, or the pane may have
+    been reused. Any doubt, a failed ps included, reads as changed, so a key
+    only ever lands where the Mac believes it does.
+    """
+    try:
+        completed = run_command(
+            ["ps", "-axo", "pid=,ppid=,uid=,user=,tty=,comm=,args="], timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if completed.returncode != 0:
+        return False
+    rows = parse_ps(completed.stdout.decode("utf-8", "replace"))
+    row = None
+    for candidate in rows:
+        if candidate["pid"] == pid:
+            row = candidate
+            break
+    if row is None or agent_name(row) != comm:
+        return False
+    parents = dict((r["pid"], r["ppid"]) for r in rows)
+    found = pane_for(pid, parents, tmux_panes())
+    if found is None or found.get("id") != pane.get("id"):
+        return False
+    return os.path.realpath(found.get("socket", "")) == os.path.realpath(pane.get("socket", ""))
+
+
 def handle_tmux(request):
     """capture, keys and paste. Keys are confirmed against a fresh capture of
     the visible screen taken immediately before sending, and any missing
@@ -1206,6 +1238,10 @@ def handle_tmux(request):
         confirming read failed), or "send failed" (plus "sent_count" for
         keys, how many keys landed first).
       any command: {"ok": false, "error": "bad pane" | "bad keys" | "bad text"}
+
+    keys may carry `pid` (int) and `comm` (str), always together. With them
+    the target is re-read before anything else, and a pid that is gone, is
+    another agent, or no longer sits in this pane answers "changed".
     """
     pane = valid_pane(request.get("pane"))
     if pane is None:
@@ -1240,6 +1276,14 @@ def handle_tmux(request):
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
             or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect):
         return {"ok": False, "error": "bad keys"}
+    has_pid, has_comm = "pid" in request, "comm" in request
+    if has_pid or has_comm:
+        pid, comm = request.get("pid"), request.get("comm")
+        if not (has_pid and has_comm) or isinstance(pid, bool) \
+                or not isinstance(pid, int) or not isinstance(comm, str):
+            return {"ok": False, "error": "bad keys"}
+        if not target_still_there(pid, comm, request.get("pane")):
+            return {"sent": False, "reason": "changed"}
     gap = request.get("gap", KEY_GAP_DEFAULT)
     if not isinstance(gap, (int, float)) or isinstance(gap, bool) or gap < 0:
         gap = KEY_GAP_DEFAULT

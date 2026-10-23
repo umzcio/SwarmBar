@@ -333,11 +333,21 @@ final class SessionStore {
     /// row swap its buttons for the terminal note.
     var remoteHoldRevision = 0
 
-    /// How a remote row's prompt can be answered, for the view. Reads
-    /// `remoteHoldRevision` so a view that asks is redrawn when a hold
-    /// comes or goes.
+    /// The same for panes: moves when a poll finds a process in a different
+    /// pane, or none, and when a gap makes the last pane map untrustworthy.
+    /// A row's pid can stay the same while its pane comes and goes.
+    private(set) var remotePaneRevision = 0
+
+    func noteRemotePanesChanged() {
+        remotePaneRevision &+= 1
+    }
+
+    /// How a remote row's prompt can be answered, for the view. Reads both
+    /// revisions so a view that asks is redrawn when a hold or a pane comes
+    /// or goes.
     func remoteAnswerability(for session: AgentSession) -> RemoteAnswerability {
         _ = remoteHoldRevision
+        _ = remotePaneRevision
         return remoteActions?.answerability(for: session) ?? .terminalOnly
     }
 
@@ -626,11 +636,14 @@ final class SessionStore {
     }
 
     /// A remote answer's keys landed. The answer took a round trip, so the
-    /// row is moved on only if it is still asking: a poll that has already
-    /// seen the prompt settle knows better than this does.
+    /// row is moved on only if it is still asking the SAME question: a poll
+    /// that has already seen the prompt settle knows better than this does,
+    /// and a row now asking about another command was not answered.
     func noteRemoteAnswerSent(_ session: AgentSession, allow: Bool) {
-        guard let current = sessions.first(where: { $0.id == session.id }),
-              case .waitingApproval(let command) = current.status
+        guard case .waitingApproval(let answered) = session.status,
+              let current = sessions.first(where: { $0.id == session.id }),
+              case .waitingApproval(let command) = current.status,
+              command == answered
         else { return }
         noteAnswered(session.id, command: command, allow: allow)
     }

@@ -1002,8 +1002,9 @@ class ProcessTableTests(unittest.TestCase):
 class TmuxRecorder(object):
     """Stands in for helper.run_command and records argv lists and inputs."""
 
-    def __init__(self, screen="", fail_on_send=None, capture_code=0):
+    def __init__(self, screen="", fail_on_send=None, capture_code=0, ps=None, panes=None):
         self.capture_code = capture_code
+        self.ps, self.panes = ps, panes or {}
         self.calls = []
         self.inputs = []
         self.screen = screen
@@ -1013,6 +1014,14 @@ class TmuxRecorder(object):
     def __call__(self, argv, timeout=5, input=None):
         self.calls.append(list(argv))
         self.inputs.append(input)
+        if argv[0] == "ps":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=(self.ps or "").encode("utf-8"), stderr=b"")
+        if "list-panes" in argv:
+            text = self.panes.get(argv[2])
+            return subprocess.CompletedProcess(
+                argv, 0 if text is not None else 1,
+                stdout=(text or "").encode("utf-8"), stderr=b"")
         code = 0
         if "send-keys" in argv:
             self.sends += 1
@@ -1121,6 +1130,54 @@ class TmuxCommandTests(unittest.TestCase):
                          "expect": []}, rec)
         self.assertEqual(out, {"sent": False, "reason": "send failed", "sent_count": 1})
         self.assertEqual(len(rec.sent()), 2)
+
+    def target_recorder(self, ps=PS_SAMPLE, pane_line="%3 610\n"):
+        return TmuxRecorder(screen="1. Approve once", ps=ps, panes={self.sock: pane_line})
+
+    def test_keys_sent_when_target_still_matches(self):
+        rec = self.target_recorder()
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": ["Approve once"], "pid": 700, "comm": "claude"}, rec)
+        self.assertEqual(out, {"sent": True})
+        self.assertEqual(len(rec.sent()), 1)
+
+    def test_keys_not_sent_when_pid_gone(self):
+        rec = self.target_recorder()
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": [], "pid": 999, "comm": "claude"}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_keys_not_sent_when_comm_changed(self):
+        # The pid was reused by another agent, or the snapshot named another.
+        rec = self.target_recorder()
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["y"],
+                         "expect": [], "pid": 700, "comm": "codex"}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_keys_not_sent_when_pane_changed(self):
+        rec = self.target_recorder(pane_line="%4 610\n")
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": [], "pid": 700, "comm": "claude"}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_keys_not_sent_when_ps_fails(self):
+        rec = self.target_recorder(ps="")
+        out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["1"],
+                         "expect": [], "pid": 700, "comm": "claude"}, rec)
+        self.assertEqual(out, {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_target_args_must_come_together(self):
+        for extra in ({"pid": 700}, {"comm": "claude"}, {"pid": "700", "comm": "claude"},
+                      {"pid": True, "comm": "claude"}, {"pid": 700, "comm": 3}):
+            request = {"cmd": "keys", "pane": self.pane, "keys": ["1"], "expect": []}
+            request.update(extra)
+            rec = self.target_recorder()
+            self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad keys"}, extra)
+            self.assertEqual(rec.sent(), [])
 
     def test_paste_never_sends_enter(self):
         rec = TmuxRecorder()

@@ -53,26 +53,37 @@ final class RemoteHookRelay {
     /// Read per event rather than once, so switching approvals off for a
     /// host in Settings applies to its next prompt without a restart.
     private let approvalsOff: @MainActor () -> Set<AgentTool>
+    /// Told when the helper process exits, so what the Mac learned from it
+    /// (which pane each agent sits in) is dropped with the holds.
+    private let onHelperExited: @MainActor () -> Void
     /// The newest helper process known to have exited. Its events, and any
     /// older one's, can still be draining from the old reader, and a hold
     /// they describe died with it.
     private var exitedGeneration = 0
 
+    /// The connection's snapshot is forgotten when its helper exits, and
+    /// `onHelperExited` hears about it afterwards.
     convenience init(
         connection: RemoteHostConnection, hookServer: HookServer,
-        approvalsOff: (@MainActor () -> Set<AgentTool>)? = nil
+        approvalsOff: (@MainActor () -> Set<AgentTool>)? = nil,
+        onHelperExited: (@MainActor () -> Void)? = nil
     ) {
         let host = connection.host
         self.init(
             hostID: host.id, hostName: host.displayName, mirror: connection.mirror,
             events: connection.channel.events, replier: connection.channel,
-            hookServer: hookServer, approvalsOff: approvalsOff ?? { host.approvalsOff })
+            hookServer: hookServer, approvalsOff: approvalsOff ?? { host.approvalsOff },
+            onHelperExited: { [weak connection] in
+                connection?.noteLost()
+                onHelperExited?()
+            })
     }
 
     init(
         hostID: UUID, hostName: String, mirror: RemoteMirror,
         events: AsyncStream<HelperEvent>, replier: any RemoteHookReplying,
-        hookServer: HookServer, approvalsOff: @escaping @MainActor () -> Set<AgentTool>
+        hookServer: HookServer, approvalsOff: @escaping @MainActor () -> Set<AgentTool>,
+        onHelperExited: @escaping @MainActor () -> Void = {}
     ) {
         self.hostID = hostID
         self.hostName = hostName
@@ -81,6 +92,7 @@ final class RemoteHookRelay {
         self.replier = replier
         self.hookServer = hookServer
         self.approvalsOff = approvalsOff
+        self.onHelperExited = onHelperExited
     }
 
     /// Runs until the task is cancelled or the channel ends. Either way no
@@ -97,6 +109,7 @@ final class RemoteHookRelay {
         if event.name == HelperEvent.helperExited {
             exitedGeneration = max(exitedGeneration, event.generation)
             hookServer.dropRemote(hostID: hostID)
+            onHelperExited()
             return
         }
         // From a process already gone: whatever it held is gone too.

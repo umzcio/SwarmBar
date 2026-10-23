@@ -20,7 +20,33 @@ final class RemoteHostConnection {
         self.mirror = mirror
     }
 
-    func noteApplied(_ snapshot: RemoteSnapshot) {
+    /// Returns whether any process's pane differs from the previous
+    /// snapshot's, a pane appearing or vanishing included, so the caller
+    /// can redraw the rows whose buttons depend on one.
+    @discardableResult
+    func noteApplied(_ snapshot: RemoteSnapshot) -> Bool {
+        let changed = Self.panes(of: lastSnapshot) != Self.panes(of: snapshot)
         lastSnapshot = snapshot
+        return changed
+    }
+
+    /// The helper went away or a poll failed. Which pane each process sat
+    /// in is only known as of before the gap, and a pane can be closed,
+    /// reused or handed to another program while nobody is looking, so no
+    /// key is aimed by it until a fresh snapshot lands. Returns whether
+    /// there was a snapshot to forget.
+    @discardableResult
+    func noteLost() -> Bool {
+        guard lastSnapshot != nil else { return false }
+        lastSnapshot = nil
+        return true
+    }
+
+    private static func panes(of snapshot: RemoteSnapshot?) -> [Int: RemotePane] {
+        var panes: [Int: RemotePane] = [:]
+        for process in snapshot?.processes ?? [] {
+            if let pane = process.pane { panes[process.pid] = pane }
+        }
+        return panes
     }
 }

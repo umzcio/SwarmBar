@@ -122,7 +122,8 @@ final class RemoteMonitorSupervisor {
                     connection: connection, hookServer: hookServer,
                     approvalsOff: { [weak registry = self.registry] in
                         registry?.host(id: id)?.approvalsOff ?? fallback
-                    })
+                    },
+                    onHelperExited: { [weak store] in store?.noteRemotePanesChanged() })
                 relay = Task { await relayer.run() }
             }
             running[host.id] = Running(host: host, task: task, connection: connection, relay: relay)

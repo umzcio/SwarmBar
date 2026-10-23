@@ -215,6 +215,9 @@ struct RemoteHostMonitorTests {
         }
         #expect(rig.rows.map(\.id) == before.map(\.id))
         #expect(rig.rows.map(\.status) == before.map(\.status))
+        // The rows stay, but which pane each process sat in is from before
+        // the gap, and keys must not be aimed by it.
+        #expect(rig.connection.lastSnapshot == nil)
     }
 
     @Test("a restarted helper resets the mirror", .enabled(if: pythonAvailable))
