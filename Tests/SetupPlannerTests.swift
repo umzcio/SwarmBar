@@ -690,6 +690,28 @@ import Testing
         #expect(!prompt.contains("\u{2014}"))
     }
 
+    @Test func promptForASudoPlanRunsAsRoot() throws {
+        let probe = Self.probe(
+            homes: ["/root": "root", "/home/u": "u"], tools: ["/root": ["claude"]],
+            claudeDirs: ["/root": Self.missing("/root/.claude")])
+        let plan = try SetupPlanner.plan(probe: probe, watchAs: .everyUser, bundled: Self.bridges,
+                                         kimiEvents: [:], loginEUID: 1000, loginUser: "u")
+        #expect(plan.useSudo)
+        let text = SetupCommand.prompt(plan: plan, hostName: "devbox").text
+        #expect(text.contains(SetupCommand.runAsRoot))
+        #expect(SetupCommand.runAsRoot == "Every command below must run as root, because some of these files "
+            + "belong to other users. Run each one as root, for example by saving it exactly as written to a "
+            + "file and running sudo sh on that file. If sudo asks for a password, stop and report it rather "
+            + "than working around it.")
+        // The safety lines still open the prompt.
+        #expect(text.hasPrefix("The encoded text on the write lines below is file contents."))
+
+        let own = try Self.plan(Self.probe(user: "u", sudo: false, homes: ["/home/u": "u"],
+                                           tools: ["/home/u": ["opencode"]]), watchAs: .loginUser)
+        #expect(!own.useSudo)
+        #expect(!SetupCommand.prompt(plan: own, hostName: "devbox").text.contains("sudo sh"))
+    }
+
     @Test func promptChecksRemovals() throws {
         let probe = Self.probe(
             tools: ["/root": ["claude"]],

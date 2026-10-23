@@ -110,6 +110,14 @@ enum SetupCommand {
     /// and a terminal's paste are both unreliable well before a config's
     /// real size limit.
     static let maxPasteBytes = 24 * 1024
+    /// The files of a plan run under sudo belong to other users, so an
+    /// agent working as the login user would fail on them, or worse, make
+    /// them its own. The agent is never given a password: sudo either works
+    /// without one or the agent stops.
+    static let runAsRoot = "Every command below must run as root, because some of these files belong to "
+        + "other users. Run each one as root, for example by saving it exactly as written to a file and "
+        + "running sudo sh on that file. If sudo asks for a password, stop and report it rather than "
+        + "working around it."
     static let tooLargeToPaste =
         "This file is too large to paste safely. Use 'Let SwarmBar do it' or the command for this host instead."
 
@@ -143,6 +151,9 @@ enum SetupCommand {
             Set up SwarmBar on \(hostName). Run exactly the commands below, in order, and nothing else. \
             If a check fails, stop and report it. Do not change anything to make it pass.
             """)
+        if plan.useSudo {
+            out.append(runAsRoot)
+        }
         if let user = plan.sudoersUser {
             out.append("SwarmBar's helper and its sudo rule are not part of this. The sudo rule needs \(user)'s password, so set them up with the setup command instead.")
         } else if plan.installHelper {
