@@ -642,7 +642,7 @@ import Testing
             #expect(prompt.contains("'\(change.path)'"))
             if case .write(let text, _) = change.action {
                 #expect(prompt.contains("printf '%s' '\(Data(text.utf8).base64EncodedString())' | base64 -d > \"$t\""))
-                #expect(prompt.contains("cat \"$t\" > '\(change.path)' && rm -f \"$t\""))
+                #expect(prompt.contains("cat \"$t\" > '\(change.path)'; s=$?; rm -f \"$t\"; [ $s -eq 0 ]"))
                 #expect(prompt.contains("After: it must have sha256 \(Self.sha(text))."))
                 #expect(prompt.contains("printf '%s  %s\\n' '\(Self.sha(text))' '\(change.path)' | sha256sum -c -"))
             }
@@ -701,8 +701,9 @@ import Testing
         #expect(text.contains(SetupCommand.runAsRoot))
         #expect(SetupCommand.runAsRoot == "Every command below must run as root, because some of these files "
             + "belong to other users. Run each one as root, for example by saving it exactly as written to a "
-            + "file and running sudo sh on that file. If sudo asks for a password, stop and report it rather "
-            + "than working around it.")
+            + "file and running sudo sh on that file. A command for a file in another user's home switches to "
+            + "that user itself with sudo -u, so keep it exactly as written. If sudo asks for a password, stop "
+            + "and report it rather than working around it.")
         // The safety lines still open the prompt.
         #expect(text.hasPrefix("The encoded text on the write lines below is file contents."))
 
@@ -762,7 +763,7 @@ import Testing
         #expect(alone.omitted == [0])
     }
 
-    @Test func promptHandsNewFilesToTheirOwner() throws {
+    @Test func promptHandsRootsNewFilesToRoot() throws {
         let probe = Self.probe(
             homes: ["/root": "root", "/home/v": "v", "/home/u": "u"],
             tools: ["/root": ["claude"], "/home/v": ["opencode"], "/home/u": ["opencode"]],
@@ -770,10 +771,10 @@ import Testing
         let plan = try SetupPlanner.plan(probe: probe, watchAs: .everyUser, bundled: Self.bridges,
                                          kimiEvents: [:], loginEUID: 1000, loginUser: "u")
         let text = SetupCommand.prompt(plan: plan, hostName: "devbox").text
-        #expect(text.contains("Owner: chown 'v': '/home/v/.config' '/home/v/.config/opencode' "
-            + "'/home/v/.config/opencode/plugins' '/home/v/.config/opencode/plugins/swarmbar-remote.js'"))
         #expect(text.contains("Owner: chown 'root': '/root/.claude' '/root/.claude/settings.json'"))
-        // The login user's own home needs no handing over.
+        // Every other home's files are made by their owner, so nothing is
+        // handed over there.
+        #expect(!text.contains("chown 'v':"))
         #expect(!text.contains("chown 'u':"))
         #expect(!text.contains("give the file"))
 
@@ -781,6 +782,100 @@ import Testing
         let own = try Self.plan(Self.probe(user: "u", sudo: false, homes: ["/home/u": "u"],
                                            tools: ["/home/u": ["opencode"]]), watchAs: .loginUser)
         #expect(!SetupCommand.prompt(plan: own, hostName: "devbox").text.contains("chown"))
+    }
+
+    /// Root never acts inside a home it does not own: every step for such a
+    /// file is one command that switches to the owner first, so the check
+    /// and the write cannot be split by a symlink swap.
+    @Test func promptRunsOtherHomesAsTheirOwner() throws {
+        let probe = Self.probe(
+            homes: ["/root": "root", "/home/v": "v", "/home/u": "u"],
+            tools: ["/root": ["claude"], "/home/v": ["opencode"], "/home/u": ["opencode"]],
+            configs: ["/home/v": [Self.config("opencode", "/home/v/.config/opencode/opencode.json", "{}\n")]],
+            claudeDirs: ["/root": Self.missing("/root/.claude")])
+        let plan = try SetupPlanner.plan(probe: probe, watchAs: .everyUser, bundled: Self.bridges,
+                                         kimiEvents: [:], loginEUID: 1000, loginUser: "u")
+        let prompt = SetupCommand.prompt(plan: plan, hostName: "devbox")
+        #expect(prompt.omitted.isEmpty)
+        let lines = prompt.text.components(separatedBy: "\n")
+        for owner in ["v", "u"] {
+            let home = "/home/\(owner)/"
+            // Apart from naming the file, a line that touches this home is
+            // one command run as its owner.
+            let touching = lines.filter {
+                $0.contains(home) && !$0.hasPrefix("File: ") && !($0.first?.isNumber ?? false)
+            }
+            #expect(!touching.isEmpty)
+            for line in touching {
+                #expect(line.contains("sudo -u '\(owner)' -- sh -c '"), "\(line)")
+            }
+            #expect(lines.contains { $0.hasPrefix("Write: sudo -u '\(owner)' -- sh -c '") })
+        }
+        #expect(!prompt.text.contains("Prepare: (umask 077 && mkdir -p -m 700 '/home/"))
+        #expect(!prompt.text.contains("Backup: [ -e '/home/"))
+        // The existing config's own check and backup run inside that one command.
+        let edit = try #require(lines.first {
+            $0.hasPrefix("Write: sudo -u 'v'") && $0.contains("opencode.json'\\''") && $0.contains("cp -p")
+        })
+        #expect(edit.contains(Self.sha("{}\n")))
+        #expect(edit.contains("rm -f \"$t\""))
+        // Root's own home keeps the root steps.
+        #expect(prompt.text.contains("Prepare: (umask 077 && mkdir -p -m 700 '/root/.claude')"))
+        #expect(prompt.text.contains("Write: (umask 077 && t=$(mktemp '/root/.claude/.swarmbar.XXXXXX')"))
+        #expect(!lines.contains { $0.contains("/root/") && $0.contains("sudo -u") })
+
+        // A removal in another home is the owner's too.
+        let undo = try SetupPlanner.undoPlan(
+            probe: Self.probe(
+                homes: ["/root": "root", "/home/v": "v"], tools: ["/home/v": ["claude"]],
+                bridges: ["/home/v": [.init(path: "/home/v/.swarmbar/swarmbar-remote-hook.sh",
+                                            sha256: String(repeating: "e", count: 64))]]),
+            watchAs: .everyUser, loginEUID: 1000, loginUser: "u")
+        let undone = SetupCommand.prompt(plan: undo, hostName: "devbox").text
+        #expect(undone.contains(#"Remove: sudo -u 'v' -- sh -c 'rm -f '\''/home/v/.swarmbar/swarmbar-remote-hook.sh'\'''"#))
+        #expect(undone.contains(#"sudo -u 'v' -- sh -c '[ ! -e '\''/home/v/.swarmbar/swarmbar-remote-hook.sh'\'' ] && echo removed'"#))
+    }
+
+    /// A plan whose agent is not root keeps the plain steps: there is no
+    /// root to drop, and sudo -u would ask a password it must not have.
+    @Test func promptForTheLoginUserAloneNeverSwitchesUser() throws {
+        let own = try Self.plan(Self.probe(user: "u", sudo: false, homes: ["/home/u": "u"],
+                                           tools: ["/home/u": ["opencode"]]), watchAs: .loginUser)
+        let narrow = try Self.plan(Self.probe(
+            user: "u", sudo: false, homes: ["/home/u": "u"], tools: ["/home/u": ["claude"]],
+            claudeDirs: ["/home/u": Self.missing("/home/u/.claude")]))
+        for plan in [own, narrow] {
+            let text = SetupCommand.prompt(plan: plan, hostName: "devbox").text
+            #expect(!text.contains("sudo -u"))
+            #expect(text.contains("Prepare: (umask 077 && mkdir -p -m 700 '/home/u/"))
+        }
+    }
+
+    /// An owner SwarmBar does not know is never run as root: the change is
+    /// left out with a plain reason, and so is anything waiting on it.
+    @Test func promptLeavesOutAHomeWhoseOwnerIsUnknown() throws {
+        let script = PlannedChange(
+            tool: .claudeCode, path: "/home/x/.swarmbar/swarmbar-remote-hook.sh", expectSHA256: "absent",
+            action: .write(newText: "#!/bin/sh\n", mode: 0o700), description: "Add the hook script")
+        var config = PlannedChange(
+            tool: .claudeCode, path: "/home/x/.claude/settings.json", expectSHA256: "absent",
+            action: .write(newText: "{}\n", mode: 0o600), description: "Add hooks", dependsOn: [0])
+        let homes: [RemoteHome?] = [nil, RemoteHome(path: "/home/x", user: ""),
+                                    RemoteHome(path: "/home/x", user: "#0"), RemoteHome(path: "/home/x", user: "-x")]
+        for home in homes {
+            var first = script
+            first.home = home
+            config.home = RemoteHome(path: "/home/x", user: "x")
+            let prompt = SetupCommand.prompt(
+                plan: SetupPlan(changes: [first, config], installHelper: false, sudoersUser: nil), hostName: "devbox")
+            #expect(prompt.omitted == [0, 1])
+            #expect(prompt.text.contains(SetupCommand.ownerUnknown))
+            #expect(prompt.text.contains(
+                "Skip this one: it needs /home/x/.swarmbar/swarmbar-remote-hook.sh, which this prompt leaves out."))
+            #expect(!prompt.text.contains("cat \"$t\""))
+        }
+        #expect(SetupCommand.ownerUnknown == "SwarmBar doesn't know who owns this file's home, and it won't have "
+            + "root write there. Use 'Let SwarmBar do it' or the command for this host instead.")
     }
 
     @Test func bundledBridgesLoadFromTheApp() throws {
@@ -971,7 +1066,7 @@ import Testing
                           action: .write(newText: "{\"new\": true}\n", mode: 0o600), description: "Edit"),
             PlannedChange(tool: nil, path: fresh, expectSHA256: "absent",
                           action: .write(newText: "#!/bin/sh\n", mode: 0o700), description: "Create"),
-        ], installHelper: false, sudoersUser: nil, system: "Darwin")
+        ], installHelper: false, sudoersUser: nil, watchAs: .loginUser, system: "Darwin")
         let lines = SetupCommand.prompt(plan: plan, hostName: "devbox").text.components(separatedBy: "\n")
         func run(_ label: String, occurrence: Int = 0, edit: (String) -> String = { $0 }) throws -> Int32 {
             let matching = lines.filter { $0.hasPrefix(label + ": ") }
@@ -1010,6 +1105,83 @@ import Testing
         for dir in ["\(home.path)/.claude", "\(home.path)/.swarmbar"] {
             #expect(try FileManager.default.contentsOfDirectory(atPath: dir).allSatisfy { !$0.hasPrefix(".swarmbar.") })
         }
+    }
+
+    /// The temporary file goes even when cat fails, so a failed write never
+    /// leaves a copy of a config beside it.
+    @Test func promptWriteRemovesItsTemporaryFileWhenCatFails() throws {
+        let home = try Home()
+        defer { try? FileManager.default.removeItem(at: home.url) }
+        // A directory where the file should be: cat cannot write to it.
+        let target = "\(home.path)/.claude/settings.json"
+        try FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+        let plan = SetupPlan(changes: [
+            PlannedChange(tool: nil, path: target, expectSHA256: SetupPlannerTests.sha("{}\n"),
+                          action: .write(newText: "{\"new\": true}\n", mode: 0o600), description: "Edit"),
+        ], installHelper: false, sudoersUser: nil, watchAs: .loginUser, system: "Darwin")
+        let line = try #require(SetupCommand.prompt(plan: plan, hostName: "devbox").text
+            .components(separatedBy: "\n").first { $0.hasPrefix("Write: ") })
+        #expect(try Self.sh(String(line.dropFirst("Write: ".count))) != 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: "\(home.path)/.claude")
+            .allSatisfy { !$0.hasPrefix(".swarmbar.") })
+    }
+
+    /// The owner's one command, run here without its sudo -u prefix, does
+    /// the whole change from a path with a single quote in it: quoted twice,
+    /// once for sh -c and once inside it, the path still lands as one word.
+    @Test func promptOwnerCommandRoundTripsItsQuoting() throws {
+        let home = try Home()
+        defer { try? FileManager.default.removeItem(at: home.url) }
+        let odd = "it's here"
+        let file = try home.put("\(odd)/settings.json", "{\"old\": true}\n")
+        let fresh = "\(home.path)/\(odd)/new dir/hook.sh"
+        let owner = RemoteHome(path: home.path, user: "o'brien")
+        let plan = SetupPlan(changes: [
+            PlannedChange(tool: nil, path: file, expectSHA256: SetupPlannerTests.sha("{\"old\": true}\n"),
+                          action: .write(newText: "{\"new\": true}\n", mode: 0o600), description: "Edit", home: owner),
+            PlannedChange(tool: nil, path: fresh, expectSHA256: "absent",
+                          action: .write(newText: "#!/bin/sh\n", mode: 0o700), description: "Create", home: owner),
+        ], installHelper: false, sudoersUser: nil, watchAs: .everyUser, system: "Darwin")
+        let prompt = SetupCommand.prompt(plan: plan, hostName: "devbox")
+        #expect(prompt.omitted.isEmpty)
+        let prefix = #"Write: sudo -u 'o'\''brien' -- "#
+        let writes = prompt.text.components(separatedBy: "\n").filter { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+        try #require(writes.count == 2)
+        #expect(writes.allSatisfy { $0.hasPrefix("sh -c '") })
+
+        // A tampered payload, or a file that changed since the probe, writes nothing.
+        let right = Data("{\"new\": true}\n".utf8).base64EncodedString()
+        let wrong = Data("{\"evil\": true}\n".utf8).base64EncodedString()
+        #expect(try Self.sh(writes[0].replacingOccurrences(of: right, with: wrong)) != 0)
+        #expect(try home.read(file) == "{\"old\": true}\n")
+        try "{\"moved\": true}\n".write(toFile: file, atomically: false, encoding: .utf8)
+        #expect(try Self.sh(writes[0]) != 0)
+        #expect(try home.read(file) == "{\"moved\": true}\n")
+        try "{\"old\": true}\n".write(toFile: file, atomically: false, encoding: .utf8)
+
+        #expect(try Self.sh(writes[0]) == 0)
+        #expect(try home.read(file) == "{\"new\": true}\n")
+        #expect(try home.read(file + ".backup-swarmbar") == "{\"old\": true}\n")
+        #expect(try Self.sh(writes[1]) == 0)
+        #expect(try home.read(fresh) == "#!/bin/sh\n")
+        #expect(try FileManager.default.attributesOfItem(atPath: fresh)[.posixPermissions] as? Int == 0o700)
+        // A second run finds the new file there and refuses.
+        #expect(try Self.sh(writes[1]) != 0)
+        for dir in ["\(home.path)/\(odd)", "\(home.path)/\(odd)/new dir"] {
+            #expect(try FileManager.default.contentsOfDirectory(atPath: dir).allSatisfy { !$0.hasPrefix(".swarmbar.") })
+        }
+    }
+
+    private static func sh(_ line: String) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", line]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 
     @MainActor

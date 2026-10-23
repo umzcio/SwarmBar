@@ -120,12 +120,59 @@ enum SetupCommand {
     /// without one or the agent stops. Not for a plan that sets up the
     /// narrow sudo rule: without passwordless sudo the plan only reaches
     /// files the login user can write, and the line would dead-end it.
+    /// Each command still starts as root; one for a file in another user's
+    /// home drops to that user itself, which the second sentence says so an
+    /// agent does not strip the sudo -u as noise.
     static let runAsRoot = "Every command below must run as root, because some of these files belong to "
         + "other users. Run each one as root, for example by saving it exactly as written to a file and "
-        + "running sudo sh on that file. If sudo asks for a password, stop and report it rather than "
-        + "working around it."
+        + "running sudo sh on that file. A command for a file in another user's home switches to that user "
+        + "itself with sudo -u, so keep it exactly as written. If sudo asks for a password, stop and report "
+        + "it rather than working around it."
     static let tooLargeToPaste =
         "This file is too large to paste safely. Use 'Let SwarmBar do it' or the command for this host instead."
+    static let ownerUnknown = "SwarmBar doesn't know who owns this file's home, and it won't have root write "
+        + "there. Use 'Let SwarmBar do it' or the command for this host instead."
+
+    /// Who a change's commands run as when the agent is root.
+    private enum RunAs {
+        /// Root, as written: a file in root's own home, or any plan whose
+        /// agent works as the login user.
+        case asIs
+        /// A file in another user's home: the whole change is one command
+        /// that drops to its owner first.
+        case owner(String)
+        /// The home's owner is not known, so the change is left out rather
+        /// than run as root.
+        case unknown
+    }
+
+    /// Root must never act inside a home it does not own. The steps are
+    /// plain shell on paths that home's owner controls, and an agent runs
+    /// them as separate commands seconds apart, so a watched user could swap
+    /// a file or a parent folder for a symlink between the hash check and
+    /// the write and have root write, back up or chown anywhere. Run as the
+    /// owner, in one shell, a symlink there is only the owner's own problem.
+    private static func runAs(_ change: PlannedChange, _ plan: SetupPlan) -> RunAs {
+        // The agent is root only when every user is watched and no narrow
+        // rule is being set up: then the prompt says run as root, or the
+        // login itself is root.
+        guard plan.watchAs == .everyUser, plan.sudoersUser == nil else { return .asIs }
+        guard let user = change.home?.user, isSafeOwner(user) else { return .unknown }
+        return user == "root" ? .asIs : .owner(user)
+    }
+
+    /// A name sudo -u takes as a user name and nothing else: never empty,
+    /// never an option, never sudo's `#uid` form, and nothing that is not
+    /// printable.
+    private static func isSafeOwner(_ user: String) -> Bool {
+        !user.isEmpty && !user.hasPrefix("-") && !user.hasPrefix("#") && SetupPlanner.isPrintable(user)
+    }
+
+    /// A shell line that runs `script` as `owner`, quoted whole so sh -c
+    /// gets it as one argument.
+    private static func asOwner(_ owner: String, _ script: String) -> String {
+        "sudo -u \(shellQuoted(owner)) -- sh -c \(shellQuoted(script))"
+    }
 
     /// Plain text for an agent on the host: exact shell lines, each change
     /// guarded by the hash it must have before and checked against the
@@ -136,10 +183,11 @@ enum SetupCommand {
     /// every write is base64 the agent only decodes into a temporary file.
     /// That file is checked against the hash the write must have, and only
     /// then copied over the target with `cat`, which keeps its inode and
-    /// every hardlink. A mismatch leaves the target untouched. The contents
-    /// are still all there, provider keys included, which the opening
-    /// lines say. The sudo rule is never in it: it needs the user's
-    /// password, which an agent must not be given.
+    /// every hardlink. A mismatch leaves the target untouched, and the
+    /// temporary file goes whether `cat` worked or not. The contents are
+    /// still all there, provider keys included, which the opening lines
+    /// say. The sudo rule is never in it: it needs the user's password,
+    /// which an agent must not be given.
     static func prompt(plan: SetupPlan, hostName: String) -> Prompt {
         let darwin = plan.system == "Darwin"
         let decode = darwin ? "base64 -D" : "base64 -d"
@@ -147,6 +195,7 @@ enum SetupCommand {
         func hashCheck(_ sha: String, _ path: String) -> String {
             "printf '%s  %s\\n' '\(sha)' \(path) | \(check)"
         }
+        let mismatch = "echo 'SwarmBar: the decoded contents did not match, nothing was written. Stop and report.'; false"
 
         var out: [String] = []
         out.append("""
@@ -167,6 +216,7 @@ enum SetupCommand {
         }
 
         var omitted: [Int] = []
+        var tooLarge: Set<Int> = []
         var finalChecks: [String] = []
         var number = 0
         for (index, change) in plan.changes.enumerated() where change.isSent {
@@ -176,13 +226,23 @@ enum SetupCommand {
             if case .write(let text, _) = change.action,
                Data(text.utf8).base64EncodedString().utf8.count > maxPasteBytes {
                 omitted.append(index)
+                tooLarge.insert(index)
                 step.append(tooLargeToPaste)
                 out.append(step.joined(separator: "\n"))
                 continue
             }
             if let waiting = change.dependsOn.first(where: omitted.contains) {
                 omitted.append(index)
-                step.append("Skip this one: it needs \(plan.changes[waiting].path), which is too large to paste.")
+                step.append(tooLarge.contains(waiting)
+                    ? "Skip this one: it needs \(plan.changes[waiting].path), which is too large to paste."
+                    : "Skip this one: it needs \(plan.changes[waiting].path), which this prompt leaves out.")
+                out.append(step.joined(separator: "\n"))
+                continue
+            }
+            let runAs = runAs(change, plan)
+            if case .unknown = runAs {
+                omitted.append(index)
+                step.append(ownerUnknown)
                 out.append(step.joined(separator: "\n"))
                 continue
             }
@@ -191,29 +251,59 @@ enum SetupCommand {
                 let after = HelperInstaller.sha256(Data(text.utf8))
                 let encoded = Data(text.utf8).base64EncodedString()
                 let folder = (change.path as NSString).deletingLastPathComponent
+                let temp = "t=$(mktemp \(shellQuoted(folder + "/.swarmbar.XXXXXX")))"
                 let new = change.expectSHA256 == SetupPlanner.absent
-                if new {
-                    step.append("Before: it must not exist. Check: [ ! -e \(path) ] && [ ! -L \(path) ] && echo absent")
-                    step.append("Prepare: (umask 077 && mkdir -p -m 700 \(shellQuoted(folder)))")
+                let backup = shellQuoted(change.path + ".backup-swarmbar")
+                // The temporary file goes whether or not cat worked, so a
+                // failed write never leaves a copy of a config beside it.
+                let install = "cat \"$t\" > \(path); s=$?; rm -f \"$t\"; [ $s -eq 0 ]"
+                    + (new ? " && chmod \(octal(mode)) \(path)" : "")
+                let write = "if printf '%s' '\(encoded)' | \(decode) > \"$t\" && \(hashCheck(after, "\"$t\"")) >/dev/null; "
+                    + "then \(install); else rm -f \"$t\"; \(mismatch); fi"
+                if case .owner(let owner) = runAs {
+                    // One command, so the check, the backup, the temporary
+                    // file and the write all happen in one shell as the owner.
+                    var script = ["umask 077"]
+                    if new {
+                        step.append("Before: it must not exist.")
+                        script.append("if [ -e \(path) ] || [ -L \(path) ]; then "
+                            + "echo 'SwarmBar: the file already exists, nothing was written. Stop and report.'; exit 1; fi")
+                        script.append("mkdir -p -m 700 \(shellQuoted(folder)) || exit 1")
+                    } else {
+                        step.append("Before: it must have sha256 \(change.expectSHA256).")
+                        script.append("\(hashCheck(change.expectSHA256, path)) || "
+                            + "{ echo 'SwarmBar: the file has changed, nothing was written. Stop and report.'; exit 1; }")
+                        script.append("{ [ -e \(backup) ] || cp -p \(path) \(backup); } || exit 1")
+                    }
+                    script.append("\(temp) || exit 1")
+                    script.append(write)
+                    step.append("This runs as \(owner), the file's owner, and checks the file itself before it writes.")
+                    step.append("Write: \(asOwner(owner, script.joined(separator: "; ")))")
+                    finalChecks.append(asOwner(owner, hashCheck(after, path)))
                 } else {
-                    let backup = shellQuoted(change.path + ".backup-swarmbar")
-                    step.append("Before: it must have sha256 \(change.expectSHA256). Check: \(hashCheck(change.expectSHA256, path))")
-                    step.append("Backup: [ -e \(backup) ] || cp -p \(path) \(backup)")
-                }
-                // One line, so it is followed whole or not at all.
-                let install = "cat \"$t\" > \(path) && rm -f \"$t\"" + (new ? " && chmod \(octal(mode)) \(path)" : "")
-                step.append("Write: (umask 077 && t=$(mktemp \(shellQuoted(folder + "/.swarmbar.XXXXXX"))) && "
-                    + "if printf '%s' '\(encoded)' | \(decode) > \"$t\" && \(hashCheck(after, "\"$t\"")) >/dev/null; "
-                    + "then \(install); "
-                    + "else rm -f \"$t\"; echo 'SwarmBar: the decoded contents did not match, nothing was written. Stop and report.'; false; fi)")
-                if new, let owner = Self.handOver(change, plan) {
-                    step.append("Owner: chown \(shellQuoted(owner.user)): \(owner.paths.map(shellQuoted).joined(separator: " "))")
+                    if new {
+                        step.append("Before: it must not exist. Check: [ ! -e \(path) ] && [ ! -L \(path) ] && echo absent")
+                        step.append("Prepare: (umask 077 && mkdir -p -m 700 \(shellQuoted(folder)))")
+                    } else {
+                        step.append("Before: it must have sha256 \(change.expectSHA256). Check: \(hashCheck(change.expectSHA256, path))")
+                        step.append("Backup: [ -e \(backup) ] || cp -p \(path) \(backup)")
+                    }
+                    // One line, so it is followed whole or not at all.
+                    step.append("Write: (umask 077 && \(temp) && \(write))")
+                    if new, let owner = Self.handOver(change, plan) {
+                        step.append("Owner: chown \(shellQuoted(owner.user)): \(owner.paths.map(shellQuoted).joined(separator: " "))")
+                    }
+                    finalChecks.append(hashCheck(after, path))
                 }
                 step.append("After: it must have sha256 \(after).")
-                finalChecks.append(hashCheck(after, path))
             case .remove:
-                step.append("Remove: rm -f \(path)")
-                finalChecks.append("[ ! -e \(path) ] && echo removed")
+                if case .owner(let owner) = runAs {
+                    step.append("Remove: \(asOwner(owner, "rm -f \(path)"))")
+                    finalChecks.append(asOwner(owner, "[ ! -e \(path) ] && echo removed"))
+                } else {
+                    step.append("Remove: rm -f \(path)")
+                    finalChecks.append("[ ! -e \(path) ] && echo removed")
+                }
             case .byHand, .skipped:
                 break
             }
@@ -236,7 +326,9 @@ enum SetupCommand {
     /// Who a file the prompt creates must belong to, and the paths to hand
     /// over: the folders below the home that the write may have made, then
     /// the file. Only when every user is watched, so the agent writes as
-    /// root, and only in a home that is not the login user's own.
+    /// root, and only in a home that is not the login user's own. When the
+    /// agent is root, a home whose owner is not root is written as that
+    /// owner instead and never gets here.
     private static func handOver(_ change: PlannedChange, _ plan: SetupPlan) -> (user: String, paths: [String])? {
         guard plan.watchAs == .everyUser, let home = change.home, home.user != plan.loginUser else { return nil }
         let root = home.path.hasSuffix("/") ? String(home.path.dropLast()) : home.path
