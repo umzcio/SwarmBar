@@ -219,11 +219,12 @@ struct RemoteDiscoveryTests {
         let result = RemoteDiscovery.sessions(
             snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
         let claude = try #require(result[.claudeCode]?.first)
-        #expect(claude.id == RemoteIdentity.sessionID(hostID: hostID, localID: Rig.claudeID))
+        #expect(claude.id == RemoteIdentity.sessionID(
+            hostID: hostID, home: rig.home, localID: Rig.claudeID))
         #expect(claude.id != Rig.claudeID)
         let codex = try #require(result[.codex]?.first)
         let codexLocal = try #require(UUID(uuidString: Rig.codexID))
-        #expect(codex.id == RemoteIdentity.sessionID(hostID: hostID, localID: codexLocal))
+        #expect(codex.id == RemoteIdentity.sessionID(hostID: hostID, home: rig.home, localID: codexLocal))
     }
 
     @Test("the Claude status is what the local parser reads", .enabled(if: pythonAvailable))
@@ -352,6 +353,28 @@ struct RemoteDiscoveryMirrorTests {
         let seen = try #require(both.sessions[.kimiCode]?.first)
         #expect(seen.processAlive)
         #expect(seen.pid == 300)
+    }
+
+    /// A home copied to a second user carries its transcripts, and their
+    /// ids, along with it. Each copy is its own session and gets its own row.
+    @Test func sameLocalIDInTwoHomesGivesTwoRows() throws {
+        defer { try? FileManager.default.removeItem(at: mirror.root) }
+        let shared = UUID()
+        let transcript = try fixture("claude-working")
+        for home in ["/home/u", "/root"] {
+            try write(
+                transcript,
+                remote: "\(home)/.claude/projects/-home-u-demo/\(shared.uuidString.lowercased()).jsonl")
+        }
+        let result = discover(snapshot(
+            homes: [RemoteHome(path: "/home/u", user: "u"), RemoteHome(path: "/root", user: "root")],
+            processes: []))
+        let ids = (result.sessions[.claudeCode] ?? []).map(\.id)
+        #expect(ids.count == 2)
+        #expect(Set(ids) == [
+            RemoteIdentity.sessionID(hostID: hostID, home: "/home/u", localID: shared),
+            RemoteIdentity.sessionID(hostID: hostID, home: "/root", localID: shared),
+        ])
     }
 
     @Test func unreadableCodexLeavesOnlyCodexUnverified() {

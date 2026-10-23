@@ -97,20 +97,21 @@ enum RemoteDiscovery {
                 screen: { facts.screen(pid: $0) },
                 resolvesPids: true)
             for (tool, sessions) in discoverAll(now: now, context: context) {
-                found[tool, default: []] += sessions
+                // Rekeyed per home, because the same local id can sit in
+                // two homes and must still give two rows.
+                found[tool, default: []] += sessions.map {
+                    $0.withID(
+                        RemoteIdentity.sessionID(hostID: hostID, home: home.path, localID: $0.id),
+                        host: hostName)
+                }
             }
         }
         warnings += refused.paths.map {
             "skipped session directory \($0): it cannot be mapped into the mirror"
         }
 
-        let sessions = found.mapValues { rows in
-            rows.map {
-                $0.withID(RemoteIdentity.sessionID(hostID: hostID, localID: $0.id), host: hostName)
-            }
-        }
         return Result(
-            sessions: sessions, warnings: warnings,
+            sessions: found, warnings: warnings,
             processesFailed: snapshot.processesFailed, unverifiedTools: unverified)
     }
 
