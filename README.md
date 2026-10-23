@@ -205,13 +205,25 @@ token to manage.
 
 **What gets written where.**
 - The helper goes in `/usr/local/lib/swarmbar-helper`, or `~/.swarmbar/swarmbar-helper` without root.
-- Bridge scripts go in `~/.swarmbar/`, plus the OpenCode plugin where you use OpenCode.
-- Hook entries go into each agent's own config, with a one-time `.backup-swarmbar` copy beside every
-  changed file.
+- Bridge scripts go in `~/.swarmbar/` (mode 0700, scripts 0700). They talk to the helper over a
+  private Unix socket in that folder, not a network port.
+- The OpenCode plugin goes in `~/.config/opencode/plugins/swarmbar-remote.js` (0600), with an entry
+  in `opencode.json` or `opencode.jsonc`.
+- Hook entries go into each agent's own config: Claude Code's `settings.json` in each profile
+  folder, Kimi Code's and BearCode's `config.toml`, and the OpenCode config. A one-time
+  `.backup-swarmbar` copy sits beside every changed file, and any config SwarmBar creates is 0600.
 - `/etc/sudoers.d/swarmbar` is written only for the narrow sudo rule above, and is checked with
   `visudo` first.
 
-**Undo.** Settings, then Hosts, then Undo changes removes all of it and restores the backups.
+**Undo.** Settings, then Hosts, then Undo changes strips SwarmBar's entries from each agent config
+and removes the two bridge scripts and the OpenCode plugin. It leaves the helper, the
+`.backup-swarmbar` files, `~/.swarmbar` itself, and `/etc/sudoers.d/swarmbar` if you set up the sudo
+rule. That rule stays in force until you remove it. To clear the rest by hand:
+
+```bash
+sudo rm /etc/sudoers.d/swarmbar /usr/local/lib/swarmbar-helper
+rm -rf ~/.swarmbar    # only once SwarmBar no longer watches that host
+```
 
 **Answering.** Claude Code and OpenCode can be approved and denied remotely without anything extra.
 Codex, Kimi Code, BearCode, Grok Build, and Antigravity need the agent to run inside tmux, because
@@ -223,7 +235,7 @@ rows and is marked unreachable rather than ended.
 
 ## Roadmap
 
-- Remote sessions over SSH: first release, more hosts and polish to come
+- Remote hosts: a faster first sync, and Terminal.app answers for local sessions
 - More agents, added the way the seven built in were
 
 ---

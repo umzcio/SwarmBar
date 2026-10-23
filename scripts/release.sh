@@ -31,37 +31,15 @@ if [ "$BUILT_VERSION" != "$VERSION" ]; then
     exit 1
 fi
 
-echo "==> [3/7] Package .dmg"
-bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
-
-echo "==> [4/7] Notarize the .dmg (which notarizes the app inside it)"
-bash "$ROOT/scripts/notarize.sh" "$DMG"
-
-# Stapling the dmg does not staple the app inside it, so a user who copies
-# SwarmBar.app out and later goes offline has no ticket to check. Staple the
-# app, repackage, and notarize the new dmg, which is a different file.
-echo "==> [5/7] Staple the app, repackage, notarize again"
-xcrun stapler staple "$APP_DIR"
-bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
-bash "$ROOT/scripts/notarize.sh" "$DMG"
-
-echo "==> [6/7] Verifying the way Gatekeeper will"
-# The real question is not "is it signed" but "would a first launch on
-# someone else's Mac be allowed", and that is what spctl answers. Both
-# artifacts are checked: the dmg is what gets downloaded, the app is what
-# gets run, and they carry separate tickets.
-spctl --assess --type execute --verbose=4 "$APP_DIR"
-xcrun stapler validate "$APP_DIR"
-spctl --assess --type open --context context:primary-signature -v "$DMG"
-xcrun stapler validate "$DMG"
-
 # The remote setup command downloads exactly this file for this version
 # (releases/download/v<version>/swarmbar-helper.py) and refuses to run it
 # unless its sha256 matches the helper bundled in the app. A release that
 # does not carry the helper makes that URL a 404, and one that carries a
 # different helper makes every setup command fail its check, so the asset
-# is the bundled copy, byte for byte.
-echo "==> [7/7] Stage the remote helper"
+# is the bundled copy, byte for byte. Checked here, right after the
+# build, so a mismatch fails before the long notarization wait. Stapling
+# only touches the bundle's signature ticket, never Resources.
+echo "==> [3/7] Stage the remote helper"
 HELPER="$ROOT/build/swarmbar-helper.py"
 cp "$ROOT/scripts/swarmbar-helper.py" "$HELPER"
 if ! cmp -s "$HELPER" "$APP_DIR/Contents/Resources/swarmbar-helper.py"; then
@@ -70,6 +48,30 @@ if ! cmp -s "$HELPER" "$APP_DIR/Contents/Resources/swarmbar-helper.py"; then
     exit 1
 fi
 HELPER_SHA="$(shasum -a 256 "$HELPER" | awk '{print $1}')"
+
+echo "==> [4/7] Package .dmg"
+bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
+
+echo "==> [5/7] Notarize the .dmg (which notarizes the app inside it)"
+bash "$ROOT/scripts/notarize.sh" "$DMG"
+
+# Stapling the dmg does not staple the app inside it, so a user who copies
+# SwarmBar.app out and later goes offline has no ticket to check. Staple the
+# app, repackage, and notarize the new dmg, which is a different file.
+echo "==> [6/7] Staple the app, repackage, notarize again"
+xcrun stapler staple "$APP_DIR"
+bash "$ROOT/scripts/make-dmg.sh" "$VERSION"
+bash "$ROOT/scripts/notarize.sh" "$DMG"
+
+echo "==> [7/7] Verifying the way Gatekeeper will"
+# The real question is not "is it signed" but "would a first launch on
+# someone else's Mac be allowed", and that is what spctl answers. Both
+# artifacts are checked: the dmg is what gets downloaded, the app is what
+# gets run, and they carry separate tickets.
+spctl --assess --type execute --verbose=4 "$APP_DIR"
+xcrun stapler validate "$APP_DIR"
+spctl --assess --type open --context context:primary-signature -v "$DMG"
+xcrun stapler validate "$DMG"
 
 echo "==> Generating the signed Sparkle appcast"
 # generate_appcast reads the EdDSA private key from the login keychain,
