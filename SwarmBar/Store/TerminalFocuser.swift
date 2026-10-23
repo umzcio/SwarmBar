@@ -686,9 +686,14 @@ enum TerminalFocuser {
     /// session: same walk and re-parse cost, paid once per poll instead of
     /// once per session per poll. `claudePid(forSession:)` stays for the
     /// answer path (TerminalFocuser.tty), where a single lookup is fine.
-    nonisolated static func claudePidsBySession() -> [String: Int] {
+    ///
+    /// `home` and `isAlive` come from discovery's context, so the same walk
+    /// can read a remote host's mirrored records against its process table.
+    nonisolated static func claudePidsBySession(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+    ) -> [String: Int] {
         let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
         var result: [String: Int] = [:]
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
         for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
@@ -699,7 +704,7 @@ enum TerminalFocuser {
                       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       let sessionId = (json["sessionId"] as? String)?.lowercased(),
                       let pid = json["pid"] as? Int,
-                      kill(pid_t(pid), 0) == 0
+                      isAlive(pid)
                 else { continue }
                 result[sessionId] = pid
             }
@@ -728,9 +733,10 @@ enum TerminalFocuser {
     /// NETWORK addresses are printed, never file paths, which is all this
     /// reads: against a fixed set of pids both spellings produce identical
     /// output.
-    nonisolated static func codexPidsBySessionSuffix() -> [String: Int] {
-        let sessionsRoot = FileManager.default.homeDirectoryForCurrentUser
+    nonisolated static func codexPidsBySessionSuffix(
+        sessionsRoot: String = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions").path
+    ) -> [String: Int] {
         guard let output = run("/usr/sbin/lsof", ["-n", "-P", "-F", "pn"]) else { return [:] }
         return codexPids(inLsofOutput: output, sessionsRoot: sessionsRoot)
     }

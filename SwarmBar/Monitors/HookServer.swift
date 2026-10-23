@@ -338,9 +338,14 @@ final class HookServer: ApprovalResponding {
     /// Which tool a hook event came from. Grok Build's Claude-compat layer
     /// runs the same hook commands, and Kimi's own hooks post the same
     /// schema, so check both before assuming Claude Code.
-    nonisolated static func originTool(rawSessionID: String) -> AgentTool {
+    ///
+    /// `home` is whose state to consult: this Mac's for the local hook
+    /// server, a host's mirrored home for an event relayed from it.
+    nonisolated static func originTool(
+        rawSessionID: String,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> AgentTool {
         if rawSessionID.hasPrefix("session_") {
-            let home = FileManager.default.homeDirectoryForCurrentUser
             let indexes: [(String, AgentTool)] = [
                 (".kimi-code/session_index.jsonl", .kimiCode),
                 (".bearcode/session_index.jsonl", .bearCode),
@@ -353,8 +358,7 @@ final class HookServer: ApprovalResponding {
                 }
             }
         }
-        let grokRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".grok")
+        let grokRoot = home.appendingPathComponent(".grok")
         let active = grokRoot.appendingPathComponent("active_sessions.json")
         if let data = try? Data(contentsOf: active),
            let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],

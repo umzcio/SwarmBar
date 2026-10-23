@@ -40,13 +40,20 @@ enum AntigravityReader {
         let sentAt: Date
     }
 
-    nonisolated static func defaultHome() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/antigravity-cli")
+    /// Antigravity's state directory under a user's home, this Mac's by
+    /// default.
+    nonisolated static func defaultHome(
+        userHome: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        userHome.appendingPathComponent(".gemini/antigravity-cli")
     }
 
     nonisolated static func defaultDatabasePath() -> String {
-        defaultHome().appendingPathComponent("conversation_summaries.db").path
+        databasePath(home: defaultHome())
+    }
+
+    nonisolated static func databasePath(home: URL) -> String {
+        home.appendingPathComponent("conversation_summaries.db").path
     }
 
     /// Where a live session's own state lives. The id is the conversation
@@ -71,9 +78,14 @@ enum AntigravityReader {
         return id.isEmpty ? nil : id
     }
 
-    /// Every live conversation, mapped to the pid running it.
-    nonisolated static func liveConversations(home: URL = defaultHome()) -> [String: Int] {
-        let held = ProcessLiveness.openFiles(
+    /// Every live conversation, mapped to the pid running it. `processes`
+    /// answers who holds each lock: lsof on this Mac by default, the
+    /// helper's table when discovery reads a remote host.
+    nonisolated static func liveConversations(
+        home: URL = defaultHome(),
+        processes: any ProcessFacts = LocalProcessFacts()
+    ) -> [String: Int] {
+        let held = processes.heldFiles(
             processName: "agy", inDirectory: presenceDirectory(home: home).path)
         var live: [String: Int] = [:]
         for (path, pid) in held {

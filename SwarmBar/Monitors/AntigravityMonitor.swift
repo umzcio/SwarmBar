@@ -36,15 +36,7 @@ struct AntigravityMonitor: SessionMonitor {
             if !store.isPaused {
                 let now = Date.now
                 let sessions = await Task.detached {
-                    let home = AntigravityReader.defaultHome()
-                    return Self.discover(
-                        home: home,
-                        rows: AntigravityReader.rows(),
-                        live: AntigravityReader.liveConversations(home: home),
-                        history: AntigravityReader.history(
-                            atPath: home.appendingPathComponent("history.jsonl").path),
-                        now: now
-                    )
+                    Self.discover(now: now, context: .local())
                 }.value
                 store.sync(tool: .antigravity, sessions: sessions)
             }
@@ -52,9 +44,29 @@ struct AntigravityMonitor: SessionMonitor {
         }
     }
 
+    /// Every input read from the context: Antigravity's directory under its
+    /// home, the summaries table there, the held presence locks from its
+    /// process table, and the screen and working directory of a live pid.
+    nonisolated static func discover(now: Date, context: DiscoveryContext) -> [AgentSession] {
+        let home = AntigravityReader.defaultHome(userHome: context.home)
+        return discover(
+            home: home,
+            rows: AntigravityReader.rows(dbPath: AntigravityReader.databasePath(home: home)),
+            live: AntigravityReader.liveConversations(home: home, processes: context.processes),
+            history: AntigravityReader.history(
+                atPath: home.appendingPathComponent("history.jsonl").path),
+            screen: context.screen,
+            cwd: { context.processes.cwd(pid: $0) },
+            now: now
+        )
+    }
+
     /// Defaults are inert rather than live, so a test that supplies one
     /// input does not silently pick up this machine's real sessions through
     /// the others.
+    ///
+    /// `cwd` is where a live process was launched, which is the workspace
+    /// whenever history.jsonl cannot name one.
     nonisolated static func discover(
         home: URL = AntigravityReader.defaultHome(),
         rows: [AntigravityReader.Row] = [],
@@ -62,6 +74,7 @@ struct AntigravityMonitor: SessionMonitor {
         history: [String: AntigravityReader.HistoryEntry] = [:],
         transcript: (URL) -> String? = { ClaudeCodeMonitor.tail(of: $0) },
         screen: (Int) -> String? = { TerminalFocuser.screenText(pid: $0) },
+        cwd: (Int) -> String? = { ProcessLiveness.cwd(pid: $0) },
         now: Date
     ) -> [AgentSession] {
         var sessions: [AgentSession] = []
@@ -81,7 +94,7 @@ struct AntigravityMonitor: SessionMonitor {
                 // all: agy writes it before the conversation has one. The
                 // process cwd covers that gap, and the two agreed wherever
                 // both existed.
-                workspace: entry?.workspace ?? workingDirectory(pid),
+                workspace: entry?.workspace ?? cwd(pid),
                 title: nil,
                 status: status(
                     home: home, id: id, pid: pid,
@@ -153,12 +166,6 @@ struct AntigravityMonitor: SessionMonitor {
         }
         return AntigravityTranscript.status(for: steps)
             ?? .working(activity: entry?.prompt ?? "Working…")
-    }
-
-    /// Where the process was launched, which is the workspace whenever
-    /// history.jsonl cannot name one.
-    private nonisolated static func workingDirectory(_ pid: Int) -> String? {
-        ProcessLiveness.cwd(pid: pid)
     }
 
     private nonisolated static func session(

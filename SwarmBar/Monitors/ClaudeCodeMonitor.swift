@@ -24,9 +24,10 @@ struct ClaudeCodeMonitor: SessionMonitor {
         }
     }
 
-    nonisolated static func roots() -> [URL] {
+    nonisolated static func roots(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
         let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
         var seen = Set<String>()
         var roots: [URL] = []
@@ -49,12 +50,15 @@ struct ClaudeCodeMonitor: SessionMonitor {
     /// a cached tail is cheap; re-reading the file is the expensive part.
     private nonisolated static let tailCache = TailCache<String>()
 
-    nonisolated static func discover(now: Date) -> [AgentSession] {
+    nonisolated static func discover(
+        now: Date, context: DiscoveryContext = .local()
+    ) -> [AgentSession] {
         let fm = FileManager.default
         var sessions: [AgentSession] = []
         var seenPaths = Set<String>()
-        let livePids = TerminalFocuser.claudePidsBySession()
-        for root in roots() {
+        let livePids = TerminalFocuser.claudePidsBySession(
+            home: context.home, isAlive: { context.processes.isAlive($0) })
+        for root in roots(home: context.home) {
             let projectDirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
             for projectDir in projectDirs {
                 let files = (try? fm.contentsOfDirectory(
@@ -76,6 +80,7 @@ struct ClaudeCodeMonitor: SessionMonitor {
                     else { continue }
                     let cwd = parsed.cwd ?? ClaudeSessionParser.decodeProjectDir(projectDir.lastPathComponent)
                     let projectPath = cwd.map { URL(fileURLWithPath: $0) }
+                    let pid = livePids[id.uuidString.lowercased()]
                     sessions.append(AgentSession(
                         id: id,
                         tool: .claudeCode,
@@ -84,7 +89,8 @@ struct ClaudeCodeMonitor: SessionMonitor {
                         status: parsed.status,
                         startedAt: values.creationDate ?? mtime,
                         lastActivityAt: mtime,
-                        processAlive: livePids[id.uuidString.lowercased()] != nil,
+                        pid: pid.map { pid_t($0) },
+                        processAlive: pid != nil,
                         attentionEventID: parsed.attentionEventID
                     ))
                 }

@@ -15,16 +15,27 @@ struct GrokBuildMonitor: SessionMonitor {
         while !Task.isCancelled {
             if !store.isPaused {
                 let now = Date.now
-                let root = Self.defaultRoot()
-                let sessions = await Task.detached { Self.discover(root: root, now: now) }.value
+                let sessions = await Task.detached {
+                    Self.discover(now: now, context: .local())
+                }.value
                 store.sync(tool: .grokBuild, sessions: sessions)
             }
             try? await Task.sleep(for: .seconds(5))
         }
     }
 
-    nonisolated static func defaultRoot() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".grok")
+    nonisolated static func defaultRoot(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        home.appendingPathComponent(".grok")
+    }
+
+    /// The root under the context's home, with a registered pid judged
+    /// alive by the context's process table rather than by this Mac's.
+    nonisolated static func discover(now: Date, context: DiscoveryContext) -> [AgentSession] {
+        discover(
+            root: defaultRoot(home: context.home), now: now,
+            isAlive: { context.processes.isAlive($0) })
     }
 
     /// The session ids that are subagents of another session in the same
@@ -50,9 +61,11 @@ struct GrokBuildMonitor: SessionMonitor {
         return ids
     }
 
-    nonisolated static func discover(root: URL, now: Date) -> [AgentSession] {
+    nonisolated static func discover(
+        root: URL, now: Date, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+    ) -> [AgentSession] {
         let fm = FileManager.default
-        let activeIds = activeSessionIDs(root: root)
+        let active = activeSessions(root: root, isAlive: isAlive)
 
         let sessionsRoot = root.appendingPathComponent("sessions")
         let cwdDirs = (try? fm.contentsOfDirectory(
@@ -72,7 +85,8 @@ struct GrokBuildMonitor: SessionMonitor {
                       // project's name and flipping between Active and
                       // Recent as they started and finished.
                       !subagents.contains(sessionDir.lastPathComponent),
-                      let session = parseSession(dir: sessionDir, activeIds: activeIds, now: now)
+                      let session = parseSession(
+                        dir: sessionDir, activeIds: active.ids, pids: active.pids, now: now)
                 else { continue }
                 sessions.append(session)
             }
@@ -115,11 +129,25 @@ struct GrokBuildMonitor: SessionMonitor {
     /// pid), and the TUI can switch sessions within one process, leaving
     /// the abandoned session still registered under the same pid. Only the
     /// newest opened_at per pid is genuinely attached.
-    nonisolated static func activeSessionIDs(root: URL) -> Set<String> {
+    ///
+    /// `isAlive` is this Mac's kill(pid, 0) by default, and the context's
+    /// process table when discovery reads a remote host.
+    nonisolated static func activeSessionIDs(
+        root: URL, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+    ) -> Set<String> {
+        activeSessions(root: root, isAlive: isAlive).ids
+    }
+
+    /// The active ids as above, plus the pid each one's entry names where
+    /// it names one. Bare id strings and entries without a pid are active
+    /// with no pid to report.
+    private nonisolated static func activeSessions(
+        root: URL, isAlive: (Int) -> Bool
+    ) -> (ids: Set<String>, pids: [String: Int]) {
         let path = root.appendingPathComponent("active_sessions.json")
         guard let data = try? Data(contentsOf: path),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
-        else { return [] }
+        else { return ([], [:]) }
         let idKeys = ["id", "session_id", "sessionId", "sessionID"]
 
         var ids = Set<String>()
@@ -136,18 +164,20 @@ struct GrokBuildMonitor: SessionMonitor {
                 ids.insert(id)
                 continue
             }
-            guard kill(pid_t(pid), 0) == 0 else { continue }
+            guard isAlive(pid) else { continue }
             let openedAt = (entry["opened_at"] as? String)
                 .flatMap { ClaudeSessionParser.date($0) } ?? .distantPast
             if let current = newestPerPid[pid], current.openedAt >= openedAt { continue }
             newestPerPid[pid] = (id, openedAt)
         }
         ids.formUnion(newestPerPid.values.map(\.id))
-        return ids
+        var pids: [String: Int] = [:]
+        for (pid, entry) in newestPerPid { pids[entry.id] = pid }
+        return (ids, pids)
     }
 
     private nonisolated static func parseSession(
-        dir: URL, activeIds: Set<String>, now: Date
+        dir: URL, activeIds: Set<String>, pids: [String: Int], now: Date
     ) -> AgentSession? {
         let summaryPath = dir.appendingPathComponent("summary.json")
         guard let data = try? Data(contentsOf: summaryPath),
@@ -196,6 +226,7 @@ struct GrokBuildMonitor: SessionMonitor {
             status: status,
             startedAt: createdAt,
             lastActivityAt: updatedAt,
+            pid: isActive ? infoId.flatMap { pids[$0] }.map { pid_t($0) } : nil,
             processAlive: isActive
         )
     }

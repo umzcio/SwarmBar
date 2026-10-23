@@ -58,10 +58,11 @@ struct CodexMonitor: SessionMonitor {
         return nil
     }
 
-    nonisolated static func discover(now: Date) -> [AgentSession] {
+    nonisolated static func discover(
+        now: Date, context: DiscoveryContext = .local()
+    ) -> [AgentSession] {
         let fm = FileManager.default
-        let root = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions")
+        let root = context.home.appendingPathComponent(".codex/sessions")
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
@@ -69,7 +70,7 @@ struct CodexMonitor: SessionMonitor {
 
         var sessions: [AgentSession] = []
         var seenPaths = Set<String>()
-        let livePids = TerminalFocuser.codexPidsBySessionSuffix()
+        let livePids = context.processes.codexPidsBySessionSuffix(sessionsRoot: root.path)
         for case let file as URL in enumerator {
             guard file.pathExtension == "jsonl",
                   file.lastPathComponent.hasPrefix("rollout-"),
@@ -104,6 +105,7 @@ struct CodexMonitor: SessionMonitor {
             let id = meta.sessionId.flatMap(UUID.init(uuidString:))
                 ?? fallbackId(for: file.lastPathComponent)
             let projectPath = meta.cwd.map { URL(fileURLWithPath: $0) }
+            let pid = livePids["\(id.uuidString.lowercased()).jsonl"]
             sessions.append(AgentSession(
                 id: id,
                 tool: .codex,
@@ -112,7 +114,8 @@ struct CodexMonitor: SessionMonitor {
                 status: parsed.status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                processAlive: livePids["\(id.uuidString.lowercased()).jsonl"] != nil,
+                pid: pid.map { pid_t($0) },
+                processAlive: pid != nil,
                 attentionEventID: parsed.attentionEventID
             ))
         }
