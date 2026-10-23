@@ -2288,6 +2288,71 @@ class ProbeTests(unittest.TestCase):
         configs = self.probe()["configs"][self.home]
         self.assertEqual([c["path"] for c in configs], [os.path.realpath(shared)])
 
+    def test_probe_reports_bridge_files_with_hash(self):
+        script = self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n", 0o700)
+        bridges = self.probe()["bridges"][self.home]
+        by_path = dict((b["path"], b) for b in bridges)
+        self.assertEqual(sorted(by_path), sorted(os.path.join(self.home, p) for p in (
+            ".swarmbar/swarmbar-remote-hook.sh", ".swarmbar/swarmbar-remote-kimi-hook.sh",
+            ".config/opencode/plugins/swarmbar-remote.js")))
+        self.assertEqual(by_path[script]["sha256"], hashlib.sha256(b"#!/bin/sh\n").hexdigest())
+        self.assertNotIn("unreadable", by_path[script])
+        # Absent is a null hash, never "unreadable".
+        absent = by_path[os.path.join(self.home, ".swarmbar/swarmbar-remote-kimi-hook.sh")]
+        self.assertIsNone(absent["sha256"])
+        self.assertNotIn("unreadable", absent)
+
+    def test_probe_reports_unreadable_bridge_files(self):
+        path = self.put(".swarmbar/swarmbar-remote-kimi-hook.sh", "#!/bin/sh\n", 0o700)
+        real_open = open
+
+        def refusing(name, *args, **kwargs):
+            if os.path.realpath(name) == os.path.realpath(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+        with mock.patch("builtins.open", side_effect=refusing):
+            result = self.probe()
+        entry = [b for b in result["bridges"][self.home] if b["path"] == path][0]
+        self.assertIsNone(entry["sha256"])
+        self.assertTrue(entry["unreadable"])
+        self.assertTrue(any(path in w for w in result["warnings"]), result["warnings"])
+
+    def test_probe_refuses_bridge_files_not_the_owners_own(self):
+        path = self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n", 0o700)
+        os.chmod(os.path.dirname(path), 0o777)
+        self.addCleanup(os.chmod, os.path.dirname(path), 0o700)
+        entry = [b for b in self.probe()["bridges"][self.home] if b["path"] == path][0]
+        self.assertIsNone(entry["sha256"])
+        self.assertTrue(entry["unreadable"])
+
+    def test_probe_reports_used_claude_dirs(self):
+        self.put(".claude/projects/p/s.jsonl", "{}\n")
+        self.put(".claude/settings.json", "{}\n")
+        self.put(".claude-work/projects/p/s.jsonl", "{}\n")
+        # Not used: no projects. A backup by name, and a link to a used dir.
+        self.put(".claude-empty/settings.json", "{}\n")
+        self.put(".claude-old.bak/projects/p/s.jsonl", "{}\n")
+        os.symlink(os.path.join(self.home, ".claude"), os.path.join(self.home, ".claude-link"))
+        dirs = self.probe()["claude_dirs"][self.home]
+        real = os.path.realpath(self.home)
+        self.assertEqual(dirs, [
+            {"path": os.path.join(real, ".claude"), "settings": "present"},
+            {"path": os.path.join(real, ".claude-work"), "settings": "missing"},
+        ])
+
+    def test_probe_reports_unreadable_claude_settings(self):
+        self.put(".claude/projects/p/s.jsonl", "{}\n")
+        path = self.put(".claude/settings.json", "{}\n")
+        real_open = open
+
+        def refusing(name, *args, **kwargs):
+            if os.path.realpath(name) == os.path.realpath(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(name, *args, **kwargs)
+        with mock.patch("builtins.open", side_effect=refusing):
+            dirs = self.probe()["claude_dirs"][self.home]
+        self.assertEqual([d["settings"] for d in dirs], ["unreadable"])
+
     def test_probe_reports_config_identity_for_hardlinks(self):
         # Two profiles sharing one settings.json by hardlink have two
         # realpaths but one file. dev and ino let the Mac plan one write for

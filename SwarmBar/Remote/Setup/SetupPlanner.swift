@@ -25,6 +25,10 @@ struct PlannedChange: Equatable, Sendable {
     var action: Action
     /// The sheet's line, e.g. "Add 4 hook entries to /root/.claude/settings.json".
     var description: String
+    /// Indexes of earlier changes in the same plan that must end done
+    /// before this one is made: a config waits for the bridge file it
+    /// names, and an undo's removal waits for the config that named it.
+    var dependsOn: [Int] = []
 
     /// Whether the helper is asked to make this change at all.
     var isSent: Bool {
@@ -48,6 +52,14 @@ struct SetupPlan: Equatable, Sendable {
     /// is watched, the login user's own otherwise. The helper refuses any
     /// other destination.
     var helperDestination: String = HelperLaunch.rootHelperPath
+    /// The host's `platform.system()`, which picks the prompt's base64 flag.
+    var system: String = "Linux"
+    /// Whether the setup command runs `apply` under sudo.
+    var useSudo: Bool = false
+    /// The plan covers only what the login user could see of a host whose
+    /// every user is watched: the narrow sudo rule is not there yet, so the
+    /// other homes were never looked at. Probe again once it is.
+    var isPartial: Bool = false
 }
 
 /// The three remote bridge files, as this build bundles them.
@@ -76,8 +88,8 @@ struct BundledBridges: Equatable, Sendable {
 /// entries.
 enum SetupPlanner {
     enum PlanError: Error, Equatable {
-        /// Watching as the login user, yet the probe listed no home of
-        /// theirs. Could not look, which must not plan as nothing to do.
+        /// The probe listed no home to plan for. Could not look, which must
+        /// not plan as nothing to do.
         case noHome(user: String)
     }
 
@@ -98,25 +110,43 @@ enum SetupPlanner {
         (.bearCode, "bearcode", ".bearcode"),
     ]
 
+    /// A change before its dependencies are known by index: `needs` names
+    /// the paths of the changes it waits for.
+    private struct Pending {
+        var change: PlannedChange
+        var needs: [String] = []
+    }
+
     static func plan(
         probe: ProbeResult, watchAs: WatchAs, bundled: BundledBridges, kimiEvents: [String: [String]]
     ) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
-        var bridges: [PlannedChange] = []
-        var configs: [PlannedChange] = []
+        let owners = fileOwners(probe, homes)
+        var bridges: [Pending] = []
+        var configs: [Pending] = []
         var seen = Seen()
 
         for home in homes {
             let tools = Set(toolList(probe.tools[home.path]))
-            let installed = Set(toolList(probe.installed[home.path]))
-            let files = probe.configs[home.path] ?? []
+            let reported = probe.bridges?[home.path] ?? []
+            // A file several homes share is planned once, from the home
+            // whose owner owns it: that is where it was readable, and its
+            // bridge path is the one that home's agents run.
+            let files = (probe.configs[home.path] ?? []).filter { file in
+                guard let key = Seen.key(file) else { return true }
+                return owners[key] == home.path
+            }
 
             if tools.contains(.claudeCode) {
                 let script = claudeScript(home: home.path)
-                let found = files.filter { $0.tool == "claude" }
-                let targets: [(file: ProbeResult.ConfigFile?, path: String)] = found.isEmpty
-                    ? [(nil, "\(home.path)/.claude/settings.json")]
-                    : found.map { ($0, $0.path) }
+                // Every settings file there is, and one to create for each
+                // used profile that has none. Never a guessed ~/.claude: a
+                // profile the probe did not report is not known to exist.
+                var targets: [(file: ProbeResult.ConfigFile?, path: String)] =
+                    files.filter { $0.tool == "claude" }.map { ($0, $0.path) }
+                for dir in probe.claudeDirs?[home.path] ?? [] where dir.settings == "missing" {
+                    targets.append((nil, "\(dir.path)/settings.json"))
+                }
                 for target in targets {
                     let events = ClaudeHookTransform.events.map(\.name)
                     let change = configChange(
@@ -125,11 +155,11 @@ enum SetupPlanner {
                         instruction: "Add hooks for \(list(events)) that run bash '\(script)' <event>.",
                         refusal: "isn't valid JSON"
                     ) { try ClaudeHookTransform.install($0, scriptPath: script, family: .remote) }
-                    if let change { configs.append(change) }
+                    if let change { configs.append(Pending(change: change, needs: [script])) }
                 }
-                if !installed.contains(.claudeCode) {
-                    bridges.append(bridgeFile(.claudeCode, script, bundled.claudeHook, scriptMode,
-                                              "Install the Claude Code hook script at \(script)"))
+                if let change = bridgeChange(.claudeCode, script, bundled.claudeHook, scriptMode,
+                                             "Claude Code hook script", reported) {
+                    bridges.append(Pending(change: change))
                 }
             }
 
@@ -140,10 +170,13 @@ enum SetupPlanner {
                 let path = file?.path ?? "\(home.path)/\(family.dir)/config.toml"
                 let (events, leftOut) = acceptedEvents(for: family.tool, kimiEvents)
                 if events.isEmpty {
+                    // Never an empty list: install with no events removes
+                    // the block, and a build that takes none of these has
+                    // nothing SwarmBar can register.
                     if seen.first(path, file) {
-                        configs.append(PlannedChange(
+                        configs.append(Pending(change: PlannedChange(
                             tool: family.tool, path: path, expectSHA256: "", action: .skipped,
-                            description: "Skipped \(path): this \(family.tool.label) build accepts none of SwarmBar's hook events"))
+                            description: "Skipped \(path): this \(family.tool.label) build accepts none of SwarmBar's hook events")))
                     }
                     continue
                 }
@@ -158,16 +191,16 @@ enum SetupPlanner {
                     instruction: "Add [[hooks]] entries for \(list(events.map(\.name))) that run '\(kimiScriptPath)' <event>.",
                     refusal: "can't be edited"
                 ) { TomlHooksTransform.install($0, scriptPath: kimiScriptPath, family: .remote, events: events) }
-                if let change { configs.append(change) }
+                if let change { configs.append(Pending(change: change, needs: [kimiScriptPath])) }
             }
-            // One script serves both tools, and either one reported as set
-            // up means it is already there.
-            if kimiScriptNeeded && installed.isDisjoint(with: [.kimiCode, .bearCode]) {
-                bridges.append(bridgeFile(.kimiCode, kimiScriptPath, bundled.kimiHook, scriptMode,
-                                          "Install the Kimi hook script at \(kimiScriptPath)"))
+            // One script serves both tools.
+            if kimiScriptNeeded, let change = bridgeChange(
+                .kimiCode, kimiScriptPath, bundled.kimiHook, scriptMode, "Kimi hook script", reported) {
+                bridges.append(Pending(change: change))
             }
 
             if tools.contains(.openCode) {
+                let pluginPath = plugin(home: home.path)
                 let spec = pluginSpec(home: home.path)
                 // The .jsonc wins when both exist, as it does for the local toggle.
                 let opencode = files.filter { $0.tool == "opencode" }
@@ -179,36 +212,49 @@ enum SetupPlanner {
                     instruction: "Add \"\(spec)\" to its \"plugin\" list.",
                     refusal: "has comments"
                 ) { try OpenCodeConfigTransform.install($0, pluginSpec: spec, family: .remote) }
-                if let change { configs.append(change) }
-                if !installed.contains(.openCode) {
-                    let path = plugin(home: home.path)
-                    bridges.append(bridgeFile(.openCode, path, bundled.openCodePlugin, pluginMode,
-                                              "Install the OpenCode plugin at \(path)"))
+                if let change { configs.append(Pending(change: change, needs: [pluginPath])) }
+                if let change = bridgeChange(.openCode, pluginPath, bundled.openCodePlugin, pluginMode,
+                                             "OpenCode plugin", reported) {
+                    bridges.append(Pending(change: change))
                 }
             }
         }
 
-        // Bridge files first, so no config ever names a file not there yet.
+        // Bridge files first, so no config is written before the file it names.
         var paths = Set<String>()
-        let uniqueBridges = bridges.filter { paths.insert($0.path).inserted }
+        let uniqueBridges = bridges.filter { paths.insert($0.change.path).inserted }
         let narrow = watchAs == .everyUser && !probe.sudoOK
+        let asRoot = probe.euid == 0
         return SetupPlan(
-            changes: uniqueBridges + configs, installHelper: narrow, sudoersUser: narrow ? probe.user : nil,
-            watchAs: watchAs, helperDestination: helperDestination(homes: homes, watchAs: watchAs))
+            changes: resolve(uniqueBridges + configs),
+            installHelper: narrow,
+            // Root has no use for a rule that lets it run its own helper.
+            sudoersUser: narrow && !asRoot ? probe.user : nil,
+            watchAs: watchAs,
+            helperDestination: helperDestination(homes: homes, watchAs: watchAs),
+            system: probe.system,
+            // A root login with no sudo installed runs apply as it is. A
+            // root view taken through sudo says sudo works, and the person
+            // pasting the command is then not root, so it keeps sudo.
+            useSudo: watchAs == .everyUser && !(asRoot && !probe.sudoOK),
+            isPartial: narrow && !asRoot)
     }
 
     /// The `.remote` uninstall for every config that names a remote bridge,
-    /// then the bridge files themselves. Local entries are never touched.
+    /// then the bridge files themselves, each after the configs that named
+    /// it. Local entries are never touched.
     static func undoPlan(probe: ProbeResult, watchAs: WatchAs) throws -> SetupPlan {
         let homes = try watchedHomes(probe, watchAs)
-        var configs: [PlannedChange] = []
-        var removals: [PlannedChange] = []
+        let owners = fileOwners(probe, homes)
+        var configs: [Pending] = []
+        var removals: [Pending] = []
         var seen = Seen()
 
         for home in homes {
             let tools = Set(toolList(probe.tools[home.path]))
             let installed = Set(toolList(probe.installed[home.path]))
             let unknown = Set(toolList(probe.installedUnknown[home.path]))
+            let reported = probe.bridges?[home.path]
             let bridges: [(path: String, users: Set<AgentTool>)] = [
                 (claudeScript(home: home.path), [.claudeCode]),
                 (kimiScript(home: home.path), [.kimiCode, .bearCode]),
@@ -218,8 +264,10 @@ enum SetupPlanner {
             // edit: OpenCode will not start with a plugin entry whose file
             // is gone.
             var keep = Set<String>()
+            var namedBy: [String: [String]] = [:]
 
             for file in probe.configs[home.path] ?? [] {
+                if let key = Seen.key(file), owners[key] != home.path { continue }
                 guard let tool = ProbeResult.tool(named: file.tool),
                       let bridge = bridges.first(where: { $0.users.contains(tool) })?.path
                 else { continue }
@@ -257,21 +305,35 @@ enum SetupPlanner {
                 }
                 guard let change else { continue }
                 if change.action == .byHand { keep.insert(bridge) }
-                configs.append(change)
+                namedBy[bridge, default: []].append(change.path)
+                configs.append(Pending(change: change))
             }
 
             let relevant = tools.union(installed).union(unknown)
-            for bridge in bridges where !relevant.isDisjoint(with: bridge.users) && !keep.contains(bridge.path) {
-                removals.append(PlannedChange(
-                    tool: bridge.users.count == 1 ? bridge.users.first : .kimiCode, path: bridge.path,
-                    expectSHA256: "", action: .remove, description: "Remove \(bridge.path)"))
+            for bridge in bridges where !keep.contains(bridge.path) {
+                // The probe says which bridge files are there. Without that
+                // report, any tool that could have used one counts.
+                let there: Bool
+                if let reported {
+                    there = reported.contains { $0.path == bridge.path && ($0.sha256 != nil || $0.unreadable == true) }
+                } else {
+                    there = !relevant.isDisjoint(with: bridge.users)
+                }
+                guard there else { continue }
+                removals.append(Pending(
+                    change: PlannedChange(
+                        tool: bridge.users.count == 1 ? bridge.users.first : .kimiCode, path: bridge.path,
+                        expectSHA256: "", action: .remove, description: "Remove \(bridge.path)"),
+                    needs: namedBy[bridge.path] ?? []))
             }
         }
         var paths = Set<String>()
-        let uniqueRemovals = removals.filter { paths.insert($0.path).inserted }
+        let uniqueRemovals = removals.filter { paths.insert($0.change.path).inserted }
         return SetupPlan(
-            changes: configs + uniqueRemovals, installHelper: false, sudoersUser: nil, watchAs: watchAs,
-            helperDestination: helperDestination(homes: homes, watchAs: watchAs))
+            changes: resolve(configs + uniqueRemovals), installHelper: false, sudoersUser: nil, watchAs: watchAs,
+            helperDestination: helperDestination(homes: homes, watchAs: watchAs), system: probe.system,
+            useSudo: watchAs == .everyUser && !(probe.euid == 0 && !probe.sudoOK),
+            isPartial: watchAs == .everyUser && !probe.sudoOK && probe.euid != 0)
     }
 
     /// The tool a kimi_events key names: its binary's path, or the BearCode
@@ -283,18 +345,46 @@ enum SetupPlanner {
         return nil
     }
 
+    /// Whether every character of a path is one a person can see. A path
+    /// holding a newline or another control character would turn the
+    /// prompt's shell lines into something else, so it is never sent.
+    static func isPrintable(_ path: String) -> Bool {
+        path.unicodeScalars.allSatisfy { scalar in
+            switch scalar.properties.generalCategory {
+            case .control, .format, .surrogate, .privateUse, .unassigned, .lineSeparator, .paragraphSeparator:
+                false
+            default:
+                true
+            }
+        }
+    }
+
     // MARK: Pieces
 
-    /// Every home for every user, or the login user's own.
+    /// Every home for every user, or the login user's own. Either way an
+    /// empty list is an error, never a plan with nothing in it.
     private static func watchedHomes(_ probe: ProbeResult, _ watchAs: WatchAs) throws -> [RemoteHome] {
-        switch watchAs {
-        case .everyUser:
-            return probe.homes
-        case .loginUser:
-            let own = probe.homes.filter { $0.user == probe.user }
-            guard !own.isEmpty else { throw PlanError.noHome(user: probe.user) }
-            return own
+        let homes = switch watchAs {
+        case .everyUser: probe.homes
+        case .loginUser: probe.homes.filter { $0.user == probe.user }
         }
+        guard !homes.isEmpty else { throw PlanError.noHome(user: probe.user) }
+        return homes
+    }
+
+    /// For each (dev, ino) the watched homes share, the home to plan it
+    /// from: the first where the probe could read it, since the probe reads
+    /// a config only where the home's owner owns it, else the first at all.
+    private static func fileOwners(_ probe: ProbeResult, _ homes: [RemoteHome]) -> [String: String] {
+        var owners: [String: String] = [:]
+        for readable in [true, false] {
+            for home in homes {
+                for file in probe.configs[home.path] ?? [] where (file.sha256 != nil) == readable {
+                    if let key = Seen.key(file), owners[key] == nil { owners[key] = home.path }
+                }
+            }
+        }
+        return owners
     }
 
     private static func helperDestination(homes: [RemoteHome], watchAs: WatchAs) -> String {
@@ -309,10 +399,17 @@ enum SetupPlanner {
     }
 
     /// The events every probed build of this tool accepts, in the order
-    /// SwarmBar writes them, and the ones left out. No probe for the tool
-    /// means the full list, the same one the local toggle writes. Several
-    /// builds of one tool get only what all of them accept, since one
-    /// config can be read by any of them.
+    /// SwarmBar writes them, and the ones left out. Several builds of one
+    /// tool get only what all of them accept, since one config can be read
+    /// by any of them.
+    ///
+    /// A key that names no Kimi-family binary is ignored, and a tool with
+    /// no recognised key gets the full list. That is safe: the full list
+    /// is exactly what the local toggle writes on every Kimi and BearCode
+    /// build, and every name in it is in both engines' event enums
+    /// (TurnStarted, the one that is not, is deliberately left out of it).
+    /// Narrowing only protects a build the probe has actually shown to
+    /// reject a name.
     private static func acceptedEvents(
         for tool: AgentTool, _ kimiEvents: [String: [String]]
     ) -> (kept: [(name: String, timeout: Int?)], leftOut: [String]) {
@@ -324,13 +421,28 @@ enum SetupPlanner {
         return (kept, leftOut)
     }
 
-    private static func bridgeFile(
-        _ tool: AgentTool, _ path: String, _ text: String, _ mode: Int, _ description: String
-    ) -> PlannedChange {
-        // The probe does not read bridge files, so each is planned as new.
-        // One already there answers "changed", which the sheet reports.
-        PlannedChange(tool: tool, path: path, expectSHA256: absent, action: .write(newText: text, mode: mode),
-                      description: description)
+    /// A bridge file's write, against what the probe found there: nothing
+    /// when it already holds the bundled bytes, a replacement guarded by
+    /// its hash when it differs, a new file only when it is really absent,
+    /// and a hand edit when it is there but could not be read.
+    private static func bridgeChange(
+        _ tool: AgentTool, _ path: String, _ text: String, _ mode: Int, _ name: String,
+        _ reported: [ProbeResult.BridgeFile]
+    ) -> PlannedChange? {
+        let found = reported.first { $0.path == path }
+        if found?.unreadable == true {
+            return PlannedChange(
+                tool: tool, path: path, expectSHA256: "", action: .byHand,
+                description: "Edit by hand: SwarmBar couldn't read \(path). Delete it, then set this host up again.")
+        }
+        guard let sha = found?.sha256 else {
+            return PlannedChange(tool: tool, path: path, expectSHA256: absent,
+                                 action: .write(newText: text, mode: mode),
+                                 description: "Install the \(name) at \(path)")
+        }
+        if sha == HelperInstaller.sha256(Data(text.utf8)) { return nil }
+        return PlannedChange(tool: tool, path: path, expectSHA256: sha, action: .write(newText: text, mode: mode),
+                             description: "Update the \(name) at \(path)")
     }
 
     /// One config's change: the transform's text against the bytes the
@@ -365,6 +477,27 @@ enum SetupPlanner {
                              action: .write(newText: text, mode: configMode), description: description)
     }
 
+    /// The final list: a path no one could read safely becomes a hand
+    /// edit, then each change's `needs` becomes the indexes of the planned
+    /// writes and removals at those paths.
+    private static func resolve(_ pending: [Pending]) -> [PlannedChange] {
+        var changes = pending.map(\.change)
+        for index in changes.indices where !isPrintable(changes[index].path) {
+            changes[index].action = .byHand
+            changes[index].expectSHA256 = ""
+            changes[index].description =
+                "Edit by hand: SwarmBar won't write a path with control characters: \(String(reflecting: changes[index].path))"
+        }
+        for (index, item) in pending.enumerated() {
+            // Only earlier changes: the applier goes in order, and a plan
+            // is built with what a change waits for ahead of it.
+            changes[index].dependsOn = changes.indices.filter { other in
+                other < index && changes[other].isSent && item.needs.contains(changes[other].path)
+            }
+        }
+        return changes
+    }
+
     /// "A, B and C".
     private static func list(_ names: [String]) -> String {
         guard names.count > 1 else { return names.first ?? "" }
@@ -377,10 +510,15 @@ enum SetupPlanner {
         var paths = Set<String>()
         var files = Set<String>()
 
+        static func key(_ file: ProbeResult.ConfigFile) -> String? {
+            guard let dev = file.dev, let ino = file.ino else { return nil }
+            return "\(dev):\(ino)"
+        }
+
         mutating func first(_ path: String, _ file: ProbeResult.ConfigFile?) -> Bool {
             guard !paths.contains(path) else { return false }
-            if let dev = file?.dev, let ino = file?.ino {
-                guard files.insert("\(dev):\(ino)").inserted else { return false }
+            if let file, let key = Self.key(file) {
+                guard files.insert(key).inserted else { return false }
             }
             paths.insert(path)
             return true

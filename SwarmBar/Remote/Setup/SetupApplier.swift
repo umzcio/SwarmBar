@@ -13,7 +13,13 @@ final class SetupApplier {
         /// was written.
         case changed
         case failed(String)
+        /// Never sent: a person has to make it.
+        case byHand
+        /// Never sent: nothing is needed, as the change's description says.
+        case skipped
     }
+
+    static let dependencyFailed = "skipped because a change it depends on did not apply"
 
     private let connection: SSHChannel
 
@@ -22,8 +28,11 @@ final class SetupApplier {
     }
 
     /// Reports every change's outcome by its index in `plan.changes`. A
-    /// change that comes back changed or failed stops only itself: each
-    /// file is guarded by its own hash, so the rest are still safe to make.
+    /// change that comes back changed or failed stops only itself and the
+    /// changes that depend on it: each file is guarded by its own hash, so
+    /// the rest are still safe to make, but a config is never written to
+    /// name a bridge file that did not go in, and a bridge file is never
+    /// removed while a config still names it.
     func apply(_ plan: SetupPlan, progress: @MainActor (Int, StepOutcome) -> Void) async {
         // The wizard can reach a host before any monitor has installed the
         // helper there, and an older helper may not know write_file.
@@ -35,11 +44,32 @@ final class SetupApplier {
         case .current, .installed:
             break
         case .failed(let message), .needsSetup(let message):
-            for index in plan.changes.indices { progress(index, .failed(message)) }
+            for (index, change) in plan.changes.enumerated() {
+                progress(index, Self.unsent(change) ?? .failed(message))
+            }
             return
         }
-        for (index, change) in plan.changes.enumerated() {
-            progress(index, await step(change))
+        var outcomes: [StepOutcome] = []
+        for change in plan.changes {
+            let outcome: StepOutcome
+            if let unsent = Self.unsent(change) {
+                outcome = unsent
+            } else if change.dependsOn.contains(where: { $0 >= outcomes.count || outcomes[$0] != .done }) {
+                outcome = .failed(Self.dependencyFailed)
+            } else {
+                outcome = await step(change)
+            }
+            outcomes.append(outcome)
+            progress(outcomes.count - 1, outcome)
+        }
+    }
+
+    /// What a change that is never sent comes to, or nil for one that is.
+    private static func unsent(_ change: PlannedChange) -> StepOutcome? {
+        switch change.action {
+        case .write, .remove: nil
+        case .byHand: .byHand
+        case .skipped: .skipped
         }
     }
 
@@ -55,9 +85,9 @@ final class SetupApplier {
         case .remove:
             command = "remove_file"
         case .byHand:
-            return .failed("edit by hand")
+            return .byHand
         case .skipped:
-            return .failed("skipped")
+            return .skipped
         }
         do {
             return Self.outcome(of: try await connection.request(command, arguments))

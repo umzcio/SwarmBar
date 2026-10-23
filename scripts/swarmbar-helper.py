@@ -1215,6 +1215,8 @@ BRIDGE_FILES = (
     ("bearcode", ALLOWED[7]),
     ("opencode", ALLOWED[5]),
 )
+# The order the probe lists a home's bridge files in.
+BRIDGE_PATHS = (ALLOWED[6], ALLOWED[7], ALLOWED[5])
 BRIDGE_MARK = b"swarmbar-remote"
 HELPER_PATHS = ("/usr/local/lib/swarmbar-helper",)
 USER_HELPER = ".swarmbar/swarmbar-helper"
@@ -1347,6 +1349,68 @@ def home_configs(home, warnings):
     return configs
 
 
+def owned_state(home, path, uid):
+    """("absent", None), ("present", sha256) or ("unreadable", None) for a
+    file the setup plan may write. Absent only when lstat says there is no
+    such file: anything else that stops the read is unreadable, which must
+    never plan as a new file. The read is the configs' own: refused unless
+    the file is the home owner's all the way down."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unreadable", None
+    resolved = os.path.realpath(path)
+    if not owner_only_path(home, resolved, uid):
+        return "unreadable", None
+    digest = read_owned(resolved, uid, 0)
+    if digest is None:
+        return "unreadable", None
+    return "present", digest[0]
+
+
+def home_bridges(home, warnings):
+    """SwarmBar's three remote bridge files in a home, each {"path",
+    "sha256"}, the sha256 null when the file is absent. One there that
+    cannot be read adds "unreadable": true and a warning, so the plan can
+    replace a current copy, skip an identical one, and never take a file it
+    could not read for a missing one."""
+    uid = home_owner(home)[1]
+    found = []
+    for relative in BRIDGE_PATHS:
+        path = os.path.join(home, relative)
+        state, digest = owned_state(home, path, uid)
+        entry = {"path": path, "sha256": digest}
+        if state == "unreadable":
+            entry["unreadable"] = True
+            warnings.append("cannot read bridge file %s" % path)
+        found.append(entry)
+    return found
+
+
+def home_claude_dirs(home, warnings):
+    """Every Claude config dir in use in a home (one with projects/), once
+    by realpath, each {"path", "settings": "present" | "missing" |
+    "unreadable"}. A profile with no settings.json still needs hooks, and
+    only this says where it is."""
+    uid = home_owner(home)[1]
+    found = []
+    seen = set()
+    for directory in claude_config_dirs(home):
+        if not os.path.isdir(os.path.join(directory, "projects")):
+            continue
+        real = os.path.realpath(directory)
+        if real in seen:
+            continue
+        seen.add(real)
+        state = owned_state(home, os.path.join(real, "settings.json"), uid)[0]
+        if state == "unreadable":
+            warnings.append("cannot read Claude settings in %s" % real)
+        found.append({"path": real, "settings": "missing" if state == "absent" else state})
+    return found
+
+
 def mentions_bridge(home, path, uid):
     """True or False, or None when the file is there but cannot be read, or
     is not the home owner's own all the way down (owner_only_path). Like
@@ -1456,10 +1520,12 @@ def probe():
         user = pwd.getpwuid(os.geteuid()).pw_name
     except (ImportError, KeyError):
         user = ""
-    installed, unknown, configs = {}, {}, {}
+    installed, unknown, configs, bridges, claude_dirs = {}, {}, {}, {}, {}
     for path in paths:
         installed[path], unknown[path] = home_installed(path, warnings)
         configs[path] = home_configs(path, warnings)
+        bridges[path] = home_bridges(path, warnings)
+        claude_dirs[path] = home_claude_dirs(path, warnings)
     return {
         "ok": True,
         "protocol": PROTOCOL_VERSION,
@@ -1476,6 +1542,8 @@ def probe():
         "installed": installed,
         "installed_unknown": unknown,
         "configs": configs,
+        "bridges": bridges,
+        "claude_dirs": claude_dirs,
         "helper": installed_helpers(paths),
         "self_sha256": own_digest(),
         "warnings": warnings,

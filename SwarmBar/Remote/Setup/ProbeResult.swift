@@ -23,6 +23,24 @@ struct ProbeResult: Decodable, Sendable, Equatable {
         var ino: UInt64? = nil
     }
 
+    /// One of SwarmBar's remote bridge files in a home. `sha256` is nil
+    /// when the file is absent, and also when `unreadable` says it is there
+    /// but could not be read, which must never plan as a new file.
+    struct BridgeFile: Decodable, Sendable, Equatable {
+        var path: String
+        var sha256: String?
+        /// Optional only so a probe that leaves it out still decodes.
+        var unreadable: Bool? = nil
+    }
+
+    /// A Claude config dir in use (it has projects/), by realpath.
+    /// `settings` is "present", "missing" or "unreadable". A profile with
+    /// no settings.json still needs hooks, and only this says where.
+    struct ClaudeDir: Decodable, Sendable, Equatable {
+        var path: String
+        var settings: String
+    }
+
     /// An installed copy of SwarmBar's helper. `sha256` is nil when the file
     /// is there but this view cannot read it, which is the normal state of
     /// root's mode 700 copy seen without sudo.
@@ -53,6 +71,11 @@ struct ProbeResult: Decodable, Sendable, Equatable {
     /// because a config that would say could not be read.
     var installedUnknown: [String: [String]] = [:]
     var configs: [String: [ConfigFile]] = [:]
+    /// Keyed by home path. Optional, like `claudeDirs`, so a probe from an
+    /// older installed helper still decodes and reads as needing setup.
+    var bridges: [String: [BridgeFile]]? = nil
+    /// Keyed by home path.
+    var claudeDirs: [String: [ClaudeDir]]? = nil
     var helper: [HelperFile] = []
     /// The probing helper's own sha256 when it ran from an installed file,
     /// as it does under the narrow sudo rule; nil when it came from stdin.
@@ -61,12 +84,13 @@ struct ProbeResult: Decodable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case system, python, hostname, user, euid, homes, processes, tools, installed, configs, helper,
-             warnings
+             warnings, bridges
         case protocolVersion = "protocol"
         case sudoOK = "sudo_ok"
         case processesFailed = "processes_failed"
         case installedUnknown = "installed_unknown"
         case selfSHA256 = "self_sha256"
+        case claudeDirs = "claude_dirs"
     }
 
     /// The helper's tool names, as in its SPECS table and the probe's
