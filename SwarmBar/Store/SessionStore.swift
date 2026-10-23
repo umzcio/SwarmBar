@@ -18,6 +18,25 @@ final class SessionStore {
         remoteReachability[host] = state
     }
 
+    /// Forgets everything about one remote host: its rows, its reachability
+    /// and the per-session records keyed by those rows. Used when a host is
+    /// removed or renamed, since its monitor will never sync again to delete
+    /// the rows itself and a stale row would read as a live session.
+    func clearHost(_ host: String) {
+        let ids = Set(sessions.filter { $0.host == host }.map(\.id))
+        sessions.removeAll { $0.host == host }
+        remoteReachability.removeValue(forKey: host)
+        for id in ids {
+            hookOverrides.removeValue(forKey: id)
+            acknowledgedAt.removeValue(forKey: id)
+            alertedStatus.removeValue(forKey: id)
+            endedSessions.removeValue(forKey: id)
+            remindedTurn.removeValue(forKey: id)
+        }
+        noteAttentionTransitions()
+        refreshIconTicker()
+    }
+
     var isPaused = false
 
     /// Tools the user has switched off in Settings. A tool that is off is

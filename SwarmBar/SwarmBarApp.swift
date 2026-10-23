@@ -4,6 +4,9 @@ import SwiftUI
 struct SwarmBarApp: App {
     @State private var store: SessionStore
     private let hookServer: HookServer
+    /// Held for the life of the app. Nil under --mock, which has no remote hosts.
+    private let remoteRegistry: RemoteHostRegistry?
+    private let remoteSupervisor: RemoteMonitorSupervisor?
 
     init() {
         // A write to a pipe whose reader has already gone raises SIGPIPE,
@@ -71,6 +74,8 @@ struct SwarmBarApp: App {
         // Real monitors by default; --mock replays the prototype simulation
         // so the demo mode survives.
         if CommandLine.arguments.contains("--mock") {
+            remoteRegistry = nil
+            remoteSupervisor = nil
             Task { await MockSessionMonitor().start(into: store) }
         } else {
             Task { await ClaudeCodeMonitor().start(into: store) }
@@ -80,9 +85,14 @@ struct SwarmBarApp: App {
             Task { await OpenCodeMonitor().start(into: store) }
             Task { await GrokBuildMonitor().start(into: store) }
             Task { await AntigravityMonitor().start(into: store) }
-            for host in RemoteHostStore.load(from: .standard) where host.isEnabled {
-                Task { await RemoteHostMonitor(host: host).start(into: store) }
+            let registry = RemoteHostRegistry(defaults: .standard)
+            let supervisor = RemoteMonitorSupervisor(store: store, registry: registry) {
+                RemoteHostMonitor(host: $0)
             }
+            registry.onChange = { [supervisor] in supervisor.reconcile() }
+            supervisor.reconcile()
+            remoteRegistry = registry
+            remoteSupervisor = supervisor
         }
     }
 
