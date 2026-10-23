@@ -54,11 +54,17 @@ enum ClaudeHookTransform {
     /// holding both families would satisfy a substring test for either.
     static func isInstalled(_ text: String, family: BridgeFamily = .local) -> Bool {
         guard let data = text.data(using: .utf8),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let hooks = root["hooks"] as? [String: Any]
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
-            return text.components(separatedBy: "\n").contains { family.owns($0) }
+            // Unparseable text: fall back to the script names themselves.
+            switch family {
+            case .local: return text.contains("swarmbar-hook.sh") && !text.contains("swarmbar-remote")
+            case .remote: return text.contains("swarmbar-remote-hook.sh")
+            }
         }
+        // Valid JSON with no hooks object cannot hold a bridge, whatever else
+        // mentions swarmbar (a permission rule, an env var).
+        guard let hooks = root["hooks"] as? [String: Any] else { return false }
         return hooks.values.contains { value in
             (value as? [[String: Any]] ?? []).contains { mentionsSwarmBar($0, family: family) }
         }
@@ -182,6 +188,7 @@ enum TomlHooksTransform {
         events: [(name: String, timeout: Int?)] = TomlHooksTransform.events
     ) -> String {
         let (begin, end) = markers(family)
+        if events.isEmpty { return uninstall(text, family: family) }
         var block = [begin]
         for (event, timeout) in events {
             block.append("")
@@ -203,6 +210,8 @@ enum TomlHooksTransform {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed == begin { inMarkedBlock = true; continue }
             if trimmed == end { inMarkedBlock = false; continue }
+            // An unclosed block ends where the other family's block begins.
+            if inMarkedBlock, isMarker(trimmed) { inMarkedBlock = false }
             if !inMarkedBlock { lines.append(line) }
         }
         // Sweep unmarked [[hooks]] tables that mention swarmbar.
