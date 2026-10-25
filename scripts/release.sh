@@ -84,8 +84,10 @@ echo "==> Generating the signed Sparkle appcast"
 # appcast at the repo root, so a release that never reaches it is a
 # release nobody is offered.
 DIST="$ROOT/build/dist"
-GEN="$(find "$ROOT/build/archive-derived" "$ROOT/build" ~/Library/Developer/Xcode/DerivedData \
-        -name generate_appcast -type f 2>/dev/null | head -1)"
+# A folder that does not exist makes find exit 1, which pipefail would turn
+# into a silent stop here, so its status is ignored and the result checked.
+GEN="$({ find "$ROOT/build/archive-derived" "$ROOT/build" ~/Library/Developer/Xcode/DerivedData \
+        -name generate_appcast -type f 2>/dev/null || true; } | head -1)"
 [ -n "$GEN" ] || { echo "error: generate_appcast not found; build once so SPM fetches Sparkle"; exit 1; }
 rm -rf "$DIST"; mkdir -p "$DIST"
 cp "$DMG" "$DIST/"
