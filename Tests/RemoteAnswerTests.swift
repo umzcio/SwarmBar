@@ -484,6 +484,46 @@ struct RemoteAnswerTests {
         #expect(calls[1].arguments["comm"] == .string("grok"))
     }
 
+    // MARK: Removing a host
+
+    @Test func removingAsksTheHelperToCleanUpThenForgetsTheHost() async throws {
+        let rig = Rig(replies: [
+            "uninstall": #"{"ok":true,"shared":false,"removed":["/root/.swarmbar"],"kept":[]}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await rig.supervisor.remove(hostID: rig.host.id) == .cleaned(kept: []))
+        #expect(await rig.helper.commands == ["uninstall"])
+        #expect(rig.registry.hosts.isEmpty)
+        #expect(rig.supervisor.removing.isEmpty)
+    }
+
+    @Test func removingReportsWhatTheHostKeptOrWhyNothingWent() async throws {
+        let kept = Rig(replies: [
+            "uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[{"path":"/root/.swarmbar","reason":"other files are still in it"}]}"#,
+        ])
+        kept.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await kept.supervisor.remove(hostID: kept.host.id) == .cleaned(kept: ["/root/.swarmbar"]))
+
+        let shared = Rig(replies: ["uninstall": #"{"ok":true,"shared":true,"removed":[],"kept":[]}"#])
+        shared.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await shared.supervisor.remove(hostID: shared.host.id) == .shared)
+        #expect(shared.registry.hosts.isEmpty)
+
+        let old = Rig(replies: ["uninstall": #"{"ok":false,"error":"unknown command: uninstall"}"#])
+        old.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await old.supervisor.remove(hostID: old.host.id) == .failed("unknown command: uninstall"))
+        #expect(old.registry.hosts.isEmpty)
+    }
+
+    /// An unreachable host is still removed from the list; it is just not
+    /// asked anything.
+    @Test func removingAnUnreachableHostSendsNothing() async throws {
+        let rig = Rig(replies: ["uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[]}"#])
+        #expect(await rig.supervisor.remove(hostID: rig.host.id) == .failed("it couldn't be reached"))
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.registry.hosts.isEmpty)
+    }
+
     @Test func remoteCodexSendsItsHotkeyWithoutACapture() async throws {
         let rig = Rig(replies: ["keys": #"{"sent":true}"#])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "codex"))

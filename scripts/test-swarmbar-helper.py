@@ -3723,5 +3723,145 @@ class SudoersTests(unittest.TestCase):
             return handle.read()
 
 
+class UninstallTests(unittest.TestCase):
+    """Removing a host: SwarmBar's own files go, and nothing goes while
+    another Mac is watching."""
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbu-"))
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.dir = os.path.join(self.home, ".swarmbar")
+        os.makedirs(self.dir, 0o700)
+        self.installed = os.path.join(self.dir, "swarmbar-helper")
+        for name in ("hook.lock", "hook.sock", "broker.sock", "swarmbar-helper"):
+            open(os.path.join(self.dir, name), "w").close()
+        self.sudoers = os.path.join(self.home, "sudoers-swarmbar")
+        for patch in (mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home}),
+                      mock.patch.object(helper, "helper_destination", return_value=self.installed),
+                      mock.patch.object(helper, "SUDOERS_PATH", self.sudoers)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def uninstall(self, others=0, relay=None):
+        relay = relay if relay is not None else mock.Mock()
+        with mock.patch.object(helper, "other_watchers", return_value=others):
+            return helper.uninstall(relay), relay
+
+    def test_relay_files_helper_and_directory_go(self):
+        result, relay = self.uninstall()
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["shared"])
+        self.assertEqual(result["removed"], [self.installed, self.dir])
+        self.assertEqual(result["kept"], [])
+        self.assertFalse(os.path.lexists(self.dir))
+        relay.close.assert_called_once()
+
+    def test_a_bridge_script_undo_left_keeps_the_directory(self):
+        script = os.path.join(self.dir, "swarmbar-remote-hook.sh")
+        open(script, "w").close()
+        result, _ = self.uninstall()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["swarmbar-remote-hook.sh"])
+        self.assertEqual(result["kept"], [{"path": self.dir, "reason": "other files are still in it"}])
+
+    def test_another_mac_watching_changes_nothing(self):
+        before = sorted(os.listdir(self.dir))
+        result, relay = self.uninstall(others=1)
+        self.assertEqual(result, {"ok": True, "shared": True, "removed": [], "kept": []})
+        self.assertEqual(sorted(os.listdir(self.dir)), before)
+        relay.close.assert_not_called()
+
+    def test_an_unreadable_process_table_changes_nothing(self):
+        before = sorted(os.listdir(self.dir))
+        result, relay = self.uninstall(others=None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(sorted(os.listdir(self.dir)), before)
+        relay.close.assert_not_called()
+
+    def test_a_link_in_place_of_the_directory_is_not_followed(self):
+        shutil.rmtree(self.dir)
+        target = os.path.join(self.home, "elsewhere")
+        os.makedirs(target)
+        open(os.path.join(target, "hook.lock"), "w").close()
+        os.symlink(target, self.dir)
+        result, _ = self.uninstall()
+        self.assertEqual([k["path"] for k in result["kept"]], [self.dir])
+        self.assertTrue(os.path.exists(os.path.join(target, "hook.lock")))
+
+    def test_the_relay_stays_closed(self):
+        open(os.path.join(self.dir, "swarmbar-remote-hook.sh"), "w").close()
+        for name in ("hook.lock", "hook.sock", "broker.sock"):
+            os.unlink(os.path.join(self.dir, name))
+        relay = helper.HookRelay(emit=lambda message: None)
+        self.addCleanup(relay.close)
+        relay.refresh()
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "hook.sock")))
+        result, _ = self.uninstall(relay=relay)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(os.path.lexists(os.path.join(self.dir, "hook.sock")))
+        # A snapshot after the cleanup must not bind the sockets again.
+        relay.refresh()
+        self.assertEqual(sorted(os.listdir(self.dir)), ["swarmbar-remote-hook.sh"])
+
+    def test_only_python_running_an_installed_helper_counts(self):
+        me = os.getpid()
+        table = "\n".join([
+            "%d python3 -I /usr/local/lib/swarmbar-helper" % me,
+            "4001 sudo -n /usr/local/lib/swarmbar-helper",
+            "4002 python3 -I /usr/local/lib/swarmbar-helper",
+            "4003 /usr/bin/python3.12 -I /home/u/.swarmbar/swarmbar-helper",
+            "4004 python3 -I /usr/local/lib/swarmbar-helper probe",
+            "4005 python3 /usr/local/lib/swarmbar-helper apply eJx",
+            "4006 vim /usr/local/lib/swarmbar-helper",
+            "4007 python3 -I - probe",
+        ]) + "\n"
+        ps = lambda argv, timeout=5, input=None, **options: completed(argv, 0, table)
+        with mock.patch.object(helper, "run_command", ps):
+            self.assertEqual(helper.other_watchers(), 2)
+        failing = lambda argv, timeout=5, input=None, **options: completed(argv, 1, "")
+        with mock.patch.object(helper, "run_command", failing):
+            self.assertIsNone(helper.other_watchers())
+
+    def test_only_swarmbars_exact_rule_matches(self):
+        rule = helper.SUDOERS_RULE.fullmatch
+        self.assertTrue(rule("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\n"))
+        for other in ("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper",
+                      "nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\nALL ALL=(ALL) ALL\n",
+                      "ALL ALL=(ALL) NOPASSWD: ALL\n",
+                      "nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helperX\n"):
+            self.assertIsNone(rule(other), other)
+
+    def write_rule(self, text):
+        with open(self.sudoers, "w") as handle:
+            handle.write(text)
+
+    def as_root_owned(self):
+        real = os.fstat
+        def fstat(fd):
+            info = real(fd)
+            return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink, 0,
+                                   info.st_gid, info.st_size, int(info.st_atime),
+                                   int(info.st_mtime), int(info.st_ctime)))
+        return mock.patch.object(helper.os, "fstat", fstat)
+
+    def test_swarmbars_rule_is_removed_as_root(self):
+        self.write_rule("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\n")
+        with mock.patch.object(os, "geteuid", return_value=0), self.as_root_owned():
+            self.assertEqual(helper.remove_sudoers_rule(), (self.sudoers, None))
+        self.assertFalse(os.path.lexists(self.sudoers))
+
+    def test_any_other_rule_is_kept(self):
+        self.write_rule("nobody ALL=(ALL) NOPASSWD: ALL\n")
+        with mock.patch.object(os, "geteuid", return_value=0), self.as_root_owned():
+            self.assertEqual(helper.remove_sudoers_rule(), (None, "not the rule SwarmBar writes"))
+        # A file root does not own is not one install_sudoers wrote.
+        self.write_rule("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\n")
+        with mock.patch.object(os, "geteuid", return_value=0):
+            self.assertEqual(helper.remove_sudoers_rule(), (None, "not the rule SwarmBar writes"))
+        self.assertTrue(os.path.exists(self.sudoers))
+        # Not root: nothing to look at.
+        self.assertEqual(helper.remove_sudoers_rule(), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2145,7 +2145,37 @@ def step_connect(directory, umask_lock):
     return [sock.detach()]
 
 
-BY_KIND = {"prepare": step_prepare, "bind": step_bind, "connect": step_connect}
+def step_clear(directory, umask_lock):
+    """Removes the relay's own files from ~/.swarmbar (both sockets and the
+    lock), then the directory itself once nothing else is in it. Never
+    through a link, never a directory, and only in this user's own
+    ~/.swarmbar. Anything else in it, such as a bridge script Undo has not
+    removed, stays, and so does the directory. Returns []."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
+    except FileNotFoundError:
+        return []
+    try:
+        info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise StepError(".swarmbar is not this user's own directory")
+        for name in (HOOK_SOCKET, BROKER_SOCKET, HOOK_LOCK):
+            try:
+                entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(entry.st_mode):
+                os.unlink(name, dir_fd=dir_fd)
+        left = os.listdir(dir_fd)
+    finally:
+        os.close(dir_fd)
+    if not left:
+        os.rmdir(directory)
+    return []
+
+
+BY_KIND = {"prepare": step_prepare, "bind": step_bind, "connect": step_connect,
+           "clear": step_clear}
 
 BACKUP_SUFFIX = ".backup-swarmbar"
 # A job is a few config files' worth of JSON. Past this the parent is not
@@ -2800,7 +2830,7 @@ def spawn_step(owner, kind, directory, child):
 
 
 def run_as_user(owner, kind, directory):
-    """Runs one step ("prepare", "bind" or "connect") as the home's owner
+    """Runs one step ("prepare", "bind", "connect" or "clear") as the home's owner
     and returns the descriptors it produced.
 
     As root, or when STEP_CHILD is set, the step runs in a child python
@@ -4122,6 +4152,157 @@ def install_sudoers(request):
     return {"ok": True, "installed": SUDOERS_PATH}
 
 
+# Removing a host. Exactly the rule install_sudoers writes, so a rule
+# someone wrote by hand, or changed since, is never deleted.
+SUDOERS_RULE = re.compile(r"[a-z_][a-z0-9_-]*[$]? ALL=\(root\) NOPASSWD: %s\n"
+                          % re.escape(HELPER_PATHS[0]))
+
+
+def other_watchers():
+    """How many other SwarmBar helpers are running on this host, each one a
+    Mac watching it. None when the process table cannot be read, which is
+    never taken to mean none. A helper is python running an installed copy;
+    sudo's own process, the probe and the pasted setup command are not."""
+    try:
+        done = run_command(["ps", "-axo", "pid=,args="], timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    count = 0
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        args = parts[1:]
+        if pid == os.getpid() or not os.path.basename(args[0]).startswith("python"):
+            continue
+        for index, arg in enumerate(args):
+            if arg == HELPER_PATHS[0] or arg.endswith("/" + USER_HELPER):
+                if not set(args[index + 1:index + 2]) & {"probe", "apply"}:
+                    count += 1
+                break
+    return count
+
+
+def remove_own_helper():
+    """Deletes the installed copy at helper_destination(), when it is a plain
+    file this user owns and, as root, sits in a directory only root can
+    write. Returns (removed path or None, reason kept or None). This process
+    keeps running from the open file."""
+    path = helper_destination()
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, error_text(error)
+    if not stat_module.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        return None, "not SwarmBar's own file"
+    directory = os.path.dirname(path)
+    if os.geteuid() == 0:
+        try:
+            parent = os.stat(directory)
+        except OSError as error:
+            return None, error_text(error)
+        if parent.st_uid != 0 or not only_owner_can_write(parent):
+            return None, "%s is writable by another user" % directory
+    try:
+        os.unlink(path)
+    except OSError as error:
+        return None, error_text(error)
+    fsync_directory(directory)
+    return path, None
+
+
+def remove_sudoers_rule():
+    """Deletes /etc/sudoers.d/swarmbar when it is exactly a rule SwarmBar
+    writes. Returns (removed path or None, reason kept or None). Removing a
+    file from sudoers.d cannot make the rest fail to parse, so there is no
+    visudo step to undo."""
+    if os.geteuid() != 0:
+        return None, None
+    try:
+        fd = os.open(SUDOERS_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, error_text(error)
+    try:
+        info = os.fstat(fd)
+        data = os.read(fd, 4096)
+    except OSError as error:
+        return None, error_text(error)
+    finally:
+        os.close(fd)
+    if not stat_module.S_ISREG(info.st_mode) or info.st_uid != 0 \
+            or not SUDOERS_RULE.fullmatch(data.decode("utf-8", "replace")):
+        return None, "not the rule SwarmBar writes"
+    try:
+        os.unlink(SUDOERS_PATH)
+    except OSError as error:
+        return None, error_text(error)
+    fsync_directory(os.path.dirname(SUDOERS_PATH))
+    return SUDOERS_PATH, None
+
+
+def uninstall(relay):
+    """{}: SwarmBar's own files off this host, for a Mac removing it. Each
+    watched home's relay files, and its ~/.swarmbar once that is empty; the
+    sudo rule, if it is exactly SwarmBar's; and this helper's installed
+    copy. Agent configs, bridge scripts and .backup-swarmbar files are not
+    touched: the first two are Undo's, and the backups are the user's
+    originals.
+
+    Nothing at all happens while another helper is running: that is another
+    Mac watching, and it uses every one of these files. The relay is closed
+    first and stays closed, so no later snapshot binds a socket again. The
+    helper itself keeps serving until its Mac hangs up, so that Mac never
+    sees an early exit to reconnect and reinstall over."""
+    others = other_watchers()
+    if others is None:
+        return {"ok": False, "error": "cannot tell whether another Mac is watching"}
+    if others:
+        return {"ok": True, "shared": True, "removed": [], "kept": []}
+    relay.close()
+    removed, kept = [], []
+    # First, so a login user's ~/.swarmbar, which holds it, can empty.
+    path, reason = remove_own_helper()
+    if path:
+        removed.append(path)
+    elif reason:
+        kept.append({"path": helper_destination(), "reason": reason})
+    root = os.geteuid() == 0
+    for home in home_dirs():
+        directory = os.path.join(home, HOOK_DIR)
+        if not os.path.lexists(directory):
+            continue
+        owner = home_owner(home)
+        if not root and owner[1] != os.geteuid():
+            continue
+        try:
+            run_as_user(owner, "clear", directory)
+        except (HookHomeError, OSError) as error:
+            # In-process (not root) a filesystem error arrives as itself,
+            # not as the step child's message.
+            kept.append({"path": directory, "reason": error_text(error)})
+            continue
+        if os.path.lexists(directory):
+            kept.append({"path": directory, "reason": "other files are still in it"})
+        else:
+            removed.append(directory)
+    path, reason = remove_sudoers_rule()
+    if path:
+        removed.append(path)
+    elif reason:
+        kept.append({"path": SUDOERS_PATH, "reason": reason})
+    return {"ok": True, "shared": False, "removed": removed, "kept": kept}
+
+
 def apply_operation(operation, source):
     kind = operation.get("op")
     if kind == "write_file":
@@ -4276,6 +4457,8 @@ def serve_requests(stdin, relay):
                 response = remove_file(request)
             elif command == "kimi_events":
                 response = kimi_events(request)
+            elif command == "uninstall":
+                response = uninstall(relay)
             elif command == "echo":
                 # Hands back whatever the request carried, under the
                 # request's own id. It proves on the Mac that concurrent

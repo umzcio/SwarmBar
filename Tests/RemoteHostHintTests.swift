@@ -260,6 +260,25 @@ struct RemoteHostHintTests {
         #expect(rig.supervisor.checking.isEmpty)
     }
 
+    @Test func removalNoteSaysWhatHappenedOnTheHost() {
+        typealias Cleanup = RemoteMonitorSupervisor.Cleanup
+        let notes = [
+            HostRowText.removalNote(name: "devbox", .cleaned(kept: [])),
+            HostRowText.removalNote(name: "devbox", .cleaned(kept: ["/root/.swarmbar", "/etc/sudoers.d/swarmbar"])),
+            HostRowText.removalNote(name: "devbox", .shared),
+            HostRowText.removalNote(name: "devbox", .failed("it couldn't be reached")),
+        ]
+        #expect(notes[0] == "Removed devbox. SwarmBar's helper and its files are gone from it. "
+            + "Any .backup-swarmbar copies of your configs are still there.")
+        #expect(notes[1] == "Removed devbox. SwarmBar's helper is gone from it. "
+            + "Left in place: /root/.swarmbar, /etc/sudoers.d/swarmbar.")
+        #expect(notes[2] == "Removed devbox from this Mac. Another Mac still watches it, "
+            + "so SwarmBar's files there were left in place.")
+        #expect(notes[3] == "Removed devbox from this Mac, but SwarmBar's files are still on it: "
+            + "it couldn't be reached.")
+        #expect(!notes.joined().contains("\u{2014}"))
+    }
+
     @Test func wizardLookIsAdoptedForTheHostItNames() {
         let rig = Rig()
         let host = RemoteHost(alias: "devbox", watchAs: .loginUser)

@@ -219,6 +219,58 @@ final class RemoteMonitorSupervisor {
         }
     }
 
+    // MARK: Removing
+
+    /// What removing a host did on the host itself.
+    enum Cleanup: Equatable {
+        /// SwarmBar's own files are gone. `kept` names what stayed, such as
+        /// a ~/.swarmbar still holding a bridge script Undo never removed.
+        case cleaned(kept: [String])
+        /// Another Mac is still watching, so nothing there was touched.
+        case shared
+        /// Nothing was removed on the host, and why.
+        case failed(String)
+    }
+
+    /// Hosts being removed right now.
+    private(set) var removing: Set<UUID> = []
+
+    /// Asks the host's helper to delete SwarmBar's own files, then stops
+    /// watching the host whatever it said. The helper keeps running until
+    /// this Mac hangs up, so the monitor never sees it exit and reinstalls
+    /// it in the moment before the host leaves the list. Nil when the host
+    /// is gone or already being removed.
+    func remove(hostID id: UUID) async -> Cleanup? {
+        guard let host = registry.host(id: id), !removing.contains(id) else { return nil }
+        removing.insert(id)
+        defer {
+            registry.remove(id: id)
+            removing.remove(id)
+        }
+        guard let connection = connection(forHostID: id),
+              store.remoteReachability[host.displayName] == .reachable
+        else { return .failed("it couldn't be reached") }
+        do {
+            let reply = try await requester(connection).request("uninstall", [:], timeout: .seconds(30))
+            return Self.cleanup(from: reply)
+        } catch {
+            return .failed("it didn't answer")
+        }
+    }
+
+    /// Pure: the helper's uninstall reply. Only an explicit success counts.
+    static func cleanup(from data: Data) -> Cleanup {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .failed("its reply couldn't be read")
+        }
+        guard object["ok"] as? Bool == true else {
+            return .failed(object["error"] as? String ?? "it refused")
+        }
+        if object["shared"] as? Bool == true { return .shared }
+        let kept = (object["kept"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
+        return .cleaned(kept: kept)
+    }
+
     /// The wizard's last look at a host it just finished with, taken the
     /// same way a check is, so there is no reason to look again.
     func adopt(_ outcome: ProbeRunner.Outcome, alias: String) {

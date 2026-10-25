@@ -108,6 +108,24 @@ enum HostRowText {
         return "No agents found on this host."
     }
 
+    /// What Settings says once a host is gone, about the host itself. The
+    /// backups are named because they are the one thing removing never
+    /// deletes: they are the user's own configs.
+    static func removalNote(name: String, _ cleanup: RemoteMonitorSupervisor.Cleanup) -> String {
+        switch cleanup {
+        case .cleaned(let kept) where kept.isEmpty:
+            "Removed \(name). SwarmBar's helper and its files are gone from it. "
+                + "Any .backup-swarmbar copies of your configs are still there."
+        case .cleaned(let kept):
+            "Removed \(name). SwarmBar's helper is gone from it. Left in place: \(kept.joined(separator: ", "))."
+        case .shared:
+            "Removed \(name) from this Mac. Another Mac still watches it, "
+                + "so SwarmBar's files there were left in place."
+        case .failed(let why):
+            "Removed \(name) from this Mac, but SwarmBar's files are still on it: \(why)."
+        }
+    }
+
     /// A check that could not connect is wrong about a host the monitor is
     /// connected to right now, so it is set aside rather than shown.
     static func live(_ assessment: HostAssessment?, _ reachability: RemoteReachability?) -> HostAssessment? {
@@ -143,6 +161,8 @@ struct HostsSettingsTab: View {
     @Environment(RemoteMonitorSupervisor.self) private var supervisor: RemoteMonitorSupervisor?
     @Environment(\.openRemoteWizard) private var openRemoteWizard
     @State private var expanded: UUID?
+    /// What the last removal did on its host, until the window closes.
+    @State private var removalNote: String?
 
     var body: some View {
         if let registry, let supervisor {
@@ -184,12 +204,26 @@ struct HostsSettingsTab: View {
                 HostSettingsRow(
                     host: host, registry: registry, supervisor: supervisor, now: now,
                     isExpanded: expanded == host.id,
-                    toggleExpanded: { expanded = expanded == host.id ? nil : host.id })
+                    toggleExpanded: { expanded = expanded == host.id ? nil : host.id },
+                    reportRemoval: { removalNote = $0 })
             }
         }
     }
 
     private func footer(_ supervisor: RemoteMonitorSupervisor) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let removalNote {
+                Text(verbatim: removalNote)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            footerButtons(supervisor)
+        }
+        .padding(.top, 10)
+    }
+
+    private func footerButtons(_ supervisor: RemoteMonitorSupervisor) -> some View {
         HStack {
             Button("Add hosts…") { openRemoteWizard(.fresh) }
             Spacer()
@@ -201,7 +235,6 @@ struct HostsSettingsTab: View {
             .foregroundStyle(.orange)
             .disabled(supervisor.checkingAll || !supervisor.checking.isEmpty)
         }
-        .padding(.top, 10)
     }
 
     private var emptyState: some View {
@@ -231,6 +264,7 @@ private struct HostSettingsRow: View {
     let now: Date
     let isExpanded: Bool
     let toggleExpanded: () -> Void
+    let reportRemoval: (String) -> Void
     @State private var confirmingRemove = false
 
     var body: some View {
@@ -266,7 +300,7 @@ private struct HostSettingsRow: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    if supervisor.checking.contains(host.id) {
+                    if supervisor.checking.contains(host.id) || supervisor.removing.contains(host.id) {
                         ProgressView()
                             .controlSize(.mini)
                     } else if let pill = HostRowText.pill(
@@ -289,11 +323,19 @@ private struct HostSettingsRow: View {
             Text(verbatim: "Remove \(host.displayName)?"), isPresented: $confirmingRemove,
             titleVisibility: .visible
         ) {
-            Button("Remove", role: .destructive) { registry.remove(id: host.id) }
+            Button("Remove", role: .destructive) {
+                let name = host.displayName
+                Task {
+                    if let cleanup = await supervisor.remove(hostID: host.id) {
+                        reportRemoval(HostRowText.removalNote(name: name, cleanup))
+                    }
+                }
+            }
             Button("Undo changes first") { openWizard(.undo(alias: host.alias)) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("SwarmBar stops watching it. Its config changes stay until you undo them.")
+            Text("SwarmBar stops watching it and deletes its helper from it, unless another Mac "
+                + "still watches it. Config changes stay until you undo them.")
         }
     }
 
@@ -345,6 +387,7 @@ private struct HostSettingsRow: View {
                 Button("Undo changes…") { openWizard(.undo(alias: host.alias)) }
                 Spacer()
                 Button("Remove") { confirmingRemove = true }
+                    .disabled(supervisor.removing.contains(host.id))
             }
             .controlSize(.small)
             .padding(.top, 8)
