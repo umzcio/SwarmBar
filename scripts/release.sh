@@ -17,8 +17,12 @@ DMG="$ROOT/build/$APP_NAME-$VERSION.dmg"
 
 echo "==> [1/7] Run the test suite"
 (cd "$ROOT" && xcodegen generate)
+# Its own build folder, as the archive has: with Xcode's DerivedData moved
+# in its settings, a command-line build resolves Sparkle in one place and
+# looks for it in another, and fails before a single test runs.
 xcodebuild -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Debug \
     -destination 'platform=macOS' \
+    -derivedDataPath "$ROOT/build/test-derived" \
     test
 
 echo "==> [2/7] Build + sign app"
@@ -80,7 +84,7 @@ echo "==> Generating the signed Sparkle appcast"
 # appcast at the repo root, so a release that never reaches it is a
 # release nobody is offered.
 DIST="$ROOT/build/dist"
-GEN="$(find "$ROOT/build" ~/Library/Developer/Xcode/DerivedData \
+GEN="$(find "$ROOT/build/archive-derived" "$ROOT/build" ~/Library/Developer/Xcode/DerivedData \
         -name generate_appcast -type f 2>/dev/null | head -1)"
 [ -n "$GEN" ] || { echo "error: generate_appcast not found; build once so SPM fetches Sparkle"; exit 1; }
 rm -rf "$DIST"; mkdir -p "$DIST"
