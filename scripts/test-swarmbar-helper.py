@@ -3390,7 +3390,13 @@ class KimiEventsTests(unittest.TestCase):
                                % (sys.executable, helper_py, redirect, "30" if keep_stdout else "0"))
 
     def grandchild(self, pidfile):
-        self.assertTrue(wait_until(lambda: os.path.exists(pidfile) and open(pidfile).read(), 5))
+        """The grandchild's pid, or None when it was killed before it could
+        write one, which on a loaded host is the cleanup winning the race.
+        None only once nothing is left running the script."""
+        if not wait_until(lambda: os.path.exists(pidfile) and open(pidfile).read(), 5):
+            script = os.path.join(self.root, "detach.py")
+            self.assertFalse(self.running(script), "no pid written, yet %s still runs" % script)
+            return None
         pid = int(open(pidfile).read())
 
         def cleanup():
@@ -3400,6 +3406,11 @@ class KimiEventsTests(unittest.TestCase):
                 pass
         self.addCleanup(cleanup)
         return pid
+
+    def running(self, script):
+        """Whether any process's arguments name `script`."""
+        listing = subprocess.run(["ps", "-axo", "args="], stdout=subprocess.PIPE, check=False)
+        return any(script in line for line in listing.stdout.decode("utf-8", "replace").splitlines())
 
     def test_a_detached_grandchild_holding_the_pipe_cannot_stall_the_call(self):
         pidfile = os.path.join(self.root, "detached")
@@ -3421,6 +3432,8 @@ class KimiEventsTests(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 pass
             pid = self.grandchild(pidfile)
+            if pid is None:
+                continue
 
             def gone():
                 try:
