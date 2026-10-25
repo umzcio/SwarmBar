@@ -3872,14 +3872,27 @@ class UninstallTests(unittest.TestCase):
         with self.assertRaises(OSError):
             helper.fcntl.flock(theirs, helper.fcntl.LOCK_EX | helper.fcntl.LOCK_NB)
 
-    def test_a_narrow_rule_run_clears_only_its_own_users_home(self):
+    def test_a_sudo_run_clears_every_home(self):
+        # Full passwordless sudo looks like the narrow rule from inside
+        # (a login user, through sudo, running the installed copy), so a
+        # sudo run must not narrow the cleanup to that user's home. The
+        # helper copy here is this test user's, which faked root rightly
+        # refuses, so it is taken out of the way first.
+        os.unlink(self.installed)
+        real_euid = os.geteuid()
+
+        def as_owner(owner, kind, directory):
+            # The step child runs as the home's owner, not as root.
+            with mock.patch.object(os, "geteuid", return_value=real_euid):
+                return helper.STEP_BY_KIND[kind](directory, None)
         with mock.patch.object(helper, "narrow_rule_run", return_value=True), \
                 mock.patch.dict(os.environ, {"SUDO_UID": str(os.getuid() + 1)}), \
-                mock.patch.object(os, "geteuid", return_value=0):
+                mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "run_as_user", side_effect=as_owner):
             result, _ = self.uninstall()
         self.assertTrue(result["ok"], result)
-        self.assertNotIn(self.dir, result["removed"])
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "hook.lock")))
+        self.assertIn(self.dir, result["removed"])
+        self.assertFalse(os.path.lexists(self.dir))
 
     def test_only_swarmbars_exact_rule_matches(self):
         rule = helper.SUDOERS_RULE.fullmatch

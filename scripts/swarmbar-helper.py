@@ -4362,16 +4362,13 @@ def uninstall(relay):
         removed.append(path)
     elif reason:
         kept.append({"path": helper_destination(), "reason": reason})
-    # Root clears every home it served, except through the narrow rule,
-    # which lets one user run the helper and so reaches only that user's.
-    only = os.geteuid()
-    if only == 0:
-        only = None
-        if narrow_rule_run():
-            try:
-                only = int(os.environ.get("SUDO_UID", ""))
-            except ValueError:
-                only = -1
+    # Root clears every home it served. It is not narrowed to the sudo
+    # user's own: narrow_rule_run() cannot tell the narrow rule from full
+    # passwordless sudo, which also arrives as a login user through sudo,
+    # and narrowing on it left root's ~/.swarmbar behind on a real host.
+    # A user could at most clear SwarmBar's own relay files while no Mac is
+    # connected, which the next connection makes again.
+    only = None if os.geteuid() == 0 else os.geteuid()
     for home in home_dirs():
         directory = os.path.join(home, HOOK_DIR)
         # A stat, as hook_homes makes; nothing inside the home is opened.
