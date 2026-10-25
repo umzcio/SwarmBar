@@ -69,7 +69,8 @@ enum TuiPromptLayout {
             let stripped = raw.trimmingCharacters(in: .whitespaces)
             let marked = stripped.unicodeScalars.first.map(cursorMarkers.contains) ?? false
             let line = stripped
-                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{258F}"))
+                // Box edges: light, Grok 1.0's heavy, and a left eighth block.
+                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{2503}\u{258F}"))
                 .trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }          // blank lines do not break a block
             let number: Int, label: String, isCursor: Bool

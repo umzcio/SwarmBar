@@ -91,22 +91,22 @@ struct RemoteAnswerTests {
     /// deny is one down. Both confirm the filled button is where it was.
     @Test func grokWalksFromItsFilledButton() {
         let screen = """
-          │ 1 (○) Yes, and don't ask again for anything (always-approve mode)
-          │ 2 (●) Yes, proceed
-          │ 3 (○) No, reject (type to add feedback)
-          │ 4 (○) Never allow: touch /tmp/example
+          ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+          ┃  2 (●) Yes, proceed
+          ┃  3 (○) No, reject (type to add feedback)
+          ┃  4 (○) Never allow: touch /tmp/example
         """
         let approve = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: true, in: .init()),
             screen: screen, choose: TuiPromptLayout.approveOnceOption(in:))
-        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed", "│ 2 (●) Yes, proceed"]))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed", "┃  2 (●) Yes, proceed"]))
 
         let deny = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init()),
             screen: screen, choose: TuiPromptLayout.rejectOption(in:))
         #expect(deny == RemoteKeyCommand(
             keys: ["DOWN", "\n"],
-            expect: ["No, reject (type to add feedback)", "│ 2 (●) Yes, proceed"]))
+            expect: ["No, reject (type to add feedback)", "┃  2 (●) Yes, proceed"]))
         #expect(deny?.keys.contains { Int($0) != nil } == false)
     }
 

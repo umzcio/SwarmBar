@@ -253,14 +253,14 @@ struct TuiPromptLayoutTests {
     /// command replaced. The cursor is the filled button, not a marker in
     /// front, and the list opens on "Yes, proceed", not at the top.
     let grokPrompt = """
-      │ ›  Create a scratch file
-      │ touch /tmp/example
-      │ ← → narrow scope
+      ┃  ›  Create a scratch file
+      ┃  touch /tmp/example
+      ┃  ← → narrow scope
       │
-      │ 1 (○) Yes, and don't ask again for anything (always-approve mode)
-      │ 2 (●) Yes, proceed
-      │ 3 (○) No, reject (type to add feedback)
-      │ 4 (○) Never allow: touch /tmp/example
+      ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+      ┃  2 (●) Yes, proceed
+      ┃  3 (○) No, reject (type to add feedback)
+      ┃  4 (○) Never allow: touch /tmp/example
 
       1/4:select  │  Tab:next option  │  ←/→:scope  │  Ctrl+c:cancel
     """
@@ -270,7 +270,7 @@ struct TuiPromptLayoutTests {
         #expect(selector.options.map(\.number) == [1, 2, 3, 4])
         #expect(selector.options[1].label == "Yes, proceed")
         #expect(selector.cursor == 2)
-        #expect(selector.cursorLine == "│ 2 (●) Yes, proceed")
+        #expect(selector.cursorLine == "┃  2 (●) Yes, proceed")
     }
 
     /// Approve is the once-only yes, and deny is the plain reject. "Never
