@@ -72,33 +72,6 @@ enum RemoteAnswerPlan {
         }
     }
 
-    /// `needsScreen`, plus Grok: see `command(tool:route:screen:choose:)`.
-    static func needsScreen(tool: AgentTool, route: ApprovalRoute) -> Bool {
-        if tool == .grokBuild, case .keys = route { return true }
-        return needsScreen(route)
-    }
-
-    /// `command(route:screen:choose:)` with one remote-only gate. Grok's
-    /// fixed sequence (eight DOWNs, then UP or Enter, then Enter) is only
-    /// pressed where a selector is drawn. Locally the session's own tty is
-    /// known to be at the prompt; remotely the pane is matched from a
-    /// snapshot, and the same keys at a bare shell recall a history line
-    /// and run it. The selector's labels go along as `expect`, so the
-    /// helper re-confirms it is still on screen at press time. Codex is
-    /// not gated: "y" or ESC at a shell does nothing worth guarding.
-    static func command(
-        tool: AgentTool, route: ApprovalRoute, screen: String?,
-        choose: (String) -> TuiPromptLayout.Option?
-    ) -> RemoteKeyCommand? {
-        guard tool == .grokBuild, case .keys(let keys) = route else {
-            return command(route: route, screen: screen, choose: choose)
-        }
-        guard let screen else { return nil }
-        let options = TuiPromptLayout.selector(in: screen).options
-        guard options.count >= 2 else { return nil }
-        return RemoteKeyCommand(keys: keys, expect: options.map(\.label))
-    }
-
     /// The visible screen from a `capture` reply, or nil for an error reply
     /// or anything unreadable. Success replies carry no `ok` field, so an
     /// explicit `ok: false` is the error and the text is the success.

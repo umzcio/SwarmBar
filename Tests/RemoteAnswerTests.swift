@@ -87,17 +87,27 @@ struct RemoteAnswerTests {
         #expect(codex == RemoteKeyCommand(keys: ["ESC"], expect: []))
     }
 
-    @Test func grokKeysPassThroughUnchanged() {
+    /// Grok 1.0 opens on "Yes, proceed", so approve is just the submit and
+    /// deny is one down. Both confirm the filled button is where it was.
+    @Test func grokWalksFromItsFilledButton() {
+        let screen = """
+          │ 1 (○) Yes, and don't ask again for anything (always-approve mode)
+          │ 2 (●) Yes, proceed
+          │ 3 (○) No, reject (type to add feedback)
+          │ 4 (○) Never allow: touch /tmp/example
+        """
         let approve = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: true, in: .init()),
-            screen: nil, choose: TuiPromptLayout.approveOnceOption(in:))
-        #expect(approve == RemoteKeyCommand(keys: TuiAnswer.grokApprove, expect: []))
-        #expect(approve?.keys.contains { Int($0) != nil } == false)
+            screen: screen, choose: TuiPromptLayout.approveOnceOption(in:))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed", "│ 2 (●) Yes, proceed"]))
 
         let deny = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init()),
-            screen: nil, choose: TuiPromptLayout.rejectOption(in:))
-        #expect(deny == RemoteKeyCommand(keys: TuiAnswer.grokDeny, expect: []))
+            screen: screen, choose: TuiPromptLayout.rejectOption(in:))
+        #expect(deny == RemoteKeyCommand(
+            keys: ["DOWN", "\n"],
+            expect: ["No, reject (type to add feedback)", "│ 2 (●) Yes, proceed"]))
+        #expect(deny?.keys.contains { Int($0) != nil } == false)
     }
 
     @Test func unreadableScreenGivesNil() {
@@ -134,30 +144,19 @@ struct RemoteAnswerTests {
             == .notSent("send failed (sent_count 1)"))
     }
 
-    /// Grok's fixed sequence clamps to the bottom and submits. At a bare
-    /// shell that is a history recall and Enter, so remotely it is only
-    /// sent where a selector is actually drawn.
-    @Test func grokKeysNeedASelectorOnScreen() {
+    /// Grok is read before anything is pressed: at a bare shell, or with
+    /// one numbered line of prose, there is nothing to walk to.
+    @Test func grokNeedsASelectorOnScreen() {
         let route = ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init())
-        #expect(RemoteAnswerPlan.needsScreen(tool: .grokBuild, route: route))
+        #expect(RemoteAnswerPlan.needsScreen(route))
         let choose = TuiPromptLayout.rejectOption(in:)
-        #expect(RemoteAnswerPlan.command(tool: .grokBuild, route: route, screen: nil, choose: choose) == nil)
-        #expect(RemoteAnswerPlan.command(
-            tool: .grokBuild, route: route, screen: "u@devbox:~/proj$ ", choose: choose) == nil)
-        // One numbered line is prose, not a selector.
-        #expect(RemoteAnswerPlan.command(
-            tool: .grokBuild, route: route, screen: "1. Yes\nthat was it", choose: choose) == nil)
-
-        let screen = "Allow write?\n> 1. Yes\n  2. Yes, always\n  3. No"
-        let command = RemoteAnswerPlan.command(tool: .grokBuild, route: route, screen: screen, choose: choose)
-        #expect(command?.keys == TuiAnswer.grokDeny)
-        #expect(command?.expect == ["Yes", "Yes, always", "No"])
+        #expect(RemoteAnswerPlan.command(route: route, screen: nil, choose: choose) == nil)
+        #expect(RemoteAnswerPlan.command(route: route, screen: "u@devbox:~/proj$ ", choose: choose) == nil)
+        #expect(RemoteAnswerPlan.command(route: route, screen: "1. Yes\nthat was it", choose: choose) == nil)
 
         // Codex's hotkeys are harmless at a shell and keep their plain path.
         let codex = ApprovalRouter.route(tool: .codex, allow: true, in: .init())
-        #expect(!RemoteAnswerPlan.needsScreen(tool: .codex, route: codex))
-        #expect(RemoteAnswerPlan.command(tool: .codex, route: codex, screen: nil, choose: choose)
-            == RemoteKeyCommand(keys: ["y"], expect: []))
+        #expect(!RemoteAnswerPlan.needsScreen(codex))
     }
 
     // MARK: - The supervisor
@@ -473,14 +472,15 @@ struct RemoteAnswerTests {
         #expect(await shell.helper.commands == ["capture"])
 
         let prompt = Rig(replies: [
-            "capture": #"{"text":"Allow write?\n> 1. Yes\n  2. Yes, always\n  3. No"}"#,
+            "capture": #"{"text":"Allow write?\n1 (○) Yes, always\n2 (●) Yes, proceed\n3 (○) No, reject"}"#,
             "keys": #"{"sent":true}"#,
         ])
         prompt.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
-        #expect(await prompt.supervisor.performAnswer(grok, allow: true))
+        #expect(await prompt.supervisor.performAnswer(grok, allow: false))
         let calls = await prompt.helper.calls
         #expect(calls.map(\.command) == ["capture", "keys"])
-        #expect(calls[1].arguments["keys"] == .array(TuiAnswer.grokApprove.map(JSONValue.string)))
+        #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
+        #expect(calls[1].arguments["expect"] == .array([.string("No, reject"), .string("2 (●) Yes, proceed")]))
         #expect(calls[1].arguments["comm"] == .string("grok"))
     }
 

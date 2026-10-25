@@ -4,18 +4,6 @@ import Testing
 
 @MainActor
 struct TuiAnswerTests {
-    @Test func grokApproveClampsThenStepsUp() {
-        #expect(TuiAnswer.grokApprove.filter { $0 == "DOWN" }.count == 8)
-        #expect(TuiAnswer.grokApprove.suffix(2) == ["UP", "\n"])
-    }
-
-    @Test func grokDenyClampsAndSubmitsTwice() {
-        #expect(TuiAnswer.grokDeny.filter { $0 == "DOWN" }.count == 8)
-        #expect(TuiAnswer.grokDeny.suffix(2) == ["\n", "\n"])
-        // Deny must never step back up: that is how a deny once approved.
-        #expect(!TuiAnswer.grokDeny.contains("UP"))
-    }
-
     @Test func codexUsesLabeledHotkeys() {
         #expect(TuiAnswer.codexApprove == ["y"])
         #expect(TuiAnswer.codexDeny == ["ESC"])
@@ -67,11 +55,12 @@ struct ApprovalRouterTests {
 
     // MARK: - Keystroke tools
 
-    @Test func grokUsesItsNavigationSequences() {
-        #expect(ApprovalRouter.route(tool: .grokBuild, allow: true, in: on)
-            == .keys(TuiAnswer.grokApprove))
-        #expect(ApprovalRouter.route(tool: .grokBuild, allow: false, in: on)
-            == .keys(TuiAnswer.grokDeny))
+    /// Grok 1.0 put "Never allow" below reject, so the old clamp to the
+    /// bottom saved a rule on Deny and denied on Approve. It is walked to
+    /// by label now, and never sent a digit.
+    @Test func grokWalksTheCursorByLabel() {
+        #expect(ApprovalRouter.route(tool: .grokBuild, allow: true, in: on) == .navigateSelector)
+        #expect(ApprovalRouter.route(tool: .grokBuild, allow: false, in: on) == .navigateSelector)
     }
 
     @Test func codexUsesItsLabeledHotkeys() {
@@ -104,8 +93,9 @@ struct ApprovalRouterTests {
             for tool in [AgentTool.kimiCode, .bearCode] {
                 #expect(ApprovalRouter.route(tool: tool, allow: allow, in: on) != .navigateSelector)
             }
-            #expect(ApprovalRouter.route(tool: .antigravity, allow: allow, in: on)
-                != .numberedSelector)
+            for tool in [AgentTool.antigravity, .grokBuild] {
+                #expect(ApprovalRouter.route(tool: tool, allow: allow, in: on) != .numberedSelector)
+            }
         }
     }
 
@@ -129,7 +119,7 @@ struct ApprovalRouterTests {
             == .navigateSelector)
         let agyOff = ApprovalRouter.Environment(antigravityKeystrokes: false)
         #expect(ApprovalRouter.route(tool: .grokBuild, allow: true, in: agyOff)
-            == .keys(TuiAnswer.grokApprove))
+            == .navigateSelector)
     }
 
     /// An off switch must never fall through to the mock transition, which

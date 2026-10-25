@@ -247,6 +247,64 @@ struct TuiPromptLayoutTests {
         #expect(TuiPromptLayout.selector(in: kimiShellPrompt).cursor == 1)
     }
 
+    // MARK: - Grok's radio selector
+
+    /// Grok 1.0's permission prompt, in the shape of a live one with the
+    /// command replaced. The cursor is the filled button, not a marker in
+    /// front, and the list opens on "Yes, proceed", not at the top.
+    let grokPrompt = """
+      │ ›  Create a scratch file
+      │ touch /tmp/example
+      │ ← → narrow scope
+      │
+      │ 1 (○) Yes, and don't ask again for anything (always-approve mode)
+      │ 2 (●) Yes, proceed
+      │ 3 (○) No, reject (type to add feedback)
+      │ 4 (○) Never allow: touch /tmp/example
+
+      1/4:select  │  Tab:next option  │  ←/→:scope  │  Ctrl+c:cancel
+    """
+
+    @Test func grokRadioButtonsAreReadAsASelector() {
+        let selector = TuiPromptLayout.selector(in: grokPrompt)
+        #expect(selector.options.map(\.number) == [1, 2, 3, 4])
+        #expect(selector.options[1].label == "Yes, proceed")
+        #expect(selector.cursor == 2)
+        #expect(selector.cursorLine == "│ 2 (●) Yes, proceed")
+    }
+
+    /// Approve is the once-only yes, and deny is the plain reject. "Never
+    /// allow" is neither: it denies AND saves a rule, which is the reason
+    /// Grok 1.0 broke the old clamp-to-the-bottom deny.
+    @Test func grokChoicesSkipAlwaysAndNever() {
+        #expect(TuiPromptLayout.approveOnce(in: grokPrompt) == 2)
+        #expect(TuiPromptLayout.reject(in: grokPrompt) == 3)
+    }
+
+    /// The command lands in the "Never allow" label, so whatever it says
+    /// must not make that option look like an approve or a plain reject.
+    @Test func aCommandInTheNeverLabelChangesNothing() {
+        let screen = """
+          1 (○) Never allow: echo yes, reject it
+          2 (●) Yes, proceed
+          3 (○) No, reject (type to add feedback)
+        """
+        #expect(TuiPromptLayout.approveOnce(in: screen) == 2)
+        #expect(TuiPromptLayout.reject(in: screen) == 3)
+    }
+
+    /// Grok's question prompt puts a description after a wide gap. The
+    /// label stops at the gap, and the line still reads as an option.
+    @Test func aGrokDescriptionIsNotPartOfTheLabel() {
+        let selector = TuiPromptLayout.selector(in: """
+              1 (●) Yes, run it  Create or update the empty file
+              2 (○) No, skip it  Do not run the command
+              z (○) Type your answer here
+            """)
+        #expect(selector.options.map(\.label) == ["Yes, run it", "No, skip it"])
+        #expect(selector.cursor == 1)
+    }
+
     @Test func latestBlockWins() {
         let screen = """
           1. Approve once

@@ -260,7 +260,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
         ])
 
         var screen: String?
-        if RemoteAnswerPlan.needsScreen(tool: session.tool, route: route) {
+        if RemoteAnswerPlan.needsScreen(route) {
             do {
                 screen = RemoteAnswerPlan.screen(
                     fromCapture: try await requester.request("capture", ["pane": pane], timeout: .seconds(30)))
@@ -270,8 +270,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
             }
         }
         let choose = allow ? TuiPromptLayout.approveOnceOption(in:) : TuiPromptLayout.rejectOption(in:)
-        guard let command = RemoteAnswerPlan.command(
-            tool: session.tool, route: route, screen: screen, choose: choose)
+        guard let command = RemoteAnswerPlan.command(route: route, screen: screen, choose: choose)
         else {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
             return false
