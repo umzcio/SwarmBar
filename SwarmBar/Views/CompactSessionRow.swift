@@ -6,8 +6,15 @@ struct CompactSessionRow: View {
     @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
-    private var isLocal: Bool {
-        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    /// See SessionRow.canReply.
+    private var canReply: Bool { store.canReply(session) }
+
+    /// Set for a remote prompt nothing here can answer.
+    private var terminalOnlyNote: String? {
+        guard let host = session.host,
+              store.remoteAnswerability(for: session) == .terminalOnly
+        else { return nil }
+        return RemoteRowLabel.terminalOnlyNote(host: host)
     }
 
     var body: some View {
@@ -69,22 +76,30 @@ struct CompactSessionRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .doubleClickOpensTerminal(session, store: store)
 
-            // Approve, Deny and Reply all answer through a terminal on THIS
-            // Mac, so a remote row does not offer them. Dismiss does not:
-            // it only writes SwarmBar's own store. See
-            // SessionRowInteraction.allowsLocalTerminalActions.
-            if case .waitingApproval = session.status, isLocal {
-                MicroButton(.approve, help: "Approve") { store.approve(session) }
-                MicroButton(.deny, help: "Deny") { store.deny(session) }
+            // Reply pastes into the session's terminal, its tmux pane for a
+            // remote row, and a remote row with no pane does not offer it.
+            // Dismiss only writes SwarmBar's own store. A remote prompt is
+            // answered by its held request or its tmux pane, and when
+            // neither can reach it the row says where to go instead.
+            if case .waitingApproval = session.status {
+                if let note = terminalOnlyNote {
+                    Text(note)
+                        .swarmFont(.meta)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    MicroButton(.approve, help: "Approve") { store.approve(session) }
+                    MicroButton(.deny, help: "Deny") { store.deny(session) }
+                }
             }
             if case .waitingInput = session.status {
-                if isLocal {
+                if canReply {
                     MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
                 }
                 MicroButton(.dismiss, help: "Dismiss") { store.acknowledge(session) }
             }
             // A finished turn whose process is still up can be steered.
-            if case .done = session.status, session.processAlive, isLocal {
+            if case .done = session.status, session.processAlive, canReply {
                 MicroButton(.reply, help: "Reply") { store.replyingTo = session.id }
             }
 

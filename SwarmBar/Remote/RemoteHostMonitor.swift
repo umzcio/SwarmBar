@@ -4,19 +4,37 @@ import Foundation
 /// rather than one monitor per tool, because a host costs one round trip
 /// per tick regardless of how many sessions it holds.
 ///
-/// Phase 1a covers Claude Code only. The helper's protocol version gates
-/// what later phases add, and a version bump is a redeploy rather than a
-/// migration.
+/// Each poll checks the helper, takes a snapshot, writes it into the host's
+/// mirror, and runs every local monitor's discovery against that mirror.
+/// The helper ships bytes and never verdicts, so there is no second parser
+/// for remote sessions.
 struct RemoteHostMonitor: SessionMonitor {
-    let host: RemoteHost
+    let connection: RemoteHostConnection
+    let pollInterval: Duration
+    let installRunner: HelperInstaller.Runner?
 
     /// Gentler than the local 3 seconds. Remote hosts relay through
     /// Tailscale and a snapshot is one round trip for the whole host.
     static let pollSeconds: TimeInterval = 10
 
+    /// How often a helper that answers but is out of date gets another
+    /// push. It is still being polled, so the update is not urgent, and a
+    /// push that keeps failing costs one extra connection a minute rather
+    /// than one a poll.
+    static let staleRetry: Duration = .seconds(60)
+
+    /// `pollInterval` and `installRunner` are for tests, which cannot wait
+    /// ten seconds a poll and must never run ssh.
+    init(connection: RemoteHostConnection, pollInterval: Duration = .seconds(Self.pollSeconds),
+         installRunner: HelperInstaller.Runner? = nil) {
+        self.connection = connection
+        self.pollInterval = pollInterval
+        self.installRunner = installRunner
+    }
+
     /// Whether a failed poll should force a helper reinstall on the next
     /// attempt. A transient failure is almost never a missing helper, so
-    /// reinstalling on it just doubles the connection attempts: installHelper
+    /// reinstalling on it just doubles the connection attempts: the install
     /// spawns its own ssh, and the snapshot retry that follows spawns a
     /// second one, each with its own ConnectTimeout, against a host that may
     /// be down precisely because it is flaky or access-controlled. A host
@@ -28,176 +46,229 @@ struct RemoteHostMonitor: SessionMonitor {
         backoff >= 60
     }
 
-    func start(into store: SessionStore) async {
-        let channel = SSHChannel(alias: host.alias)
-        let name = host.displayName
-        var installed = false
-        // The warning set from the previous successful snapshot for this
-        // host, so a warning that persists across polls (the common case:
-        // a backup-looking root or an unreadable transcript does not fix
-        // itself) is logged once rather than every ten seconds.
+    /// What making sure of the helper came to.
+    enum InstallOutcome: Sendable, Equatable {
+        /// The host already runs the bundled helper.
+        case current
+        /// The bundled helper was pushed and the channel shut down, so the
+        /// next request starts it.
+        case installed
+        /// Neither, with ssh's own words where it said any. That is the only
+        /// thing that separates a missing NOPASSWD rule from an unauthorized
+        /// key from a host that is simply down.
+        case failed(String)
+        /// sudo would not install the root helper without a password, which
+        /// the setup command fixes.
+        case needsSetup(String)
+
+        var ok: Bool { self == .current || self == .installed }
+    }
+
+    /// What one host's loop carries from poll to poll.
+    private struct PollState {
+        /// The stream the mirror was last filled from. Nil until a snapshot
+        /// has been applied in full, and again after any that was not, so
+        /// the next one always starts from an empty mirror.
+        var stream: String?
+        /// When the helper was last pushed, so pushes are spaced out.
+        var lastPush: ContinuousClock.Instant?
+        /// The running helper answered with another version's hash.
+        var runningStale = false
+        /// Set while sudo refuses to update the helper. It stands in for
+        /// reachability until the update goes through, because it is the
+        /// one thing the user can act on.
+        var setupNeeded: String?
+        /// The previous poll's warnings, so a warning that persists (an
+        /// unreadable transcript does not fix itself) is logged once rather
+        /// than every ten seconds.
         var lastWarnings: [String] = []
 
+        /// Setup can only be asked of a host that answers. When the ping,
+        /// the push or the snapshot itself failed, the host reads
+        /// unreachable whatever it needed before, or its rows would lose
+        /// their "Cannot reach" note and Settings would ask for a setup
+        /// command on a machine that is down.
+        func reachability(failing reason: String, hostAnswered: Bool) -> RemoteReachability {
+            guard hostAnswered, let setupNeeded else { return .unreachable(reason) }
+            return .needsSetup(setupNeeded)
+        }
+    }
+
+    func start(into store: SessionStore) async {
+        var state = PollState()
         while !Task.isCancelled {
-            if !store.isPaused && host.isEnabled {
-                if !installed {
-                    let outcome = await Self.installHelper(alias: host.alias)
-                    installed = outcome.ok
-                    if !outcome.ok {
-                        // The snapshot below still runs: the helper may
-                        // already be installed from an earlier session, and
-                        // a successful poll overwrites this in the same
-                        // iteration. What this buys is a reason on the row
-                        // when the poll fails too.
-                        store.noteRemoteReachability(host: name, .unreachable(outcome.message))
-                    }
-                }
-                do {
-                    let snapshot = try await channel.snapshot()
-                    let now = Date.now
-                    // Off the main actor, exactly as ClaudeCodeMonitor.start
-                    // does with its own discovery. This splits every tail on
-                    // newlines and runs JSONSerialization over the trailing
-                    // lines, on the order of a megabyte of string work, and
-                    // the SessionMonitor protocol is @MainActor.
-                    let sessions = await Task.detached {
-                        RemoteSnapshot.sessions(from: snapshot, host: name, now: now)
-                    }.value
-                    store.sync(tool: .claudeCode, host: name, sessions: sessions)
-                    store.noteRemoteReachability(host: name, .reachable)
-                    if snapshot.processesFailed {
-                        // An empty process list would otherwise read as
-                        // "no agents running". BSD ps rejecting a GNU flag
-                        // produces exactly that.
-                        NSLog("SwarmBar: \(name) could not list processes: \(snapshot.warnings)")
-                    } else if !snapshot.warnings.isEmpty && snapshot.warnings != lastWarnings {
-                        // Warnings unrelated to ps: a backup-looking root
-                        // the helper skipped, an unreadable transcript, or a
-                        // record beyond the 4 MB ceiling omitted rather than
-                        // shipped empty. None of those set processesFailed,
-                        // so without this branch they were silent on the
-                        // Mac. Logged only when the set changes from the
-                        // previous snapshot for this host, not on every
-                        // poll while the same condition persists.
-                        NSLog("SwarmBar: \(name) reported warnings: \(snapshot.warnings)")
-                    }
-                    lastWarnings = snapshot.warnings
-                } catch {
-                    // Deliberately does NOT clear this host's sessions. The
-                    // work is still running on the far side and SwarmBar has
-                    // simply gone blind, so marking it ended would be a lie
-                    // and dropping it would look like the work finished.
-                    //
-                    // Deliberately does NOT call channel.noteFailure either.
-                    // snapshot() routes its own failures through it, so a
-                    // second call here would double-count and double the
-                    // backoff on every failure. This block only mirrors the
-                    // state into the store for the UI.
-                    store.noteRemoteReachability(host: name, .unreachable("\(error)"))
-                    let backoff = await channel.currentBackoff
-                    if Self.shouldReinstall(afterBackoff: backoff) {
-                        installed = false
-                    }
-                    try? await Task.sleep(for: .seconds(backoff))
-                    continue
+            var delay = pollInterval
+            if !store.isPaused && connection.host.isEnabled {
+                delay = await poll(into: store, state: &state)
+            }
+            if Task.isCancelled { break }
+            try? await Task.sleep(for: delay)
+        }
+        // A snapshot the helper built for a poll that was then cancelled is
+        // marked shipped on the far side and never reached the mirror. Ending
+        // the process ends that stream with it.
+        await connection.channel.shutdown()
+    }
+
+    /// One poll. Returns how long to wait before the next one.
+    ///
+    /// Cancel is only a request, and the supervisor clears this host's rows
+    /// right after asking. Every store write is gated on it, after the last
+    /// await before it, so an in-flight poll cannot bring the cleared rows
+    /// back.
+    private func poll(into store: SessionStore, state: inout PollState) async -> Duration {
+        let host = connection.host, channel = connection.channel, mirror = connection.mirror
+        let name = host.displayName
+
+        let backoff = await channel.currentBackoff
+        let check = await HelperInstaller.check(channel: channel)
+        // A cancelled ping reads as unreachable, and must not set off a push.
+        if Task.isCancelled { return pollInterval }
+        switch check {
+        case .current:
+            state.setupNeeded = nil
+            if state.runningStale {
+                // The ping hashes the file on disk, not the code running, so
+                // a helper replaced underneath an old process (the setup
+                // command run again) matches while the old one still runs.
+                state.runningStale = false
+                await channel.shutdown()
+            }
+        case .stale:
+            state.runningStale = true
+            let now = ContinuousClock.now
+            if state.lastPush.map({ now - $0 >= Self.staleRetry }) ?? true {
+                state.lastPush = now
+                switch await push(host, channel) {
+                case .current, .installed:
+                    state.runningStale = false
+                    state.setupNeeded = nil
+                case .needsSetup(let message):
+                    state.setupNeeded = message
+                case .failed(let message):
+                    NSLog("SwarmBar: \(name) keeps its old helper: \(message)")
                 }
             }
-            try? await Task.sleep(for: .seconds(Self.pollSeconds))
+            // Either way the helper answers, and an old helper that still
+            // speaks this protocol keeps the rows current meanwhile.
+        case .unreachable(let reason):
+            // A helper that was never installed fails its ping the same way
+            // a host that is down does. Push on the first failure, as the
+            // only way to tell, and after that only once the backoff says
+            // the failure is not transient.
+            guard state.lastPush == nil || Self.shouldReinstall(afterBackoff: backoff) else {
+                return await failed(reason, hostAnswered: false, store: store, state: &state)
+            }
+            state.lastPush = ContinuousClock.now
+            switch await push(host, channel) {
+            case .current, .installed:
+                state.setupNeeded = nil
+            case .needsSetup(let message):
+                // sudo answered, so the host did.
+                state.setupNeeded = message
+                return await failed(message, hostAnswered: true, store: store, state: &state)
+            case .failed(let message):
+                return await failed(message, hostAnswered: false, store: store, state: &state)
+            }
         }
-        await channel.shutdown()
-    }
+        if Task.isCancelled { return pollInterval }
+        // Set before the snapshot, so a helper that is still the old one
+        // (its push failed, or the next push is not due yet) never has keys
+        // aimed through it, though its snapshot keeps the rows current.
+        // Every path that leaves runningStale false has either confirmed
+        // the running helper or shut the channel down so the next request
+        // starts the bundled one.
+        if connection.noteHelperCurrent(!state.runningStale) { store.noteRemotePanesChanged() }
 
-    /// Pushes the helper over the same ssh connection rather than a
-    /// separate scp step, so there is only ever one channel to authorize.
-    /// Idempotent: `install` overwrites, so a redeploy is safe.
-    /// `nonisolated` and detached on purpose. `RemoteHostMonitor` conforms
-    /// to the `@MainActor` `SessionMonitor` protocol, and `waitUntilExit()`
-    /// blocks, so running this on the main actor would freeze the popover
-    /// for the length of an ssh round trip.
-    nonisolated static func installHelper(alias: String) async -> InstallOutcome {
-        guard let source = Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"),
-              let data = try? Data(contentsOf: source)
-        else {
-            NSLog("SwarmBar: swarmbar-helper.py missing from the app bundle")
-            return InstallOutcome(ok: false, message: "helper missing from the app bundle")
-        }
-        return await Task.detached { install(data: data, alias: alias) }.value
-    }
-
-    /// Whether the install worked, and what went wrong if it did not. The
-    /// message carries ssh's own first stderr line, which is the only thing
-    /// that separates a missing NOPASSWD rule from an unauthorized key from
-    /// a host that is simply down.
-    struct InstallOutcome: Sendable {
-        let ok: Bool
-        let message: String
-    }
-
-    /// How long the install ssh gets, end to end. `waitUntilExit()` alone is
-    /// unbounded: a connection that goes half open AFTER the handshake
-    /// (laptop sleep, Tailscale dropping mid transfer) is not covered by
-    /// ConnectTimeout, and default TCP keepalive takes roughly two hours to
-    /// notice. This whole function then blocks the host's monitor loop
-    /// BEFORE its do/catch, so that host never polls, never updates
-    /// reachability, and its rows freeze with no note explaining why. It is
-    /// the one failure here that is silent rather than visible.
-    ///
-    /// 30 seconds: three times ConnectTimeout, and the transfer itself is
-    /// one ssh handshake plus a 9 KB write. The ServerAlive options below
-    /// would take 45 seconds to fire, so this deadline is the effective
-    /// bound; they are set anyway so ssh notices on its own if this path
-    /// ever stops being the one holding the stopwatch.
-    nonisolated static let installTimeout: TimeInterval = 30
-
-    private nonisolated static func install(data: Data, alias: String) -> InstallOutcome {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = [
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            alias,
-        ] + SSHChannel.installCommand(helperPath: "/usr/local/lib/swarmbar-helper")
-        let stdin = Pipe(), stderr = Pipe()
-        task.standardInput = stdin
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = stderr
+        let snapshot: RemoteSnapshot
         do {
-            try task.run()
-            try stdin.fileHandleForWriting.write(contentsOf: data)
-            try stdin.fileHandleForWriting.close()
+            snapshot = try await channel.snapshot()
         } catch {
-            let hint = Self.stderrHint(stderr)
-            NSLog("SwarmBar: helper install failed on \(alias): \(error) \(hint)")
-            return InstallOutcome(ok: false, message: "helper install failed\(hint)")
+            // snapshot() ends the helper on every failure it counts, so the
+            // next request starts a fresh stream. A cancelled poll is ended
+            // by the shutdown when the loop exits.
+            if Task.isCancelled { return pollInterval }
+            return await failed("\(error)", hostAnswered: false, store: store, state: &state)
         }
 
-        let deadline = Date.now.addingTimeInterval(installTimeout)
-        while task.isRunning && Date.now < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
+        // A new stream means a new helper process, which ships every file
+        // relative to nothing the mirror holds. Mirror writes are disk I/O
+        // and run off the main actor.
+        let reset = snapshot.stream != state.stream
+        let mirrorWarnings: [String]
+        do {
+            mirrorWarnings = try await Task.detached {
+                if reset { try mirror.reset() }
+                return try mirror.apply(snapshot)
+            }.value
+        } catch {
+            // The helper believes it shipped bytes the mirror does not hold,
+            // and its next growth chunk would land on top of the gap. Only a
+            // fresh helper and an empty mirror recover from that, and this
+            // is counted as a failure so a disk that keeps refusing backs off
+            // rather than taking a full reship every poll.
+            NSLog("SwarmBar: \(name) mirror write failed: \(error)")
+            state.stream = nil
+            await channel.noteFailure("mirror: \(error)")
+            if Task.isCancelled { return pollInterval }
+            // The host answered; it is this Mac's disk that refused.
+            return await failed("\(error)", hostAnswered: true, store: store, state: &state)
         }
-        if task.isRunning {
-            task.terminate()
-            NSLog("SwarmBar: helper install timed out after \(Int(installTimeout))s on \(alias)")
-            return InstallOutcome(
-                ok: false, message: "helper install timed out on \(alias)")
+        state.stream = snapshot.stream
+
+        // Off the main actor, exactly as the local monitors run their own
+        // discovery: it is on the order of a megabyte of string work.
+        let now = Date.now, hostID = host.id
+        let result = await Task.detached {
+            RemoteDiscovery.discover(
+                snapshot: snapshot, mirror: mirror, hostID: hostID, hostName: name, now: now)
+        }.value
+        if Task.isCancelled { return pollInterval }
+
+        if connection.noteApplied(snapshot) { store.noteRemotePanesChanged() }
+        // A tool this pass cannot vouch for keeps its previous rows. Its
+        // sessions may only be missing because the evidence could not be
+        // read, and syncing would turn "could not look" into "nothing there".
+        for tool in AgentTool.allCases where !result.unverifiedTools.contains(tool) {
+            store.sync(tool: tool, host: name, sessions: result.sessions[tool] ?? [])
         }
-        if task.terminationStatus != 0 {
-            let hint = Self.stderrHint(stderr)
-            NSLog("SwarmBar: helper install exited \(task.terminationStatus) on \(alias)\(hint)")
-            return InstallOutcome(
-                ok: false,
-                message: "helper install exited \(task.terminationStatus)\(hint)")
+        store.noteRemoteReachability(host: name, state.setupNeeded.map { .needsSetup($0) } ?? .reachable)
+
+        // The helper's own warnings (a backup-looking root skipped, a record
+        // beyond the 4 MB ceiling omitted), chunks the mirror refused, and
+        // what discovery could not see, including a failed process list.
+        // Logged only when the set changes, not every poll while the same
+        // condition persists.
+        let warnings = snapshot.warnings + mirrorWarnings + result.warnings
+        if !warnings.isEmpty && warnings != state.lastWarnings {
+            NSLog("SwarmBar: \(name) reported warnings: \(warnings)")
         }
-        return InstallOutcome(ok: true, message: "")
+        state.lastWarnings = warnings
+        return pollInterval
     }
 
-    /// Reads what ssh has already said, without waiting for more. Never
-    /// blocks, so it is safe even when the spawn itself failed and nothing
-    /// will ever close the pipe.
-    private nonisolated static func stderrHint(_ pipe: Pipe) -> String {
-        let line = SSHChannel.firstLine(of: SSHChannel.readAvailable(pipe.fileHandleForReading))
-        return line.isEmpty ? "" : ": \(line)"
+    private func push(_ host: RemoteHost, _ channel: SSHChannel) async -> InstallOutcome {
+        await HelperInstaller.push(
+            alias: host.alias, watchAs: host.watchAs, channel: channel, runner: installRunner)
+    }
+
+    /// Deliberately does NOT clear this host's sessions, though it does
+    /// forget the last snapshot's panes (see RemoteHostConnection.noteLost). The work is still
+    /// running on the far side and SwarmBar has simply gone blind, so
+    /// marking it ended would be a lie and dropping it would look like the
+    /// work finished. Nor does it clear the mirror: the next helper process
+    /// is a new stream, and that is what resets it.
+    private func failed(
+        _ reason: String, hostAnswered: Bool, store: SessionStore, state: inout PollState
+    ) async -> Duration {
+        state.stream = nil
+        // Unlike the rows, the pane map is not kept: keys aimed by it after
+        // a gap could land in whatever now owns the pane.
+        if connection.noteLost() { store.noteRemotePanesChanged() }
+        let backoff = await connection.channel.currentBackoff
+        if Task.isCancelled { return pollInterval }
+        store.noteRemoteReachability(
+            host: connection.host.displayName, state.reachability(failing: reason, hostAnswered: hostAnswered))
+        return .seconds(backoff)
     }
 }

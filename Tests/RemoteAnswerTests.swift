@@ -1,0 +1,1067 @@
+import Foundation
+import Testing
+@testable import SwarmBar
+
+/// Records every request the supervisor makes of a host's helper and
+/// answers each command with a scripted reply, so the keystroke path runs
+/// end to end without ssh, tmux or a python process.
+private actor FakeHelper: RemoteRequesting {
+    private(set) var calls: [(command: String, arguments: [String: JSONValue])] = []
+    private let replies: [String: String]
+    /// Replies used in order, one per request, before `replies` applies:
+    /// a reply reads the screen both before and after it pastes.
+    private var sequences: [String: [String]]
+    /// Holds every answer back this long, so a test can act while a
+    /// request is still in flight.
+    private let delay: Duration?
+
+    init(replies: [String: String], sequences: [String: [String]] = [:], delay: Duration? = nil) {
+        self.replies = replies
+        self.sequences = sequences
+        self.delay = delay
+    }
+
+    func request(
+        _ command: String, _ arguments: [String: JSONValue], timeout: Duration
+    ) async throws -> Data {
+        calls.append((command, arguments))
+        if let delay { try await Task.sleep(for: delay) }
+        if let next = sequences[command]?.first {
+            sequences[command]?.removeFirst()
+            return Data(next.utf8)
+        }
+        guard let reply = replies[command] else { throw SSHChannelError.timedOut }
+        return Data(reply.utf8)
+    }
+
+    var commands: [String] { calls.map(\.command) }
+}
+
+/// The remote answer path: what is pressed, where, and when nothing is.
+/// A wrong key here lands in somebody's live agent session on a server.
+@MainActor
+@Suite("Remote keystroke answers")
+struct RemoteAnswerTests {
+    // MARK: - The pure plan
+
+    @Test func numberedPlanPressesTheReadDigit() {
+        let screen = "1. Approve once\n2. Approve for session\n3. Reject"
+        let command = RemoteAnswerPlan.command(
+            route: .numberedSelector, screen: screen,
+            choose: TuiPromptLayout.approveOnceOption(in:))
+        #expect(command == RemoteKeyCommand(keys: ["1"], expect: ["1. Approve once"]))
+
+        let deny = RemoteAnswerPlan.command(
+            route: .numberedSelector, screen: screen,
+            choose: TuiPromptLayout.rejectOption(in:))
+        #expect(deny == RemoteKeyCommand(keys: ["3"], expect: ["3. Reject"]))
+
+        // What is confirmed is the label at that digit, not the label
+        // anywhere: a prompt redrawn with Reject at 2 no longer holds it,
+        // and neither does one with something else at 3. A cursor marker
+        // in front of the line does not get in the way.
+        #expect(!"1. Approve once\n2. Reject".contains("3. Reject"))
+        #expect(!"1. Approve once\n2. Reject\n3. Approve always".contains("3. Reject"))
+        #expect("1. Approve once\n2. Approve for session\n> 3. Reject".contains("3. Reject"))
+    }
+
+    @Test func navigatePlanWalksFromCursor() {
+        let screen = "> 1. Approve\n  2. Deny"
+        let command = RemoteAnswerPlan.command(
+            route: .navigateSelector, screen: screen,
+            choose: TuiPromptLayout.rejectOption(in:))
+        #expect(command == RemoteKeyCommand(keys: ["DOWN", "\n"], expect: ["Deny", "> 1. Approve"]))
+
+        // Already on the option: no arrows, just the submit, and the marked
+        // line is still what is confirmed.
+        let approve = RemoteAnswerPlan.command(
+            route: .navigateSelector, screen: screen,
+            choose: TuiPromptLayout.approveOnceOption(in:))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Approve", "> 1. Approve"]))
+    }
+
+    @Test func fixedKeysPassThrough() {
+        let codex = RemoteAnswerPlan.command(
+            route: .keys(TuiAnswer.codexDeny), screen: nil,
+            choose: TuiPromptLayout.rejectOption(in:))
+        #expect(codex == RemoteKeyCommand(keys: ["ESC"], expect: []))
+    }
+
+    /// Grok 1.0 opens on "Yes, proceed", so approve is just the submit and
+    /// deny is one down. Both confirm the filled button is where it was.
+    @Test func grokWalksFromItsFilledButton() {
+        let screen = """
+          ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+          ┃  2 (●) Yes, proceed
+          ┃  3 (○) No, reject (type to add feedback)
+          ┃  4 (○) Never allow: touch /tmp/example
+        """
+        let approve = RemoteAnswerPlan.command(
+            route: ApprovalRouter.route(tool: .grokBuild, allow: true, in: .init()),
+            screen: screen, choose: TuiPromptLayout.approveOnceOption(in:))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed", "┃  2 (●) Yes, proceed"]))
+
+        let deny = RemoteAnswerPlan.command(
+            route: ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init()),
+            screen: screen, choose: TuiPromptLayout.rejectOption(in:))
+        #expect(deny == RemoteKeyCommand(
+            keys: ["DOWN", "\n"],
+            expect: ["No, reject (type to add feedback)", "┃  2 (●) Yes, proceed"]))
+        #expect(deny?.keys.contains { Int($0) != nil } == false)
+    }
+
+    @Test func unreadableScreenGivesNil() {
+        let approve = TuiPromptLayout.approveOnceOption(in:)
+        // No screen at all.
+        #expect(RemoteAnswerPlan.command(route: .numberedSelector, screen: nil, choose: approve) == nil)
+        #expect(RemoteAnswerPlan.command(route: .navigateSelector, screen: nil, choose: approve) == nil)
+        // A screen with no selector on it.
+        let prose = "Thinking about the change\nstill working"
+        #expect(RemoteAnswerPlan.command(route: .numberedSelector, screen: prose, choose: approve) == nil)
+        // A selector with no marked cursor cannot be walked.
+        let unmarked = "1. Approve\n2. Deny"
+        #expect(RemoteAnswerPlan.command(route: .navigateSelector, screen: unmarked, choose: approve) == nil)
+        // Routes that never press anything.
+        #expect(RemoteAnswerPlan.command(route: .focusTerminal, screen: unmarked, choose: approve) == nil)
+        #expect(RemoteAnswerPlan.command(route: .mockTransition, screen: unmarked, choose: approve) == nil)
+    }
+
+    @Test func repliesDecodeStrictly() {
+        #expect(RemoteAnswerPlan.screen(fromCapture: Data(#"{"text":"1. Yes","id":3}"#.utf8)) == "1. Yes")
+        #expect(RemoteAnswerPlan.screen(fromCapture: Data(#"{"ok":false,"error":"bad pane","id":3}"#.utf8)) == nil)
+        #expect(RemoteAnswerPlan.screen(fromCapture: Data("not json".utf8)) == nil)
+
+        #expect(RemoteAnswerPlan.keysOutcome(from: Data(#"{"sent":true,"id":4}"#.utf8)) == .sent)
+        #expect(RemoteAnswerPlan.keysOutcome(from: Data(#"{"sent":false,"reason":"changed","id":4}"#.utf8))
+            == .notSent("changed"))
+        #expect(RemoteAnswerPlan.keysOutcome(from: Data(#"{"ok":false,"error":"bad pane","id":4}"#.utf8))
+            == .notSent("bad pane"))
+        #expect(RemoteAnswerPlan.keysOutcome(from: Data("garbage".utf8)) == .notSent("unreadable reply"))
+        // A partial send says how many keys landed, which is what anyone
+        // reading the log needs to know about the pane's state.
+        #expect(RemoteAnswerPlan.keysOutcome(
+            from: Data(#"{"sent":false,"reason":"send failed","sent_count":1}"#.utf8))
+            == .notSent("send failed (sent_count 1)"))
+    }
+
+    /// Grok is read before anything is pressed: at a bare shell, or with
+    /// one numbered line of prose, there is nothing to walk to.
+    @Test func grokNeedsASelectorOnScreen() {
+        let route = ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init())
+        #expect(RemoteAnswerPlan.needsScreen(route))
+        let choose = TuiPromptLayout.rejectOption(in:)
+        #expect(RemoteAnswerPlan.command(route: route, screen: nil, choose: choose) == nil)
+        #expect(RemoteAnswerPlan.command(route: route, screen: "u@devbox:~/proj$ ", choose: choose) == nil)
+        #expect(RemoteAnswerPlan.command(route: route, screen: "1. Yes\nthat was it", choose: choose) == nil)
+
+        // Codex's hotkeys are harmless at a shell and keep their plain path.
+        let codex = ApprovalRouter.route(tool: .codex, allow: true, in: .init())
+        #expect(!RemoteAnswerPlan.needsScreen(codex))
+    }
+
+    // MARK: - The supervisor
+
+    private static let pane = #"{"socket":"/tmp/tmux-1000/default","id":"%3"}"#
+
+    private static func snapshot(pid: Int, pane: String?, comm: String = "kimi") throws -> RemoteSnapshot {
+        let paneField = pane.map { #","pane":\#($0)"# } ?? ""
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s1","hostname":"devbox","system":"Linux","now":1,
+         "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],
+         "processes":[{"pid":\(pid),"ppid":1,"user":"u","comm":"\(comm)","args":"\(comm)",
+                       "cwd":"/home/u/proj","tty":"pts/1"\(paneField),"open":[]}],
+         "processes_failed":false}
+        """
+        return try RemoteSnapshot.decode(Data(json.utf8))
+    }
+
+    @MainActor private final class Rig {
+        let store: SessionStore
+        let registry: RemoteHostRegistry
+        let server: HookServer
+        let supervisor: RemoteMonitorSupervisor
+        let helper: FakeHelper
+        let host: RemoteHost
+
+        var connection: RemoteHostConnection? { supervisor.connection(forHostID: host.id) }
+
+        /// A snapshot applied in full by a poll that also found the host
+        /// reachable, which is what a keystroke answer needs both of.
+        func land(_ snapshot: RemoteSnapshot) {
+            connection?.noteHelperCurrent(true)
+            connection?.noteApplied(snapshot)
+            store.noteRemoteReachability(host: "devbox", .reachable)
+        }
+
+        init(
+            approvalsOff: Set<AgentTool> = [], replies: [String: String] = [:],
+            sequences: [String: [String]] = [:],
+            delay: Duration? = nil, remoteHold: Duration = .seconds(350)
+        ) {
+            let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+            let localHome = FileManager.default.temporaryDirectory
+                .appendingPathComponent("remote-answer-local-\(UUID().uuidString)", isDirectory: true)
+            let server = HookServer(store: store, remoteDecisionHold: remoteHold, localHome: localHome)
+            store.approvalResponder = server
+            // Nothing here may ever drive this Mac's terminal.
+            store.localAnswerObserver = { _, _ in Issue.record("reached the local terminal path") }
+            let registry = RemoteHostRegistry(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+            let mirrorRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("remote-answer-mirror-\(UUID().uuidString)", isDirectory: true)
+            let helper = FakeHelper(replies: replies, sequences: sequences, delay: delay)
+            let supervisor = RemoteMonitorSupervisor(
+                store: store, registry: registry,
+                factory: { host in
+                    // Never started: the fake below answers in its place.
+                    let connection = RemoteHostConnection(
+                        host: host,
+                        channel: SSHChannel(launch: .local(python: "/usr/bin/false", script: "", homes: [])),
+                        mirror: RemoteMirror(root: mirrorRoot))
+                    return (IdleMonitor(), connection)
+                },
+                hookServer: server)
+            supervisor.requester = { _ in helper }
+            supervisor.keystrokeToggles = { (grok: true, antigravity: true) }
+            store.remoteActions = supervisor
+            let host = RemoteHost(alias: "devbox", approvalsOff: approvalsOff)
+            registry.upsert(host)
+            supervisor.reconcile()
+            self.store = store
+            self.registry = registry
+            self.server = server
+            self.supervisor = supervisor
+            self.helper = helper
+            self.host = host
+        }
+    }
+
+    private struct IdleMonitor: SessionMonitor {
+        func start(into store: SessionStore) async {
+            try? await Task.sleep(for: .seconds(3600))
+        }
+    }
+
+    private func kimi(pid: pid_t? = 4242) -> AgentSession {
+        AgentSession(
+            tool: .kimiCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "rm -rf build"), pid: pid, host: "devbox")
+    }
+
+    @Test func kimiWithAPaneTakesKeystrokes() async throws {
+        let rig = Rig()
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(rig.supervisor.answerability(for: kimi()) == .keystrokes)
+        // A session whose pid is unknown cannot be matched to a pane.
+        #expect(rig.supervisor.answerability(for: kimi(pid: nil)) == .terminalOnly)
+        // Nor can one whose pid is not in the snapshot.
+        #expect(rig.supervisor.answerability(for: kimi(pid: 7)) == .terminalOnly)
+    }
+
+    @Test func noPaneMeansTerminalOnly() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"1. Approve once\n2. Reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: nil))
+        let session = kimi()
+        rig.store.upsert(session)
+        #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+        #expect(rig.store.remoteAnswerability(for: session) == .terminalOnly)
+
+        let sent = await rig.supervisor.performAnswer(session, allow: true)
+        #expect(!sent)
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "rm -rf build"))
+    }
+
+    /// Two sessions in one directory both resolve to the newest process
+    /// there, so a pid they share cannot say whose pane it is. Neither gets
+    /// keys or a reply: both fall back to the terminal on the host.
+    @Test func aPidSharedByTwoRowsTakesNoKeys() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"1. Approve once\n2. Reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let older = kimi(), newer = kimi()
+        rig.store.upsert(older)
+        #expect(rig.supervisor.answerability(for: older) == .keystrokes)
+        rig.store.upsert(newer)
+        for session in [older, newer] {
+            #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+            #expect(!rig.supervisor.canReply(session))
+            #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+            let reply = await rig.supervisor.performReply(session, text: "go on")
+            #expect(reply == .failed("Another session on devbox runs in the same folder, so SwarmBar can't "
+                + "tell their terminals apart. Reply in its terminal."))
+        }
+        #expect(await rig.helper.commands.isEmpty)
+
+        // The same pid on another tool's row, or another host's, is not a clash.
+        rig.store.remove(id: newer.id)
+        rig.store.upsert(AgentSession(tool: .codex, projectName: "proj", status: .working(activity: "x"), pid: 4242, host: "devbox"))
+        rig.store.upsert(AgentSession(tool: .kimiCode, projectName: "proj", status: .working(activity: "x"), pid: 4242, host: "other"))
+        #expect(rig.supervisor.answerability(for: older) == .keystrokes)
+    }
+
+    @Test func approvalsOffMeansTerminalOnly() async throws {
+        let rig = Rig(approvalsOff: [.kimiCode], replies: ["keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(rig.supervisor.answerability(for: kimi()) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(kimi(), allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+    }
+
+    @Test func claudeIsHeldOnlyWhileHolding() async throws {
+        let rig = Rig()
+        let mirrorRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-answer-hold-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mirrorRoot, withIntermediateDirectories: true)
+        let mirror = RemoteMirror(root: mirrorRoot)
+        let raw = UUID().uuidString
+        let origin = RemoteHookOrigin(
+            hostID: rig.host.id, hostName: "devbox", home: "/home/u",
+            mirrorHome: mirror.local("/home/u"), peer: ["curl", "bash", "claude"], approvalsOff: [])
+        rig.server.handleRemote(
+            event: "PermissionRequest",
+            body: ["session_id": raw, "tool_name": "Bash",
+                   "tool_input": ["command": "git push"], "cwd": "/home/u/proj"],
+            accountLabel: nil, origin: origin, rid: "r1", held: true) { _, _ in }
+        let row = try #require(rig.store.sessions.first)
+        #expect(row.tool == .claudeCode)
+        #expect(rig.supervisor.answerability(for: row) == .held)
+
+        // The hold ends somewhere else, and the view's observable signal
+        // moves with it, so the row switches to the terminal note.
+        let before = rig.store.remoteHoldRevision
+        rig.server.cancelRemote(rid: "r1")
+        #expect(rig.store.remoteHoldRevision != before)
+        #expect(rig.supervisor.answerability(for: row) == .terminalOnly)
+
+        // A Claude row nothing holds is never answered by keystrokes, even
+        // with a pane.
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let unheld = AgentSession(
+            tool: .claudeCode, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "git push"), pid: 4242, host: "devbox")
+        #expect(rig.supervisor.answerability(for: unheld) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(unheld, allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+    }
+
+    @Test func refusedKeysLeaveTheRowAlone() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"Run it?\n1. Approve once\n2. Approve for session\n3. Reject"}"#,
+            "keys": #"{"sent":false,"reason":"changed"}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+
+        let sent = await rig.supervisor.performAnswer(session, allow: true)
+        #expect(!sent)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "rm -rf build"))
+
+        // The keys went to the session's own pane, with the digit read off
+        // the screen and its label for the helper to re-confirm.
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["capture", "keys"])
+        let paneValue: JSONValue = .object(["socket": .string("/tmp/tmux-1000/default"), "id": .string("%3")])
+        #expect(calls[0].arguments == ["pane": paneValue])
+        #expect(calls[1].arguments["pane"] == paneValue)
+        #expect(calls[1].arguments["keys"] == .array([.string("1")]))
+        #expect(calls[1].arguments["expect"] == .array([.string("1. Approve once")]))
+        // And with the process it was meant for, so the helper can refuse
+        // if that pid is gone, is another agent, or has left the pane.
+        #expect(calls[1].arguments["pid"] == .int(4242))
+        #expect(calls[1].arguments["comm"] == .string("kimi"))
+    }
+
+    // MARK: - Gaps, gates and the remaining routes
+
+    @Test func unreachableHostSendsNothing() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"1. Approve once\n2. Reject"}"#, "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+        #expect(rig.supervisor.answerability(for: session) == .keystrokes)
+
+        // The host goes dark. The snapshot is still held, but its pane map
+        // is from before the gap, and a request would start ssh again.
+        rig.store.noteRemoteReachability(host: "devbox", .unreachable("down"))
+        #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+        #expect(rig.store.remoteAnswerability(for: session) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+
+        // Reachable again but with no snapshot since the gap: still nothing.
+        rig.connection?.noteLost()
+        rig.store.noteRemoteReachability(host: "devbox", .reachable)
+        #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+
+        // A fresh snapshot lands and the row is answerable again.
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(rig.supervisor.answerability(for: session) == .keystrokes)
+    }
+
+    /// A host can read reachable while an out-of-date helper still runs
+    /// (a push that failed for a reason other than sudo, or the minute
+    /// before the next push). That helper ignores pid and comm, so keys
+    /// would go unconfirmed by them.
+    @Test func staleHelperSendsNoKeys() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"1. Approve once\n2. Reject"}"#, "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+        let connection = try #require(rig.connection)
+
+        let before = rig.store.remotePaneRevision
+        #expect(connection.noteHelperCurrent(false))
+        #expect(!connection.noteHelperCurrent(false))
+        rig.store.noteRemotePanesChanged()
+        #expect(rig.store.remotePaneRevision != before)
+        #expect(rig.store.remoteReachability["devbox"] == .reachable)
+        #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+        #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+        #expect(await rig.helper.commands.isEmpty)
+
+        // A gap makes the helper unknown again, as well as the panes.
+        #expect(connection.noteHelperCurrent(true))
+        connection.noteLost()
+        #expect(!connection.helperIsCurrent)
+    }
+
+    @Test func helperExitForgetsThePanes() async throws {
+        let rig = Rig()
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let connection = try #require(rig.connection)
+        var told = 0
+        let relay = RemoteHookRelay(
+            connection: connection, hookServer: rig.server, onHelperExited: { told += 1 })
+        relay.handle(HelperEvent(name: HelperEvent.helperExited, payload: Data(), generation: 1))
+        #expect(connection.lastSnapshot == nil)
+        #expect(told == 1)
+        #expect(rig.supervisor.answerability(for: kimi()) == .terminalOnly)
+    }
+
+    @Test func paneMapChangesAreReported() throws {
+        let rig = Rig()
+        let connection = try #require(rig.connection)
+        #expect(connection.noteApplied(try Self.snapshot(pid: 4242, pane: Self.pane)))
+        #expect(!connection.noteApplied(try Self.snapshot(pid: 4242, pane: Self.pane)))
+        #expect(connection.noteApplied(try Self.snapshot(pid: 4242, pane: nil)))
+        #expect(connection.noteApplied(try Self.snapshot(pid: 5000, pane: Self.pane)))
+        #expect(connection.noteLost())
+        #expect(!connection.noteLost())
+
+        let before = rig.store.remotePaneRevision
+        rig.store.noteRemotePanesChanged()
+        #expect(rig.store.remotePaneRevision != before)
+    }
+
+    @Test func remoteGrokCapturesFirstAndNeedsASelector() async throws {
+        let shell = Rig(replies: ["capture": #"{"text":"u@devbox:~/proj$ "}"#, "keys": #"{"sent":true}"#])
+        shell.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
+        let grok = AgentSession(
+            tool: .grokBuild, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "write a.txt"), pid: 4242, host: "devbox")
+        #expect(await shell.supervisor.performAnswer(grok, allow: true) == false)
+        #expect(await shell.helper.commands == ["capture"])
+
+        let prompt = Rig(replies: [
+            "capture": #"{"text":"Allow write?\n1 (○) Yes, always\n2 (●) Yes, proceed\n3 (○) No, reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        prompt.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
+        #expect(await prompt.supervisor.performAnswer(grok, allow: false))
+        let calls = await prompt.helper.calls
+        #expect(calls.map(\.command) == ["capture", "keys"])
+        #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
+        #expect(calls[1].arguments["expect"] == .array([.string("No, reject"), .string("2 (●) Yes, proceed")]))
+        #expect(calls[1].arguments["comm"] == .string("grok"))
+    }
+
+    // MARK: Removing a host
+
+    @Test func removingAsksTheHelperToCleanUpThenForgetsTheHost() async throws {
+        let rig = Rig(replies: [
+            "uninstall": #"{"ok":true,"shared":false,"removed":["/root/.swarmbar"],"kept":[]}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await rig.supervisor.remove(hostID: rig.host.id) == .cleaned(kept: []))
+        #expect(await rig.helper.commands == ["uninstall"])
+        #expect(rig.registry.hosts.isEmpty)
+        #expect(rig.supervisor.removing.isEmpty)
+    }
+
+    @Test func removingReportsWhatTheHostKeptOrWhyNothingWent() async throws {
+        let kept = Rig(replies: [
+            "uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[{"path":"/root/.swarmbar","reason":"other files are still in it"}]}"#,
+        ])
+        kept.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await kept.supervisor.remove(hostID: kept.host.id) == .cleaned(kept: ["/root/.swarmbar"]))
+
+        let shared = Rig(replies: ["uninstall": #"{"ok":true,"shared":true,"removed":[],"kept":[]}"#])
+        shared.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await shared.supervisor.remove(hostID: shared.host.id) == .shared)
+        #expect(shared.registry.hosts.isEmpty)
+
+        let old = Rig(replies: ["uninstall": #"{"ok":false,"error":"unknown command: uninstall"}"#])
+        old.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await old.supervisor.remove(hostID: old.host.id) == .failed("unknown command: uninstall"))
+        #expect(old.registry.hosts.isEmpty)
+    }
+
+    /// An unreachable host is still removed from the list; it is just not
+    /// asked anything.
+    @Test func removingAnUnreachableHostSendsNothing() async throws {
+        let rig = Rig(replies: ["uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[]}"#])
+        #expect(await rig.supervisor.remove(hostID: rig.host.id) == .failed("it couldn't be reached"))
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.registry.hosts.isEmpty)
+    }
+
+    /// A host turned off has no connection, and saying it was unreachable
+    /// would be a guess about a host nobody asked.
+    @Test func removingATurnedOffHostSaysSo() async throws {
+        let rig = Rig(replies: ["uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[]}"#])
+        var off = rig.host
+        off.isEnabled = false
+        rig.registry.upsert(off)
+        #expect(await rig.supervisor.remove(hostID: rig.host.id)
+            == .failed("it wasn't being watched, so it wasn't asked"))
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.registry.hosts.isEmpty)
+    }
+
+    @Test func remoteCodexSendsItsHotkeyWithoutACapture() async throws {
+        let rig = Rig(replies: ["keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "codex"))
+        let codex = AgentSession(
+            tool: .codex, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "make"), pid: 4242, host: "devbox")
+        #expect(await rig.supervisor.performAnswer(codex, allow: true))
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["keys"])
+        #expect(calls[0].arguments["keys"] == .array([.string("y")]))
+        #expect(calls[0].arguments["expect"] == .array([]))
+    }
+
+    @Test func remoteAntigravityWalksByLabel() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"Allow creation of this file?\n> 1. Approve\n  2. Deny"}"#,
+                                "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "agy"))
+        let agy = AgentSession(
+            tool: .antigravity, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "write a.txt"), pid: 4242, host: "devbox")
+        rig.store.upsert(agy)
+        #expect(await rig.supervisor.performAnswer(agy, allow: false))
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["capture", "keys"])
+        #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
+        #expect(calls[1].arguments["expect"] == .array([.string("Deny"), .string("> 1. Approve")]))
+        #expect(calls[1].arguments["pid"] == .int(4242))
+        #expect(calls[1].arguments["comm"] == .string("agy"))
+        #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+    }
+
+    @Test func keystrokeTogglesOffMeanTerminalOnly() async throws {
+        let rig = Rig(replies: ["keys": #"{"sent":true}"#])
+        rig.supervisor.keystrokeToggles = { (grok: false, antigravity: false) }
+        for (tool, comm) in [(AgentTool.grokBuild, "grok"), (.antigravity, "agy")] {
+            rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: comm))
+            let session = AgentSession(
+                tool: tool, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+                status: .waitingApproval(command: "x"), pid: 4242, host: "devbox")
+            #expect(rig.supervisor.answerability(for: session) == .terminalOnly)
+            #expect(await rig.supervisor.performAnswer(session, allow: true) == false)
+        }
+        #expect(await rig.helper.commands.isEmpty)
+    }
+
+    @Test func captureFailureSendsNothing() async throws {
+        let refused = Rig(replies: ["capture": #"{"ok":false,"error":"capture failed"}"#, "keys": #"{"sent":true}"#])
+        refused.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        refused.store.upsert(session)
+        #expect(await refused.supervisor.performAnswer(session, allow: true) == false)
+        #expect(await refused.helper.commands == ["capture"])
+
+        // No answer at all: the fake throws, as a timed out request does.
+        let silent = Rig(replies: ["keys": #"{"sent":true}"#])
+        silent.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await silent.supervisor.performAnswer(kimi(), allow: true) == false)
+        #expect(await silent.helper.commands == ["capture"])
+    }
+
+    @Test func aSecondClickWhileAnsweringSendsNothing() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"1. Approve once\n2. Reject"}"#, "keys": #"{"sent":true}"#],
+                      delay: .milliseconds(200))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+        let first = Task { await rig.supervisor.performAnswer(session, allow: true) }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !rig.supervisor.answering.contains(session.id) && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        #expect(await rig.supervisor.performAnswer(session, allow: false) == false)
+        #expect(await first.value)
+        #expect(await rig.helper.commands == ["capture", "keys"])
+        #expect(rig.supervisor.answering.isEmpty)
+    }
+
+    @Test func holdExpiryRedrawsTheRow() async throws {
+        let rig = Rig(remoteHold: .milliseconds(50))
+        let mirrorRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-answer-expiry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mirrorRoot, withIntermediateDirectories: true)
+        let mirror = RemoteMirror(root: mirrorRoot)
+        let origin = RemoteHookOrigin(
+            hostID: rig.host.id, hostName: "devbox", home: "/home/u",
+            mirrorHome: mirror.local("/home/u"), peer: ["curl", "bash", "claude"], approvalsOff: [])
+        rig.server.handleRemote(
+            event: "PermissionRequest",
+            body: ["session_id": UUID().uuidString, "tool_name": "Bash",
+                   "tool_input": ["command": "git push"], "cwd": "/home/u/proj"],
+            accountLabel: nil, origin: origin, rid: "r9", held: true) { _, _ in }
+        let row = try #require(rig.store.sessions.first)
+        #expect(rig.supervisor.answerability(for: row) == .held)
+        let before = rig.store.remoteHoldRevision
+        let deadline = ContinuousClock.now + .seconds(2)
+        while rig.server.isHolding(sessionID: row.id) && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        // The row keeps its prompt, so only the revision can redraw it.
+        #expect(rig.store.sessions.first?.status == row.status)
+        #expect(rig.store.remoteHoldRevision != before)
+        #expect(rig.store.remoteAnswerability(for: row) == .terminalOnly)
+    }
+
+    @Test func sentKeysMoveTheRowOn() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"1. Approve once\n2. Reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = kimi()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performAnswer(session, allow: false))
+        #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+    }
+
+    // MARK: - Inline reply
+
+    private static let paneValue: JSONValue = .object([
+        "socket": .string("/tmp/tmux-1000/default"), "id": .string("%3"),
+    ])
+
+    private func waiting(_ tool: AgentTool = .kimiCode, pid: pid_t? = 4242) -> AgentSession {
+        AgentSession(
+            tool: tool, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingInput(prompt: "Which branch?"), pid: pid, host: "devbox")
+    }
+
+    private static let noPane = SessionStore.ReplyResult.failed(
+        "This session isn't in tmux on devbox, so reply in its terminal.")
+    /// Every failure after a paste landed, or may have, says so: sending
+    /// again would paste the text a second time.
+    private static let pastedNotSubmitted = SessionStore.ReplyResult.failed(
+        "The reply was pasted into the session on devbox but not submitted, so it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice.")
+    private static let pasteUncertain = SessionStore.ReplyResult.failed(
+        "The reply may have been partly pasted into the session on devbox, so it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice.")
+
+    /// The screen before the paste, then after it.
+    private static let screens = [#"{"text":"> "}"#, #"{"text":"> use main"}"#]
+
+    @Test func replyWithoutPaneFailsWithReason() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> use main"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        let session = waiting()
+        rig.store.upsert(session)
+
+        rig.land(try Self.snapshot(pid: 4242, pane: nil))
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+
+        // Every other gate fails the same way: a pid not in the snapshot,
+        // a dark host, a stale helper, and no snapshot since a gap.
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(waiting(pid: 7), text: "use main") == Self.noPane)
+        #expect(await rig.supervisor.performReply(waiting(pid: nil), text: "use main") == Self.noPane)
+        rig.store.noteRemoteReachability(host: "devbox", .unreachable("down"))
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        rig.connection?.noteHelperCurrent(false)
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+        rig.connection?.noteLost()
+        rig.store.noteRemoteReachability(host: "devbox", .reachable)
+        #expect(!rig.supervisor.canReply(session))
+        #expect(await rig.supervisor.performReply(session, text: "use main") == Self.noPane)
+
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    /// A held Claude row needs no pane to be answered, but a reply is typed,
+    /// so it does need one.
+    @Test func replyNeedsAPaneEvenForClaude() async throws {
+        let rig = Rig()
+        rig.land(try Self.snapshot(pid: 4242, pane: nil, comm: "claude"))
+        #expect(!rig.supervisor.canReply(waiting(.claudeCode)))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "claude"))
+        #expect(rig.supervisor.canReply(waiting(.claudeCode)))
+    }
+
+    /// Reply is not an approval, so the approval switches do not gate it,
+    /// as the local reply works whatever the keystroke switches say.
+    @Test func replyIgnoresTheApprovalSwitches() async throws {
+        let rig = Rig(approvalsOff: [.grokBuild])
+        rig.supervisor.keystrokeToggles = { (grok: false, antigravity: false) }
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
+        #expect(rig.supervisor.canReply(waiting(.grokBuild)))
+    }
+
+    @Test func replySubmitsOnlyWhenProbeVisible() async throws {
+        let rig = Rig(replies: [
+            "paste": #"{"sent":true}"#,
+            "capture": #"{"text":"> something else entirely"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+
+        let result = await rig.supervisor.performReply(session, text: "use the main branch")
+        #expect(result == .failed(
+            "The reply did not appear on screen in the session on devbox, so it was not submitted. Part of it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."))
+        #expect(await rig.helper.commands == ["capture", "paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    /// A short reply is usually on screen already, so presence alone would
+    /// confirm a paste that never landed. The count has to rise.
+    @Test func aShortReplyAlreadyOnScreenSendsWhenTheCountRises() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"Continue? ok\n> "}"#, #"{"text":"Continue? ok\n> ok"}"#]])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performReply(session, text: "ok") == .sent)
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["capture", "paste", "capture", "keys"])
+        #expect(calls[3].arguments["expect_more"] == .array([
+            .object(["text": .string("ok"), "before": .int(1)]),
+        ]))
+        #expect(calls[3].arguments["expect"] == nil)
+    }
+
+    @Test func noEnterWhenTheCountDoesNotRise() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"Continue? ok\n> "}"#, #"{"text":"Continue? ok\n> "}"#]])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performReply(session, text: "ok") == .failed(
+            "The reply did not appear on screen in the session on devbox, so it was not submitted. Part of it may be sitting in the composer. Check the terminal before sending again, or it may be pasted twice."))
+        #expect(await rig.helper.commands == ["capture", "paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    /// Counted as the helper's str.count counts: without overlap.
+    @Test func occurrencesDoNotOverlap() {
+        #expect(RemoteAnswerPlan.occurrences(of: "aa", in: "aaa") == 1)
+        #expect(RemoteAnswerPlan.occurrences(of: "aa", in: "aaaa") == 2)
+        #expect(RemoteAnswerPlan.occurrences(of: "ok", in: "ok\n> ok") == 2)
+        #expect(RemoteAnswerPlan.occurrences(of: "ok", in: "") == 0)
+        #expect(RemoteAnswerPlan.occurrences(of: "", in: "ok") == 0)
+    }
+
+    @Test func replySendsTheExactSequence() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"> "}"#, #"{"text":"> first line\n  use the main branch"}"#]])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+
+        let text = "first line\nuse the main branch"
+        #expect(await rig.supervisor.performReply(session, text: text) == .sent)
+        #expect(rig.store.sessions.first?.status == .working(activity: "Working on your reply…"))
+
+        let calls = await rig.helper.calls
+        #expect(calls.map(\.command) == ["capture", "paste", "capture", "keys"])
+        #expect(calls[0].arguments == ["pane": Self.paneValue])
+        #expect(calls[1].arguments == [
+            "pane": Self.paneValue, "text": .string(text),
+            "pid": .int(4242), "comm": .string("kimi"),
+        ])
+        #expect(calls[2].arguments == ["pane": Self.paneValue])
+        let probe = try #require(TerminalFocuser.verificationProbe(for: text))
+        #expect(calls[3].arguments == [
+            "pane": Self.paneValue, "keys": .array([.string("\n")]),
+            "expect_more": .array([.object(["text": .string(probe), "before": .int(0)])]),
+            "pid": .int(4242), "comm": .string("kimi"),
+        ])
+        #expect(rig.supervisor.answering.isEmpty)
+    }
+
+    @Test func replyStripsControlCharactersBeforeTheProbe() async throws {
+        #expect(RemoteAnswerPlan.pasteText("a\u{1b}[201~b\tc\nd\u{0}\u{7f}e\r") == "a[201~b\tc\nde")
+        #expect(RemoteAnswerPlan.pasteText("caf\u{e9} \u{1F600}") == "caf\u{e9} \u{1F600}")
+
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": [#"{"text":"> "}"#, #"{"text":"> ship it[201~ now"}"#]])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        #expect(await rig.supervisor.performReply(session, text: "ship it\u{1b}[201~ now\u{7f}") == .sent)
+        let calls = await rig.helper.calls
+        #expect(calls[1].arguments["text"] == .string("ship it[201~ now"))
+        #expect(calls[3].arguments["expect_more"] == .array([
+            .object(["text": .string("ship it[201~ now"), "before": .int(0)]),
+        ]))
+
+        // Text that is nothing once stripped sends nothing at all.
+        let empty = Rig(replies: ["paste": #"{"sent":true}"#])
+        empty.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        #expect(await empty.supervisor.performReply(waiting(), text: "\u{1b}\u{7}") == .failed("Nothing to send."))
+        #expect(await empty.helper.commands.isEmpty)
+    }
+
+    @Test func pasteRepliesDecodeByCertainty() {
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":true}"#.utf8)) == .pasted)
+        // Refused before anything was typed.
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":false,"reason":"changed"}"#.utf8))
+            == .refused("changed"))
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"ok":false,"error":"bad text"}"#.utf8))
+            == .refused("bad text"))
+        // The text never reached tmux.
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":false,"reason":"load failed"}"#.utf8))
+            == .refused("load failed"))
+        // A step failed partway, or the reply is unreadable: some of the
+        // text may be in the composer.
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data(#"{"sent":false,"reason":"send failed"}"#.utf8))
+            == .uncertain("send failed"))
+        #expect(RemoteAnswerPlan.pasteOutcome(from: Data("garbage".utf8)) == .uncertain("unreadable reply"))
+    }
+
+    @Test func replyFailuresNeverClaimSuccess() async throws {
+        let screens = Self.screens
+        let cases: [(replies: [String: String], sequences: [String: [String]],
+                     commands: [String], result: SessionStore.ReplyResult)] = [
+            // The first read fails: nothing is pasted.
+            ([:], [:], ["capture"],
+             .failed("Could not read the screen on devbox, so nothing was sent.")),
+            (["capture": #"{"ok":false,"error":"capture failed"}"#], [:], ["capture"],
+             .failed("Could not read the screen on devbox, so nothing was sent.")),
+            // The paste is refused before anything is typed.
+            (["paste": #"{"sent":false,"reason":"changed"}"#], ["capture": screens], ["capture", "paste"],
+             .failed("Could not paste into this session on devbox, so nothing was sent.")),
+            (["paste": #"{"ok":false,"error":"bad text"}"#], ["capture": screens], ["capture", "paste"],
+             .failed("Could not paste into this session on devbox, so nothing was sent.")),
+            (["paste": #"{"sent":false,"reason":"load failed"}"#], ["capture": screens], ["capture", "paste"],
+             .failed("Could not paste into this session on devbox, so nothing was sent.")),
+            // The paste fails partway, or its answer never comes.
+            (["paste": #"{"sent":false,"reason":"send failed"}"#], ["capture": screens], ["capture", "paste"],
+             Self.pasteUncertain),
+            ([:], ["capture": [screens[0]]], ["capture", "paste"], Self.pasteUncertain),
+            // The confirming read fails after the paste.
+            (["paste": #"{"sent":true}"#, "capture": #"{"ok":false,"error":"capture failed"}"#],
+             ["capture": [screens[0]]], ["capture", "paste", "capture"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#], ["capture": [screens[0]]], ["capture", "paste", "capture"],
+             Self.pastedNotSubmitted),
+            // Enter is refused at press time, fails, or its answer never comes.
+            (["paste": #"{"sent":true}"#, "keys": #"{"sent":false,"reason":"changed"}"#],
+             ["capture": screens], ["capture", "paste", "capture", "keys"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#, "keys": #"{"sent":false,"reason":"send failed","sent_count":0}"#],
+             ["capture": screens], ["capture", "paste", "capture", "keys"], Self.pastedNotSubmitted),
+            (["paste": #"{"sent":true}"#], ["capture": screens], ["capture", "paste", "capture", "keys"],
+             .failed("Could not confirm the reply was submitted in the session on devbox. It may be sitting in the composer or already sent. Check the terminal before sending again.")),
+        ]
+        for (replies, sequences, commands, expected) in cases {
+            let rig = Rig(replies: replies, sequences: sequences)
+            rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+            let session = waiting()
+            rig.store.upsert(session)
+            let result = await rig.supervisor.performReply(session, text: "use main")
+            #expect(result == expected, "\(replies) \(sequences)")
+            #expect(await rig.helper.commands == commands, "\(replies) \(sequences)")
+            #expect(rig.store.sessions.first?.status == session.status)
+            #expect(rig.supervisor.answering.isEmpty)
+        }
+    }
+
+    /// Waits until the helper has been asked `count` things, so a test can
+    /// change the host while the last of them is in flight.
+    private func untilCalls(_ count: Int, on rig: Rig) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await rig.helper.calls.count < count && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+    }
+
+    @Test func aTargetThatChangesWhilePastingGetsNoEnter() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(150))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let reply = Task { await rig.supervisor.performReply(session, text: "use main") }
+        // The paste is in flight when the session leaves its pane.
+        await untilCalls(2, on: rig)
+        rig.land(try Self.snapshot(pid: 4242, pane: nil))
+        #expect(await reply.value == .failed(
+            "The session on devbox changed while pasting, so the reply was not submitted, but it may be sitting in the composer. Check the terminal before sending again, or it will be pasted twice."))
+        #expect(await rig.helper.commands == ["capture", "paste", "capture"])
+        #expect(rig.store.sessions.first?.status == session.status)
+    }
+
+    @Test func aTargetThatChangesBeforeThePastePastesNothing() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(150))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let reply = Task { await rig.supervisor.performReply(session, text: "use main") }
+        // The first read is in flight when the host goes dark.
+        await untilCalls(1, on: rig)
+        rig.store.noteRemoteReachability(host: "devbox", .unreachable("down"))
+        #expect(await reply.value == .failed(
+            "The session on devbox changed while reading its screen, so nothing was sent."))
+        #expect(await rig.helper.commands == ["capture"])
+    }
+
+    @Test func aSecondSendWhileReplyingPastesNothing() async throws {
+        let rig = Rig(
+            replies: ["paste": #"{"sent":true}"#, "keys": #"{"sent":true}"#],
+            sequences: ["capture": Self.screens], delay: .milliseconds(200))
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let session = waiting()
+        rig.store.upsert(session)
+        let first = Task { await rig.supervisor.performReply(session, text: "use main") }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !rig.supervisor.answering.contains(session.id) && ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        #expect(await rig.supervisor.performReply(session, text: "use main")
+            == .failed("SwarmBar is already answering this session."))
+        #expect(await first.value == .sent)
+        #expect(await rig.helper.commands == ["capture", "paste", "capture", "keys"])
+    }
+
+    // MARK: - The store
+
+    @MainActor private final class RecordingActions: RemoteActing {
+        var answers: [(UUID, Bool)] = []
+        var replies: [(UUID, String)] = []
+        var repliable = true
+        func answerability(for session: AgentSession) -> RemoteAnswerability { .keystrokes }
+        func canReply(_ session: AgentSession) -> Bool { repliable }
+        func answer(_ session: AgentSession, allow: Bool) { answers.append((session.id, allow)) }
+        func reply(
+            _ session: AgentSession, text: String,
+            completion: @escaping @MainActor (SessionStore.ReplyResult) -> Void
+        ) {
+            replies.append((session.id, text))
+            completion(.sent)
+        }
+    }
+
+    @Test func remoteReplyNeverUsesLocalTerminal() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        var local: [AgentSession] = []
+        store.localReplyObserver = { session, _ in local.append(session) }
+        let actions = RecordingActions()
+        store.remoteActions = actions
+
+        let remote = waiting()
+        store.upsert(remote)
+        var results: [SessionStore.ReplyResult] = []
+        store.sendReply(remote, text: "use main") { results.append($0) }
+        #expect(local.isEmpty)
+        #expect(actions.replies.map(\.0) == [remote.id])
+        #expect(actions.replies.map(\.1) == ["use main"])
+        #expect(results == [.sent])
+
+        // The Reply button follows the remote side's answer, and a local
+        // row always offers it.
+        #expect(store.canReply(remote))
+        actions.repliable = false
+        #expect(!store.canReply(remote))
+        store.remoteActions = nil
+        #expect(!store.canReply(remote))
+
+        // The local seam does see a local row, so the empty list above
+        // means something.
+        let here = AgentSession(
+            tool: .kimiCode, projectName: "proj", projectPath: URL(fileURLWithPath: "/tmp"),
+            status: .waitingInput(prompt: ""))
+        store.upsert(here)
+        #expect(store.canReply(here))
+        store.sendReply(here, text: "go") { _ in }
+        #expect(local.map(\.id) == [here.id])
+        #expect(actions.replies.count == 1)
+    }
+
+    @Test func remoteApproveNeverUsesLocalTerminal() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        var routed: [AgentSession] = []
+        store.localAnswerObserver = { session, _ in routed.append(session) }
+        let actions = RecordingActions()
+        store.remoteActions = actions
+
+        let remote = kimi()
+        store.upsert(remote)
+        store.approve(remote)
+        store.deny(remote)
+        #expect(routed.isEmpty)
+        #expect(actions.answers.map(\.0) == [remote.id, remote.id])
+        #expect(actions.answers.map(\.1) == [true, false])
+
+        // The local seam does see a local row, so the empty list above
+        // means something.
+        let local = AgentSession(
+            tool: .kimiCode, projectName: "proj", projectPath: URL(fileURLWithPath: "/tmp"),
+            status: .waitingApproval(command: "ls"))
+        store.upsert(local)
+        store.approve(local)
+        #expect(routed.map(\.id) == [local.id])
+        #expect(actions.answers.count == 2)
+    }
+
+    /// Keys confirmed for one prompt must not move a row that has since
+    /// started asking about something else.
+    @Test func aSentAnswerOnlyMovesTheSamePrompt() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        let answered = kimi()
+        store.upsert(answered)
+        var newer = answered
+        newer.status = .waitingApproval(command: "git push --force")
+        store.upsert(newer)
+        store.noteRemoteAnswerSent(answered, allow: true)
+        #expect(store.sessions.first?.status == .waitingApproval(command: "git push --force"))
+
+        store.noteRemoteAnswerSent(newer, allow: true)
+        #expect(store.sessions.first?.status == .runningTool(activity: "Running git"))
+    }
+
+    @Test func terminalOnlyNoteNamesTheHost() {
+        #expect(RemoteRowLabel.terminalOnlyNote(host: "devbox") == "Answer in the terminal on devbox")
+    }
+}

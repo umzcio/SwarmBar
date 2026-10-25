@@ -2,8 +2,8 @@ import ServiceManagement
 import SwiftUI
 
 /// Settings in the System Settings idiom: toolbar tabs for General
-/// (behavior), Providers (per-tool approval wiring), and Notifications
-/// (alerts when an agent needs you).
+/// (behavior), Providers (per-tool approval wiring), Notifications (alerts
+/// when an agent needs you), and Hosts (remote hosts watched over ssh).
 struct SettingsView: View {
     var body: some View {
         TabView {
@@ -13,6 +13,8 @@ struct SettingsView: View {
                 .tabItem { Label("Providers", systemImage: "circle.hexagongrid") }
             NotificationSettingsTab()
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
+            HostsSettingsTab()
+                .tabItem { Label("Hosts", systemImage: "server.rack") }
         }
         .frame(width: 440)
         .background(
@@ -379,7 +381,11 @@ struct NotificationSettingsTab: View {
 
 // MARK: - Shared pieces
 
-private struct SettingsCardList<Content: View>: View {
+// The card, its group label, divider and toggle row are internal because the
+// remote hosts wizard is built from them too, so the two windows read as one
+// app. The card list is internal for the Hosts tab, which has its own file.
+
+struct SettingsCardList<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -391,7 +397,7 @@ private struct SettingsCardList<Content: View>: View {
     }
 }
 
-private struct SettingsCard<Content: View>: View {
+struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -404,7 +410,7 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct SettingsGroupLabel: View {
+struct SettingsGroupLabel: View {
     let title: String
     init(_ title: String) { self.title = title }
 
@@ -418,7 +424,7 @@ private struct SettingsGroupLabel: View {
     }
 }
 
-private struct SettingsDivider: View {
+struct SettingsDivider: View {
     var body: some View {
         Divider()
             .overlay(.white.opacity(0.06))
@@ -457,7 +463,7 @@ private struct SettingsPickerRow<Control: View>: View {
     }
 }
 
-private struct SettingsToggleRow: View {
+struct SettingsToggleRow: View {
     let symbol: String
     var symbolTint: Color = .secondary
     let title: String

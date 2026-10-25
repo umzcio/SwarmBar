@@ -12,10 +12,44 @@ final class SessionStore {
     /// routinely exercised path rather than an error case, so rows keep
     /// their last known status and say the host cannot be reached.
     private(set) var remoteReachability: [String: RemoteReachability] = [:]
+    /// When each host's current outage began, for "Unreachable for 4 min".
+    /// One outage can change its reason between polls (a timeout, then a
+    /// refused connection), so only reaching the host again ends it.
+    private(set) var remoteUnreachableSince: [String: Date] = [:]
+    /// Called with a host's display name when it becomes reachable, so a
+    /// check that could not connect earlier is not left contradicting a
+    /// live connection. Set by the remote monitor supervisor.
+    @ObservationIgnored var remoteReachableHandler: ((String) -> Void)?
 
-    func noteRemoteReachability(host: String, _ state: RemoteReachability) {
+    func noteRemoteReachability(host: String, _ state: RemoteReachability, now: Date = .now) {
+        if case .unreachable = state {
+            if remoteUnreachableSince[host] == nil { remoteUnreachableSince[host] = now }
+        } else if remoteUnreachableSince[host] != nil {
+            remoteUnreachableSince.removeValue(forKey: host)
+        }
         guard remoteReachability[host] != state else { return }
         remoteReachability[host] = state
+        if state == .reachable { remoteReachableHandler?(host) }
+    }
+
+    /// Forgets everything about one remote host: its rows, its reachability
+    /// and the per-session records keyed by those rows. Used when a host is
+    /// removed or renamed, since its monitor will never sync again to delete
+    /// the rows itself and a stale row would read as a live session.
+    func clearHost(_ host: String) {
+        let ids = Set(sessions.filter { $0.host == host }.map(\.id))
+        sessions.removeAll { $0.host == host }
+        remoteReachability.removeValue(forKey: host)
+        remoteUnreachableSince.removeValue(forKey: host)
+        for id in ids {
+            hookOverrides.removeValue(forKey: id)
+            acknowledgedAt.removeValue(forKey: id)
+            alertedStatus.removeValue(forKey: id)
+            endedSessions.removeValue(forKey: id)
+            remindedTurn.removeValue(forKey: id)
+        }
+        noteAttentionTransitions()
+        refreshIconTicker()
     }
 
     var isPaused = false
@@ -299,6 +333,53 @@ final class SessionStore {
     @ObservationIgnored private(set) var hookOverrides: [UUID: HookOverride] = [:]
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
+    /// Test seam. When set, a local answer is reported here instead of
+    /// being carried out, so a test can prove which sessions would have
+    /// driven this Mac's terminal without ever driving it.
+    @ObservationIgnored var localAnswerObserver: ((AgentSession, ApprovalRoute) -> Void)?
+
+    /// The same for replies: a local reply is reported here, with its text,
+    /// instead of being pasted into this Mac's terminal.
+    @ObservationIgnored var localReplyObserver: ((AgentSession, String) -> Void)?
+
+    /// Answers rows that have a host. Weak because the app owns it.
+    @ObservationIgnored weak var remoteActions: RemoteActing?
+
+    /// Moves whenever a relayed hold starts or ends. Whether a remote row
+    /// can be answered depends on HookServer's holds, which nothing
+    /// observes, and a hold that ends at its timeout changes no row: the
+    /// row keeps its prompt. Reading this from a view is what makes that
+    /// row swap its buttons for the terminal note.
+    var remoteHoldRevision = 0
+
+    /// The same for panes: moves when a poll finds a process in a different
+    /// pane, or none, and when a gap makes the last pane map untrustworthy.
+    /// A row's pid can stay the same while its pane comes and goes.
+    private(set) var remotePaneRevision = 0
+
+    func noteRemotePanesChanged() {
+        remotePaneRevision &+= 1
+    }
+
+    /// How a remote row's prompt can be answered, for the view. Reads both
+    /// revisions so a view that asks is redrawn when a hold or a pane comes
+    /// or goes.
+    func remoteAnswerability(for session: AgentSession) -> RemoteAnswerability {
+        _ = remoteHoldRevision
+        _ = remotePaneRevision
+        return remoteActions?.answerability(for: session) ?? .terminalOnly
+    }
+
+    /// Whether the row offers Reply, for the view. A local row always
+    /// does; its status decides the rest. A remote row only while its
+    /// session sits in a tmux pane SwarmBar can type into, which moves with
+    /// the pane revision and the host's reachability.
+    func canReply(_ session: AgentSession) -> Bool {
+        guard session.host != nil else { return true }
+        _ = remotePaneRevision
+        return remoteActions?.canReply(session) ?? false
+    }
+
     /// Sessions whose tool reported the session over (Claude and Grok's
     /// SessionEnd hook fires on /exit), and when. The transcript keeps
     /// looking fresh for a while, so without this an exited session reads
@@ -332,7 +413,8 @@ final class SessionStore {
         sticky: Bool,
         cwd: String?,
         accountLabel: String?,
-        title: String? = nil
+        title: String? = nil,
+        host: String? = nil
     ) {
         // Hooks arrive independently of polling, so a disabled tool would
         // otherwise reappear the moment one of its agents did anything.
@@ -360,6 +442,9 @@ final class SessionStore {
                 projectPath: path,
                 status: status,
                 accountLabel: accountLabel,
+                // A row a relayed hook creates belongs to its host from the
+                // start, so it never offers this Mac's terminal actions.
+                host: host,
                 attentionEventID: eventID
             ))
         }
@@ -504,7 +589,14 @@ final class SessionStore {
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
-            update(id: session.id) { $0.status = .runningTool(activity: running(command)) }
+            noteAnswered(session.id, command: command, allow: true)
+            return
+        }
+        // Every route below reaches into a terminal on THIS Mac, which a
+        // remote session is not in. Its keys go to its own tmux pane on its
+        // host instead, or nowhere.
+        guard session.host == nil else {
+            remoteActions?.answer(session, allow: true)
             return
         }
         follow(
@@ -516,9 +608,13 @@ final class SessionStore {
     }
 
     func deny(_ session: AgentSession) {
-        guard case .waitingApproval = session.status else { return }
+        guard case .waitingApproval(let command) = session.status else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: false) == true {
-            update(id: session.id) { $0.status = .working(activity: "Rethinking after deny…") }
+            noteAnswered(session.id, command: command, allow: false)
+            return
+        }
+        guard session.host == nil else {
+            remoteActions?.answer(session, allow: false)
             return
         }
         follow(
@@ -545,6 +641,10 @@ final class SessionStore {
         choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?,
         mockStatus: SessionStatus
     ) {
+        if let localAnswerObserver {
+            localAnswerObserver(session, route)
+            return
+        }
         switch route {
         case .keys(let keys):       answerTuiPrompt(session, keys: keys)
         case .numberedSelector:     answerNumberedPrompt(session, choose: choose)
@@ -552,6 +652,29 @@ final class SessionStore {
         case .focusTerminal:        openInTerminal(session)
         case .mockTransition:       update(id: session.id) { $0.status = mockStatus }
         }
+    }
+
+    /// The row after an answer was delivered, by a held reply or by keys
+    /// a helper confirmed it pressed.
+    private func noteAnswered(_ id: UUID, command: String, allow: Bool) {
+        update(id: id) {
+            $0.status = allow
+                ? .runningTool(activity: running(command))
+                : .working(activity: "Rethinking after deny…")
+        }
+    }
+
+    /// A remote answer's keys landed. The answer took a round trip, so the
+    /// row is moved on only if it is still asking the SAME question: a poll
+    /// that has already seen the prompt settle knows better than this does,
+    /// and a row now asking about another command was not answered.
+    func noteRemoteAnswerSent(_ session: AgentSession, allow: Bool) {
+        guard case .waitingApproval(let answered) = session.status,
+              let current = sessions.first(where: { $0.id == session.id }),
+              case .waitingApproval(let command) = current.status,
+              command == answered
+        else { return }
+        noteAnswered(session.id, command: command, allow: allow)
     }
 
     private func running(_ command: String) -> String {
@@ -687,6 +810,21 @@ final class SessionStore {
             return
         }
 
+        // A remote session's terminal is on its host. Pasting here would
+        // find a same-named directory on this Mac, if anything.
+        if let host = session.host {
+            guard let remoteActions else {
+                completion(.failed("This session isn't in tmux on \(host), so reply in its terminal."))
+                return
+            }
+            remoteActions.reply(current, text: text, completion: completion)
+            return
+        }
+        if let localReplyObserver {
+            localReplyObserver(session, text)
+            return
+        }
+
         let id = session.id
         let path = session.projectPath
         Task.detached {
@@ -695,9 +833,7 @@ final class SessionStore {
             await MainActor.run {
                 switch outcome {
                 case .sent:
-                    self.update(id: id) {
-                        $0.status = .working(activity: "Working on your reply…")
-                    }
+                    self.noteReplySent(id)
                     completion(.sent)
                 case .pasteNotVisible:
                     TerminalFocuser.focus(sessionID: id, projectPath: path)
@@ -708,6 +844,14 @@ final class SessionStore {
                         "Could not reach this session's terminal. Inline reply needs iTerm2."))
                 }
             }
+        }
+    }
+
+    /// A reply was submitted, here or on a host: the session's next turn
+    /// has started.
+    func noteReplySent(_ id: UUID) {
+        update(id: id) {
+            $0.status = .working(activity: "Working on your reply…")
         }
     }
 

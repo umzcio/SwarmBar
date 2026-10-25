@@ -19,6 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The remote helper is plain python3 that runs on hosts we do not
+      # control, and the Swift suite never executes it. Apple's python3 is
+      # the 3.9 that macOS hosts ship, so test on exactly that, and
+      # first, since it needs no build and fails fastest.
+      - name: Test the remote helper
+        run: /usr/bin/python3 scripts/test-swarmbar-helper.py
+
       # The .xcodeproj is generated, not committed, so this is not optional
       # setup: without it there is nothing to build. It is also the step
       # that catches a source file added without regenerating the project,
@@ -45,14 +52,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Most hosts the helper runs on are Linux, so it is tested there too.
+      - name: Test the remote helper
+        run: python3 scripts/test-swarmbar-helper.py
+
       # CLAUDE.md: no em dashes anywhere in UI copy or docs. It is a real
       # rule that is otherwise enforced by remembering it, which is how the
       # README ended up advertising six tools the day the seventh shipped.
       # Scoped to compiled source and docs, so the superseded phase-1 sketch
-      # at the repo root is out of scope rather than excluded by name.
+      # at the repo root is out of scope rather than excluded by name. The
+      # :(glob) magic is what makes ** match any depth, the top level
+      # included; without it a pathspec's * already crosses slashes and **/
+      # demands one more directory, so it matched no test file at all.
       - name: No em dashes
         run: |
-          if git ls-files '*.md' 'SwarmBar/**/*.swift' 'Tests/**/*.swift' \
+          if git ls-files '*.md' ':(glob)SwarmBar/**/*.swift' ':(glob)Tests/**/*.swift' \
             | xargs grep -n '—' ; then
             echo "::error::Em dash found. Use a comma, a colon, or a full stop."
             exit 1

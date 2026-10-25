@@ -185,9 +185,57 @@ approvals appear immediately.
 
 ---
 
+## Remote hosts
+
+SwarmBar can show and answer agents running on servers you ssh into, next to the ones on this Mac.
+Everything rides your own ssh connection, so nothing listens on a network port and there is no
+token to manage.
+
+**Start.** An empty popover points at setup, or open Settings, then Hosts, then Add hosts.
+
+1. **Check first.** The check is read-only and writes nothing. It reports what each host has, which
+   agents are running, and whether tmux and passwordless sudo are available.
+2. **Pick a setup path.** There are three: let SwarmBar make the changes over ssh, paste a prompt
+   into an agent already running on the host, or run one command yourself on the host. The command
+   downloads the helper for your exact version and checks its sha256 before running it.
+3. **Choose who to watch.** "Just" followed by your login name sees agents running as the account
+   you ssh in as. "Every user" also sees agents run by other accounts, such as root. Without
+   passwordless sudo, that needs a one-time sudo rule that lets the login act as root through
+   SwarmBar's helper, so only set it up for an account you would trust with root.
+
+**What gets written where.**
+- The helper goes in `/usr/local/lib/swarmbar-helper`, or `~/.swarmbar/swarmbar-helper` without root.
+- Bridge scripts go in `~/.swarmbar/` (mode 0700, scripts 0700). They talk to the helper over a
+  private Unix socket in that folder, not a network port.
+- The OpenCode plugin goes in `~/.config/opencode/plugins/swarmbar-remote.js` (0600), with an entry
+  in `opencode.json` or `opencode.jsonc`.
+- Hook entries go into each agent's own config: Claude Code's `settings.json` in each profile
+  folder, Kimi Code's and BearCode's `config.toml`, and the OpenCode config. A one-time
+  `.backup-swarmbar` copy sits beside every changed file, and any config SwarmBar creates is 0600.
+- `/etc/sudoers.d/swarmbar` is written only for the narrow sudo rule above, and is checked with
+  `visudo` first.
+
+**Undo.** Settings, then Hosts, then Undo changes strips SwarmBar's entries from each agent config
+and removes the two bridge scripts and the OpenCode plugin. It leaves the helper, the
+`.backup-swarmbar` files, `~/.swarmbar` itself, and `/etc/sudoers.d/swarmbar` if you set up the sudo
+rule. That rule stays in force until you remove it. To clear the rest by hand:
+
+```bash
+sudo rm /etc/sudoers.d/swarmbar /usr/local/lib/swarmbar-helper
+rm -rf ~/.swarmbar    # only once SwarmBar no longer watches that host
+```
+
+**Answering.** Claude Code and OpenCode can be approved and denied remotely without anything extra.
+Codex, Kimi Code, BearCode, Grok Build, and Antigravity need the agent to run inside tmux, because
+SwarmBar types into the tmux pane. Without tmux those sessions are still listed and still show when
+they need you, and Approve and Deny are unavailable. A host that drops off the network keeps its
+rows and is marked unreachable rather than ended.
+
+---
+
 ## Roadmap
 
-- Remote sessions over SSH
+- Remote hosts: a faster first sync, and Terminal.app answers for local sessions
 - More agents, added the way the seven built in were
 
 ---

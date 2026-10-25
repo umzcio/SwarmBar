@@ -46,10 +46,19 @@ final class TailCache<Value>: @unchecked Sendable {
         return fresh
     }
 
-    /// Drops entries for files no longer in the discovery window.
-    func retain(paths: Set<String>) {
+    /// Drops entries for files no longer in the discovery window, but only
+    /// beneath the roots the caller scanned. One cache serves this Mac and
+    /// every remote host's mirror, and each discovery pass sees only its
+    /// own roots; evicting everything it did not see would have each pass
+    /// throw away the others' tails, so every poll would read them all
+    /// again.
+    func retain(paths: Set<String>, under roots: [String]) {
+        let prefixes = roots.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
         lock.lock()
-        storage = storage.filter { paths.contains($0.key.path) }
+        storage = storage.filter { entry in
+            let path = entry.key.path
+            return paths.contains(path) || !prefixes.contains { path.hasPrefix($0) }
+        }
         lock.unlock()
     }
 }

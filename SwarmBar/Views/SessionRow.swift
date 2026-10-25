@@ -6,10 +6,17 @@ struct SessionRow: View {
     @Environment(\.swarmScale) private var scale
     let session: AgentSession
 
-    /// Reply, Approve and Deny all reach into a terminal on this Mac. See
-    /// SessionRowInteraction.allowsLocalTerminalActions.
-    private var isLocal: Bool {
-        SessionRowInteraction.allowsLocalTerminalActions(host: session.host)
+    /// Reply pastes into the session's own terminal: here for a local row,
+    /// its tmux pane for a remote one, and a remote row with no pane to
+    /// reach does not offer it.
+    private var canReply: Bool { store.canReply(session) }
+
+    /// Set for a remote prompt nothing here can answer.
+    private var terminalOnlyNote: String? {
+        guard let host = session.host,
+              store.remoteAnswerability(for: session) == .terminalOnly
+        else { return nil }
+        return RemoteRowLabel.terminalOnlyNote(host: host)
     }
 
     var body: some View {
@@ -61,10 +68,14 @@ struct SessionRow: View {
                 switch session.status {
                 case .waitingApproval(let command):
                     CommandPreview(command: command)
-                    // The command is still worth showing on a remote row;
-                    // answering it from here is not, and would answer on
-                    // this Mac.
-                    if isLocal {
+                    // A remote prompt is answered by its held request or
+                    // in its own tmux pane on its host, never on this Mac.
+                    // When neither is possible the row says where to go.
+                    if let note = terminalOnlyNote {
+                        Text(note)
+                            .swarmFont(.meta)
+                            .foregroundStyle(.secondary)
+                    } else {
                         ApprovalActions(session: session)
                     }
                 case .waitingInput(let prompt):
@@ -74,7 +85,7 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 6) {
-                        if isLocal {
+                        if canReply {
                             Button("Reply…") { store.replyingTo = session.id }
                                 .buttonStyle(ActionPill.reply)
                                 .accessibilityLabel("Reply")
@@ -94,7 +105,7 @@ struct SessionRow: View {
                         .foregroundStyle(.secondary)
                     // A finished turn is still steerable: its composer is
                     // idle, so a reply can start the next turn.
-                    if session.processAlive && isLocal {
+                    if session.processAlive && canReply {
                         Button("Reply…") { store.replyingTo = session.id }
                             .buttonStyle(ActionPill.reply)
                             .accessibilityLabel("Reply")
@@ -151,13 +162,13 @@ extension View {
 /// test can observe which one wins. Do not add a test that claims to.
 enum SessionRowInteraction {
     /// Whether a row may offer the actions that reach into a terminal on
-    /// THIS Mac: Reply, Approve, Deny, Open in Terminal and the double
-    /// click behind it.
+    /// THIS Mac: Open in Terminal and the double click behind it. A remote
+    /// row's Approve, Deny and Reply go through RemoteActing instead.
     ///
     /// A remote session's terminal is on another host, and the failure is
     /// not merely that nothing happens. TerminalFocuser matches a local
     /// process by cwd, and the fleet includes a macOS host whose paths are
-    /// /Users/zach/... , the same shape as this Mac's, so a same-named
+    /// /Users/u/... , the same shape as this Mac's, so a same-named
     /// directory here is enough for `open -a iTerm` to take you somewhere
     /// and imply it is the session you asked for. Phase 1a is status only
     /// for remote rows; gating Approve and Deny too keeps phase 3 from

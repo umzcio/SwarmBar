@@ -1,106 +1,178 @@
 import Foundation
 
-/// One agent state file as the helper shipped it. The helper sends bytes
-/// and never verdicts, so the tail is parsed here with the same parser the
-/// local monitor uses and there is no second implementation to drift.
-struct RemoteSessionRecord: Decodable, Sendable {
-    let tool: String
-    let path: String
-    let root: String
-    let projectDir: String
-    let mtime: TimeInterval
-    /// Protocol 2 and later. Optional so a host still running an older
-    /// helper decodes rather than failing the whole snapshot, which would
-    /// take every session on that host with it.
-    let created: TimeInterval?
-    let size: Int
-    let tail: String
+/// One run of a file's bytes at its true offset. On the wire it is
+/// `[offset, base64]`. The bytes are written back exactly where they came
+/// from and never adjusted: a tail chunk deliberately starts one byte early
+/// on the newline that ends the previous record, and it runs through the
+/// file's true size, half-written last line included.
+struct RemoteChunk: Sendable, Equatable {
+    let offset: Int
+    let data: Data
+}
 
-    enum CodingKeys: String, CodingKey {
-        case tool, path, root, mtime, created, size, tail
-        case projectDir = "project_dir"
+extension RemoteChunk: Decodable {
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        let offset = try container.decode(Int.self)
+        let encoded = try container.decode(String.self)
+        // A bad offset or bad base64 fails the whole snapshot. Writing what
+        // could be salvaged would leave the mirror holding bytes the helper
+        // believes it shipped differently, and the next growth chunk would
+        // land on top of them.
+        guard offset >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                in: container, debugDescription: "negative chunk offset \(offset)")
+        }
+        guard let data = Data(base64Encoded: encoded) else {
+            throw DecodingError.dataCorruptedError(
+                in: container, debugDescription: "chunk is not base64")
+        }
+        self.init(offset: offset, data: data)
     }
 }
 
-struct RemoteProcessRecord: Decodable, Sendable {
-    let pid: Int
-    let user: String
-    let comm: String
-    let cwd: String
+/// One agent state file in the manifest. A file with no chunks is
+/// unchanged since the last snapshot on this stream, but it is still
+/// listed, because the listing is what tells the mirror the file still
+/// exists.
+struct RemoteFileRecord: Sendable, Equatable {
+    let path: String
+    let size: Int
+    let mtime: TimeInterval
+    /// Birth time where the remote records one (Darwin), else nil. Linux's
+    /// st_ctime is not offered in its place because every write refreshes
+    /// it, so it is really the last write.
+    let created: TimeInterval?
+    /// Discard whatever the mirror holds for this path before writing.
+    let reset: Bool
+    let chunks: [RemoteChunk]
 }
 
+extension RemoteFileRecord: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case path, size, mtime, created, reset, chunks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let size = try container.decode(Int.self, forKey: .size)
+        // Rejected like a negative offset: the mirror truncates to `size`,
+        // and there is no honest file of negative length to make.
+        guard size >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .size, in: container, debugDescription: "negative file size \(size)")
+        }
+        self.init(
+            path: try container.decode(String.self, forKey: .path),
+            size: size,
+            mtime: try container.decode(TimeInterval.self, forKey: .mtime),
+            created: try container.decodeIfPresent(TimeInterval.self, forKey: .created),
+            reset: try container.decode(Bool.self, forKey: .reset),
+            chunks: try container.decode([RemoteChunk].self, forKey: .chunks))
+    }
+}
+
+/// A directory the mirror must hold: every ancestor of a shipped file
+/// between it and its home, and any directory a tool's monitor lists.
+struct RemoteDirRecord: Decodable, Sendable, Equatable {
+    let path: String
+    let mtime: TimeInterval
+    let created: TimeInterval?
+}
+
+/// A file the helper found but could not ship this time. It says nothing
+/// about the session, so the mirror keeps whatever it already holds.
+struct RemoteOmission: Decodable, Sendable, Equatable {
+    let path: String
+    let reason: String
+}
+
+/// A home the helper scanned, and the user who owns it.
+struct RemoteHome: Decodable, Sendable, Equatable {
+    let path: String
+    let user: String
+}
+
+/// The tmux pane an agent runs in, which is how keystrokes reach it.
+struct RemotePane: Codable, Sendable, Equatable {
+    let socket: String
+    let id: String
+}
+
+struct RemoteProcessRecord: Sendable, Equatable {
+    let pid: Int
+    let ppid: Int
+    let user: String
+    /// The resolved agent name, so a BearCode process reads `bearcode`
+    /// rather than the `node` that ps reports.
+    let comm: String
+    let args: String
+    let cwd: String
+    /// Empty when the process has no controlling terminal.
+    let tty: String
+    let pane: RemotePane?
+    let open: [String]
+    /// True when the helper could not read this process's open files, so
+    /// an empty `open` means unknown rather than none.
+    let openFailed: Bool
+    let screen: String?
+}
+
+extension RemoteProcessRecord: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case pid, ppid, user, comm, args, cwd, tty, pane, open, screen
+        case openFailed = "open_failed"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            pid: try container.decode(Int.self, forKey: .pid),
+            ppid: try container.decode(Int.self, forKey: .ppid),
+            user: try container.decode(String.self, forKey: .user),
+            comm: try container.decode(String.self, forKey: .comm),
+            args: try container.decode(String.self, forKey: .args),
+            cwd: try container.decode(String.self, forKey: .cwd),
+            tty: try container.decode(String.self, forKey: .tty),
+            pane: try container.decodeIfPresent(RemotePane.self, forKey: .pane),
+            open: try container.decode([String].self, forKey: .open),
+            // The helper only sends the key when the read failed.
+            openFailed: try container.decodeIfPresent(Bool.self, forKey: .openFailed) ?? false,
+            screen: try container.decodeIfPresent(String.self, forKey: .screen))
+    }
+}
+
+/// Protocol 3. The helper ships bytes and never verdicts: the files land in
+/// a RemoteMirror, and the same readers the local monitors use run against
+/// it, so there is no second parser to drift.
 struct RemoteSnapshot: Decodable, Sendable {
     let ok: Bool
     let protocolVersion: Int
+    /// Fixed for the life of one helper process. A new value means the
+    /// helper restarted and every chunk it sends is relative to nothing the
+    /// mirror holds.
+    let stream: String
     let hostname: String
     let system: String
     let now: TimeInterval
-    let roots: [String]
-    let sessions: [RemoteSessionRecord]
+    let homes: [RemoteHome]
+    let files: [RemoteFileRecord]
+    let dirs: [RemoteDirRecord]
+    let omitted: [RemoteOmission]
+    let warnings: [String]
     let processes: [RemoteProcessRecord]
     /// True when `ps` itself failed on the remote. An empty process list
     /// is otherwise indistinguishable from "no agents running", and BSD
     /// `ps` rejecting a GNU flag produces exactly that empty list.
     let processesFailed: Bool
-    let warnings: [String]
 
     enum CodingKeys: String, CodingKey {
-        case ok, hostname, system, now, roots, sessions, processes, warnings
+        case ok, stream, hostname, system, now, homes, files, dirs, omitted, warnings, processes
         case protocolVersion = "protocol"
         case processesFailed = "processes_failed"
     }
 
     static func decode(_ data: Data) throws -> RemoteSnapshot {
         try JSONDecoder().decode(RemoteSnapshot.self, from: data)
-    }
-
-    /// Maps a snapshot to sessions. Identity is derived from host plus
-    /// absolute path, because two hosts can legitimately hold the same
-    /// session id if a home directory is copied between them.
-    static func sessions(from snapshot: RemoteSnapshot, host: String, now: Date) -> [AgentSession] {
-        let liveCwds: Set<String> = snapshot.processesFailed
-            ? []
-            : Set(snapshot.processes.filter { $0.comm == "claude" }.map(\.cwd).filter { !$0.isEmpty })
-
-        var result: [AgentSession] = []
-        for record in snapshot.sessions where record.tool == "claudeCode" {
-            guard let parsed = ClaudeSessionParser.parse(tail: record.tail, now: now) else { continue }
-            let cwd = parsed.cwd ?? ClaudeSessionParser.decodeProjectDir(record.projectDir)
-            let projectPath = cwd.map { URL(fileURLWithPath: $0) }
-            let modified = Date(timeIntervalSince1970: record.mtime)
-            // startedAt is what AgentSession.elapsedAnchor reads while a
-            // session is active, so anchoring it on mtime like
-            // lastActivityAt made an actively working row show its time
-            // since the last write, which is always seconds. The local
-            // monitor uses the file's creation date for exactly this
-            // reason. A helper too old to send one falls back to mtime,
-            // which is the previous behaviour rather than a wrong date.
-            //
-            // `created` is st_birthtime where the remote has one (Darwin);
-            // elsewhere (Linux before Python 3.12) the helper falls back to
-            // st_ctime, which every write refreshes and so usually equals
-            // mtime for a transcript being actively appended to. It is not
-            // bounded by mtime, though: a metadata-only change (chmod,
-            // chown, rename, a hardlink) bumps ctime without a write, so
-            // `created > mtime` is reachable on that fallback. When it
-            // happens, startedAt lands after lastActivityAt and the row's
-            // elapsed time goes negative; ElapsedTimeText clamps at zero, so
-            // the visible effect is a row reading "0s", not a negative
-            // duration.
-            let started = record.created.map { Date(timeIntervalSince1970: $0) } ?? modified
-            result.append(AgentSession(
-                id: StableID.uuid(for: "\(host):\(record.path)"),
-                tool: .claudeCode,
-                projectName: projectPath?.lastPathComponent ?? record.projectDir,
-                projectPath: projectPath,
-                status: parsed.status,
-                startedAt: started,
-                lastActivityAt: modified,
-                processAlive: cwd.map { liveCwds.contains($0) } ?? false,
-                host: host,
-                attentionEventID: parsed.attentionEventID
-            ))
-        }
-        return result.sorted { $0.startedAt > $1.startedAt }
     }
 }

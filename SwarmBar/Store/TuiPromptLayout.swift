@@ -69,20 +69,27 @@ enum TuiPromptLayout {
             let stripped = raw.trimmingCharacters(in: .whitespaces)
             let marked = stripped.unicodeScalars.first.map(cursorMarkers.contains) ?? false
             let line = stripped
-                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{258F}"))
+                // Box edges: light, Grok 1.0's heavy, and a left eighth block.
+                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{2503}\u{258F}"))
                 .trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }          // blank lines do not break a block
-            guard let dot = line.firstIndex(of: "."),
-                  let number = Int(line[line.startIndex..<dot]),
-                  (1...9).contains(number)
-            else { endBlock(); continue }         // prose ends the block
-            let label = line[line.index(after: dot)...]
-                .trimmingCharacters(in: .whitespaces)
+            let number: Int, label: String, isCursor: Bool
+            if let radio = radioOption(line) {
+                (number, label, isCursor) = (radio.number, radio.label, radio.marked)
+            } else if let dot = line.firstIndex(of: "."),
+                      let digit = Int(line[line.startIndex..<dot]),
+                      (1...9).contains(digit) {
+                number = digit
+                label = line[line.index(after: dot)...].trimmingCharacters(in: .whitespaces)
+                isCursor = marked
+            } else {
+                endBlock(); continue              // prose ends the block
+            }
             guard !label.isEmpty else { endBlock(); continue }
             if number == 1 { endBlock() }
             if number == current.options.count + 1 {
                 current.options.append(Option(number: number, label: label))
-                if marked {
+                if isCursor {
                     current.cursor = number
                     current.cursorLine = stripped
                 }
@@ -94,13 +101,46 @@ enum TuiPromptLayout {
         return blocks.last ?? Selector(options: [], cursor: nil)
     }
 
+    /// Grok 1.0 draws "2 (●) Yes, proceed": the number, a radio button,
+    /// the label, and on question prompts a description after a wide gap.
+    /// The filled button, not a marker in front, is the cursor. The label
+    /// stops at the gap, so it names the option and nothing more.
+    nonisolated static func radioOption(_ line: String) -> (number: Int, label: String, marked: Bool)? {
+        guard let first = line.first, let number = first.wholeNumberValue, (1...9).contains(number)
+        else { return nil }
+        let afterNumber = line.dropFirst()
+        guard afterNumber.first == " " else { return nil }
+        let button = afterNumber.drop { $0 == " " }
+        let marked: Bool
+        if button.hasPrefix("(●)") { marked = true }
+        else if button.hasPrefix("(○)") { marked = false }
+        else { return nil }
+        let rest = button.dropFirst(3)
+        guard rest.first == " " else { return nil }
+        let label = rest.trimmingCharacters(in: .whitespaces)
+            .components(separatedBy: "  ").first ?? ""
+        return label.isEmpty ? nil : (number, label, marked)
+    }
+
+    /// The label's first word, lowercased: "no" for "No, reject", "never"
+    /// for "Never allow: <command>".
+    private nonisolated static func firstWord(_ label: String) -> String? {
+        label.lowercased()
+            .split(whereSeparator: { $0 == " " || $0 == "," || $0 == ":" })
+            .first.map(String.init)
+    }
+
     /// The option number that approves this one call, preferring the
-    /// once-only choice over any always/session-wide variant.
+    /// once-only choice over any always/session-wide variant. A label
+    /// that opens with "no" or "never" is never an approve, whatever the
+    /// command quoted after it says.
     nonisolated static func approveOnce(in screen: String) -> Int? {
         let options = options(in: screen)
         let approvals = options.filter { option in
             let label = option.label.lowercased()
+            let first = firstWord(option.label)
             return (label.contains("approve") || label.contains("yes") || label.contains("allow"))
+                && first != "no" && first != "never"
                 && !label.contains("don't ask")
                 && !label.contains("always")
                 && !label.contains("session")
@@ -109,16 +149,18 @@ enum TuiPromptLayout {
     }
 
     /// The option number that rejects the call, preferring a plain reject
-    /// over one that opens a feedback field.
+    /// over one that opens a feedback field. Grok's "Never allow: <command>"
+    /// is not a reject: it also saves a rule against the command for good.
     nonisolated static func reject(in screen: String) -> Int? {
         let options = options(in: screen)
         let rejections = options.filter { option in
             let label = option.label.lowercased()
+            let first = firstWord(option.label)
+            if first == "never" { return false }
             if label.contains("reject") || label.contains("deny") { return true }
             // "No", "No, ...", "No thanks" are rejections; "Note:", "Not now",
             // and "No changes needed" are not selector rejections.
-            let firstWord = label.split(whereSeparator: { $0 == " " || $0 == "," }).first
-            return firstWord == "no"
+            return first == "no"
         }
         let plain = rejections.first { !$0.label.lowercased().contains("feedback") }
         return (plain ?? rejections.first)?.number

@@ -531,12 +531,58 @@ struct TailCacheTests {
         let cache = TailCache<String>()
         let modified = Date()
         _ = cache.value(for: file, size: 2, modified: modified) { "one" }
-        cache.retain(paths: [])
+        cache.retain(paths: [], under: [file.deletingLastPathComponent().path])
         var recomputed = false
         _ = cache.value(for: file, size: 2, modified: modified) {
             recomputed = true; return "again"
         }
         #expect(recomputed)
+    }
+
+    /// Local discovery and each remote home share one cache. A pass that
+    /// scanned one root must leave every other root's entries alone, or
+    /// the passes evict each other and every poll re-reads every tail.
+    @Test func retainLeavesOtherRootsAlone() throws {
+        let mine = try tempFile("a\n")
+        let theirs = try tempFile("b\n")
+        defer {
+            try? FileManager.default.removeItem(at: mine.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: theirs.deletingLastPathComponent())
+        }
+        let cache = TailCache<String>()
+        let modified = Date()
+        _ = cache.value(for: mine, size: 2, modified: modified) { "mine" }
+        _ = cache.value(for: theirs, size: 2, modified: modified) { "theirs" }
+
+        cache.retain(paths: [], under: [mine.deletingLastPathComponent().path])
+
+        var recomputedMine = false
+        var recomputedTheirs = false
+        _ = cache.value(for: mine, size: 2, modified: modified) {
+            recomputedMine = true; return "mine"
+        }
+        _ = cache.value(for: theirs, size: 2, modified: modified) {
+            recomputedTheirs = true; return "theirs"
+        }
+        #expect(recomputedMine)
+        #expect(!recomputedTheirs)
+    }
+
+    /// A root is a directory, so a sibling whose name merely starts the
+    /// same way is not under it.
+    @Test func retainMatchesWholePathComponents() throws {
+        let file = try tempFile("a\n")
+        let dir = file.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = TailCache<String>()
+        let modified = Date()
+        _ = cache.value(for: file, size: 2, modified: modified) { "one" }
+        cache.retain(paths: [], under: [String(dir.path.dropLast())])
+        var recomputed = false
+        _ = cache.value(for: file, size: 2, modified: modified) {
+            recomputed = true; return "again"
+        }
+        #expect(!recomputed)
     }
 }
 

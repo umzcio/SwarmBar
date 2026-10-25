@@ -5,10 +5,6 @@ import Foundation
 /// Kimi's session dirs) can only be waiting or working if their process is
 /// actually running in the session's directory.
 enum ProcessLiveness {
-    nonisolated static func directories(processName: String) -> Set<String> {
-        Set(directoryCounts(processName: processName).keys)
-    }
-
     /// How many live processes with the given name run in each directory.
     /// Restart trails leave several sessions sharing one workDir; only as
     /// many of them can be live as there are processes there.

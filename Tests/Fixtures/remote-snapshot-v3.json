@@ -1,0 +1,194 @@
+{
+ "ok": true,
+ "protocol": 3,
+ "stream": "0123456789abcdef",
+ "hostname": "devbox",
+ "system": "Linux",
+ "now": 1792656000.25,
+ "homes": [
+  {
+   "path": "/home/u",
+   "user": "u"
+  },
+  {
+   "path": "/root",
+   "user": "root"
+  }
+ ],
+ "files": [
+  {
+   "path": "/home/u/.claude/projects/-home-u-demo/11111111-1111-1111-1111-111111111111.jsonl",
+   "mtime": 1792655405.5,
+   "created": null,
+   "size": 200294,
+   "reset": true,
+   "chunks": [
+    [
+     0,
+     "eyJ0eXBlIjoidXNlciIsImN3ZCI6Ii9ob21lL3UvZGVtbyIsInRpbWVzdGFtcCI6IjIwMjYtMTAtMjJUMDk6MDA6MDAuMDAwWiIsIm1lc3NhZ2UiOnsicm9sZSI6InVzZXIiLCJjb250ZW50IjoiU3ludGhldGljIGZpcnN0IHByb21wdC4ifX0K"
+    ],
+    [
+     200000,
+     "CnsidHlwZSI6ImFzc2lzdGFudCIsImN3ZCI6Ii9ob21lL3UvZGVtbyIsInRpbWVzdGFtcCI6IjIwMjYtMTAtMjJUMDk6MzA6MDAuMDAwWiIsIm1lc3NhZ2UiOnsicm9sZSI6ImFzc2lzdGFudCIsImNvbnRlbnQiOlt7InR5cGUiOiJ0ZXh0IiwidGV4dCI6IlN5bnRoZXRpYyByZXBseS4ifV19fQp7InR5cGUiOiJ1c2VyIiwiY3dkIjoiL2hvbWUvdS9kZW1vIiwidGltZXN0YW1wIjoiMjAyNi0xMC0yMlQwOTozMDowNS4wMDBaIiwibWVzc2FnZSI6eyJyb2xlIjoidXNlciIsImNvbnRlbnQiOiJTeW50aGV0aWMgZm9sbG93"
+    ]
+   ]
+  },
+  {
+   "path": "/root/.codex/sessions/2026/10/22/rollout-2026-10-22T10-00-00-22222222-2222-2222-2222-222222222222.jsonl",
+   "mtime": 1792655700.0,
+   "created": 1792654800.75,
+   "size": 4223,
+   "reset": false,
+   "chunks": [
+    [
+     4096,
+     "eyJ0aW1lc3RhbXAiOiIyMDI2LTEwLTIyVDEwOjA1OjAwLjAwMFoiLCJ0eXBlIjoiZXZlbnRfbXNnIiwicGF5bG9hZCI6eyJ0eXBlIjoiYWdlbnRfbWVzc2FnZSIsIm1lc3NhZ2UiOiJTeW50aGV0aWMgcHJvZ3Jlc3MuIn19Cg=="
+    ]
+   ]
+  },
+  {
+   "path": "/home/u/.grok/active_sessions.json",
+   "mtime": 1792655000.0,
+   "created": null,
+   "size": 59,
+   "reset": true,
+   "chunks": [
+    [
+     0,
+     "eyJzZXNzaW9ucyI6W3siaWQiOiJzeW50aGV0aWMtZ3JvayIsImN3ZCI6Ii9ob21lL3UvZGVtbyJ9XX0="
+    ]
+   ]
+  },
+  {
+   "path": "/home/u/.kimi-code/session_index.jsonl",
+   "mtime": 1792650000.0,
+   "created": null,
+   "size": 512,
+   "reset": false,
+   "chunks": []
+  }
+ ],
+ "dirs": [
+  {
+   "path": "/home/u/.claude",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/home/u/.claude/projects",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/home/u/.claude/projects/-home-u-demo",
+   "mtime": 1792655405.5,
+   "created": null
+  },
+  {
+   "path": "/home/u/.grok",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/home/u/.kimi-code",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/root/.codex",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/root/.codex/sessions",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/root/.codex/sessions/2026",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/root/.codex/sessions/2026/10",
+   "mtime": 1792600000.0,
+   "created": null
+  },
+  {
+   "path": "/root/.codex/sessions/2026/10/22",
+   "mtime": 1792654800.75,
+   "created": null
+  }
+ ],
+ "omitted": [
+  {
+   "path": "/home/u/.claude/projects/-home-u-demo/33333333-3333-3333-3333-333333333333.jsonl",
+   "reason": "no complete record yet"
+  }
+ ],
+ "warnings": [
+  "cannot read open files of pid 4300"
+ ],
+ "processes": [
+  {
+   "pid": 4100,
+   "ppid": 4000,
+   "user": "u",
+   "tty": "pts/1",
+   "comm": "claude",
+   "args": "claude --resume",
+   "cwd": "/home/u/demo",
+   "pane": {
+    "socket": "/tmp/tmux-1000/default",
+    "id": "%3"
+   },
+   "open": [
+    "/home/u/.claude/projects/-home-u-demo/11111111-1111-1111-1111-111111111111.jsonl"
+   ],
+   "screen": null
+  },
+  {
+   "pid": 4200,
+   "ppid": 1,
+   "user": "root",
+   "tty": "",
+   "comm": "codex",
+   "args": "codex",
+   "cwd": "/root/work",
+   "pane": null,
+   "open": [
+    "/root/.codex/sessions/2026/10/22/rollout-2026-10-22T10-00-00-22222222-2222-2222-2222-222222222222.jsonl"
+   ],
+   "screen": null
+  },
+  {
+   "pid": 4300,
+   "ppid": 4001,
+   "user": "u",
+   "tty": "pts/2",
+   "comm": "bearcode",
+   "args": "node /home/u/bearcode-cli/apps/kimi-code/dist/main.mjs",
+   "cwd": "/home/u/demo",
+   "pane": null,
+   "open": [],
+   "open_failed": true,
+   "screen": null
+  },
+  {
+   "pid": 4400,
+   "ppid": 4002,
+   "user": "u",
+   "tty": "pts/3",
+   "comm": "agy",
+   "args": "agy",
+   "cwd": "/home/u/demo",
+   "pane": {
+    "socket": "/tmp/tmux-1000/default",
+    "id": "%5"
+   },
+   "open": [],
+   "screen": "Allow creation of this file?\n> 1. Approve\n  2. Deny"
+  }
+ ],
+ "processes_failed": false
+}

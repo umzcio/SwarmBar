@@ -1,0 +1,142 @@
+import Foundation
+
+/// What `python3 - probe` reported about a host: the helper run once, from
+/// stdin, before anything is installed there. Read-only on the host, and the
+/// only input the setup wizard's assessment and plan have.
+struct ProbeResult: Decodable, Sendable, Equatable {
+    /// An agent config file the setup plan may edit, read as it stood when
+    /// the probe ran. `text` is nil when the file was too big or not UTF-8,
+    /// and the plan cannot edit what it did not read. Both are nil when the
+    /// file is there but could not be read at all, which is never the same
+    /// as the file being absent.
+    struct ConfigFile: Decodable, Sendable, Equatable {
+        var tool: String
+        /// Resolved through symlinks, so profiles sharing one file name it once.
+        var path: String
+        var sha256: String?
+        var text: String?
+        /// The file's identity. Profiles sharing one file by hardlink name
+        /// it under two realpaths, and the plan must write it once: a second
+        /// write would find the hash it expected already gone. Unsigned,
+        /// since an inode number can use all 64 bits.
+        var dev: UInt64? = nil
+        var ino: UInt64? = nil
+        /// The .backup-swarmbar beside it, which Undo writes back when it
+        /// means what removing SwarmBar's entries made.
+        var backupText: String? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case tool, path, sha256, text, dev, ino
+            case backupText = "backup_text"
+        }
+    }
+
+    /// One of SwarmBar's remote bridge files in a home. `sha256` is nil
+    /// when the file is absent, and also when `unreadable` says it is there
+    /// but could not be read, which must never plan as a new file.
+    struct BridgeFile: Decodable, Sendable, Equatable {
+        var path: String
+        var sha256: String?
+        /// Optional only so a probe that leaves it out still decodes.
+        var unreadable: Bool? = nil
+    }
+
+    /// A Claude config dir in use (it has projects/), by realpath.
+    /// `settings` is "present", "missing" or "unreadable". A profile with
+    /// no settings.json still needs hooks, and only this says where.
+    struct ClaudeDir: Decodable, Sendable, Equatable {
+        var path: String
+        var settings: String
+    }
+
+    /// An installed copy of SwarmBar's helper. `sha256` is nil when the file
+    /// is there but this view cannot read it, which is the normal state of
+    /// root's mode 700 copy seen without sudo.
+    struct HelperFile: Decodable, Sendable, Equatable {
+        var path: String
+        var sha256: String?
+    }
+
+    /// The ssh alias that was probed. Set by the runner, never by the host.
+    var alias: String = ""
+    var protocolVersion: Int
+    var system: String
+    var python: String
+    var hostname: String
+    /// The account the probe ran as: the login user, or root under sudo.
+    var user: String
+    var euid: Int
+    var sudoOK: Bool
+    var homes: [RemoteHome]
+    var processes: [RemoteProcessRecord]
+    /// True when ps failed, so an empty `processes` is unknown, not none.
+    var processesFailed: Bool = false
+    /// Keyed by home path: which tools have their state directory there.
+    var tools: [String: [String]]
+    /// Keyed by home path: which tools' remote bridges are in place there.
+    var installed: [String: [String]]
+    /// Keyed by home path: tools whose setup state could not be told,
+    /// because a config that would say could not be read.
+    var installedUnknown: [String: [String]] = [:]
+    var configs: [String: [ConfigFile]] = [:]
+    /// Keyed by home path. Optional, like `claudeDirs`, so a probe from an
+    /// older installed helper still decodes and reads as needing setup.
+    var bridges: [String: [BridgeFile]]? = nil
+    /// Keyed by home path.
+    var claudeDirs: [String: [ClaudeDir]]? = nil
+    var helper: [HelperFile] = []
+    /// The probing helper's own sha256 when it ran from an installed file,
+    /// as it does under the narrow sudo rule; nil when it came from stdin.
+    var selfSHA256: String?
+    var warnings: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case system, python, hostname, user, euid, homes, processes, tools, installed, configs, helper,
+             warnings, bridges
+        case protocolVersion = "protocol"
+        case sudoOK = "sudo_ok"
+        case processesFailed = "processes_failed"
+        case installedUnknown = "installed_unknown"
+        case selfSHA256 = "self_sha256"
+        case claudeDirs = "claude_dirs"
+    }
+
+    /// The helper's tool names, as in its SPECS table and the probe's
+    /// `tools`, `installed` and `configs`.
+    static func tool(named name: String) -> AgentTool? {
+        switch name {
+        case "claude": .claudeCode
+        case "codex": .codex
+        case "kimi": .kimiCode
+        case "bearcode": .bearCode
+        case "opencode": .openCode
+        case "grok": .grokBuild
+        case "antigravity": .antigravity
+        default: nil
+        }
+    }
+
+    /// A process's resolved name, the way discovery maps it: both Kimi
+    /// binaries are Kimi Code, and Antigravity's CLI is `agy`.
+    static func tool(forProcess comm: String) -> AgentTool? {
+        switch comm {
+        case "claude": .claudeCode
+        case "codex": .codex
+        case "kimi", "kimi-code": .kimiCode
+        case "bearcode": .bearCode
+        case "opencode": .openCode
+        case "grok": .grokBuild
+        case "agy": .antigravity
+        default: nil
+        }
+    }
+
+    /// The probe's own failure report: `{"ok": false, "error": ...}`. Read
+    /// before the full decode, which would only say a field was missing.
+    struct Envelope: Decodable {
+        var ok: Bool
+        var error: String?
+        /// Sent even on failure, so an old python reads as too old.
+        var python: String?
+    }
+}

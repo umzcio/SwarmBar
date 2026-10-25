@@ -4,6 +4,12 @@ import SwiftUI
 struct SwarmBarApp: App {
     @State private var store: SessionStore
     private let hookServer: HookServer
+    /// Held for the life of the app. Nil under --mock, which has no remote hosts.
+    private let remoteRegistry: RemoteHostRegistry?
+    private let remoteSupervisor: RemoteMonitorSupervisor?
+    /// The remote hosts wizard's one model, built with the registry above
+    /// the first time the wizard opens.
+    @State private var remoteWizard: RemoteWizardLauncher
 
     init() {
         // A write to a pipe whose reader has already gone raises SIGPIPE,
@@ -71,8 +77,17 @@ struct SwarmBarApp: App {
         // Real monitors by default; --mock replays the prototype simulation
         // so the demo mode survives.
         if CommandLine.arguments.contains("--mock") {
+            remoteRegistry = nil
+            remoteSupervisor = nil
+            _remoteWizard = State(initialValue: RemoteWizardLauncher(makeModel: nil))
             Task { await MockSessionMonitor().start(into: store) }
         } else {
+            // Every mirror from the previous run is meaningless now: each
+            // was filled from a helper stream that ended with that run, so
+            // its files would only be reset by the first snapshot anyway.
+            // Moved aside at once and deleted in the background; with no
+            // mirror there, nothing is created.
+            RemoteMirror.discard()
             Task { await ClaudeCodeMonitor().start(into: store) }
             Task { await CodexMonitor().start(into: store) }
             Task { await KimiMonitor().start(into: store) }
@@ -80,9 +95,21 @@ struct SwarmBarApp: App {
             Task { await OpenCodeMonitor().start(into: store) }
             Task { await GrokBuildMonitor().start(into: store) }
             Task { await AntigravityMonitor().start(into: store) }
-            for host in RemoteHostStore.load(from: .standard) where host.isEnabled {
-                Task { await RemoteHostMonitor(host: host).start(into: store) }
-            }
+            let registry = RemoteHostRegistry(defaults: .standard)
+            let supervisor = RemoteMonitorSupervisor(
+                store: store, registry: registry, hookServer: hookServer)
+            registry.onChange = { [supervisor] in supervisor.reconcile() }
+            store.remoteActions = supervisor
+            supervisor.reconcile()
+            remoteRegistry = registry
+            remoteSupervisor = supervisor
+            _remoteWizard = State(initialValue: RemoteWizardLauncher {
+                let model = RemoteWizardModel(services: LiveRemoteWizardServices(), registry: registry)
+                model.publishCheck = { [weak supervisor] alias, outcome in
+                    supervisor?.adopt(outcome, alias: alias)
+                }
+                return model
+            })
         }
     }
 
@@ -90,6 +117,8 @@ struct SwarmBarApp: App {
         MenuBarExtra {
             PopoverRootView()
                 .environment(store)
+                .environment(remoteRegistry)
+                .remoteWizardLauncher(remoteWizard)
         } label: {
             MenuBarLabel()
                 .environment(store)
@@ -99,7 +128,22 @@ struct SwarmBarApp: App {
         Settings {
             SettingsView()
                 .environment(store)
+                // Nil under --mock, where the Hosts tab says so.
+                .environment(remoteRegistry)
+                .environment(remoteSupervisor)
+                .remoteWizardLauncher(remoteWizard)
         }
+
+        // Opened only through `openRemoteWizard`, from Settings or the
+        // popover: never at launch and never restored, since the wizard
+        // must not open by itself.
+        Window("Add remote hosts", id: RemoteWizardLauncher.windowID) {
+            RemoteWizardWindow(launcher: remoteWizard)
+                .environment(store)
+        }
+        .defaultSize(width: 520, height: 560)
+        .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.suppressed)
     }
 }
 

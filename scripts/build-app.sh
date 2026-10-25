@@ -22,7 +22,10 @@ echo "==> Generating the project"
 
 echo "==> Archiving $APP_NAME (Release)"
 rm -rf "$ARCHIVE"
+# Its own build folder, so where Xcode's settings put DerivedData cannot
+# leave the archive looking for Sparkle somewhere it was never resolved.
 xcodebuild -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Release \
+    -derivedDataPath "$ROOT/build/archive-derived" \
     -archivePath "$ARCHIVE" \
     archive
 

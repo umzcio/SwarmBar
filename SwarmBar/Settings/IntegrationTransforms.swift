@@ -22,6 +22,25 @@ func shellQuoted(_ path: String) -> String {
     "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
+/// Which set of SwarmBar bridge entries a transform manages. One Mac can be
+/// both a local machine and a remote host (a Mac in the fleet is), so the two
+/// families can land in the very same config file. Each must install, replace
+/// and remove only its own entries, or toggling a remote host off would
+/// silently strip the local bridge, and the reverse. Every remote command,
+/// script and plugin name contains `swarmbar-remote`; local ones contain
+/// `swarmbar` and never that. This predicate is the only place that rule
+/// lives.
+enum BridgeFamily: Sendable {
+    case local, remote
+
+    func owns(_ command: String) -> Bool {
+        switch self {
+        case .remote: command.contains("swarmbar-remote")
+        case .local: command.contains("swarmbar") && !command.contains("swarmbar-remote")
+        }
+    }
+}
+
 /// ~/.claude/settings.json: hook entries under hooks.<Event> arrays.
 enum ClaudeHookTransform {
     static let events: [(name: String, timeout: Int)] = [
@@ -31,15 +50,31 @@ enum ClaudeHookTransform {
         ("SessionEnd", 2),
     ]
 
-    static func isInstalled(_ text: String) -> Bool {
-        text.contains("swarmbar-hook.sh")
+    /// Reads the parsed commands rather than the raw text, because a file
+    /// holding both families would satisfy a substring test for either.
+    static func isInstalled(_ text: String, family: BridgeFamily = .local) -> Bool {
+        guard let data = text.data(using: .utf8),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            // Unparseable text: fall back to the script names themselves.
+            switch family {
+            case .local: return text.contains("swarmbar-hook.sh") && !text.contains("swarmbar-remote")
+            case .remote: return text.contains("swarmbar-remote-hook.sh")
+            }
+        }
+        // Valid JSON with no hooks object cannot hold a bridge, whatever else
+        // mentions swarmbar (a permission rule, an env var).
+        guard let hooks = root["hooks"] as? [String: Any] else { return false }
+        return hooks.values.contains { value in
+            (value as? [[String: Any]] ?? []).contains { mentionsSwarmBar($0, family: family) }
+        }
     }
 
-    static func install(_ text: String, scriptPath: String) throws -> String {
+    static func install(_ text: String, scriptPath: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
         var hooks = root["hooks"] as? [String: Any] ?? [:]
         for (event, timeout) in events {
-            var entries = (hooks[event] as? [[String: Any]] ?? []).filter { !mentionsSwarmBar($0) }
+            var entries = (hooks[event] as? [[String: Any]] ?? []).filter { !mentionsSwarmBar($0, family: family) }
             entries.append([
                 "hooks": [[
                     "type": "command",
@@ -53,21 +88,25 @@ enum ClaudeHookTransform {
         return try serialize(root)
     }
 
-    static func uninstall(_ text: String) throws -> String {
+    static func uninstall(_ text: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
         guard var hooks = root["hooks"] as? [String: Any] else { return text }
+        var removed = false
         for (event, value) in hooks {
             guard let entries = value as? [[String: Any]] else { continue }
-            let kept = entries.filter { !mentionsSwarmBar($0) }
+            let kept = entries.filter { !mentionsSwarmBar($0, family: family) }
+            removed = removed || kept.count != entries.count
             hooks[event] = kept.isEmpty ? nil : kept
         }
-        root["hooks"] = hooks
+        // Emptied by this removal, it goes too: a config that had no hooks
+        // before SwarmBar must not keep an empty one after.
+        root["hooks"] = removed && hooks.isEmpty ? nil : hooks
         return try serialize(root)
     }
 
-    private static func mentionsSwarmBar(_ entry: [String: Any]) -> Bool {
+    private static func mentionsSwarmBar(_ entry: [String: Any], family: BridgeFamily) -> Bool {
         guard let inner = entry["hooks"] as? [[String: Any]] else { return false }
-        return inner.contains { ($0["command"] as? String)?.contains("swarmbar") == true }
+        return inner.contains { ($0["command"] as? String).map(family.owns) == true }
     }
 
     private static func parse(_ text: String) throws -> [String: Any] {
@@ -92,6 +131,15 @@ enum ClaudeHookTransform {
 enum TomlHooksTransform {
     static let beginMarker = "# >>> SwarmBar hooks >>>"
     static let endMarker = "# <<< SwarmBar hooks <<<"
+    static let remoteBeginMarker = "# >>> SwarmBar remote hooks >>>"
+    static let remoteEndMarker = "# <<< SwarmBar remote hooks <<<"
+
+    private static func markers(_ family: BridgeFamily) -> (begin: String, end: String) {
+        switch family {
+        case .local: (beginMarker, endMarker)
+        case .remote: (remoteBeginMarker, remoteEndMarker)
+        }
+    }
 
     /// Deliberately NOT TurnStarted, which 0.32.0 added and which would be
     /// the more direct signal. It exists only in the newer engine's enum,
@@ -113,12 +161,39 @@ enum TomlHooksTransform {
         ("SessionEnd", nil),
     ]
 
-    static func isInstalled(_ text: String) -> Bool {
-        text.contains("swarmbar-kimi-hook.sh") || text.contains(beginMarker)
+    static func isInstalled(_ text: String, family: BridgeFamily = .local) -> Bool {
+        let (begin, _) = markers(family)
+        var inBlock = false
+        var block: [String] = []
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == begin { return true }
+            if trimmed == "[[hooks]]" || trimmed.hasPrefix("[") || isMarker(trimmed) {
+                if inBlock, block.contains(where: family.owns) { return true }
+                inBlock = trimmed == "[[hooks]]"
+                block = inBlock ? [line] : []
+            } else if inBlock {
+                block.append(line)
+            }
+        }
+        return inBlock && block.contains(where: family.owns)
     }
 
-    static func install(_ text: String, scriptPath: String) -> String {
-        var block = [beginMarker]
+    private static func isMarker(_ trimmed: String) -> Bool {
+        [beginMarker, endMarker, remoteBeginMarker, remoteEndMarker].contains(trimmed)
+    }
+
+    /// `events` defaults to the full list; a remote host passes only the
+    /// events its build accepts, since one unrecognised name makes a Kimi
+    /// build drop the whole hooks section. Exactly the given events are
+    /// written, in the given order.
+    static func install(
+        _ text: String, scriptPath: String, family: BridgeFamily = .local,
+        events: [(name: String, timeout: Int?)] = TomlHooksTransform.events
+    ) -> String {
+        let (begin, end) = markers(family)
+        if events.isEmpty { return uninstall(text, family: family) }
+        var block = [begin]
         for (event, timeout) in events {
             block.append("")
             block.append("[[hooks]]")
@@ -126,18 +201,22 @@ enum TomlHooksTransform {
             block.append("command = \"\(shellQuoted(scriptPath)) \(event)\"")
             if let timeout { block.append("timeout = \(timeout)") }
         }
-        block.append(endMarker)
-        let cleaned = uninstall(text).trimmingCharacters(in: .whitespacesAndNewlines)
+        block.append(end)
+        let cleaned = uninstall(text, family: family).trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned + "\n\n" + block.joined(separator: "\n") + "\n"
     }
 
-    static func uninstall(_ text: String) -> String {
+    static func uninstall(_ text: String, family: BridgeFamily = .local) -> String {
+        let (begin, end) = markers(family)
         var lines: [String] = []
         var inMarkedBlock = false
+        var hadBlock = false
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed == beginMarker { inMarkedBlock = true; continue }
-            if trimmed == endMarker { inMarkedBlock = false; continue }
+            if trimmed == begin { inMarkedBlock = true; hadBlock = true; continue }
+            if trimmed == end { inMarkedBlock = false; continue }
+            // An unclosed block ends where the other family's block begins.
+            if inMarkedBlock, isMarker(trimmed) { inMarkedBlock = false }
             if !inMarkedBlock { lines.append(line) }
         }
         // Sweep unmarked [[hooks]] tables that mention swarmbar.
@@ -145,7 +224,7 @@ enum TomlHooksTransform {
         var block: [String] = []
         var inHooksBlock = false
         func flush() {
-            if inHooksBlock, block.contains(where: { $0.contains("swarmbar") }) {
+            if inHooksBlock, block.contains(where: family.owns) {
                 // dropped
             } else {
                 kept.append(contentsOf: block)
@@ -158,7 +237,7 @@ enum TomlHooksTransform {
                 flush()
                 inHooksBlock = true
                 block = [line]
-            } else if inHooksBlock, trimmed.hasPrefix("[") {
+            } else if inHooksBlock, trimmed.hasPrefix("[") || isMarker(trimmed) {
                 flush()
                 inHooksBlock = false
                 kept.append(line)
@@ -169,32 +248,55 @@ enum TomlHooksTransform {
             }
         }
         flush()
-        return kept.joined(separator: "\n")
+        let out = kept.joined(separator: "\n")
+        // install set the block off with a blank line after the text's own
+        // end; without this the removal left that line behind.
+        guard hadBlock else { return out }
+        let body = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? "" : body + "\n"
     }
 }
 
 /// OpenCode's opencode.json(c): a "plugin" array of module specs. The
 /// plugin file itself lives in ~/.config/opencode/plugins/. Files with
 /// comments are refused rather than rewritten, since a JSON round-trip
-/// would eat them.
+/// would eat them, and so is a "plugin" value that is not a list of plain
+/// names: SwarmBar cannot keep what it does not understand, and reading
+/// such a list as empty replaced or wiped the user's own plugins.
 enum OpenCodeConfigTransform {
-    static func isInstalled(_ text: String) -> Bool {
-        text.contains("swarmbar")
+    static func isInstalled(_ text: String, family: BridgeFamily = .local) -> Bool {
+        guard let data = text.data(using: .utf8),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            return text.components(separatedBy: "\n").contains { family.owns($0) }
+        }
+        return ((root["plugin"] as? [Any]) ?? []).contains { ($0 as? String).map(family.owns) ?? false }
     }
 
-    static func install(_ text: String, pluginSpec: String) throws -> String {
+    static func install(_ text: String, pluginSpec: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
-        var plugins = (root["plugin"] as? [String] ?? []).filter { !$0.contains("swarmbar") }
+        var plugins = try pluginList(root).filter { !family.owns($0) }
         plugins.append(pluginSpec)
         root["plugin"] = plugins
         return try serialize(root)
     }
 
-    static func uninstall(_ text: String) throws -> String {
+    static func uninstall(_ text: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
-        let plugins = (root["plugin"] as? [String] ?? []).filter { !$0.contains("swarmbar") }
+        let plugins = try pluginList(root).filter { !family.owns($0) }
         root["plugin"] = plugins.isEmpty ? nil : plugins
         return try serialize(root)
+    }
+
+    /// The "plugin" list, which must be plain names. Absent or null is an
+    /// empty list; anything else is a hand edit.
+    private static func pluginList(_ root: [String: Any]) throws -> [String] {
+        guard let value = root["plugin"], !(value is NSNull) else { return [] }
+        guard let list = value as? [Any], let names = list as? [String], names.count == list.count else {
+            throw IntegrationTransformError.unparseable(
+                "opencode config's \"plugin\" list holds something other than plain names; edit it by hand")
+        }
+        return names
     }
 
     private static func parse(_ text: String) throws -> [String: Any] {

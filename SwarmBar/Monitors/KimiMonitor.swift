@@ -22,13 +22,8 @@ struct KimiMonitor: SessionMonitor {
         while !Task.isCancelled {
             if !store.isPaused {
                 let now = Date.now
-                let root = Self.defaultRoot()
                 let sessions = await Task.detached {
-                    Self.discover(
-                        root: root,
-                        liveCounts: ProcessLiveness.directoryCounts(processNames: Self.processNames),
-                        now: now
-                    )
+                    Self.discover(now: now, context: .local())
                 }.value
                 store.sync(tool: .kimiCode, sessions: sessions)
             }
@@ -36,8 +31,10 @@ struct KimiMonitor: SessionMonitor {
         }
     }
 
-    nonisolated static func defaultRoot() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kimi-code")
+    nonisolated static func defaultRoot(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        home.appendingPathComponent(".kimi-code")
     }
 
     /// BearCode is a fork of the kimi-code engine: identical state layout
@@ -57,22 +54,50 @@ struct KimiMonitor: SessionMonitor {
             while !Task.isCancelled {
                 if !store.isPaused {
                     let now = Date.now
-                    let root = FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent(".bearcode")
                     let sessions = await Task.detached {
-                        KimiMonitor.discover(
-                            root: root,
-                            liveCounts: ProcessLiveness.directoryCounts(
-                                processName: Self.processName,
-                                orCommandPattern: Self.commandPattern),
-                            now: now,
-                            tool: .bearCode
-                        )
+                        KimiMonitor.discover(now: now, context: .local(), tool: .bearCode)
                     }.value
                     store.sync(tool: .bearCode, sessions: sessions)
                 }
                 try? await Task.sleep(for: .seconds(5))
             }
+        }
+
+        nonisolated static func defaultRoot(
+            home: URL = FileManager.default.homeDirectoryForCurrentUser
+        ) -> URL {
+            home.appendingPathComponent(".bearcode")
+        }
+    }
+
+    /// Discovery for either member of the family against a context: its
+    /// root under the context's home, liveness from the context's process
+    /// table matched the way that member's process names itself, and
+    /// sessionDir paths translated through `locate`.
+    ///
+    /// A pid is looked up only when the context asks for one, and only for
+    /// a session still live after the per-directory cap. See
+    /// `DiscoveryContext.resolvesPids` for why the Mac does not.
+    nonisolated static func discover(
+        now: Date, context: DiscoveryContext, tool: AgentTool = .kimiCode
+    ) -> [AgentSession] {
+        let isBearCode = tool == .bearCode
+        let root = isBearCode
+            ? BearCode.defaultRoot(home: context.home)
+            : defaultRoot(home: context.home)
+        let liveCounts = isBearCode
+            ? context.processes.directoryCounts(
+                processName: BearCode.processName, orCommandPattern: BearCode.commandPattern)
+            : context.processes.directoryCounts(processNames: processNames)
+        let sessions = discover(
+            root: root, liveCounts: liveCounts, now: now, tool: tool, locate: context.locate)
+        guard context.resolvesPids else { return sessions }
+        let names = isBearCode ? [BearCode.processName] : processNames
+        return sessions.map { session in
+            guard session.processAlive, let cwd = session.projectPath?.path else { return session }
+            var session = session
+            session.pid = context.processes.pid(processNames: names, cwd: cwd).map { pid_t($0) }
+            return session
         }
     }
 
@@ -110,7 +135,8 @@ struct KimiMonitor: SessionMonitor {
         root: URL,
         liveCounts: [String: Int]? = nil,
         now: Date,
-        tool: AgentTool = .kimiCode
+        tool: AgentTool = .kimiCode,
+        locate: (String) -> URL = { URL(fileURLWithPath: $0) }
     ) -> [AgentSession] {
         let fm = FileManager.default
         let indexFile = root.appendingPathComponent("session_index.jsonl")
@@ -133,7 +159,9 @@ struct KimiMonitor: SessionMonitor {
         var sessions: [AgentSession] = []
         for sessionId in order {
             guard let entry = entries[sessionId] else { continue }
-            let sessionDir = URL(fileURLWithPath: entry.sessionDir)
+            // The index stores an absolute path as the tool wrote it, which
+            // for a remote host names a directory on that host, not here.
+            let sessionDir = locate(entry.sessionDir)
             var isDirectory: ObjCBool = false
             guard fm.fileExists(atPath: sessionDir.path, isDirectory: &isDirectory), isDirectory.boolValue
             else { continue }

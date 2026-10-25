@@ -27,6 +27,20 @@ struct ClaudeHookTransformTests {
         #expect(occurrences == 1)
     }
 
+    /// A "hooks" SwarmBar emptied goes, so a config that had none before
+    /// does not keep an empty one; one that still holds the user's stays.
+    @Test func claudeUninstallDropsTheHooksItEmptied() throws {
+        let installed = try ClaudeHookTransform.install(
+            #"{"theme": "light"}"#, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh", family: .remote)
+        let out = try ClaudeHookTransform.uninstall(installed, family: .remote)
+        #expect(!out.contains("hooks"))
+        let mine = #"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/mine.sh"}]}]}}"#
+        let kept = try ClaudeHookTransform.uninstall(
+            try ClaudeHookTransform.install(mine, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh",
+                                            family: .remote), family: .remote)
+        #expect(kept.contains("/x/mine.sh"))
+    }
+
     @Test func uninstallRemovesOnlySwarmBarEntries() throws {
         let mixed = """
         {"hooks": {"Stop": [
@@ -79,6 +93,18 @@ struct TomlHooksTransformTests {
         #expect(!TomlHooksTransform.isInstalled(out))
         #expect(out.contains("[thinking]"))
         #expect(!out.contains("[[hooks]]"))
+    }
+
+    /// Installing then removing gives back the very bytes of a file that
+    /// ends in one newline, as editors save them, for both families, not
+    /// the text plus a stray blank line. Any other ending is the backup's
+    /// to restore.
+    @Test func tomlRoundTripIsExact() {
+        let saved = base + "\n"
+        for family in [BridgeFamily.local, .remote] {
+            let installed = TomlHooksTransform.install(saved, scriptPath: "/tmp/swarmbar-kimi-hook.sh", family: family)
+            #expect(TomlHooksTransform.uninstall(installed, family: family) == saved)
+        }
     }
 
     @Test func uninstallSweepsUnmarkedManualEntries() {
@@ -141,11 +167,193 @@ struct OpenCodeConfigTransformTests {
         #expect(removed.contains("some-other-plugin"))
     }
 
+    /// A "plugin" list holding anything but plain names (a [name, options]
+    /// pair, say) is a hand edit. Reading it as [String] used to fail and
+    /// fall back to an empty list, so install replaced the user's plugins
+    /// with SwarmBar's and uninstall deleted them all.
+    @Test func pluginListThatIsNotPlainNamesIsRefused() throws {
+        let tuple = #"{"plugin": ["some-plugin", ["other-plugin", {"opt": true}]]}"#
+        let withOurs = #"{"plugin": ["file:///x/swarmbar.js", ["other-plugin", {"opt": true}]]}"#
+        for family in [BridgeFamily.local, .remote] {
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.install(tuple, pluginSpec: "file:///x/swarmbar.js", family: family)
+            }
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.uninstall(withOurs, family: family)
+            }
+        }
+        for odd in [#"{"plugin": "file:///x/swarmbar.js"}"#, #"{"plugin": [1, 2]}"#, #"{"plugin": {"a": 1}}"#] {
+            #expect(throws: IntegrationTransformError.self) {
+                _ = try OpenCodeConfigTransform.install(odd, pluginSpec: "file:///x/swarmbar.js")
+            }
+            #expect(throws: IntegrationTransformError.self) { _ = try OpenCodeConfigTransform.uninstall(odd) }
+        }
+        // Ours still reads as installed beside a pair.
+        #expect(OpenCodeConfigTransform.isInstalled(withOurs))
+        // A null list is no list.
+        let fromNull = try OpenCodeConfigTransform.install(#"{"plugin": null}"#, pluginSpec: "file:///x/swarmbar.js")
+        #expect(OpenCodeConfigTransform.isInstalled(fromNull))
+    }
+
     @Test func commentedJsoncThrows() {
         #expect(throws: IntegrationTransformError.self) {
             _ = try OpenCodeConfigTransform.install(
                 "// my config\n{\"a\": 1}", pluginSpec: "file:///x/swarmbar.js")
         }
+    }
+}
+
+struct BridgeFamilyTransformTests {
+    let claudeRemote = "/root/.swarmbar/swarmbar-remote-hook.sh"
+    let claudeLocal = "/Users/x/Library/Application Support/SwarmBar/swarmbar-hook.sh"
+    let kimiRemote = "/home/u/.swarmbar/swarmbar-remote-kimi-hook.sh"
+    let kimiLocal = "/Users/x/Library/Application Support/SwarmBar/swarmbar-kimi-hook.sh"
+
+    private func both() throws -> String {
+        let local = try ClaudeHookTransform.install("{}", scriptPath: claudeLocal)
+        return try ClaudeHookTransform.install(local, scriptPath: claudeRemote, family: .remote)
+    }
+
+    @Test func familyPredicate() {
+        #expect(BridgeFamily.remote.owns("bash '/root/.swarmbar/swarmbar-remote-hook.sh' Stop"))
+        #expect(!BridgeFamily.local.owns("bash '/root/.swarmbar/swarmbar-remote-hook.sh' Stop"))
+        #expect(BridgeFamily.local.owns("bash '/a/swarmbar-hook.sh' Stop"))
+        #expect(!BridgeFamily.remote.owns("bash '/a/swarmbar-hook.sh' Stop"))
+    }
+
+    @Test func localUninstallKeepsRemoteClaudeEntries() throws {
+        let out = try ClaudeHookTransform.uninstall(try both())
+        #expect(!ClaudeHookTransform.isInstalled(out))
+        #expect(ClaudeHookTransform.isInstalled(out, family: .remote))
+        #expect(out.contains("swarmbar-remote-hook.sh' PermissionRequest"))
+    }
+
+    @Test func remoteUninstallKeepsLocalClaudeEntries() throws {
+        let out = try ClaudeHookTransform.uninstall(try both(), family: .remote)
+        #expect(ClaudeHookTransform.isInstalled(out))
+        #expect(!ClaudeHookTransform.isInstalled(out, family: .remote))
+        #expect(!out.contains("swarmbar-remote"))
+    }
+
+    @Test func bothFamiliesCoexistInOneSettingsFile() throws {
+        let out = try both()
+        let data = try #require(out.data(using: .utf8))
+        let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let hooks = try #require(root["hooks"] as? [String: [[String: Any]]])
+        let commands = hooks.values.flatMap { $0 }.flatMap { ($0["hooks"] as? [[String: Any]] ?? []) }
+            .compactMap { $0["command"] as? String }
+        #expect(commands.count == 8)
+        #expect(commands.filter(BridgeFamily.local.owns).count == 4)
+        #expect(commands.filter(BridgeFamily.remote.owns).count == 4)
+    }
+
+    @Test func localInstallDoesNotReportRemoteOnly() throws {
+        let remoteOnly = try ClaudeHookTransform.install("{}", scriptPath: claudeRemote, family: .remote)
+        #expect(!ClaudeHookTransform.isInstalled(remoteOnly))
+    }
+
+    @Test func remoteTomlBlockUsesItsOwnMarkers() {
+        let out = TomlHooksTransform.install("", scriptPath: kimiRemote, family: .remote)
+        #expect(out.contains("# >>> SwarmBar remote hooks >>>"))
+        #expect(out.contains("# <<< SwarmBar remote hooks <<<"))
+        #expect(!out.contains(TomlHooksTransform.beginMarker))
+        #expect(out.contains("command = \"'\(kimiRemote)' Stop\""))
+        #expect(TomlHooksTransform.isInstalled(out, family: .remote))
+        #expect(!TomlHooksTransform.isInstalled(out))
+        let removed = TomlHooksTransform.uninstall(out, family: .remote)
+        #expect(!removed.contains("[[hooks]]"))
+    }
+
+    @Test func localTomlSweepSparesRemoteBlock() {
+        let manual = """
+        [[hooks]]
+        event = "Stop"
+        command = "/x/swarmbar-kimi-hook.sh Stop"
+        """
+        let remote = TomlHooksTransform.install(manual, scriptPath: kimiRemote, family: .remote)
+        let local = TomlHooksTransform.uninstall(remote)
+        #expect(!local.contains("/x/swarmbar-kimi-hook.sh"))
+        #expect(local.contains("# >>> SwarmBar remote hooks >>>"))
+        #expect(local.contains("swarmbar-remote-kimi-hook.sh"))
+        let reverse = TomlHooksTransform.uninstall(
+            TomlHooksTransform.install(manual, scriptPath: kimiLocal), family: .remote)
+        #expect(reverse.contains("swarmbar-kimi-hook.sh"))
+    }
+
+    @Test func tomlEventsCanBeNarrowed() {
+        let out = TomlHooksTransform.install(
+            "", scriptPath: kimiRemote, family: .remote,
+            events: [("PermissionRequest", nil), ("Stop", 10)])
+        #expect(out.components(separatedBy: "[[hooks]]").count - 1 == 2)
+        #expect(out.contains("event = \"PermissionRequest\""))
+        #expect(out.contains("event = \"Stop\""))
+        #expect(!out.contains("PreToolUse"))
+    }
+
+    @Test func openCodeFamiliesCoexist() throws {
+        let local = try OpenCodeConfigTransform.install(
+            "{}", pluginSpec: "file:///Users/x/plugins/swarmbar.js")
+        let both = try OpenCodeConfigTransform.install(
+            local, pluginSpec: "file:///home/u/.config/opencode/plugins/swarmbar-remote.js", family: .remote)
+        #expect(both.contains("plugins/swarmbar.js"))
+        #expect(both.contains("swarmbar-remote.js"))
+        let noLocal = try OpenCodeConfigTransform.uninstall(both)
+        #expect(!OpenCodeConfigTransform.isInstalled(noLocal))
+        #expect(OpenCodeConfigTransform.isInstalled(noLocal, family: .remote))
+        let noRemote = try OpenCodeConfigTransform.uninstall(both, family: .remote)
+        #expect(OpenCodeConfigTransform.isInstalled(noRemote))
+        #expect(!noRemote.contains("swarmbar-remote"))
+    }
+
+    @Test func jsonWithoutHooksReadsNotInstalled() {
+        let json = "{\"permissions\": {\"allow\": [\"Read(//Users/x/.swarmbar/**)\"]}}"
+        #expect(!ClaudeHookTransform.isInstalled(json))
+        #expect(!ClaudeHookTransform.isInstalled(json, family: .remote))
+    }
+
+    @Test func unparseableJSONFallsBackToScriptNames() {
+        let text = "not json bash /x/swarmbar-hook.sh Stop"
+        #expect(ClaudeHookTransform.isInstalled(text))
+        #expect(!ClaudeHookTransform.isInstalled(text, family: .remote))
+    }
+
+    @Test func unclosedLocalMarkerSparesRemoteBlock() {
+        let remote = TomlHooksTransform.install("", scriptPath: kimiRemote, family: .remote)
+        let text = TomlHooksTransform.beginMarker + "\n[[hooks]]\nevent = \"Stop\"\ncommand = \"/x/swarmbar-kimi-hook.sh Stop\"\n\n" + remote
+        let out = TomlHooksTransform.uninstall(text)
+        #expect(out.contains("swarmbar-remote-kimi-hook.sh"))
+        #expect(!out.contains("/x/swarmbar-kimi-hook.sh"))
+    }
+
+    @Test func emptyEventsWritesNoBlock() {
+        let out = TomlHooksTransform.install("a = 1", scriptPath: kimiRemote, family: .remote, events: [])
+        #expect(!out.contains("SwarmBar"))
+        #expect(!TomlHooksTransform.isInstalled(out, family: .remote))
+    }
+
+    @Test func remoteFirstThenLocalThenLocalUninstall() {
+        let r = TomlHooksTransform.install("", scriptPath: kimiRemote, family: .remote)
+        let both = TomlHooksTransform.install(r, scriptPath: kimiLocal)
+        #expect(TomlHooksTransform.isInstalled(both))
+        #expect(TomlHooksTransform.isInstalled(both, family: .remote))
+        let out = TomlHooksTransform.uninstall(both)
+        #expect(!TomlHooksTransform.isInstalled(out))
+        #expect(TomlHooksTransform.isInstalled(out, family: .remote))
+        #expect(out.components(separatedBy: "[[hooks]]").count - 1 == TomlHooksTransform.events.count)
+    }
+
+    @Test func indentedMarkersAreRecognised() {
+        let text = "  " + TomlHooksTransform.remoteBeginMarker + "\n[[hooks]]\nevent = \"Stop\"\ncommand = \"" + kimiRemote + " Stop\"\n  " + TomlHooksTransform.remoteEndMarker + "\n"
+        #expect(TomlHooksTransform.isInstalled(text, family: .remote))
+        #expect(!TomlHooksTransform.uninstall(text, family: .remote).contains("[[hooks]]"))
+    }
+
+    @Test func unmarkedRemoteTableSweptOnlyByRemote() {
+        let text = "[[hooks]]\nevent = \"Stop\"\ncommand = \"" + kimiRemote + " Stop\"\n"
+        #expect(TomlHooksTransform.isInstalled(text, family: .remote))
+        #expect(!TomlHooksTransform.isInstalled(text))
+        #expect(TomlHooksTransform.uninstall(text).contains("swarmbar-remote"))
+        #expect(!TomlHooksTransform.uninstall(text, family: .remote).contains("swarmbar-remote"))
     }
 }
 

@@ -18,7 +18,7 @@ struct SessionStoreHostScopeTests {
         let local = UUID(), remote = UUID()
 
         store.sync(tool: .claudeCode, host: nil, sessions: [session(id: local, host: nil)])
-        store.sync(tool: .claudeCode, host: "umzcaio", sessions: [session(id: remote, host: "umzcaio")])
+        store.sync(tool: .claudeCode, host: "devbox", sessions: [session(id: remote, host: "devbox")])
 
         #expect(store.sessions.contains { $0.id == local })
         #expect(store.sessions.contains { $0.id == remote })
@@ -29,7 +29,7 @@ struct SessionStoreHostScopeTests {
         let store = SessionStore()
         let local = UUID(), remote = UUID()
 
-        store.sync(tool: .claudeCode, host: "umzcaio", sessions: [session(id: remote, host: "umzcaio")])
+        store.sync(tool: .claudeCode, host: "devbox", sessions: [session(id: remote, host: "devbox")])
         store.sync(tool: .claudeCode, host: nil, sessions: [session(id: local, host: nil)])
 
         #expect(store.sessions.contains { $0.id == remote })
@@ -41,8 +41,8 @@ struct SessionStoreHostScopeTests {
         let store = SessionStore()
         let gone = UUID(), kept = UUID()
 
-        store.sync(tool: .claudeCode, host: "umzcaio", sessions: [session(id: gone, host: "umzcaio")])
-        store.sync(tool: .claudeCode, host: "umzcaio", sessions: [session(id: kept, host: "umzcaio")])
+        store.sync(tool: .claudeCode, host: "devbox", sessions: [session(id: gone, host: "devbox")])
+        store.sync(tool: .claudeCode, host: "devbox", sessions: [session(id: kept, host: "devbox")])
 
         #expect(!store.sessions.contains { $0.id == gone })
         #expect(store.sessions.contains { $0.id == kept })
@@ -62,7 +62,7 @@ struct SessionStoreHostScopeTests {
 
     @Test("a remote session is not eligible to open a local terminal")
     func remoteSessionCannotOpenTerminal() {
-        let remote = session(id: UUID(), host: "umzcaio")
+        let remote = session(id: UUID(), host: "devbox")
         #expect(!SessionStore.canOpenInTerminal(remote))
     }
 

@@ -20,7 +20,9 @@ struct CodexMonitor: SessionMonitor {
     /// CodexSessionParser.parse takes `now` and downgrades to idle once a
     /// line goes stale (staleAfter), so a cached parse would freeze that
     /// time-dependent verdict. Re-parsing a cached tail is cheap.
-    private nonisolated static let tailCache = TailCache<String>()
+    /// Internal rather than private so a test can show eviction reaches
+    /// the scanned root under its real path.
+    nonisolated static let tailCache = TailCache<String>()
 
     /// The head only carries session_meta (cwd, session id, and whether the
     /// rollout belongs to a subagent), a pure function of the file's bytes
@@ -58,10 +60,11 @@ struct CodexMonitor: SessionMonitor {
         return nil
     }
 
-    nonisolated static func discover(now: Date) -> [AgentSession] {
+    nonisolated static func discover(
+        now: Date, context: DiscoveryContext = .local()
+    ) -> [AgentSession] {
         let fm = FileManager.default
-        let root = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions")
+        let root = context.home.appendingPathComponent(".codex/sessions")
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .fileSizeKey]
@@ -69,7 +72,7 @@ struct CodexMonitor: SessionMonitor {
 
         var sessions: [AgentSession] = []
         var seenPaths = Set<String>()
-        let livePids = TerminalFocuser.codexPidsBySessionSuffix()
+        let livePids = context.processes.codexPidsBySessionSuffix(sessionsRoot: root.path)
         for case let file as URL in enumerator {
             guard file.pathExtension == "jsonl",
                   file.lastPathComponent.hasPrefix("rollout-"),
@@ -104,6 +107,7 @@ struct CodexMonitor: SessionMonitor {
             let id = meta.sessionId.flatMap(UUID.init(uuidString:))
                 ?? fallbackId(for: file.lastPathComponent)
             let projectPath = meta.cwd.map { URL(fileURLWithPath: $0) }
+            let pid = livePids["\(id.uuidString.lowercased()).jsonl"]
             sessions.append(AgentSession(
                 id: id,
                 tool: .codex,
@@ -112,13 +116,28 @@ struct CodexMonitor: SessionMonitor {
                 status: parsed.status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                processAlive: livePids["\(id.uuidString.lowercased()).jsonl"] != nil,
+                pid: pid.map { pid_t($0) },
+                processAlive: pid != nil,
                 attentionEventID: parsed.attentionEventID
             ))
         }
-        tailCache.retain(paths: seenPaths)
-        headCache.retain(paths: seenPaths)
+        // The enumerator hands back real paths (/private/var for /var), so
+        // the root is offered in both spellings or a root under a symlinked
+        // directory would never match its own entries. Foundation's
+        // resolvingSymlinksInPath() is no use here: it strips /private
+        // again, back to the spelling that does not match.
+        let scanned = [root.path, realPath(root.path) ?? root.path]
+        tailCache.retain(paths: seenPaths, under: scanned)
+        headCache.retain(paths: seenPaths, under: scanned)
         return sessions.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// realpath(3): every symlink resolved, /private prefix kept, which is
+    /// how FileManager.enumerator spells the paths it returns.
+    nonisolated static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// Enough of the file to contain its first line, which is session_meta.

@@ -18,27 +18,27 @@ struct RemoteRowTests {
 
     @Test("a remote session shows its host as the badge")
     func remoteShowsHost() {
-        #expect(RemoteRowLabel.badge(for: session(host: "umzcaio")) == "umzcaio")
+        #expect(RemoteRowLabel.badge(for: session(host: "devbox")) == "devbox")
     }
 
     @Test("an unreachable host says so in sentence case with no em dash")
     func unreachableNote() {
         let note = RemoteRowLabel.unreachableNote(
-            host: "umzcaio", reachability: ["umzcaio": .unreachable("closed")])
-        #expect(note == "Cannot reach umzcaio")
-        #expect(!(note ?? "").contains("—"))
+            host: "devbox", reachability: ["devbox": .unreachable("closed")])
+        #expect(note == "Cannot reach devbox")
+        #expect(!(note ?? "").contains("\u{2014}"))
     }
 
     @Test("a reachable host adds no note")
     func reachableHasNoNote() {
         #expect(RemoteRowLabel.unreachableNote(
-            host: "umzcaio", reachability: ["umzcaio": .reachable]) == nil)
+            host: "devbox", reachability: ["devbox": .reachable]) == nil)
     }
 
     @Test("a local session never gets an unreachable note")
     func localNeverUnreachable() {
         #expect(RemoteRowLabel.unreachableNote(
-            host: nil, reachability: ["umzcaio": .unreachable("closed")]) == nil)
+            host: nil, reachability: ["devbox": .unreachable("closed")]) == nil)
     }
 
     // The compact row's badge is the only place a remote session's host
@@ -49,19 +49,19 @@ struct RemoteRowTests {
 
     @Test("the badge announcement carries the host and the unreachable reason")
     func badgeAnnouncementCarriesUnreachableReason() {
-        let s = session(host: "umzcaio")
+        let s = session(host: "devbox")
         let announcement = RemoteRowLabel.unreachableNote(
-            host: s.host, reachability: ["umzcaio": .unreachable("closed")]
+            host: s.host, reachability: ["devbox": .unreachable("closed")]
         ) ?? RemoteRowLabel.badge(for: s)
-        #expect(announcement == "Cannot reach umzcaio")
+        #expect(announcement == "Cannot reach devbox")
     }
 
     @Test("the badge announcement is just the host when reachable")
     func badgeAnnouncementIsHostWhenReachable() {
-        let s = session(host: "umzcaio")
+        let s = session(host: "devbox")
         let announcement = RemoteRowLabel.unreachableNote(
-            host: s.host, reachability: ["umzcaio": .reachable]
+            host: s.host, reachability: ["devbox": .reachable]
         ) ?? RemoteRowLabel.badge(for: s)
-        #expect(announcement == "umzcaio")
+        #expect(announcement == "devbox")
     }
 }

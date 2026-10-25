@@ -62,14 +62,15 @@ enum ApprovalRouter {
         switch tool {
         case .grokBuild:
             // Grok's hook runner ignores deny responses (all four dialects
-            // verified live), so the prompt is answered at the TUI. Layouts
-            // vary between three-option shell prompts and four-option edit
-            // prompts, but reject is always last and plain approve-once is
-            // second from last, so the sequence clamps to the bottom and
-            // steps up once for approve. Never a digit: one deny sent as a
-            // digit approved a write.
+            // verified live), so the prompt is answered at the TUI, walked
+            // to by label as Antigravity's is. A fixed clamp-to-the-bottom
+            // sequence answered it until Grok 1.0 put "Never allow" below
+            // reject: the same keys then denied on Approve and saved a
+            // permanent rule on Deny. Reading the screen survives the next
+            // redesign by focusing the terminal instead. Never a digit: one
+            // deny sent as a digit approved a write.
             guard environment.grokKeystrokes else { return .focusTerminal }
-            return .keys(allow ? TuiAnswer.grokApprove : TuiAnswer.grokDeny)
+            return .navigateSelector
 
         case .codex:
             // Labeled hotkeys rather than positions: y approves once, ESC

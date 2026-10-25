@@ -16,4 +16,12 @@ enum RemoteRowLabel {
         guard let host, case .unreachable = reachability[host] else { return nil }
         return "Cannot reach \(host)"
     }
+
+    /// Shown in place of Approve and Deny on a remote prompt nothing here
+    /// can answer: no held request, no tmux pane, or approvals switched off
+    /// for that tool on that host. Buttons that silently did nothing would
+    /// leave the user waiting on an agent that is waiting on them.
+    static func terminalOnlyNote(host: String) -> String {
+        "Answer in the terminal on \(host)"
+    }
 }
