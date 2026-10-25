@@ -1435,6 +1435,8 @@ def read_owned(path, uid, limit=None):
 def home_configs(home, warnings):
     """The agent config files in a home that exist, each once by realpath.
 
+    Each readable one carries backup_text: its .backup-swarmbar, if any.
+
     One that exists but cannot be read is still listed, with a null hash
     and text and a warning: dropping it would make the plan create a file
     that is already there, and could-not-read would read as absent. So is
@@ -1492,8 +1494,26 @@ def home_configs(home, warnings):
                 except UnicodeDecodeError:
                     text = None
             entry["sha256"], entry["text"] = digest[0], text
+            entry["backup_text"] = config_backup_text(home, resolved, uid)
             configs.append(entry)
     return configs
+
+
+def config_backup_text(home, resolved, uid):
+    """The text of the config's .backup-swarmbar, or None when there is
+    none or it cannot be read just as carefully as the config itself. Undo
+    writes these bytes back when they mean what removing SwarmBar's entries
+    made, so the user gets their own file, formatting and all."""
+    path = resolved + BACKUP_SUFFIX
+    if lookup_state(path) != "present" or not owner_only_path(home, path, uid):
+        return None
+    digest = read_owned(path, uid, CONFIG_TEXT_MAX)
+    if digest is None or digest[1] is None:
+        return None
+    try:
+        return digest[1].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def owned_state(home, path, uid):
@@ -2522,6 +2542,7 @@ HOOK_DIR = ".swarmbar"
 HOOK_SOCKET = _STEPS["HOOK_SOCKET"]
 BROKER_SOCKET = _STEPS["BROKER_SOCKET"]
 HOOK_LOCK = _STEPS["HOOK_LOCK"]
+BACKUP_SUFFIX = _STEPS["BACKUP_SUFFIX"]
 
 # A home with any of these installed is a hook home and gets a socket.
 HOOK_MARKERS = (

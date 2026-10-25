@@ -326,11 +326,12 @@ enum SetupPlanner {
                     tool: tool, file: file, path: file.path, seed: nil, seen: &seen, description: description,
                     instruction: instruction + " Then delete \(bridge).", refusal: refusal
                 ) { text in
-                    switch tool {
+                    let undone = switch tool {
                     case .claudeCode: try ClaudeHookTransform.uninstall(text, family: .remote)
                     case .openCode: try OpenCodeConfigTransform.uninstall(text, family: .remote)
                     default: TomlHooksTransform.uninstall(text, family: .remote)
                     }
+                    return restoringBackup(undone, backup: file.backupText, tool: tool)
                 }
                 guard var change else { continue }
                 change.home = home
@@ -512,6 +513,31 @@ enum SetupPlanner {
         if text == current { return nil }
         return PlannedChange(tool: tool, path: path, expectSHA256: sha,
                              action: .write(newText: text, mode: configMode), description: description)
+    }
+
+    /// The backup's own bytes when they mean exactly what Undo made, which
+    /// is the usual case: nothing else in the file changed since setup. The
+    /// user then gets their file back as they wrote it, rather than a copy
+    /// re-serialized with sorted keys. If anything else changed, the backup
+    /// would undo that too, so Undo's own result stands.
+    static func restoringBackup(_ undone: String, backup: String?, tool: AgentTool) -> String {
+        guard let backup else { return undone }
+        switch tool {
+        case .claudeCode, .openCode:
+            guard let mine = jsonObject(undone), let theirs = jsonObject(backup), mine.isEqual(theirs)
+            else { return undone }
+        default:
+            // TOML has no parser here. Its round trip is exact but for the
+            // file's end, so that is all that may differ.
+            let end = CharacterSet.whitespacesAndNewlines
+            guard undone.trimmingCharacters(in: end) == backup.trimmingCharacters(in: end) else { return undone }
+        }
+        return backup
+    }
+
+    private static func jsonObject(_ text: String) -> NSObject? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? NSObject
     }
 
     /// A path holding a control character becomes a hand edit: it would

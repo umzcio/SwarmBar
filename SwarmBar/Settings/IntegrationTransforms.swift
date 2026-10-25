@@ -91,12 +91,16 @@ enum ClaudeHookTransform {
     static func uninstall(_ text: String, family: BridgeFamily = .local) throws -> String {
         var root = try parse(text)
         guard var hooks = root["hooks"] as? [String: Any] else { return text }
+        var removed = false
         for (event, value) in hooks {
             guard let entries = value as? [[String: Any]] else { continue }
             let kept = entries.filter { !mentionsSwarmBar($0, family: family) }
+            removed = removed || kept.count != entries.count
             hooks[event] = kept.isEmpty ? nil : kept
         }
-        root["hooks"] = hooks
+        // Emptied by this removal, it goes too: a config that had no hooks
+        // before SwarmBar must not keep an empty one after.
+        root["hooks"] = removed && hooks.isEmpty ? nil : hooks
         return try serialize(root)
     }
 
@@ -206,9 +210,10 @@ enum TomlHooksTransform {
         let (begin, end) = markers(family)
         var lines: [String] = []
         var inMarkedBlock = false
+        var hadBlock = false
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed == begin { inMarkedBlock = true; continue }
+            if trimmed == begin { inMarkedBlock = true; hadBlock = true; continue }
             if trimmed == end { inMarkedBlock = false; continue }
             // An unclosed block ends where the other family's block begins.
             if inMarkedBlock, isMarker(trimmed) { inMarkedBlock = false }
@@ -243,7 +248,12 @@ enum TomlHooksTransform {
             }
         }
         flush()
-        return kept.joined(separator: "\n")
+        let out = kept.joined(separator: "\n")
+        // install set the block off with a blank line after the text's own
+        // end; without this the removal left that line behind.
+        guard hadBlock else { return out }
+        let body = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? "" : body + "\n"
     }
 }
 

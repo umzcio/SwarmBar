@@ -13,9 +13,11 @@ import Testing
     static func sha(_ text: String) -> String { HelperInstaller.sha256(Data(text.utf8)) }
 
     static func config(
-        _ tool: String, _ path: String, _ text: String?, dev: UInt64? = nil, ino: UInt64? = nil
+        _ tool: String, _ path: String, _ text: String?, dev: UInt64? = nil, ino: UInt64? = nil,
+        backup: String? = nil
     ) -> ProbeResult.ConfigFile {
-        ProbeResult.ConfigFile(tool: tool, path: path, sha256: text.map(sha), text: text, dev: dev, ino: ino)
+        ProbeResult.ConfigFile(
+            tool: tool, path: path, sha256: text.map(sha), text: text, dev: dev, ino: ino, backupText: backup)
     }
 
     static func probe(
@@ -487,6 +489,54 @@ import Testing
             == [try #require(Self.index(plan, at: "/root/.config/opencode/opencode.json"))])
         #expect(plan.changes.last?.action == .remove)
         #expect(plan.changes.first?.action != .remove)
+    }
+
+    /// The user's own formatting comes back: when the backup means exactly
+    /// what Undo made, its bytes are written, not a re-serialized copy.
+    @Test func undoRestoresTheBackupWhenNothingElseChanged() throws {
+        let claudeOriginal = "{\n  \"theme\": \"light\",\n  \"cleanupPeriodDays\": 365\n}\n"
+        // Two newlines at the end, which only the backup can give back.
+        let tomlOriginal = "[providers]\nname = \"x\"\n\n\n# my note\n\n"
+        let probe = Self.undoProbe(
+            claude: try ClaudeHookTransform.install(
+                claudeOriginal, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh", family: .remote),
+            claudeBackup: claudeOriginal,
+            toml: TomlHooksTransform.install(
+                tomlOriginal, scriptPath: "/root/.swarmbar/swarmbar-remote-kimi-hook.sh", family: .remote),
+            tomlBackup: tomlOriginal)
+        let plan = try SetupPlanner.undoPlan(probe: probe, watchAs: .everyUser)
+        #expect(Self.text(plan, at: "/root/.claude/settings.json") == claudeOriginal)
+        #expect(Self.text(plan, at: "/root/.kimi-code/config.toml") == tomlOriginal)
+    }
+
+    /// Anything else changed since setup, and the backup would undo that
+    /// too, so Undo's own result stands and the later edit is kept.
+    @Test func undoKeepsLaterEditsOverTheBackup() throws {
+        let original = "{\n  \"theme\": \"light\"\n}\n"
+        var installed = try ClaudeHookTransform.install(
+            original, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh", family: .remote)
+        installed = installed.replacingOccurrences(of: "\"theme\"", with: "\"effortLevel\" : \"high\",\n  \"theme\"")
+        let plan = try SetupPlanner.undoPlan(
+            probe: Self.undoProbe(claude: installed, claudeBackup: original), watchAs: .everyUser)
+        let text = try #require(Self.text(plan, at: "/root/.claude/settings.json"))
+        #expect(text != original)
+        #expect(text.contains("effortLevel"))
+        #expect(!text.contains("swarmbar-remote"))
+    }
+
+    private static func undoProbe(
+        claude: String, claudeBackup: String?, toml: String? = nil, tomlBackup: String? = nil
+    ) -> ProbeResult {
+        let there = String(repeating: "d", count: 64)
+        var configs = [Self.config("claude", "/root/.claude/settings.json", claude, backup: claudeBackup)]
+        if let toml { configs.append(Self.config("kimi", "/root/.kimi-code/config.toml", toml, backup: tomlBackup)) }
+        return Self.probe(
+            tools: ["/root": ["claude", "kimi"]], installed: ["/root": ["claude", "kimi"]],
+            configs: ["/root": configs],
+            bridges: ["/root": [
+                .init(path: "/root/.swarmbar/swarmbar-remote-hook.sh", sha256: there),
+                .init(path: "/root/.swarmbar/swarmbar-remote-kimi-hook.sh", sha256: there),
+            ]])
     }
 
     @Test func undoRemovesOnlyBridgeFilesThatAreThere() throws {

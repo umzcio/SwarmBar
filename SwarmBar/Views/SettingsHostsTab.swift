@@ -157,9 +157,8 @@ enum HostRowText {
 // MARK: - The tab
 
 /// Settings › Hosts: every configured remote host with its live state, its
-/// per-tool switches, and the ways back into the wizard. Nothing here
-/// reaches a host on its own; a host is only probed when the user presses
-/// "Check all again".
+/// per-tool switches, and the ways back into the wizard. Opening it checks
+/// any watched host it has no result for; "Check all again" checks them all.
 struct HostsSettingsTab: View {
     @Environment(SessionStore.self) private var store
     @Environment(RemoteHostRegistry.self) private var registry: RemoteHostRegistry?
@@ -189,6 +188,7 @@ struct HostsSettingsTab: View {
                 .frame(maxHeight: 560)
                 .fixedSize(horizontal: false, vertical: true)
             }
+            .task { await supervisor.checkUnchecked() }
         } else {
             SettingsCardList {
                 Text("Remote hosts aren't available in demo mode.")

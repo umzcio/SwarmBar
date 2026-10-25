@@ -2380,6 +2380,18 @@ class ProbeTests(unittest.TestCase):
         tools = [c["tool"] for c in self.probe()["configs"][self.home]]
         self.assertEqual(sorted(tools), ["bearcode", "claude", "opencode"])
 
+    def test_probe_reports_a_configs_backup(self):
+        # Undo restores the backup's own bytes when they mean what it made,
+        # so the probe carries them, read as carefully as the config.
+        original = '{\n  "theme": "light"\n}\n'
+        path = self.put(".claude/settings.json", '{"hooks": {}}\n')
+        self.put(".claude/settings.json.backup-swarmbar", original)
+        self.put(".bearcode/config.toml", "[hooks]\n")
+        by_path = dict((c["path"], c) for c in self.probe()["configs"][self.home])
+        self.assertEqual(by_path[os.path.realpath(path)]["backup_text"], original)
+        self.assertIsNone(by_path[os.path.realpath(
+            os.path.join(self.home, ".bearcode/config.toml"))]["backup_text"])
+
     def test_probe_skips_backup_claude_roots(self):
         self.put(".claude/settings.json", "{}\n")
         self.put(".claude-cio.pre-symlink-backup/settings.json", "{}\n")

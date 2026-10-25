@@ -21,6 +21,14 @@ struct ProbeResult: Decodable, Sendable, Equatable {
         /// since an inode number can use all 64 bits.
         var dev: UInt64? = nil
         var ino: UInt64? = nil
+        /// The .backup-swarmbar beside it, which Undo writes back when it
+        /// means what removing SwarmBar's entries made.
+        var backupText: String? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case tool, path, sha256, text, dev, ino
+            case backupText = "backup_text"
+        }
     }
 
     /// One of SwarmBar's remote bridge files in a home. `sha256` is nil

@@ -399,6 +399,31 @@ struct RemoteHostHintTests {
         #expect(rig.supervisor.assessments[host.id] == nil)
     }
 
+    /// Settings opening checks what has no result yet, so a restart does
+    /// not leave every row "Not checked yet". A host already checked, or
+    /// turned off, is not asked again.
+    @Test func openingChecksOnlyWatchedHostsWithNoResult() async {
+        let rig = Rig()
+        let checked = RemoteHost(alias: "checked")
+        var off = RemoteHost(alias: "off")
+        off.isEnabled = false
+        let fresh = RemoteHost(alias: "fresh")
+        for host in [checked, off, fresh] { rig.registry.upsert(host) }
+        var asked: [String] = []
+        rig.supervisor.prober = { alias in
+            asked.append(alias)
+            return (Self.probe(), nil, nil)
+        }
+        await rig.supervisor.checkAgain(hostID: checked.id)
+        asked = []
+
+        await rig.supervisor.checkUnchecked()
+
+        #expect(asked == ["fresh"])
+        #expect(rig.supervisor.assessments[fresh.id] != nil)
+        #expect(rig.supervisor.assessments[off.id] == nil)
+    }
+
     @Test func checkAllAgainRunsAtMostSixAtOnce() async {
         let rig = Rig()
         for n in 0..<9 { rig.registry.upsert(RemoteHost(alias: "host\(n)")) }

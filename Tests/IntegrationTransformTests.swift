@@ -27,6 +27,20 @@ struct ClaudeHookTransformTests {
         #expect(occurrences == 1)
     }
 
+    /// A "hooks" SwarmBar emptied goes, so a config that had none before
+    /// does not keep an empty one; one that still holds the user's stays.
+    @Test func claudeUninstallDropsTheHooksItEmptied() throws {
+        let installed = try ClaudeHookTransform.install(
+            #"{"theme": "light"}"#, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh", family: .remote)
+        let out = try ClaudeHookTransform.uninstall(installed, family: .remote)
+        #expect(!out.contains("hooks"))
+        let mine = #"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/mine.sh"}]}]}}"#
+        let kept = try ClaudeHookTransform.uninstall(
+            try ClaudeHookTransform.install(mine, scriptPath: "/root/.swarmbar/swarmbar-remote-hook.sh",
+                                            family: .remote), family: .remote)
+        #expect(kept.contains("/x/mine.sh"))
+    }
+
     @Test func uninstallRemovesOnlySwarmBarEntries() throws {
         let mixed = """
         {"hooks": {"Stop": [
@@ -79,6 +93,18 @@ struct TomlHooksTransformTests {
         #expect(!TomlHooksTransform.isInstalled(out))
         #expect(out.contains("[thinking]"))
         #expect(!out.contains("[[hooks]]"))
+    }
+
+    /// Installing then removing gives back the very bytes of a file that
+    /// ends in one newline, as editors save them, for both families, not
+    /// the text plus a stray blank line. Any other ending is the backup's
+    /// to restore.
+    @Test func tomlRoundTripIsExact() {
+        let saved = base + "\n"
+        for family in [BridgeFamily.local, .remote] {
+            let installed = TomlHooksTransform.install(saved, scriptPath: "/tmp/swarmbar-kimi-hook.sh", family: family)
+            #expect(TomlHooksTransform.uninstall(installed, family: family) == saved)
+        }
     }
 
     @Test func uninstallSweepsUnmarkedManualEntries() {

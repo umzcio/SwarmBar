@@ -187,8 +187,8 @@ final class RemoteMonitorSupervisor {
     // MARK: Checking again
 
     /// Probes one host the way the wizard does and publishes what it found.
-    /// Runs only when the user asks, never on a timer or when Settings
-    /// opens: the wizard's rule is that nothing reaches a host unasked.
+    /// Never on a timer. Hosts not yet added are never probed this way: the
+    /// wizard reaches them only when asked.
     func checkAgain(hostID id: UUID) async {
         guard let host = registry.host(id: id), !checking.contains(id) else { return }
         checking.insert(id)
@@ -204,7 +204,18 @@ final class RemoteMonitorSupervisor {
         guard !checkingAll else { return }
         checkingAll = true
         defer { checkingAll = false }
-        let ids = registry.hosts.map(\.id)
+        await check(registry.hosts.map(\.id))
+    }
+
+    /// Every watched host with no result yet, as Settings › Hosts opens.
+    /// They are hosts the user added and SwarmBar stays connected to, so
+    /// this reaches nothing new; without it a restart left every row "Not
+    /// checked yet" until the user thought to ask.
+    func checkUnchecked() async {
+        await check(registry.hosts.filter { $0.isEnabled && checks[$0.id] == nil }.map(\.id))
+    }
+
+    private func check(_ ids: [UUID]) async {
         await withTaskGroup(of: Void.self) { group in
             var pending = ids[...]
             for _ in 0..<min(ProbeRunner.maxConcurrent, pending.count) {
