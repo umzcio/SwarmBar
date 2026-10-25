@@ -3814,13 +3814,47 @@ class UninstallTests(unittest.TestCase):
             "4005 python3 /usr/local/lib/swarmbar-helper apply eJx",
             "4006 vim /usr/local/lib/swarmbar-helper",
             "4007 python3 -I - probe",
+            # How macOS lists a framework python, the shebang run included.
+            "4008 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
+            "Versions/3.9/Resources/Python.app/Contents/MacOS/Python -I /usr/local/lib/swarmbar-helper",
         ]) + "\n"
         ps = lambda argv, timeout=5, input=None, **options: completed(argv, 0, table)
-        with mock.patch.object(helper, "run_command", ps):
-            self.assertEqual(helper.other_watchers(), 2)
+        with mock.patch.object(helper, "run_command", ps), \
+                mock.patch.object(helper, "_WATCH_LOCK", None):
+            self.assertEqual(helper.processes_running_a_helper(), 3)
+            self.assertEqual(helper.other_watchers(), 3)
         failing = lambda argv, timeout=5, input=None, **options: completed(argv, 1, "")
         with mock.patch.object(helper, "run_command", failing):
             self.assertIsNone(helper.other_watchers())
+
+    def test_another_helpers_lock_counts_whatever_ps_says(self):
+        path = os.path.join(self.home, "installed")
+        open(path, "w").close()
+        mine = os.open(path, os.O_RDONLY)
+        theirs = os.open(path, os.O_RDONLY)
+        self.addCleanup(os.close, mine)
+        self.addCleanup(os.close, theirs)
+        helper.fcntl.flock(mine, helper.fcntl.LOCK_SH)
+        helper.fcntl.flock(theirs, helper.fcntl.LOCK_SH)
+        self.assertTrue(helper.lock_held_elsewhere(mine))
+        empty = lambda argv, timeout=5, input=None, **options: completed(argv, 0, "")
+        with mock.patch.object(helper, "run_command", empty), \
+                mock.patch.object(helper, "_WATCH_LOCK", mine):
+            self.assertEqual(helper.other_watchers(), 1)
+            helper.fcntl.flock(theirs, helper.fcntl.LOCK_UN)
+            self.assertEqual(helper.other_watchers(), 0)
+        # Left holding it shared, as a serving helper should be.
+        with self.assertRaises(OSError):
+            helper.fcntl.flock(theirs, helper.fcntl.LOCK_EX | helper.fcntl.LOCK_NB)
+
+    def test_a_narrow_rule_run_clears_only_its_own_users_home(self):
+        with mock.patch.object(helper, "narrow_rule_run", return_value=True), \
+                mock.patch.dict(os.environ, {"SUDO_UID": str(os.getuid() + 1)}), \
+                mock.patch.object(os, "geteuid", return_value=0):
+            result, _ = self.uninstall()
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn(self.dir, result["removed"])
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "hook.lock")))
 
     def test_only_swarmbars_exact_rule_matches(self):
         rule = helper.SUDOERS_RULE.fullmatch
@@ -3846,9 +3880,22 @@ class UninstallTests(unittest.TestCase):
 
     def test_swarmbars_rule_is_removed_as_root(self):
         self.write_rule("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\n")
-        with mock.patch.object(os, "geteuid", return_value=0), self.as_root_owned():
+        with mock.patch.object(os, "geteuid", return_value=0), self.as_root_owned(), \
+                mock.patch.dict(os.environ, {"SUDO_USER": "nobody"}):
             self.assertEqual(helper.remove_sudoers_rule(), (self.sudoers, None))
         self.assertFalse(os.path.lexists(self.sudoers))
+
+    def test_another_users_rule_is_kept(self):
+        # Their Mac may be asleep, and it cannot put the rule back itself.
+        self.write_rule("nobody ALL=(root) NOPASSWD: /usr/local/lib/swarmbar-helper\n")
+        for user in ("zach", None):
+            env = {key: value for key, value in os.environ.items() if key != "SUDO_USER"}
+            if user:
+                env["SUDO_USER"] = user
+            with mock.patch.object(os, "geteuid", return_value=0), self.as_root_owned(), \
+                    mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(helper.remove_sudoers_rule(), (None, "it lets nobody run the helper"))
+        self.assertTrue(os.path.exists(self.sudoers))
 
     def test_any_other_rule_is_kept(self):
         self.write_rule("nobody ALL=(ALL) NOPASSWD: ALL\n")

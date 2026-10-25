@@ -117,12 +117,17 @@ enum HostRowText {
             "Removed \(name). SwarmBar's helper and its files are gone from it. "
                 + "Any .backup-swarmbar copies of your configs are still there."
         case .cleaned(let kept):
-            "Removed \(name). SwarmBar's helper is gone from it. Left in place: \(kept.joined(separator: ", "))."
+            // Not "the helper is gone": it may be one of the things kept.
+            "Removed \(name). SwarmBar cleared what it could from it. "
+                + "Left in place: \(kept.joined(separator: ", "))."
         case .shared:
-            "Removed \(name) from this Mac. Another Mac still watches it, "
-                + "so SwarmBar's files there were left in place."
+            // A connection, not necessarily another Mac: one this Mac left
+            // half-open counts too, and nothing on the host can tell them apart.
+            "Removed \(name) from this Mac. Another SwarmBar is still connected to it, "
+                + "so its files there were left in place."
         case .failed(let why):
-            "Removed \(name) from this Mac, but SwarmBar's files are still on it: \(why)."
+            // "May": a cleanup cut short has already removed some of them.
+            "Removed \(name) from this Mac, but SwarmBar's files may still be on it: \(why)."
         }
     }
 
@@ -392,6 +397,9 @@ private struct HostSettingsRow: View {
             .controlSize(.small)
             .padding(.top, 8)
         }
+        // A switch or a re-pick mid-removal would restart the very monitor
+        // the cleanup is talking through.
+        .disabled(supervisor.removing.contains(host.id))
         .padding(.leading, 32)
         .padding(.trailing, 13)
         .padding(.top, 8)

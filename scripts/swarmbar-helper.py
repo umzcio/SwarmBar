@@ -2150,7 +2150,9 @@ def step_clear(directory, umask_lock):
     lock), then the directory itself once nothing else is in it. Never
     through a link, never a directory, and only in this user's own
     ~/.swarmbar. Anything else in it, such as a bridge script Undo has not
-    removed, stays, and so does the directory. Returns []."""
+    removed, stays, and so does the directory, which is reported as an
+    error so root never has to look inside the home to learn it. Returns
+    []."""
     try:
         dir_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
     except FileNotFoundError:
@@ -2169,8 +2171,9 @@ def step_clear(directory, umask_lock):
         left = os.listdir(dir_fd)
     finally:
         os.close(dir_fd)
-    if not left:
-        os.rmdir(directory)
+    if left:
+        raise StepError("other files are still in it")
+    os.rmdir(directory)
     return []
 
 
@@ -4158,11 +4161,67 @@ SUDOERS_RULE = re.compile(r"[a-z_][a-z0-9_-]*[$]? ALL=\(root\) NOPASSWD: %s\n"
                           % re.escape(HELPER_PATHS[0]))
 
 
+# Every helper serving a Mac holds a shared flock on its installed copy for
+# its whole life. Uninstall asks for it exclusively: refused means another
+# helper, so another Mac, holds it. That is the helper's own evidence,
+# where the process table depends on how ps spells python on each system.
+_WATCH_LOCK = None
+
+
+def hold_watch_lock():
+    """Takes the shared lock when this process runs the installed copy, and
+    never waits for it: a helper must start whatever else is happening.
+    Best effort, so a copy run from anywhere else holds none."""
+    global _WATCH_LOCK
+    path = globals().get("__file__")
+    if not path or _WATCH_LOCK is not None:
+        return
+    try:
+        if os.path.realpath(path) != os.path.realpath(helper_destination()):
+            return
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return
+    _WATCH_LOCK = fd
+
+
+def lock_held_elsewhere(fd):
+    """Whether another open of the file holds a lock that keeps `fd` from
+    taking it exclusively. Either way `fd` is left holding it shared again,
+    since a failed conversion can drop the lock it had."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = False
+    except OSError:
+        held = True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        pass
+    return held
+
+
 def other_watchers():
     """How many other SwarmBar helpers are running on this host, each one a
-    Mac watching it. None when the process table cannot be read, which is
-    never taken to mean none. A helper is python running an installed copy;
-    sudo's own process, the probe and the pasted setup command are not."""
+    Mac watching it, by the watch lock and by the process table, whichever
+    sees more. None when the process table cannot be read, which is never
+    taken to mean none. A helper in the table is python running an
+    installed copy; sudo's own process, the probe and the pasted setup
+    command are not."""
+    locked = 1 if _WATCH_LOCK is not None and lock_held_elsewhere(_WATCH_LOCK) else 0
+    listed = processes_running_a_helper()
+    if listed is None:
+        return None
+    return max(locked, listed)
+
+
+def processes_running_a_helper():
+    """The process table half of other_watchers."""
     try:
         done = run_command(["ps", "-axo", "pid=,args="], timeout=15)
     except (OSError, subprocess.SubprocessError):
@@ -4179,7 +4238,8 @@ def other_watchers():
         except ValueError:
             continue
         args = parts[1:]
-        if pid == os.getpid() or not os.path.basename(args[0]).startswith("python"):
+        # macOS shows a framework build as ".../Python.app/Contents/MacOS/Python".
+        if pid == os.getpid() or not os.path.basename(args[0]).lower().startswith("python"):
             continue
         for index, arg in enumerate(args):
             if arg == HELPER_PATHS[0] or arg.endswith("/" + USER_HELPER):
@@ -4221,7 +4281,7 @@ def remove_own_helper():
 
 def remove_sudoers_rule():
     """Deletes /etc/sudoers.d/swarmbar when it is exactly a rule SwarmBar
-    writes. Returns (removed path or None, reason kept or None). Removing a
+    writes, for the user this run came through sudo as. Returns (removed path or None, reason kept or None). Removing a
     file from sudoers.d cannot make the rest fail to parse, so there is no
     visudo step to undo."""
     if os.geteuid() != 0:
@@ -4239,9 +4299,14 @@ def remove_sudoers_rule():
         return None, error_text(error)
     finally:
         os.close(fd)
-    if not stat_module.S_ISREG(info.st_mode) or info.st_uid != 0 \
-            or not SUDOERS_RULE.fullmatch(data.decode("utf-8", "replace")):
+    text = data.decode("utf-8", "replace")
+    if not stat_module.S_ISREG(info.st_mode) or info.st_uid != 0 or not SUDOERS_RULE.fullmatch(text):
         return None, "not the rule SwarmBar writes"
+    # Only the rule for the user removing the host. Another user's Mac may
+    # be asleep, and unlike the helper it cannot put its rule back itself.
+    user = text.split(" ", 1)[0]
+    if user != os.environ.get("SUDO_USER", ""):
+        return None, "it lets %s run the helper" % user
     try:
         os.unlink(SUDOERS_PATH)
     except OSError as error:
@@ -4276,25 +4341,33 @@ def uninstall(relay):
         removed.append(path)
     elif reason:
         kept.append({"path": helper_destination(), "reason": reason})
-    root = os.geteuid() == 0
+    # Root clears every home it served, except through the narrow rule,
+    # which lets one user run the helper and so reaches only that user's.
+    only = os.geteuid()
+    if only == 0:
+        only = None
+        if narrow_rule_run():
+            try:
+                only = int(os.environ.get("SUDO_UID", ""))
+            except ValueError:
+                only = -1
     for home in home_dirs():
         directory = os.path.join(home, HOOK_DIR)
+        # A stat, as hook_homes makes; nothing inside the home is opened.
         if not os.path.lexists(directory):
             continue
         owner = home_owner(home)
-        if not root and owner[1] != os.geteuid():
+        if only is not None and owner[1] != only:
             continue
         try:
             run_as_user(owner, "clear", directory)
-        except (HookHomeError, OSError) as error:
-            # In-process (not root) a filesystem error arrives as itself,
-            # not as the step child's message.
+        except Exception as error:
+            # One home is never a reason to leave the rest. In-process (not
+            # root) a filesystem error arrives as itself, not as the step
+            # child's message.
             kept.append({"path": directory, "reason": error_text(error)})
             continue
-        if os.path.lexists(directory):
-            kept.append({"path": directory, "reason": "other files are still in it"})
-        else:
-            removed.append(directory)
+        removed.append(directory)
     path, reason = remove_sudoers_rule()
     if path:
         removed.append(path)
@@ -4401,6 +4474,7 @@ def main(stdin=None, stdout=None):
     global _OUT
     stdin = stdin if stdin is not None else sys.stdin
     _OUT = stdout if stdout is not None else sys.stdout
+    hold_watch_lock()
     relay = HookRelay()
     try:
         relay.refresh()

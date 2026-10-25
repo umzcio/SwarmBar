@@ -247,6 +247,7 @@ final class RemoteMonitorSupervisor {
             registry.remove(id: id)
             removing.remove(id)
         }
+        guard host.isEnabled else { return .failed("it wasn't being watched, so it wasn't asked") }
         guard let connection = connection(forHostID: id),
               store.remoteReachability[host.displayName] == .reachable
         else { return .failed("it couldn't be reached") }

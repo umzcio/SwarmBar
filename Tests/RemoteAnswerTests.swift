@@ -524,6 +524,19 @@ struct RemoteAnswerTests {
         #expect(rig.registry.hosts.isEmpty)
     }
 
+    /// A host turned off has no connection, and saying it was unreachable
+    /// would be a guess about a host nobody asked.
+    @Test func removingATurnedOffHostSaysSo() async throws {
+        let rig = Rig(replies: ["uninstall": #"{"ok":true,"shared":false,"removed":[],"kept":[]}"#])
+        var off = rig.host
+        off.isEnabled = false
+        rig.registry.upsert(off)
+        #expect(await rig.supervisor.remove(hostID: rig.host.id)
+            == .failed("it wasn't being watched, so it wasn't asked"))
+        #expect(await rig.helper.commands.isEmpty)
+        #expect(rig.registry.hosts.isEmpty)
+    }
+
     @Test func remoteCodexSendsItsHotkeyWithoutACapture() async throws {
         let rig = Rig(replies: ["keys": #"{"sent":true}"#])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "codex"))

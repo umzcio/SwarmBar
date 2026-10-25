@@ -270,11 +270,11 @@ struct RemoteHostHintTests {
         ]
         #expect(notes[0] == "Removed devbox. SwarmBar's helper and its files are gone from it. "
             + "Any .backup-swarmbar copies of your configs are still there.")
-        #expect(notes[1] == "Removed devbox. SwarmBar's helper is gone from it. "
+        #expect(notes[1] == "Removed devbox. SwarmBar cleared what it could from it. "
             + "Left in place: /root/.swarmbar, /etc/sudoers.d/swarmbar.")
-        #expect(notes[2] == "Removed devbox from this Mac. Another Mac still watches it, "
-            + "so SwarmBar's files there were left in place.")
-        #expect(notes[3] == "Removed devbox from this Mac, but SwarmBar's files are still on it: "
+        #expect(notes[2] == "Removed devbox from this Mac. Another SwarmBar is still connected to it, "
+            + "so its files there were left in place.")
+        #expect(notes[3] == "Removed devbox from this Mac, but SwarmBar's files may still be on it: "
             + "it couldn't be reached.")
         #expect(!notes.joined().contains("\u{2014}"))
     }
