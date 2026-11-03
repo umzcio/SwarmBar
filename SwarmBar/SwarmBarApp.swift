@@ -45,14 +45,17 @@ struct SwarmBarApp: App {
             let defaults = UserDefaults.standard
             let wantsIt: Bool
             let title: String
+            let kind: NotificationSounds.Kind
             if case .waitingApproval = session.status {
                 wantsIt = (defaults.object(forKey: "notifyApprovals") as? Bool) ?? true
                 // Not "wants to run a command": AskUserQuestion also arrives
                 // through the permission hook, with the question as the body.
                 title = "\(session.projectName) needs your approval"
+                kind = .approval
             } else {
                 wantsIt = (defaults.object(forKey: "notifyWaiting") as? Bool) ?? false
                 title = "\(session.projectName) is waiting on you"
+                kind = .waiting
             }
             guard wantsIt else { return }
             let body: String
@@ -61,8 +64,8 @@ struct SwarmBarApp: App {
             case .waitingInput(let prompt): body = prompt.isEmpty ? session.tool.label : prompt
             default: return
             }
-            let sound = (defaults.object(forKey: "notifySound") as? Bool) ?? true
-            Self.postUnlessOnScreen(session, title: title, body: body, sound: sound)
+            Self.postUnlessOnScreen(
+                session, title: title, body: body, sound: NotificationSounds.current(for: kind))
         }
         store.idleTurnHandler = { session in
             let defaults = UserDefaults.standard
@@ -72,7 +75,7 @@ struct SwarmBarApp: App {
                 session,
                 title: "\(session.projectName) is waiting on you",
                 body: summary.isEmpty ? session.tool.label : summary,
-                sound: (defaults.object(forKey: "notifySound") as? Bool) ?? true)
+                sound: NotificationSounds.current(for: .waiting))
         }
         // Real monitors by default; --mock replays the prototype simulation
         // so the demo mode survives.
@@ -152,7 +155,7 @@ extension SwarmBarApp {
     /// terminal. Off the main thread: finding the tty and asking iTerm2 for
     /// its current tab are both process launches.
     nonisolated static func postUnlessOnScreen(
-        _ session: AgentSession, title: String, body: String, sound: Bool
+        _ session: AgentSession, title: String, body: String, sound: AlertSound
     ) {
         let id = session.id, path = session.projectPath, isLocal = session.host == nil
         Task.detached {

@@ -309,7 +309,10 @@ struct NotificationSettingsTab: View {
     @AppStorage("notifyApprovals") private var notifyApprovals = true
     @AppStorage("notifyWaiting") private var notifyWaiting = false
     @AppStorage("notifySound") private var notifySound = true
+    @AppStorage(NotificationSounds.Kind.approval.defaultsKey) private var approvalSound = ""
+    @AppStorage(NotificationSounds.Kind.waiting.defaultsKey) private var waitingSound = ""
     @State private var systemAllows: Bool?
+    @State private var soundOptions = NotificationSounds.installedOptions()
 
     var body: some View {
         SettingsCardList {
@@ -361,10 +364,41 @@ struct NotificationSettingsTab: View {
                 SettingsToggleRow(
                     symbol: "speaker.wave.2",
                     title: "Sound",
-                    detail: "Play the alert sound with notifications",
+                    detail: "Play a sound with notifications",
                     isOn: $notifySound
                 )
+                SettingsDivider()
+                soundRow(
+                    title: "Approval sound",
+                    detail: "Plays when an agent asks permission",
+                    tint: .orange,
+                    choice: $approvalSound,
+                    isEnabled: notifySound && notifyApprovals
+                )
+                SettingsDivider()
+                soundRow(
+                    title: "Waiting sound",
+                    detail: "Plays when an agent asks a question",
+                    tint: .blue,
+                    choice: $waitingSound,
+                    isEnabled: notifySound && notifyWaiting
+                )
             }
+
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                // The name matters: macOS holds on to a sound by its path, so a
+                // file replaced under the same name stays silent or stale until
+                // NotificationCenter restarts, while the preview here sounds fine.
+                Text("To use your own sound, add an AIFF, WAV or CAF file under 30 seconds to your Sounds folder. If you replace a sound, give the new file a new name.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button("Open folder") { NotificationSounds.openUserFolder() }
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 6)
+            .padding(.top, 10)
 
             Text("A session posts once when it starts needing you, not on every poll.")
                 .font(.caption)
@@ -376,6 +410,54 @@ struct NotificationSettingsTab: View {
         // can grant or revoke this in System Settings while SwarmBar runs,
         // and the whole point of the row is to be right.
         .task { systemAllows = await AgentNotifier.isAllowed() }
+        // Coming back from Finder is how a newly added sound arrives.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            soundOptions = NotificationSounds.installedOptions()
+        }
+    }
+
+    private func soundRow(
+        title: String, detail: String, tint: Color, choice: Binding<String>, isEnabled: Bool
+    ) -> some View {
+        // A saved sound whose file is gone shows as Default, which is what
+        // the alert will actually play.
+        let selection = Binding<String>(
+            get: { soundOptions.contains { $0.name == choice.wrappedValue } ? choice.wrappedValue : "" },
+            set: { name in
+                choice.wrappedValue = name
+                if let option = soundOptions.first(where: { $0.name == name }) {
+                    NotificationSounds.preview(option)
+                }
+            })
+        return HStack(spacing: 11) {
+            Image(systemName: "music.note")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(tint)
+                .frame(width: 28, height: 28)
+                .background(.white.opacity(0.06), in: .rect(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Picker(title, selection: selection) {
+                Text("Default").tag("")
+                Divider()
+                ForEach(soundOptions) { option in
+                    Text(option.name).tag(option.name)
+                }
+            }
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .opacity(isEnabled ? 1 : 0.5)
+        .disabled(!isEnabled)
     }
 }
 
