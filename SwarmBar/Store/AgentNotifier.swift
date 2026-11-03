@@ -61,7 +61,7 @@ enum AgentNotifier {
         NSWorkspace.shared.open(url)
     }
 
-    static func post(title: String, body: String, sound: Bool, sessionID: UUID? = nil) {
+    static func post(title: String, body: String, sound: AlertSound, sessionID: UUID? = nil) {
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             guard settings.authorizationStatus == .authorized
@@ -73,7 +73,11 @@ enum AgentNotifier {
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
-            if sound { content.sound = .default }
+            switch sound {
+            case .silent: break
+            case .standard: content.sound = .default
+            case .file(let name): content.sound = UNNotificationSound(named: UNNotificationSoundName(name))
+            }
             // Which session this is about, so the click knows where to go.
             if let sessionID { content.userInfo = ["sessionID": sessionID.uuidString] }
             center.add(UNNotificationRequest(
