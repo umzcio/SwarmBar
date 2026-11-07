@@ -67,9 +67,47 @@ _OUT = sys.stdout
 _WRITE_LOCK = threading.Lock()
 
 
+def valid_text(text):
+    """`text` as real Unicode. A name with a byte that is not UTF-8 comes
+    out of os.listdir, os.readlink and the like holding a lone surrogate
+    (surrogateescape), which json.dumps writes as an escape such as
+    \\udcff. Swift's JSONDecoder refuses that, and with it the whole line,
+    so one such name on a host would blind the Mac to every session there.
+    The escaped bytes go back to bytes and decode with U+FFFD for each one
+    that is not UTF-8; bytes that were valid all along come back as what
+    they were. Any other lone surrogate becomes U+FFFD too."""
+    if text.isascii():
+        return text
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        pass
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:
+        return "".join("\ufffd" if 0xD800 <= ord(c) <= 0xDFFF else c for c in text)
+
+
+def valid_unicode(value):
+    """`value` with every string in it, dict keys included, made valid."""
+    if isinstance(value, str):
+        return valid_text(value)
+    if isinstance(value, dict):
+        return dict((valid_unicode(key), valid_unicode(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return [valid_unicode(item) for item in value]
+    return value
+
+
+def json_line(obj):
+    """One line of JSON for the Mac, every string in it valid Unicode."""
+    return json.dumps(valid_unicode(obj)) + "\n"
+
+
 def write_line(obj):
     """The only function that writes to the output stream."""
-    text = json.dumps(obj) + "\n"
+    text = json_line(obj)
     with _WRITE_LOCK:
         _OUT.write(text)
         _OUT.flush()
@@ -1779,7 +1817,7 @@ def probe_main():
         result = {"ok": False, "protocol": PROTOCOL_VERSION,
                   "python": platform.python_version(),
                   "error": "probe failed: %s" % error}
-    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.write(json_line(result))
     sys.stdout.flush()
 
 

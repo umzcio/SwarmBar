@@ -140,6 +140,22 @@ struct RemoteSnapshotTests {
         #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
     }
 
+    @Test("a lone surrogate escape fails the whole decode, which is why the helper never sends one")
+    func loneSurrogateFailsTheDecode() throws {
+        func json(_ cwd: String) -> String {
+            """
+            {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+             "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],"processes_failed":false,
+             "processes":[{"pid":1,"ppid":0,"user":"u","comm":"claude","args":"claude",
+                           "cwd":"\(cwd)","tty":"","pane":null,"open":[]}]}
+            """
+        }
+        #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json(#"/home/u/\udcff"#).utf8)) }
+        // What the helper sends instead: the replacement character.
+        let snapshot = try RemoteSnapshot.decode(Data(json(#"/home/u/\ufffd"#).utf8))
+        #expect(snapshot.processes.first?.cwd == "/home/u/\u{FFFD}")
+    }
+
     // MARK: Size limits
 
     private static let tiny = RemoteSnapshot.Limits(lineBytes: 4096, records: 4, chunkBytes: 8)

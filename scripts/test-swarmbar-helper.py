@@ -778,6 +778,58 @@ class ProtocolTests(unittest.TestCase):
         helper.main(stdin, stdout)
         return [json.loads(l) for l in stdout.getvalue().splitlines()]
 
+    def assert_strict_unicode(self, line):
+        """Python's json reads a lone surrogate escape happily; Swift's
+        JSONDecoder refuses the whole line. Every string must be text."""
+        def walk(value):
+            if isinstance(value, str):
+                self.assertFalse(any(0xD800 <= ord(c) <= 0xDFFF for c in value), repr(value))
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    walk(key)
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        decoded = json.loads(line)
+        walk(decoded)
+        return decoded
+
+    def test_write_line_never_emits_a_lone_surrogate(self):
+        out = io.StringIO()
+        with mock.patch.object(helper, "_OUT", out):
+            helper.write_line({
+                "path": "/home/u/\udcff.json",
+                "nested": [{"cwd": "/srv/caf\udcc3\udca9"}, "\ud800"],
+                "k\udcfe": "smile \U0001F600",
+            })
+        decoded = self.assert_strict_unicode(out.getvalue())
+        self.assertEqual(decoded["path"], "/home/u/\ufffd.json")
+        # Bytes that were valid UTF-8 all along come back as what they were.
+        self.assertEqual(decoded["nested"][0]["cwd"], "/srv/caf\u00e9")
+        self.assertEqual(decoded["nested"][1], "\ufffd")
+        self.assertEqual(decoded["k\ufffd"], "smile \U0001F600")
+
+    def test_snapshot_with_an_undecodable_cwd_stays_decodable(self):
+        process = {"pid": 4242, "ppid": 1, "uid": 1000, "user": "u", "tty": "",
+                   "comm": "claude", "args": "claude \udcff", "cwd": "/home/u/\udcff",
+                   "pane": None, "open": ["/home/u/.claude/sessions/\udcff.json"]}
+        with mock.patch.object(helper, "agent_processes", return_value=[process]):
+            stdin = io.StringIO(json.dumps({"id": 1, "cmd": "snapshot"}) + "\n")
+            stdout = io.StringIO()
+            helper.main(stdin, stdout)
+        (line,) = stdout.getvalue().splitlines()
+        reply = self.assert_strict_unicode(line)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["processes"][0]["cwd"], "/home/u/\ufffd")
+
+    def test_probe_output_never_emits_a_lone_surrogate(self):
+        out = io.StringIO()
+        with mock.patch.object(helper, "probe", return_value={"ok": True, "home": "/home/\udcff"}), \
+                mock.patch.object(helper.sys, "stdout", out):
+            helper.probe_main()
+        self.assertEqual(self.assert_strict_unicode(out.getvalue())["home"], "/home/\ufffd")
+
     def test_ping_echoes_id(self):
         (reply,) = self.run_main({"id": 7, "cmd": "ping"})
         self.assertEqual(reply["id"], 7)
