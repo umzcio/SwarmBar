@@ -1561,6 +1561,29 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad keys"}, extra)
             self.assertEqual(rec.sent(), [])
 
+    def test_expect_once_needs_exactly_one_copy(self):
+        # The marked line is the one that moves. A second copy on screen is
+        # agent text drawn to look like the selector, and zero means the
+        # cursor moved, so either sends nothing.
+        line = "> 1. Approve"
+        for screen, sent in (("> 1. Approve\n  2. Deny", True),
+                             ("> 1. Approve\n> 1. Approve\n  2. Deny", False),
+                             ("  1. Approve\n> 2. Deny", False)):
+            rec = TmuxRecorder(screen=screen)
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["DOWN", "\n"],
+                             "expect": ["Deny", {"once": line}]}, rec)
+            expected = {"sent": True} if sent else {"sent": False, "reason": "changed"}
+            self.assertEqual(out, expected, screen)
+            self.assertEqual(len(rec.sent()), 2 if sent else 0, screen)
+
+    def test_malformed_expect_once_is_bad_keys(self):
+        for bad in ({"once": 3}, {"once": ""}, {"once": "x", "more": 1}, {"twice": "x"}, {}, 3):
+            rec = TmuxRecorder(screen="x")
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect": [bad]}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
+            self.assertEqual(rec.sent(), [])
+
     def test_expect_more_needs_the_count_to_rise(self):
         # "ok" was on screen twice before the paste. Twice is not enough.
         for screen, sent in (("ok\n> ok", False), ("ok\n> x", False), ("ok\nok\n> ok", True)):

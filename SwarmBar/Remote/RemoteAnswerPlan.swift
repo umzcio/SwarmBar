@@ -3,11 +3,21 @@ import Foundation
 /// What to press in a remote session's tmux pane, and what must still be
 /// on its screen when the helper presses it. The helper re-reads the pane
 /// immediately before sending and sends nothing if any `expect` string is
-/// missing, which is the remote form of the local path's one-script read
-/// and press.
+/// missing, or any `expectOnce` string is not there exactly once, which is
+/// the remote form of the local path's one-script read and press.
 struct RemoteKeyCommand: Equatable, Sendable {
     var keys: [String]
     var expect: [String]
+    var expectOnce: [String] = []
+
+    /// The request's `expect` list: each `expect` string as itself, each
+    /// `expectOnce` one as {"once": text}. A helper from before that form
+    /// requires every item to be a string and answers "bad keys", so a
+    /// mixed install presses nothing rather than checking less.
+    var expectJSON: JSONValue {
+        .array(expect.map(JSONValue.string)
+            + expectOnce.map { .object(["once": .string($0)]) })
+    }
 }
 
 /// Turns the route `ApprovalRouter` chose into a key command, from a screen
@@ -46,8 +56,10 @@ enum RemoteAnswerPlan {
             // Walked by label from the marked line, only ever the distance
             // within the list, so a wrapping selector cannot come into it.
             // The marked line is confirmed as well as the label, since the
-            // label is on screen wherever the cursor happens to be, as in
-            // TerminalFocuser.answerByNavigation.
+            // label is on screen wherever the cursor happens to be, and it
+            // must be there exactly once, as in
+            // TerminalFocuser.answerByNavigation: the Mac's read refused two
+            // marked lines, but the pane can change before the press.
             guard let screen, let option = choose(screen) else { return nil }
             let selector = TuiPromptLayout.selector(in: screen)
             guard let cursor = selector.cursor,
@@ -56,7 +68,7 @@ enum RemoteAnswerPlan {
             else { return nil }
             return RemoteKeyCommand(
                 keys: Array(repeating: move.key, count: move.presses) + ["\n"],
-                expect: [option.label, cursorLine])
+                expect: [option.label], expectOnce: [cursorLine])
 
         case .focusTerminal, .mockTransition:
             return nil

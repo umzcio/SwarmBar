@@ -2131,6 +2131,38 @@ def valid_expect_more(entries):
     return True
 
 
+def valid_expect(entries):
+    """Whether `entries` is a list whose items are each a string, which must
+    be on the press-time screen, or {"once": non-empty str}, which must be
+    there exactly once (non-overlapping, as str.count counts).
+
+    Helpers older than the "once" form require every item to be a string
+    and answer "bad keys" to anything else, so a Mac that sends "once" to
+    one gets nothing pressed rather than a weaker check."""
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict) or set(entry) != {"once"}:
+            return False
+        if not isinstance(entry["once"], str) or not entry["once"]:
+            return False
+    return True
+
+
+def expectations_hold(screen, expect, expect_more):
+    """Whether the press-time screen still shows what the Mac read."""
+    for entry in expect:
+        if isinstance(entry, str):
+            if entry not in screen:
+                return False
+        elif screen.count(entry["once"]) != 1:
+            return False
+    # str.count is non-overlapping, as the Mac counts.
+    return not any(screen.count(m["text"]) <= m["before"] for m in expect_more)
+
+
 def tmux_key_args(key):
     """The send-keys arguments for one key. Anything unnamed is sent literally
     with -l, and "--" ends option parsing so a literal such as "-x" or "Up"
@@ -2274,6 +2306,12 @@ def handle_tmux(request):
     "changed". A malformed pair answers "bad keys" for keys and "bad target"
     for paste.
 
+    An `expect` item may be {"once": str} instead of a string: that text
+    must be on the screen exactly once. The cursor line of a walk is sent
+    this way, as the local path checks it, because a second copy is agent
+    text drawn to look like the selector. A malformed item answers "bad
+    keys".
+
     keys may also carry `expect_more`, a list of {"text": str, "before":
     int}: each text must occur more times on the press-time screen than
     `before`, the count the Mac read before it pasted. A short reply such
@@ -2340,8 +2378,7 @@ def handle_tmux(request):
     keys, expect = request.get("keys"), request.get("expect") or []
     expect_more = request.get("expect_more", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
-            or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect) \
-            or not valid_expect_more(expect_more):
+            or not valid_expect(expect) or not valid_expect_more(expect_more):
         return {"ok": False, "error": "bad keys"}
     refused = target_refusal(request, pane, "bad keys")
     if refused is not None:
@@ -2354,10 +2391,7 @@ def handle_tmux(request):
         screen = pane_text(pane)
         if screen is None:
             return {"sent": False, "reason": "capture failed"}
-        if any(e not in screen for e in expect):
-            return {"sent": False, "reason": "changed"}
-        # str.count is non-overlapping, as the Mac counts.
-        if any(screen.count(m["text"]) <= m["before"] for m in expect_more):
+        if not expectations_hold(screen, expect, expect_more):
             return {"sent": False, "reason": "changed"}
     for index, key in enumerate(keys):
         if index:
