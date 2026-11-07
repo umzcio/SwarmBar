@@ -83,7 +83,7 @@ enum AntigravityConversation {
             let sql = """
                 SELECT metadata FROM steps
                 WHERE status <> \(doneStatus)
-                ORDER BY idx DESC LIMIT 1
+                ORDER BY idx DESC
                 """
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -92,13 +92,38 @@ enum AntigravityConversation {
                 return nil
             }
             defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW,
-                  let bytes = sqlite3_column_blob(statement, 0)
-            else { return .some(nil) }
-            let count = Int(sqlite3_column_bytes(statement, 0))
-            let blob = Data(bytes: bytes, count: count)
-            return .some(pending(inMetadata: blob))
+            var blobs: [Data] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let bytes = sqlite3_column_blob(statement, 0) else {
+                    blobs.append(Data())
+                    continue
+                }
+                blobs.append(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+            }
+            return .some(pending(inMetadata: blobs))
         } ?? nil
+    }
+
+    /// What a run of unsettled steps, newest first, says is waiting.
+    ///
+    /// The newest one alone once decided, and agy can hold more than one
+    /// call unsettled at a time: one planner response carries several tool
+    /// calls. The gate on screen then belongs to whichever call agy is
+    /// asking about, which nothing in the database names, so a row showing
+    /// the newest call could put Approve on a different one. When more than
+    /// one unsettled step carries a tool call, the row says it cannot tell
+    /// which call is being asked about and offers the terminal.
+    nonisolated static func pending(inMetadata blobs: [Data]) -> Pending? {
+        let calls = blobs.compactMap { pending(inMetadata: $0) }
+        guard let newest = calls.first else { return nil }
+        guard calls.count == 1 else {
+            return Pending(
+                question: nil, options: [], summary: newest.summary,
+                prompt: .unreadable(
+                    "Antigravity has more than one call waiting, and SwarmBar cannot tell which one it is asking about. Review it in the terminal.",
+                    context: newest.summary))
+        }
+        return newest
     }
 
     /// The metadata column is a protobuf, but the tool call's arguments sit
