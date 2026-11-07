@@ -386,10 +386,14 @@ def head_chunk(path, size):
 
 
 def has_timestamp(line):
-    """Whether a JSONL line is an object with a top-level string timestamp."""
+    """Whether a JSONL line is an object with a top-level string timestamp.
+
+    A line nested deeper than the decoder will go raises RecursionError,
+    not ValueError, and is just as malformed: one user's transcript must
+    not fail the whole host's snapshot."""
     try:
         record = json.loads(line.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     return isinstance(record, dict) and isinstance(record.get("timestamp"), str)
 
@@ -672,13 +676,30 @@ def matching(directory, part, unreadable):
             and fnmatch.fnmatchcase(name, part)]
 
 
+# How far below its start a "**" walk goes. Codex nests sessions/YYYY/MM/DD,
+# three levels; anything this deep is not an agent's layout, and a tree
+# deep enough to overflow a recursive walk is one user's way to fail every
+# snapshot of a host watched as root.
+MAX_WALK_DEPTH = 32
+
+
 def subdirectories(directory, unreadable):
-    """`directory` and every directory beneath it, for "**". Symlinked
-    directories are not followed, so a link loop cannot run forever."""
-    found = [directory]
-    for path in matching(directory, "*", unreadable):
-        if os.path.isdir(path) and not os.path.islink(path):
-            found.extend(subdirectories(path, unreadable))
+    """`directory` and every directory beneath it, for "**", in the same
+    depth-first order a recursive walk gives. Symlinked directories are not
+    followed, so a link loop cannot run forever. Iterative and bounded at
+    MAX_WALK_DEPTH: a directory past it is recorded in `unreadable` and not
+    entered, so it reads as not looked at rather than as empty."""
+    found = []
+    pending = [(directory, 0)]
+    while pending:
+        current, depth = pending.pop()
+        found.append(current)
+        children = [path for path in matching(current, "*", unreadable)
+                    if os.path.isdir(path) and not os.path.islink(path)]
+        if children and depth >= MAX_WALK_DEPTH:
+            unreadable[current] = "deeper than %d levels, not walked" % MAX_WALK_DEPTH
+            continue
+        pending.extend((path, depth + 1) for path in reversed(children))
     return found
 
 
@@ -717,7 +738,14 @@ def expand(spec, homes, claude_dirs, unreadable):
         rest = spec.pattern
         bases = [(home, home) for home in homes]
     for home, base in bases:
-        for path in expand_pattern(base, rest, unreadable):
+        # Anything a hostile tree can make the walk raise costs this base
+        # this one pattern, reported as not looked at, never the snapshot.
+        try:
+            paths = expand_pattern(base, rest, unreadable)
+        except Exception as error:
+            unreadable[base] = "cannot expand %s: %s" % (rest, type(error).__name__)
+            continue
+        for path in paths:
             yield home, path
 
 
@@ -778,8 +806,14 @@ def manifest(now, warnings, shipped_before):
             if is_dir:
                 dirs[path] = stat_entry(path, info)
             else:
-                result = file_chunks(spec, path, info.st_size, info.st_mtime,
-                                     shipped_before.get(path))
+                # One file's failure is that file's omission, never the
+                # snapshot's: a user who can plant a file must not be able
+                # to blind the host for everyone.
+                try:
+                    result = file_chunks(spec, path, info.st_size, info.st_mtime,
+                                         shipped_before.get(path))
+                except Exception as error:
+                    result = "cannot read: %s" % type(error).__name__
                 # Omitting the file says nothing about the session, which is
                 # recoverable on the next poll. Shipping it empty would wipe
                 # the Mac's copy and delete its row, which is not.

@@ -340,6 +340,76 @@ class ManifestTests(unittest.TestCase):
                 mirror[offset:offset + len(data)] = data
             self.assertEqual(bytes(mirror), content.encode("utf-8"))
 
+    def make_deep_tree(self, relative, depth):
+        """`depth` nested one-letter directories under `relative`, made one
+        level at a time so no single call needs the whole path."""
+        path = os.path.join(self.home, relative)
+        os.makedirs(path, exist_ok=True)
+        for _ in range(depth):
+            path = os.path.join(path, "a")
+            os.mkdir(path)
+        return path
+
+    def test_deep_codex_tree_does_not_fail_the_snapshot(self):
+        # One user's tree must not blind the whole host. The recursion limit
+        # is lowered so the tree that would overflow it stays well inside
+        # macOS's PATH_MAX; on Linux the same failure needs ~1,000 levels.
+        good = self.put(".codex/sessions/2026/10/22/rollout-good.jsonl",
+                        record('{"type":"session_meta"}') + self.many_records(5))
+        deep = self.make_deep_tree(".codex/sessions/deep", 200)
+        self.put(os.path.relpath(os.path.join(deep, "rollout-deep.jsonl"), self.home),
+                 record('{"type":"session_meta"}'))
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(len(__import__("inspect").stack()) + 120)
+        try:
+            snap = helper.snapshot()
+        finally:
+            sys.setrecursionlimit(limit)
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        # Past the walk's depth bound the tree is reported, never read as
+        # empty, so the Mac keeps whatever it mirrors beneath it.
+        reasons = [item["reason"] for item in snap["omitted"]
+                   if item["path"].startswith(os.path.join(self.home, ".codex/sessions/deep/"))]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("deeper than", reasons[0])
+
+    def test_deeply_nested_first_line_ships_as_a_plain_head(self):
+        nested = "[" * 10000 + "\n"
+        content = nested + self.STAMPED.replace("timestamp", "ts") + self.many_records(5)
+        path = self.put(".claude/projects/-home-u-demo/nested.jsonl", content)
+        snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        # No line carries a timestamp, so the head is the first line alone.
+        self.assertEqual(decode_chunks(self.entry(snap, path))[0], (0, nested.encode("utf-8")))
+
+    def test_one_file_that_fails_is_omitted_and_the_rest_ship(self):
+        good = self.put(self.EVENTS, self.many_records(5))
+        bad = self.put(".grok/sessions/s1/abd/events.jsonl", self.many_records(5))
+        real = helper.file_chunks
+
+        def failing(spec, path, *rest):
+            if path == bad:
+                raise RuntimeError("synthetic")
+            return real(spec, path, *rest)
+
+        with mock.patch.object(helper, "file_chunks", side_effect=failing):
+            snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        self.assertIsNone(self.entry(snap, bad))
+        self.assertIn(bad, [item["path"] for item in snap["omitted"]])
+
+    def test_a_pattern_that_fails_to_expand_omits_its_base(self):
+        good = self.put(self.EVENTS, self.many_records(5))
+        with mock.patch.object(helper, "subdirectories", side_effect=RuntimeError("synthetic")):
+            snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        # The codex walk under this home failed, which is "could not look",
+        # so the home is omitted rather than its sessions read as gone.
+        self.assertIn(self.home, [item["path"] for item in snap["omitted"]])
+
     def test_whole_file_reships_on_change(self):
         path = self.put(".grok/active_sessions.json", '{"sessions":[]}')
         first = self.entry(helper.snapshot(), path)
