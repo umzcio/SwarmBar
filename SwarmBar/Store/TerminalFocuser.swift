@@ -663,17 +663,22 @@ enum TerminalFocuser {
                 cwd: path)
     }
 
+    /// The pid active_sessions.json names for the session, only while that
+    /// pid is still the Grok process that opened it (ProcessIdentity). An
+    /// entry outlives a crashed process, and its pid can go to anything.
     private nonisolated static func grokPid(forSession id: UUID) -> Int? {
         let active = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".grok/active_sessions.json")
-        guard let data = try? Data(contentsOf: active),
+        guard let data = BoundedRead.data(of: active),
               let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
         else { return nil }
         for entry in entries {
             guard let sessionId = entry["session_id"] as? String,
                   sessionId.lowercased() == id.uuidString.lowercased(),
                   let pid = entry["pid"] as? Int,
-                  kill(pid_t(pid), 0) == 0
+                  ProcessIdentity.isProcess(
+                    pid, names: ProcessIdentity.grokNames,
+                    recordedAt: GrokBuildMonitor.openedAt(entry))
             else { continue }
             return pid
         }
@@ -699,56 +704,57 @@ enum TerminalFocuser {
         return nil
     }
 
+    /// The session's live Claude Code pid, from the same records and the
+    /// same identity test as discovery.
     nonisolated static func claudePid(forSession id: UUID) -> Int? {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
-        let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
-        for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
-            let sessionsDir = entry.appendingPathComponent("sessions")
-            let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
-            for record in records where record.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: record),
-                      let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                      let sessionId = json["sessionId"] as? String,
-                      sessionId.lowercased() == id.uuidString.lowercased(),
-                      let pid = json["pid"] as? Int,
-                      kill(pid_t(pid), 0) == 0
-                else { continue }
-                return pid
-            }
-        }
-        return nil
+        claudePidsBySession()[id.uuidString.lowercased()]
     }
 
     /// sessionId to pid for every live Claude session record, read once.
     /// Discovery calls this instead of `claudePid(forSession:)` per
     /// session: same walk and re-parse cost, paid once per poll instead of
-    /// once per session per poll. `claudePid(forSession:)` stays for the
-    /// answer path (TerminalFocuser.tty), where a single lookup is fine.
+    /// once per session per poll.
     ///
-    /// `home` and `isAlive` come from discovery's context, so the same walk
+    /// `home` and `isLive` come from discovery's context, so the same walk
     /// can read a remote host's mirrored records against its process table.
+    /// `isLive` gets the pid and when the record says its session started,
+    /// and locally holds the pid to being that Claude process
+    /// (ProcessIdentity): a record outlives its process, and the pid in it
+    /// can belong to anything by the time it is read.
     nonisolated static func claudePidsBySession(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        isLive: (Int, Date?) -> Bool = {
+            ProcessIdentity.isProcess($0, names: ProcessIdentity.claudeNames, recordedAt: $1)
+        }
     ) -> [String: Int] {
         let fm = FileManager.default
         var result: [String: Int] = [:]
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
         for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
             let sessionsDir = entry.appendingPathComponent("sessions")
-            let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
+            let records = (try? fm.contentsOfDirectory(
+                at: sessionsDir, includingPropertiesForKeys: [.creationDateKey])) ?? []
             for record in records where record.pathExtension == "json" {
                 guard let data = BoundedRead.data(of: record),
                       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       let sessionId = (json["sessionId"] as? String)?.lowercased(),
                       let pid = json["pid"] as? Int,
-                      isAlive(pid)
+                      isLive(pid, claudeRecordTime(json, file: record))
                 else { continue }
                 result[sessionId] = pid
             }
         }
         return result
+    }
+
+    /// When a Claude session record was written by its process: its own
+    /// startedAt (milliseconds since 1970), or the file's creation time for
+    /// a record without one. Either is after the process started.
+    nonisolated static func claudeRecordTime(_ json: [String: Any], file: URL) -> Date? {
+        if let millis = json["startedAt"] as? Double, millis > 0 {
+            return Date(timeIntervalSince1970: millis / 1000)
+        }
+        return (try? file.resourceValues(forKeys: [.creationDateKey]))?.creationDate
     }
 
     /// pid for every codex rollout file currently held open, in one sweep.

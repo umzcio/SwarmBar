@@ -35,7 +35,9 @@ struct GrokBuildMonitor: SessionMonitor {
     nonisolated static func discover(now: Date, context: DiscoveryContext) -> [AgentSession] {
         discover(
             root: defaultRoot(home: context.home), now: now,
-            isAlive: { context.processes.isAlive($0) })
+            isLive: {
+                context.processes.isAgent($0, names: ProcessIdentity.grokNames, recordedAt: $1)
+            })
     }
 
     /// The session ids that are subagents of another session in the same
@@ -61,11 +63,16 @@ struct GrokBuildMonitor: SessionMonitor {
         return ids
     }
 
+    /// `isLive` gets an entry's pid and its opened_at, and by default holds
+    /// the pid to being the Grok process that opened the session
+    /// (ProcessIdentity): an entry outlives a crashed process, and kill(pid,
+    /// 0) passed whatever got the number next, reviving the dead session's
+    /// prompt with someone else's terminal behind it.
     nonisolated static func discover(
-        root: URL, now: Date, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        root: URL, now: Date, isLive: (Int, Date?) -> Bool = defaultIsLive
     ) -> [AgentSession] {
         let fm = FileManager.default
-        let active = activeSessions(root: root, isAlive: isAlive)
+        let active = activeSessions(root: root, isLive: isLive)
 
         let sessionsRoot = root.appendingPathComponent("sessions")
         let cwdDirs = (try? fm.contentsOfDirectory(
@@ -130,19 +137,28 @@ struct GrokBuildMonitor: SessionMonitor {
     /// the abandoned session still registered under the same pid. Only the
     /// newest opened_at per pid is genuinely attached.
     ///
-    /// `isAlive` is this Mac's kill(pid, 0) by default, and the context's
+    /// `isLive` is this Mac's identity check by default, and the context's
     /// process table when discovery reads a remote host.
     nonisolated static func activeSessionIDs(
-        root: URL, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        root: URL, isLive: (Int, Date?) -> Bool = defaultIsLive
     ) -> Set<String> {
-        activeSessions(root: root, isAlive: isAlive).ids
+        activeSessions(root: root, isLive: isLive).ids
+    }
+
+    nonisolated static func defaultIsLive(_ pid: Int, _ openedAt: Date?) -> Bool {
+        ProcessIdentity.isProcess(pid, names: ProcessIdentity.grokNames, recordedAt: openedAt)
+    }
+
+    /// An entry's opened_at, when it has one that parses.
+    nonisolated static func openedAt(_ entry: [String: Any]) -> Date? {
+        (entry["opened_at"] as? String).flatMap { ClaudeSessionParser.date($0) }
     }
 
     /// The active ids as above, plus the pid each one's entry names where
     /// it names one. Bare id strings and entries without a pid are active
     /// with no pid to report.
     private nonisolated static func activeSessions(
-        root: URL, isAlive: (Int) -> Bool
+        root: URL, isLive: (Int, Date?) -> Bool
     ) -> (ids: Set<String>, pids: [String: Int]) {
         let path = root.appendingPathComponent("active_sessions.json")
         guard let data = BoundedRead.data(of: path),
@@ -164,9 +180,9 @@ struct GrokBuildMonitor: SessionMonitor {
                 ids.insert(id)
                 continue
             }
-            guard isAlive(pid) else { continue }
-            let openedAt = (entry["opened_at"] as? String)
-                .flatMap { ClaudeSessionParser.date($0) } ?? .distantPast
+            let recorded = Self.openedAt(entry)
+            guard isLive(pid, recorded) else { continue }
+            let openedAt = recorded ?? .distantPast
             if let current = newestPerPid[pid], current.openedAt >= openedAt { continue }
             newestPerPid[pid] = (id, openedAt)
         }
