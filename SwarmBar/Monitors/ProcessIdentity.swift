@@ -53,9 +53,17 @@ enum ProcessIdentity {
     nonisolated static func matches(
         _ facts: Facts, names: Set<String>, recordedAt: Date?, uid: uid_t = getuid()
     ) -> Bool {
-        guard let recordedAt, facts.uid == uid,
-              facts.startedAt <= recordedAt.addingTimeInterval(slack)
+        guard let recordedAt, facts.startedAt <= recordedAt.addingTimeInterval(slack)
         else { return false }
+        return isNamed(facts, names: names, uid: uid)
+    }
+
+    /// The name and owner half of `matches`, with no start time to prove.
+    /// That a process is the tool's says nothing about WHICH of the tool's
+    /// sessions it is, so this alone may keep a row alive but never binds a
+    /// session to a pid, a terminal or a signal.
+    nonisolated static func isNamed(_ facts: Facts, names: Set<String>, uid: uid_t = getuid()) -> Bool {
+        guard facts.uid == uid else { return false }
         let candidates = [facts.commandName, facts.argv0, facts.executablePath]
             .compactMap { $0 }
             .map { ($0 as NSString).lastPathComponent }
@@ -64,6 +72,12 @@ enum ProcessIdentity {
         guard let resolved = facts.resolvedExecutable else { return false }
         let file = (resolved as NSString).lastPathComponent
         return names.contains { file == $0 || file.hasPrefix($0 + "-") }
+    }
+
+    /// The live name and owner check, judged by `isNamed`.
+    nonisolated static func isNamedProcess(_ pid: Int, names: Set<String>) -> Bool {
+        guard let facts = facts(pid: pid) else { return false }
+        return isNamed(facts, names: names)
     }
 
     /// The live check: `pid`'s facts, judged by `matches`.

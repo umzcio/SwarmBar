@@ -11,6 +11,10 @@ protocol ProcessFacts: Sendable {
     /// `recordedAt`, is still that tool's process (one of `names`) rather
     /// than whatever got the number after it exited.
     func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool
+    /// Whether `pid` is one of `names`, run by this user, with no record
+    /// time to hold its start to. Enough to keep a row alive, never to bind
+    /// a session to the pid.
+    func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool
     func directoryCounts(processNames: [String]) -> [String: Int]
     func directoryCounts(processName: String, orCommandPattern: String) -> [String: Int]
     func codexPidsBySessionSuffix(sessionsRoot: String) -> [String: Int]
@@ -28,6 +32,10 @@ extension ProcessFacts {
     nonisolated func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool {
         isAlive(pid)
     }
+
+    /// Nothing weaker than `isAgent` to offer, and `isAgent` already
+    /// ignores the record time here.
+    nonisolated func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool { false }
 }
 
 /// This Mac's process table. Each method calls the code discovery called
@@ -46,6 +54,10 @@ struct LocalProcessFacts: ProcessFacts {
     /// Name, owner and start time, not mere existence: see ProcessIdentity.
     nonisolated func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool {
         ProcessIdentity.isProcess(pid, names: names, recordedAt: recordedAt)
+    }
+
+    nonisolated func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool {
+        ProcessIdentity.isNamedProcess(pid, names: names)
     }
 
     nonisolated func directoryCounts(processNames: [String]) -> [String: Int] {

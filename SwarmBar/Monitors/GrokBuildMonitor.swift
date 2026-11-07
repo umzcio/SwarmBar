@@ -37,7 +37,8 @@ struct GrokBuildMonitor: SessionMonitor {
             root: defaultRoot(home: context.home), now: now,
             isLive: {
                 context.processes.isAgent($0, names: ProcessIdentity.grokNames, recordedAt: $1)
-            })
+            },
+            isNamed: { context.processes.isNamedAgent($0, names: ProcessIdentity.grokNames) })
     }
 
     /// The session ids that are subagents of another session in the same
@@ -68,11 +69,16 @@ struct GrokBuildMonitor: SessionMonitor {
     /// (ProcessIdentity): an entry outlives a crashed process, and kill(pid,
     /// 0) passed whatever got the number next, reviving the dead session's
     /// prompt with someone else's terminal behind it.
+    ///
+    /// `isNamed` gets a pid whose entry has no opened_at that reads, and
+    /// says whether it is at least a Grok process of this user. Such an
+    /// entry keeps its row alive and reports no pid (activeSessions).
     nonisolated static func discover(
-        root: URL, now: Date, isLive: (Int, Date?) -> Bool = defaultIsLive
+        root: URL, now: Date, isLive: (Int, Date?) -> Bool = defaultIsLive,
+        isNamed: (Int) -> Bool = defaultIsNamed
     ) -> [AgentSession] {
         let fm = FileManager.default
-        let active = activeSessions(root: root, isLive: isLive)
+        let active = activeSessions(root: root, isLive: isLive, isNamed: isNamed)
 
         let sessionsRoot = root.appendingPathComponent("sessions")
         let cwdDirs = (try? fm.contentsOfDirectory(
@@ -148,25 +154,59 @@ struct GrokBuildMonitor: SessionMonitor {
     /// `isLive` is this Mac's identity check by default, and the context's
     /// process table when discovery reads a remote host.
     nonisolated static func activeSessionIDs(
-        root: URL, isLive: (Int, Date?) -> Bool = defaultIsLive
+        root: URL, isLive: (Int, Date?) -> Bool = defaultIsLive,
+        isNamed: (Int) -> Bool = defaultIsNamed
     ) -> Set<String> {
-        activeSessions(root: root, isLive: isLive).ids
+        activeSessions(root: root, isLive: isLive, isNamed: isNamed).ids
     }
 
     nonisolated static func defaultIsLive(_ pid: Int, _ openedAt: Date?) -> Bool {
         ProcessIdentity.isProcess(pid, names: ProcessIdentity.grokNames, recordedAt: openedAt)
     }
 
-    /// An entry's opened_at, when it has one that parses.
+    nonisolated static func defaultIsNamed(_ pid: Int) -> Bool {
+        ProcessIdentity.isNamedProcess(pid, names: ProcessIdentity.grokNames)
+    }
+
+    /// An entry's opened_at, when it names an instant. The format has not
+    /// been sampled from a live Grok 1.x, so any unambiguous spelling is
+    /// read: ISO 8601 with a zone (a space for the T as well), or seconds
+    /// or milliseconds since 1970. A time with no zone is not an instant,
+    /// and reading it in the wrong zone would move the bound ProcessIdentity
+    /// holds a pid to by hours, so it stays unread.
     nonisolated static func openedAt(_ entry: [String: Any]) -> Date? {
-        (entry["opened_at"] as? String).flatMap { ClaudeSessionParser.date($0) }
+        let value = entry["opened_at"]
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let raw = number.doubleValue
+            guard raw.isFinite, raw > 0 else { return nil }
+            return Date(timeIntervalSince1970: raw >= 100_000_000_000 ? raw / 1000 : raw)
+        }
+        guard var text = value as? String else { return nil }
+        if let parsed = ClaudeSessionParser.date(text) { return parsed }
+        let scalars = Array(text.unicodeScalars)
+        if scalars.count > 10, scalars[10] == " " {
+            text = String(String.UnicodeScalarView(scalars[..<10])) + "T"
+                + String(String.UnicodeScalarView(scalars[11...]))
+            return ClaudeSessionParser.date(text)
+        }
+        return nil
     }
 
     /// The active ids as above, plus the pid each one's entry names where
     /// it names one. Bare id strings and entries without a pid are active
     /// with no pid to report.
+    ///
+    /// An entry whose opened_at does not read cannot be held to a start
+    /// time. If its pid is at least a Grok process of this user (`isNamed`)
+    /// its id is active, so a real session is not marked dead over a guess
+    /// about a field, but it reports no pid: nothing proves that pid is
+    /// THIS session's rather than a newer Grok's that got the number, and
+    /// the pid is what terminals and signals are aimed by. Only a pid with
+    /// exactly one such entry and no entry with a time counts, since with
+    /// no times there is no telling which of two sessions is attached.
     private nonisolated static func activeSessions(
-        root: URL, isLive: (Int, Date?) -> Bool
+        root: URL, isLive: (Int, Date?) -> Bool, isNamed: (Int) -> Bool
     ) -> (ids: Set<String>, pids: [String: Int]) {
         let path = root.appendingPathComponent("active_sessions.json")
         guard let data = BoundedRead.data(of: path),
@@ -176,6 +216,8 @@ struct GrokBuildMonitor: SessionMonitor {
 
         var ids = Set<String>()
         var newestPerPid: [Int: (id: String, openedAt: Date)] = [:]
+        var unprovenPerPid: [Int: [String]] = [:]
+        var claimedPids = Set<Int>()
         for element in array {
             if let string = element as? String {
                 ids.insert(string)
@@ -189,12 +231,20 @@ struct GrokBuildMonitor: SessionMonitor {
                 continue
             }
             let recorded = Self.openedAt(entry)
-            guard isLive(pid, recorded) else { continue }
+            if recorded != nil { claimedPids.insert(pid) }
+            guard isLive(pid, recorded) else {
+                if recorded == nil, isNamed(pid) { unprovenPerPid[pid, default: []].append(id) }
+                continue
+            }
             let openedAt = recorded ?? .distantPast
             if let current = newestPerPid[pid], current.openedAt >= openedAt { continue }
             newestPerPid[pid] = (id, openedAt)
         }
         ids.formUnion(newestPerPid.values.map(\.id))
+        for (pid, unproven) in unprovenPerPid
+        where unproven.count == 1 && newestPerPid[pid] == nil && !claimedPids.contains(pid) {
+            ids.insert(unproven[0])
+        }
         var pids: [String: Int] = [:]
         for (pid, entry) in newestPerPid { pids[entry.id] = pid }
         return (ids, pids)

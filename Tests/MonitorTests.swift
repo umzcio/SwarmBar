@@ -323,6 +323,67 @@ struct GrokBuildMonitorTests {
         #expect(sessions.first?.status == .idle)
     }
 
+    /// opened_at is held to being an instant. Any unambiguous spelling of
+    /// one is read; a time with no zone is not, since reading it in the
+    /// wrong zone would move the bound by hours and let a reused pid pass.
+    @Test func openedAtReadsUnambiguousInstants() {
+        let expected = ISO8601DateFormatter().date(from: "2026-01-02T03:04:05Z")!
+        let readable: [Any] = [
+            "2026-01-02T03:04:05Z", "2026-01-02 03:04:05Z", "2026-01-02T05:04:05+02:00",
+            "2026-01-02T03:04:05.000Z", 1_767_323_045, 1_767_323_045_000, 1_767_323_045.0,
+        ]
+        for value in readable {
+            #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == expected, "\(value)")
+        }
+        let unreadable: [Any] = ["2026-01-02T03:04:05", "2026-01-02 03:04:05", "yesterday", "", true, -5]
+        for value in unreadable {
+            #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == nil, "\(value)")
+        }
+    }
+
+    private func writeEntries(_ root: URL, _ entries: [[String: Any]]) throws {
+        try JSONSerialization.data(withJSONObject: entries)
+            .write(to: root.appendingPathComponent("active_sessions.json"))
+    }
+
+    /// An entry whose opened_at cannot be read was a guess away from
+    /// marking a real Grok session dead. Its process is still Grok's by
+    /// name and owner, so the row stays alive, but nothing proves the pid
+    /// belongs to THIS session, so the row gets no pid: no terminal is
+    /// typed into or stopped on that evidence.
+    @Test func anUnreadableOpenedAtKeepsTheRowAliveWithoutItsPid() throws {
+        let root = try makeRoot()
+        let id = UUID().uuidString
+        let now = Date.now
+        _ = try writeSession(root: root, id: id, cwd: "/tmp/proj-unread", updatedAt: now)
+        try writeEntries(root, [["session_id": id, "pid": 4242, "opened_at": "sometime"]])
+        let sessions = GrokBuildMonitor.discover(
+            root: root, now: now, isLive: { _, date in date != nil }, isNamed: { $0 == 4242 })
+        #expect(sessions.first?.processAlive == true)
+        #expect(sessions.first?.pid == nil)
+
+        // Not a Grok process at all: dead, as before.
+        let gone = GrokBuildMonitor.discover(
+            root: root, now: now, isLive: { _, date in date != nil }, isNamed: { _ in false })
+        #expect(gone.first?.processAlive == false)
+    }
+
+    /// Without times there is no telling which of two sessions on one pid
+    /// is attached, and a time that reads wins over one that does not.
+    @Test func unprovableEntriesNeverOutrankOrGuessBetweenSessions() throws {
+        let root = try makeRoot()
+        let (a, b, c) = (UUID().uuidString, UUID().uuidString, UUID().uuidString)
+        try writeEntries(root, [
+            ["session_id": a, "pid": 4242, "opened_at": "x"],
+            ["session_id": b, "pid": 4242],
+            ["session_id": c, "pid": 5151, "opened_at": "x"],
+            ["session_id": "proved", "pid": 5151, "opened_at": "2026-01-02T03:04:05Z"],
+        ])
+        let active = GrokBuildMonitor.activeSessionIDs(
+            root: root, isLive: { _, date in date != nil }, isNamed: { _ in true })
+        #expect(active == ["proved"])
+    }
+
     /// The opened_at that discovery holds the pid to is the entry's own.
     @Test func discoveryHandsTheEntrysOpenedAtToTheLivenessCheck() throws {
         let root = try makeRoot()
