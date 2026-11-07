@@ -1649,16 +1649,54 @@ def claude_config_dirs(home):
             and os.path.isdir(os.path.join(home, entry))]
 
 
-def file_digest(path, limit=None):
+# The most the probe reads of any one file. Configs, bridges and the helper
+# are all far smaller. The probe runs as root over every home, and a home's
+# user decides how big their files are: a 1 TiB sparse config read whole
+# would fail the probe for the whole host. Past this a file is unreadable.
+PROBE_READ_MAX = WHOLE_MAX_BYTES
+PROBE_READ_BLOCK = 1024 * 1024
+
+
+def bounded_digest(handle, limit=None):
+    """(sha256, bytes or None) of what `handle` reads, hashed in blocks, or
+    None past PROBE_READ_MAX. The bytes come back only when there are at
+    most `limit` of them (any number up to the ceiling for None)."""
+    digest = hashlib.sha256()
+    kept = bytearray()
+    total = 0
+    while True:
+        block = handle.read(min(PROBE_READ_BLOCK, PROBE_READ_MAX + 1 - total))
+        if not block:
+            break
+        total += len(block)
+        if total > PROBE_READ_MAX:
+            return None
+        digest.update(block)
+        if kept is not None:
+            if limit is not None and total > limit:
+                kept = None
+            else:
+                kept.extend(block)
+    return digest.hexdigest(), bytes(kept) if kept is not None else None
+
+
+def file_digest(path, limit=None, opener=None, uid=None):
     """(sha256, bytes or None) of a regular file, or None when it cannot be
-    read. The bytes come back only when the file is at most `limit`."""
+    read, is not a regular file, is not `uid`'s when one is given, or is
+    larger than PROBE_READ_MAX. The bytes come back only when the file is
+    at most `limit`. Opened without blocking, so a FIFO is refused rather
+    than waited on, and through `opener` when one is given."""
+    if opener is None:
+        def opener(name, flags):
+            return os.open(name, flags | os.O_NONBLOCK)
     try:
-        with open(path, "rb") as handle:
-            data = handle.read()
+        with open(path, "rb", opener=opener) as handle:
+            info = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(info.st_mode) or (uid is not None and info.st_uid != uid):
+                return None
+            return bounded_digest(handle, limit)
     except OSError:
         return None
-    kept = data if limit is None or len(data) <= limit else None
-    return hashlib.sha256(data).hexdigest(), kept
 
 
 def lookup_state(path):
@@ -1714,12 +1752,13 @@ def read_owned_bytes(path, uid, size=-1):
 
 
 def read_owned(path, uid, limit=None):
-    """file_digest through read_owned_bytes."""
-    data = read_owned_bytes(path, uid)
-    if data is None:
-        return None
-    kept = data if limit is None or len(data) <= limit else None
-    return hashlib.sha256(data).hexdigest(), kept
+    """file_digest of `uid`'s own regular file, opened as read_owned_bytes
+    opens it: not through a final link, and never blocking. None as well
+    past PROBE_READ_MAX, read in blocks, so no user's file can make the
+    probe hold more than that."""
+    def opener(name, flags):
+        return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+    return file_digest(path, limit, opener, uid)
 
 
 def home_configs(home, warnings):
@@ -1950,12 +1989,31 @@ def home_installed(home, warnings):
 def installed_helpers(homes):
     """{"path", "sha256"} for each installed helper. sha256 is None when the
     file is there but cannot be read, as the root helper (root's, mode 700)
-    cannot be by anyone else."""
+    cannot be by anyone else, or is not its owner's own regular file, or
+    is larger than any helper. A user's copy is opened as the snapshot
+    opens files in that home (shipped_opener), so in another user's home a
+    link out of it, to a file that never ends, is never read. Hashed in
+    bounded blocks."""
     found = []
-    for path in list(HELPER_PATHS) + [os.path.join(home, USER_HELPER) for home in homes]:
-        if not os.path.isfile(path):
+    candidates = [(path, None, 0) for path in HELPER_PATHS]
+    for home in homes:
+        candidates.append((os.path.join(home, USER_HELPER), home, home_owner(home)[1]))
+    for path, home, uid in candidates:
+        try:
+            info = os.lstat(path)
+        except OSError:
             continue
-        digest = file_digest(path)
+        if stat_module.S_ISDIR(info.st_mode):
+            continue
+        if home is None:
+            if not stat_module.S_ISREG(info.st_mode):
+                continue
+
+            def opener(name, flags):
+                return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        else:
+            opener = shipped_opener(home)
+        digest = file_digest(path, opener=opener, uid=uid) if uid is not None else None
         found.append({"path": path, "sha256": digest[0] if digest else None})
     return found
 

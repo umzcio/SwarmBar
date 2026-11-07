@@ -2824,6 +2824,46 @@ class ProbeTests(unittest.TestCase):
         self.put(".swarmbar/swarmbar-helper", "# helper\n", 0o700)
         self.put(".config/opencode/plugins/swarmbar-remote.js", "// plugin\n")
 
+    def test_huge_files_in_one_home_never_fail_the_probe(self):
+        # A user's 1 TiB sparse helper copy and config. Read whole, either
+        # would fail the root probe for every home on the host.
+        self.populate()
+        other = os.path.join(self.root, "home", "v")
+        os.makedirs(os.path.join(other, ".kimi-code"))
+        with open(os.path.join(other, ".kimi-code", "config.toml"), "w") as handle:
+            handle.write("[providers]\n")
+        for relative in (".swarmbar/swarmbar-helper", ".kimi-code/config.toml"):
+            with open(os.path.join(self.home, relative), "r+b") as handle:
+                handle.truncate(1 << 40)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home + ":" + other}):
+            result = self.probe()
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(result["ok"])
+        mine = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        self.assertIn({"path": mine, "sha256": None}, result["helper"])
+        config = [c for c in result["configs"][self.home] if c["tool"] == "kimi"][0]
+        self.assertIsNone(config["sha256"])
+        intact = [c for c in result["configs"][other] if c["tool"] == "kimi"][0]
+        self.assertEqual(intact["sha256"], hashlib.sha256(b"[providers]\n").hexdigest())
+
+    def test_another_users_helper_link_is_never_read(self):
+        # Linked to a file that never ends, as /proc/kmsg is.
+        os.makedirs(os.path.join(self.home, ".swarmbar"))
+        endless = os.path.join(self.root, "endless")
+        os.mkfifo(endless)
+        mine = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        os.symlink(endless, mine)
+        result = []
+        with mock.patch.object(helper, "cross_user", return_value=os.geteuid()):
+            reader = threading.Thread(target=lambda: result.append(
+                helper.installed_helpers([self.home])))
+            reader.daemon = True
+            reader.start()
+            reader.join(5)
+        self.assertFalse(reader.is_alive(), "blocked reading a helper link")
+        self.assertIn({"path": mine, "sha256": None}, result[0])
+
     def test_probe_writes_nothing(self):
         self.populate()
         bin_dir = os.path.join(self.root, "bin")
