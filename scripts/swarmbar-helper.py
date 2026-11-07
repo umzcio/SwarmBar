@@ -3149,15 +3149,55 @@ def grok_session(home, session_id):
                for name in directories)
 
 
+def grok_dir_parts(real_home, uid):
+    """The components from `real_home` down to that user's Grok directory:
+    [".grok"], or, when ~/.grok is that user's link, the path its text
+    names. Nothing is followed to find it: the link is read, never looked
+    through, so where it leads cannot change how soon the hook is answered.
+    The text must name a place inside the home without "..", and the walk
+    of it (owned_dir_fd) then follows no further link and passes only
+    directories the user owns. Anything else raises NotShipped, which
+    counts as Grok, as before.
+
+    Lexical on purpose: without "..", and with no link on the way (the
+    walk refuses one), the path the text names is the path the kernel
+    would resolve, so nothing outside the home is ever touched."""
+    fd = os.open(real_home, DIRECTORY_FLAGS)
+    try:
+        if os.fstat(fd).st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        info = os.stat(".grok", dir_fd=fd, follow_symlinks=False)
+        if not stat_module.S_ISLNK(info.st_mode):
+            return [".grok"]
+        if info.st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        target = os.readlink(".grok", dir_fd=fd)
+    finally:
+        os.close(fd)
+    if not target.startswith("/"):
+        target = real_home.rstrip("/") + "/" + target
+    parts = [part for part in target.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise NotShipped(errno.EPERM, "leads outside its home")
+    path = "/" + "/".join(parts)
+    if not inside(path, real_home):
+        raise NotShipped(errno.EPERM, "leads outside its home")
+    return path[len(real_home.rstrip("/")) + 1:].split("/")
+
+
 def grok_session_walked(real_home, uid, session_id):
     """grok_session for another user's home, run as root: every path is
     reached from the home down with no link followed, through directories
     that user owns. Their link to a directory only root can search is
     never looked through, so whether a name exists there cannot change the
     answer, or how soon it comes. Grok state that is there but not plainly
-    theirs counts as Grok, as unreadable state does."""
+    theirs counts as Grok, as unreadable state does.
+
+    A ~/.grok that is a link to elsewhere in the same home (a dotfiles
+    checkout) is read where it points, so that user's Claude sessions still
+    get held approvals: see grok_dir_parts."""
     try:
-        grok = owned_dir_fd(real_home, uid, [".grok"])
+        grok = owned_dir_fd(real_home, uid, grok_dir_parts(real_home, uid))
     except FileNotFoundError:
         return False
     except OSError:

@@ -801,6 +801,40 @@ class CrossUserProbeTests(unittest.TestCase):
         os.symlink(self.hidden, os.path.join(self.home, ".grok"))
         self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
 
+    def dotfiles_grok(self, target):
+        real = os.path.join(self.home, "dotfiles", "grok")
+        os.makedirs(os.path.join(real, "sessions", "cwd-x", "g-dir"))
+        os.symlink(target, os.path.join(self.home, ".grok"))
+
+    def test_a_grok_dir_linked_within_the_home_is_read(self):
+        # A dotfiles setup: ~/.grok -> dotfiles/grok. Its sessions are
+        # Grok's and anything else is not, so a Claude session in that home
+        # still gets its held approval.
+        for target in ("dotfiles/grok", os.path.join(self.home, "dotfiles", "grok")):
+            self.dotfiles_grok(target)
+            self.assertTrue(self.answers("g-dir"), target)
+            self.assertFalse(self.answers("claude-session"), target)
+            os.remove(os.path.join(self.home, ".grok"))
+            shutil.rmtree(os.path.join(self.home, "dotfiles"))
+
+    def test_an_in_home_link_that_climbs_out_counts_as_grok(self):
+        # ".." is never resolved, even back into the home: the walk would
+        # have to pass through whatever is above it.
+        os.makedirs(os.path.join(self.hidden, "sessions"))
+        for target in ("../hidden", "dotfiles/../../hidden", "dotfiles/../dotfiles/grok"):
+            self.dotfiles_grok(target)
+            self.assertTrue(self.answers("claude-session"), target)
+            os.remove(os.path.join(self.home, ".grok"))
+            shutil.rmtree(os.path.join(self.home, "dotfiles"))
+
+    def test_a_link_inside_the_linked_dir_is_not_followed(self):
+        os.makedirs(os.path.join(self.home, "dotfiles"))
+        os.symlink(self.hidden, os.path.join(self.home, "dotfiles", "grok"))
+        os.symlink("dotfiles/grok", os.path.join(self.home, ".grok"))
+        os.makedirs(os.path.join(self.hidden, "sessions", "x", "id_ed25519"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+        self.assertTrue(self.answers("nothing_here"))
+
     def test_real_grok_state_still_counts(self):
         os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))
         with open(os.path.join(self.home, ".grok", "active_sessions.json"), "w") as handle:
