@@ -31,11 +31,12 @@ final class IntegrationManager {
 
     private(set) var states: [AgentTool: InstallState] = [:]
 
-    /// Marks a bridge script that sends the SwarmBar-Token header. An
-    /// installed copy in Application Support without this marker predates
-    /// the token and would silently fail open, so it counts as not
-    /// installed until the toggle overwrites it.
-    static let bridgeMarker = "swarmbar-bridge-v2"
+    /// Marks a bridge script that posts to SwarmBar's owner-only Unix
+    /// socket. An installed copy in Application Support without this
+    /// marker predates the socket and posts to the loopback port, which
+    /// any process can hold while SwarmBar is not running, so it counts as
+    /// not installed until it is refreshed or the toggle overwrites it.
+    static let bridgeMarker = "swarmbar-bridge-v3"
 
     private let fm = FileManager.default
     private var home: URL { fm.homeDirectoryForCurrentUser }
@@ -207,8 +208,14 @@ final class IntegrationManager {
         let fm = FileManager.default
         let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SwarmBar")
-        for name in bridgeScripts {
-            let destination = dir.appendingPathComponent(name)
+        // The OpenCode plugin is SwarmBar's own file too, installed beside
+        // OpenCode's config rather than here. Only an existing copy is
+        // refreshed; its config entry is never touched.
+        let plugin = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/opencode/plugins/swarmbar.js")
+        let targets = bridgeScripts.map { ($0, dir.appendingPathComponent($0)) }
+            + [("swarmbar-opencode.js", plugin)]
+        for (name, destination) in targets {
             guard let source = Bundle.main.url(forResource: name, withExtension: nil),
                   let bundled = try? String(contentsOf: source, encoding: .utf8),
                   let updated = refreshedScript(

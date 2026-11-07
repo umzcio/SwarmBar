@@ -1,13 +1,16 @@
 import Foundation
 import Network
 
-/// Local bridge for Claude Code hooks. Hook commands POST their stdin JSON
-/// to http://127.0.0.1:48620/hook/<EventName>; most events get an instant
-/// empty response, while pending permission requests are held open until
-/// the user decides in the popover (or a timeout fails open). Bound to
-/// loopback only. Hook events from remote hosts never reach the socket:
-/// each host's RemoteHookRelay hands them to `handleRemote`, which routes
-/// them through the same code.
+/// Local bridge for agent hooks. Bridge scripts POST their stdin JSON to
+/// /hook/<EventName> on SwarmBar's owner-only Unix socket (see
+/// UnixHookSocket); most events get an instant empty response, while
+/// pending permission requests are held open until the user decides in the
+/// popover (or a timeout fails open). The loopback port 127.0.0.1:48620
+/// still answers token-carrying requests from bridges installed before the
+/// socket. HookListener reads both off the main actor, within fixed
+/// limits. Hook events from remote hosts never reach either: each host's
+/// RemoteHookRelay hands them to `handleRemote`, which routes them through
+/// the same code.
 @MainActor
 final class HookServer: ApprovalResponding {
     /// Whether the local hook bridge is actually accepting connections.
@@ -27,7 +30,7 @@ final class HookServer: ApprovalResponding {
     static let decisionHold: Duration = .seconds(345)
     /// Largest hook payload accepted. Well above any real Claude or OpenCode
     /// payload, well under the 512 KB read ceiling in `receive`.
-    static let maxBodyBytes = 256 * 1024
+    nonisolated static let maxBodyBytes = 256 * 1024
 
     private let store: SessionStore
     private var listener: NWListener?
@@ -89,60 +92,91 @@ final class HookServer: ApprovalResponding {
         self.localHome = localHome
     }
 
+    /// Reads requests off the main actor; set once `start` runs.
+    private var hookListener: HookListener?
+    private var loopback: NWListener?
+    private var ownerSocket: UnixHookSocket?
+    /// How long a transport that could not start waits before trying
+    /// again, so a process that held the port or socket for a while does
+    /// not keep the bridges out for the rest of the session.
+    static let retryDelay: Duration = .seconds(5)
+
     func start() {
         // Must exist before any bridge script needs it: hand-installed
         // scripts start looking for the file immediately, not only after a
         // Settings toggle. nil is fail open, not a startup failure.
         tokenForRequests = HookToken.loadOrCreate()
+        let listener = HookListener(
+            deliver: { [weak self] delivery in
+                Task { @MainActor in self?.route(delivery.request, client: delivery.client) }
+            },
+            clientGone: { [weak self] in
+                Task { @MainActor in self?.dropGonePending() }
+            })
+        hookListener = listener
+        startOwnerSocket(listener)
+        startLoopback(listener)
+    }
+
+    /// The bridges' way in. Its state is the one Settings shows, since a
+    /// bridge that cannot reach it fails open to the agent's own prompt.
+    private func startOwnerSocket(_ listener: HookListener) {
+        let socket = UnixHookSocket(path: UnixHookSocket.defaultPath)
+        do {
+            try socket.start(queue: listener.queue) { [weak listener] client in
+                listener?.adopt(client, transport: .ownerSocket, token: nil)
+            }
+            ownerSocket = socket
+            store.hookServerState = .listening
+        } catch {
+            store.hookServerState = .unavailable(String(describing: error))
+            retry { $0.startOwnerSocket(listener) }
+        }
+    }
+
+    /// The loopback port, kept for bridge scripts installed before the
+    /// socket existed (refreshInstalledScripts replaces them at launch).
+    /// Requests here must carry the hook token.
+    private func startLoopback(_ listener: HookListener) {
         do {
             let parameters = NWParameters.tcp
             parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
                 host: .ipv4(.loopback),
                 port: NWEndpoint.Port(rawValue: Self.port)!
             )
-            let listener = try NWListener(using: parameters)
-            listener.newConnectionHandler = { connection in
-                Task { @MainActor [weak self] in self?.accept(connection) }
+            let tcp = try NWListener(using: parameters)
+            let token = tokenForRequests
+            tcp.newConnectionHandler = { [weak listener] connection in
+                guard let listener else { connection.cancel(); return }
+                listener.adopt(NWHookClient(connection), transport: .loopback, token: token)
             }
-            listener.stateUpdateHandler = { state in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    switch state {
-                    case .ready:
-                        self.store.hookServerState = .listening
-                    case .failed(let error):
-                        // Port taken (another SwarmBar, or something else
-                        // holding 48620) means remote approve and deny are
-                        // dead while the polling monitors still look healthy.
-                        self.store.hookServerState = .unavailable(error.localizedDescription)
-                    case .cancelled:
-                        self.store.hookServerState = .unavailable("Stopped")
-                    default:
-                        break
-                    }
+            tcp.stateUpdateHandler = { [weak self, weak tcp] state in
+                guard case .failed = state, let tcp else { return }
+                // Port taken. Old bridges cannot be answered until it is
+                // free again, so keep trying rather than give up for good.
+                tcp.cancel()
+                Task { @MainActor in
+                    guard let self, self.loopback === tcp else { return }
+                    self.loopback = nil
+                    self.retry { $0.startLoopback(listener) }
                 }
             }
-            listener.start(queue: .main)
-            self.listener = listener
+            tcp.start(queue: listener.queue)
+            loopback = tcp
         } catch {
-            store.hookServerState = .unavailable(error.localizedDescription)
+            retry { $0.startLoopback(listener) }
+        }
+    }
+
+    private func retry(_ attempt: @escaping @MainActor (HookServer) -> Void) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.retryDelay)
+            guard let self else { return }
+            attempt(self)
         }
     }
 
     // MARK: - Connections
-
-    private func accept(_ connection: NWConnection) {
-        connection.stateUpdateHandler = { state in
-            switch state {
-            case .failed, .cancelled:
-                Task { @MainActor [weak self] in self?.dropGonePending() }
-            default:
-                break
-            }
-        }
-        connection.start(queue: .main)
-        receive(connection, buffer: Data())
-    }
 
     /// A held hook client went away (process killed, its own timeout fired,
     /// the prompt was answered at the terminal). The row must stop offering
@@ -158,36 +192,6 @@ final class HookServer: ApprovalResponding {
         guard let pending = pendingApprovals.removeValue(forKey: sessionID) else { return }
         pending.timeout.cancel()
         store.clearHookOverride(sessionID: sessionID)
-    }
-
-    private static func isGone(_ connection: NWConnection) -> Bool {
-        switch connection.state {
-        case .cancelled, .failed: true
-        default: false
-        }
-    }
-
-    private func receive(_ connection: NWConnection, buffer: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, error in
-            Task { @MainActor [weak self] in
-                guard let self else { connection.cancel(); return }
-                var buffer = buffer
-                if let data { buffer.append(data) }
-                if error != nil { connection.cancel(); return }
-                switch Self.parseRequest(buffer) {
-                case .complete(let request):
-                    self.route(request, connection: connection)
-                case .malformed:
-                    connection.cancel()
-                case .incomplete:
-                    if isComplete || buffer.count > 512 * 1024 {
-                        connection.cancel()
-                    } else {
-                        self.receive(connection, buffer: buffer)
-                    }
-                }
-            }
-        }
     }
 
     struct Request {
@@ -206,71 +210,24 @@ final class HookServer: ApprovalResponding {
         case malformed
     }
 
-    static func parseRequest(_ data: Data) -> ParseOutcome {
-        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return .incomplete }
-        let headerText = String(decoding: data[..<headerEnd.lowerBound], as: UTF8.self)
-        let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return .malformed }
-        let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "POST" else { return .malformed }
-
-        var contentLength = 0
-        var account: String?
-        var token: String?
-        for line in lines.dropFirst() {
-            let lower = line.lowercased()
-            if lower.hasPrefix("content-length:") {
-                let raw = line.dropFirst("content-length:".count)
-                    .trimmingCharacters(in: .whitespaces)
-                // A missing header means an empty body; a present but bogus,
-                // negative, or oversized one is a refusal. Data.prefix traps on
-                // a negative length, so this guard is load bearing.
-                guard let value = Int(raw), value >= 0, value <= Self.maxBodyBytes else {
-                    return .malformed
-                }
-                contentLength = value
-            } else if lower.hasPrefix("x-claude-account:") {
-                let value = line.dropFirst("x-claude-account:".count)
-                    .trimmingCharacters(in: .whitespaces)
-                account = value.isEmpty ? nil : value
-            } else if lower.hasPrefix("x-swarmbar-token:") {
-                token = line.dropFirst("x-swarmbar-token:".count)
-                    .trimmingCharacters(in: .whitespaces)
-            }
-        }
-        let bodyData = data[headerEnd.upperBound...]
-        guard bodyData.count >= contentLength else { return .incomplete }
-        let bodySlice = Data(bodyData.prefix(contentLength))
-        let parsed = (try? JSONSerialization.jsonObject(with: bodySlice)) as? [String: Any]
-        // An empty body is legitimate for some events; a non-empty body that is
-        // not a JSON object is not, and must not be routed as if it were empty.
-        if parsed == nil, !bodySlice.isEmpty { return .malformed }
-        return .complete(Request(
-            path: String(parts[1]), accountLabel: account, token: token, body: parsed ?? [:]))
-    }
-
-    private static func respond(
-        _ connection: NWConnection, json: Data, completion: ((Bool) -> Void)? = nil
-    ) {
-        var response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(json.count)\r\nConnection: close\r\n\r\n".utf8)
-        response.append(json)
-        connection.send(content: response, completion: .contentProcessed { error in
-            completion?(error == nil)
-            connection.cancel()
-        })
+    /// One request read whole. The server itself reads incrementally,
+    /// through HookRequestReader, which this shares its rules with.
+    nonisolated static func parseRequest(_ data: Data) -> ParseOutcome {
+        var reader = HookRequestReader()
+        return reader.append(data)
     }
 
     // MARK: - Routing
 
+    /// Routes a request read from a NWConnection, as tests drive it.
     func route(_ request: Request, connection: NWConnection) {
-        func finishEmpty() { Self.respond(connection, json: Data("{}".utf8)) }
-        // Only bridges this app installed may change what the popover shows.
-        // A wrong or missing token gets the same empty answer a non-session
-        // event gets, so a misconfigured bridge fails open rather than hanging.
-        if let expected = tokenForRequests, !HookToken.matches(request.token, expected) {
-            finishEmpty()
-            return
-        }
+        route(request, client: NWHookClient(connection))
+    }
+
+    /// Routes a complete request. Its token, where its transport needs
+    /// one, was checked by the listener before it got here.
+    func route(_ request: Request, client: any HookClient) {
+        func finishEmpty() { client.respond(Data("{}".utf8), completion: nil) }
         let event = Self.eventName(fromPath: request.path)
         let body = request.body
         // A hook payload's cwd becomes a session's projectPath, which is handed
@@ -299,9 +256,14 @@ final class HookServer: ApprovalResponding {
                 self?.holdForDecision(
                     sessionID: sessionID, kind: kind, window: Self.decisionHold,
                     respond: { json, completion in
-                        Self.respond(connection, json: json, completion: completion)
+                        // The completion is the main actor's; the client
+                        // calls back from its own queue, so hop back.
+                        let done = MainActorCallback(completion)
+                        client.respond(json) { delivered in
+                            Task { @MainActor in done.call(delivered) }
+                        }
                     },
-                    isGone: { Self.isGone(connection) },
+                    isGone: { client.isGone },
                     remote: nil)
             })
         dispatch(event: event, body: body, context: context)
@@ -792,4 +754,12 @@ final class HookServer: ApprovalResponding {
         store.clearHookOverride(sessionID: sessionID)
         return true
     }
+}
+
+/// A main-actor callback carried through a client's queue and only ever
+/// called back on the main actor.
+private struct MainActorCallback: @unchecked Sendable {
+    private let callback: ((Bool) -> Void)?
+    init(_ callback: ((Bool) -> Void)?) { self.callback = callback }
+    @MainActor func call(_ value: Bool) { callback?(value) }
 }

@@ -49,7 +49,7 @@ struct SwarmBarApp: App {
         }
         hookServer.start()
         AgentNotifier.prepare()
-        // Off the main thread: it reads and may rewrite two small files.
+        // Off the main thread: it reads and may rewrite three small files.
         Task.detached { IntegrationManager.refreshInstalledScripts() }
         // Clicking a banner brings you to the session it is about. The
         // popover cannot be opened programmatically without reaching into
