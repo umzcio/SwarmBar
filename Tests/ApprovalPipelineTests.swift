@@ -103,14 +103,20 @@ struct SessionTTYScopeTests {
         own: Int? = nil,
         kimi: [Int] = [900],
         bear: [Int] = [],
+        open: [Int] = [],
         ttys: [Int: String] = [900: "ttys009", 901: "ttys010", 902: "ttys009", 100: "ttys001"]
     ) -> TerminalFocuser.SessionLookups {
         TerminalFocuser.SessionLookups(
             claudePid: { _ in own }, grokPid: { _ in own },
             codexPid: { _ in own }, antigravityPid: { _ in own },
-            kimiFamilyPids: { tool, path in
+            directoryPids: { tool, path in
                 guard path == "/tmp/example-proj" else { return [] }
-                return tool == .kimiCode ? kimi : tool == .bearCode ? bear : []
+                switch tool {
+                case .kimiCode: return kimi
+                case .bearCode: return bear
+                case .openCode: return open
+                default: return []
+                }
             },
             tty: { ttys[$0] })
     }
@@ -128,9 +134,27 @@ struct SessionTTYScopeTests {
             #expect(TerminalFocuser.tty(
                 forSession: id, tool: tool, projectPath: dir, lookups: lookups(own: 100)) == "ttys001")
         }
-        // OpenCode has no lookup, so even a resolvable pid elsewhere is not its.
+        // OpenCode has no session-to-pid lookup, so another tool's pid is
+        // never its.
         #expect(TerminalFocuser.tty(
             forSession: id, tool: .openCode, projectPath: dir, lookups: lookups(own: 100)) == nil)
+    }
+
+    /// OpenCode is found the way the Kimi family is, by its own processes
+    /// in the row's directory, and only while they share one terminal.
+    @Test func anOpenCodeRowResolvesOnlyToItsOwnProcessesInItsDirectory() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [901])) == "ttys010")
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [900], open: [])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [900, 901])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [901])) == nil)
     }
 
     @Test func aKimiRowAloneInItsDirectoryResolves() {

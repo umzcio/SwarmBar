@@ -631,9 +631,9 @@ enum TerminalFocuser {
         var grokPid: @Sendable (UUID) -> Int?
         var codexPid: @Sendable (UUID) -> Int?
         var antigravityPid: @Sendable (UUID) -> Int?
-        /// Every live Kimi Code (or BearCode, by the tool) process whose cwd
-        /// is the directory.
-        var kimiFamilyPids: @Sendable (AgentTool, String) -> [Int]
+        /// Every live process of the tool (Kimi Code, BearCode or OpenCode)
+        /// whose cwd is the directory.
+        var directoryPids: @Sendable (AgentTool, String) -> [Int]
         /// The controlling terminal's name ("ttys004"), or nil for none.
         var tty: @Sendable (Int) -> String?
 
@@ -642,7 +642,7 @@ enum TerminalFocuser {
             grokPid: { TerminalFocuser.grokPid(forSession: $0) },
             codexPid: { TerminalFocuser.codexPid(forSession: $0) },
             antigravityPid: { TerminalFocuser.antigravityPid(forSession: $0) },
-            kimiFamilyPids: { TerminalFocuser.kimiFamilyPids(tool: $0, cwd: $1) },
+            directoryPids: { TerminalFocuser.directoryPids(tool: $0, cwd: $1) },
             tty: { TerminalFocuser.ttyName(pid: $0) }
         )
     }
@@ -652,13 +652,13 @@ enum TerminalFocuser {
     ///
     /// This used to try every tool's lookup in turn for every row and end
     /// in a working-directory match for Kimi-family processes. A row whose
-    /// own lookup missed (its process had exited, or OpenCode, which has no
-    /// lookup at all) fell through to whatever Kimi process shared the
+    /// own lookup missed (its process had exited, or OpenCode, which then
+    /// had no lookup of its own) fell through to whatever Kimi process shared the
     /// directory, and Approve, Deny and Reply typed into that session.
     /// Every caller treats nil as "focus, never type", so a miss now stays
     /// a miss.
     ///
-    /// Kimi and BearCode have no session-to-pid registry, and their
+    /// Kimi, BearCode and OpenCode have no session-to-pid registry, and their
     /// processes are told apart only by working directory, which several
     /// sessions can share. So the directory resolves to a terminal only
     /// when every one of that tool's processes in it sits on the SAME tty
@@ -673,13 +673,12 @@ enum TerminalFocuser {
         case .grokBuild:   return lookups.grokPid(id).flatMap(lookups.tty)
         case .codex:       return lookups.codexPid(id).flatMap(lookups.tty)
         case .antigravity: return lookups.antigravityPid(id).flatMap(lookups.tty)
-        case .kimiCode, .bearCode:
+        case .kimiCode, .bearCode, .openCode:
+            // No session-to-process registry, so the directory, under the
+            // one-terminal rule above.
             guard let path = projectPath?.path else { return nil }
-            let ttys = Set(lookups.kimiFamilyPids(tool, path).compactMap(lookups.tty))
+            let ttys = Set(lookups.directoryPids(tool, path).compactMap(lookups.tty))
             return ttys.count == 1 ? ttys.first : nil
-        case .openCode:
-            // No session-to-process registry, and none was ever written.
-            return nil
         }
     }
 
@@ -701,12 +700,14 @@ enum TerminalFocuser {
             .value
     }
 
-    /// Kimi (and its BearCode fork) have no session-to-pid registry, but
-    /// their processes keep the session's workDir as cwd. Each tool's own
-    /// names only: a BearCode row never resolves to a Kimi process in the
-    /// same directory, or the other way round.
-    private nonisolated static func kimiFamilyPids(tool: AgentTool, cwd: String) -> [Int] {
+    /// Kimi, its BearCode fork and OpenCode have no session-to-pid
+    /// registry, but their processes keep the session's directory as cwd.
+    /// Each tool's own names only: a BearCode row never resolves to a Kimi
+    /// process in the same directory, nor an OpenCode row to either.
+    private nonisolated static func directoryPids(tool: AgentTool, cwd: String) -> [Int] {
         switch tool {
+        case .openCode:
+            return ProcessLiveness.pids(processNames: [OpenCodeMonitor.processName], cwd: cwd)
         case .kimiCode:
             return ProcessLiveness.pids(processNames: KimiMonitor.processNames, cwd: cwd)
         case .bearCode:
