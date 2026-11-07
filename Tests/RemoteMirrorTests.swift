@@ -593,6 +593,36 @@ struct RemoteMirrorTests {
         #expect(ClaudeCodeMonitor.tail(of: local) == ClaudeCodeMonitor.tail(of: reference))
     }
 
+    @Test("a record over the per-file ceiling is an omission, and no file of that size is made")
+    func oversizedRecordIsOmitted() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let huge = "/home/u/.kimi-code/session_index.jsonl"
+        let farChunk = "/home/u/.grok/active_sessions.json"
+        let warnings = try mirror.apply(snapshot(files: [
+            file(huge, size: RemoteMirror.maxFileBytes + 1, chunks: [(0, "{}")]),
+            file(farChunk, size: 2, chunks: [(RemoteMirror.maxFileBytes - 1, "{}"), (0, "[]")]),
+        ]))
+        #expect(!exists(try #require(mirror.local(huge))))
+        // The chunk past the ceiling is skipped and never extends the file,
+        // while the rest of the record still lands.
+        #expect(try bytes(try #require(mirror.local(farChunk))) == Data("[]".utf8))
+        #expect(warnings.count == 2)
+    }
+
+    @Test("an oversized record keeps what the mirror already held for that path")
+    func oversizedRecordKeepsEarlierBytes() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.kimi-code/session_index.jsonl"
+        try mirror.apply(snapshot(files: [file(path, size: 3, chunks: [(0, "{}\n")])]))
+        try mirror.apply(snapshot(files: [
+            file(path, size: RemoteMirror.maxFileBytes + 1, reset: false, chunks: [])
+        ]))
+        let local = try #require(mirror.local(path))
+        #expect(try bytes(local) == Data("{}\n".utf8))
+    }
+
     @Test("a file shipped whole is never trimmed, since a cut database is a corrupt one")
     func wholeFileIsNotTrimmed() throws {
         let mirror = makeMirror()

@@ -140,7 +140,12 @@ struct KimiMonitor: SessionMonitor {
     ) -> [AgentSession] {
         let fm = FileManager.default
         let indexFile = root.appendingPathComponent("session_index.jsonl")
-        guard let text = try? String(contentsOf: indexFile, encoding: .utf8) else { return [] }
+        // The tail, never the whole file: the helper ships a remote index as
+        // its last maxTailBytes at its true size, so a mirrored index can be
+        // a hole of any length the host names. The newest lines are the
+        // ones that matter, since a later line for a session wins.
+        guard let text = ClaudeCodeMonitor.tail(
+            of: indexFile, startingAt: ClaudeCodeMonitor.maxTailBytes) else { return [] }
 
         // Preserve first-seen order but let a later line for the same
         // sessionId overwrite the earlier one's sessionDir/workDir.
@@ -166,7 +171,7 @@ struct KimiMonitor: SessionMonitor {
             guard fm.fileExists(atPath: sessionDir.path, isDirectory: &isDirectory), isDirectory.boolValue
             else { continue }
 
-            let stateData = try? Data(contentsOf: sessionDir.appendingPathComponent("state.json"))
+            let stateData = BoundedRead.data(of: sessionDir.appendingPathComponent("state.json"))
             let stateJSON = stateData.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             let stateWorkDir = Self.stateWorkDir(stateJSON)
             let stateUpdatedAt = Self.stateUpdatedAt(stateJSON)

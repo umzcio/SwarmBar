@@ -557,9 +557,12 @@ final class HookServer: ApprovalResponding {
                 (".kimi-code/session_index.jsonl", .kimiCode),
                 (".bearcode/session_index.jsonl", .bearCode),
             ]
+            // The tail, as discovery reads it, so a mirrored index whose
+            // size the remote host chose is never loaded whole here on the
+            // main actor.
             for (path, tool) in indexes {
-                if let text = try? String(
-                    contentsOf: home.appendingPathComponent(path), encoding: .utf8),
+                if let text = ClaudeCodeMonitor.tail(
+                    of: home.appendingPathComponent(path), startingAt: ClaudeCodeMonitor.maxTailBytes),
                    text.contains(rawSessionID) {
                     return tool
                 }
@@ -567,7 +570,7 @@ final class HookServer: ApprovalResponding {
         }
         let grokRoot = home.appendingPathComponent(".grok")
         let active = grokRoot.appendingPathComponent("active_sessions.json")
-        if let data = try? Data(contentsOf: active),
+        if let data = BoundedRead.data(of: active),
            let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
            entries.contains(where: { ($0["session_id"] as? String) == rawSessionID }) {
             return .grokBuild

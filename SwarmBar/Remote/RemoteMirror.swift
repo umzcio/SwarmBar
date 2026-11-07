@@ -39,6 +39,12 @@ struct RemoteMirror: Sendable {
     /// What trimming keeps from the end: the widest tail any local reader
     /// takes, so every reader sees the same lines after a trim as before.
     static let trimKeepBytes = ClaudeCodeMonitor.maxTailBytes
+    /// The largest logical size a mirror file may take. A sparse file of
+    /// any size costs the remote host nothing to name, so a record whose
+    /// size or chunk end passes this is treated as an omission and never
+    /// written. Far past any honest transcript, which the mirror holds
+    /// sparse anyway.
+    static let maxFileBytes = 4 * 1024 * 1024 * 1024
 
     init(root: URL) {
         self.root = root.standardizedFileURL
@@ -202,10 +208,21 @@ struct RemoteMirror: Sendable {
             guard let url = local(path), url.path != root.path else { return nil }
             return url
         }
-        let files = snapshot.files.compactMap { record in mapped(record.path).map { (record, $0) } }
-        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
-        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path })
         var warnings: [String] = []
+        var oversized: [String] = []
+        let files = snapshot.files.compactMap { record -> (RemoteFileRecord, URL)? in
+            guard let url = mapped(record.path) else { return nil }
+            if let reason = Self.oversizeReason(record) {
+                // An omission: the mirror keeps whatever it held for this
+                // path, and no file of the named size is ever made.
+                warnings.append("skipped \(record.path): \(reason)")
+                oversized.append(url.path)
+                return nil
+            }
+            return (record, url)
+        }
+        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
+        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path } + oversized)
 
         var keep = Set<String>()
         for path in files.map(\.1.path) + dirs.map(\.1.path) + omitted {
@@ -378,9 +395,13 @@ struct RemoteMirror: Sendable {
             var end = record.reset || !present ? 0 : UInt64(info.st_size)
             var gaps: [(UInt64, UInt64)] = []
             for chunk in record.chunks.sorted(by: { $0.offset < $1.offset }) {
-                guard !chunk.offset.addingReportingOverflow(chunk.data.count).overflow else {
-                    warnings.append("skipped a chunk of \(record.path) whose end overflows: "
-                        + "offset \(chunk.offset), \(chunk.data.count) bytes")
+                // Also catches an end that would overflow, since a chunk's
+                // data is never larger than the limit itself.
+                guard chunk.data.count <= Self.maxFileBytes,
+                      chunk.offset <= Self.maxFileBytes - chunk.data.count
+                else {
+                    warnings.append("skipped a chunk of \(record.path) whose end is past the mirror's "
+                        + "\(Self.maxFileBytes) byte limit: offset \(chunk.offset), \(chunk.data.count) bytes")
                     continue
                 }
                 let offset = UInt64(chunk.offset)
@@ -409,6 +430,14 @@ struct RemoteMirror: Sendable {
         }
         try fm.setAttributes(attributes, ofItemAtPath: url.path)
         return warnings
+    }
+
+    /// Why a record would make a mirror file past `maxFileBytes`, or nil
+    /// when it would not. A chunk ending past the limit is skipped in
+    /// `write` instead, like one whose end overflows.
+    private static func oversizeReason(_ record: RemoteFileRecord) -> String? {
+        guard record.size > maxFileBytes else { return nil }
+        return "\(record.size) bytes is over the mirror's \(maxFileBytes) byte limit"
     }
 
     /// True when one chunk carries the whole file. That is the helper's

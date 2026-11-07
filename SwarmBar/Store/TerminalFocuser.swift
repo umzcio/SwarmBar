@@ -700,7 +700,7 @@ enum TerminalFocuser {
             let sessionsDir = entry.appendingPathComponent("sessions")
             let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
             for record in records where record.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: record),
+                guard let data = BoundedRead.data(of: record),
                       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       let sessionId = (json["sessionId"] as? String)?.lowercased(),
                       let pid = json["pid"] as? Int,

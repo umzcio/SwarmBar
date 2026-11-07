@@ -145,7 +145,7 @@ struct GrokBuildMonitor: SessionMonitor {
         root: URL, isAlive: (Int) -> Bool
     ) -> (ids: Set<String>, pids: [String: Int]) {
         let path = root.appendingPathComponent("active_sessions.json")
-        guard let data = try? Data(contentsOf: path),
+        guard let data = BoundedRead.data(of: path),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
         else { return ([], [:]) }
         let idKeys = ["id", "session_id", "sessionId", "sessionID"]
@@ -180,7 +180,7 @@ struct GrokBuildMonitor: SessionMonitor {
         dir: URL, activeIds: Set<String>, pids: [String: Int], now: Date
     ) -> AgentSession? {
         let summaryPath = dir.appendingPathComponent("summary.json")
-        guard let data = try? Data(contentsOf: summaryPath),
+        guard let data = BoundedRead.data(of: summaryPath),
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return nil }
 
