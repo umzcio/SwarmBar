@@ -1347,6 +1347,28 @@ struct ProcessIdentityTests {
         #expect(!ProcessIdentity.matches(facts(), names: ProcessIdentity.grokNames, recordedAt: record))
     }
 
+    /// Grok installs one versioned binary with two links to it, `grok` and
+    /// `agent`, and the kernel names the process after the link it was run
+    /// through. Started as `agent`, only the file the link resolves to says
+    /// it is Grok.
+    @Test func grokRunThroughItsAgentLinkIsKnownByItsVersionedFile() {
+        let record = Date(timeIntervalSince1970: 2_000)
+        func agent(resolved: String?) -> ProcessIdentity.Facts {
+            ProcessIdentity.Facts(
+                commandName: "agent", executablePath: "/Users/example/.grok/bin/agent",
+                argv0: "agent", uid: getuid(), startedAt: Date(timeIntervalSince1970: 1_000),
+                resolvedExecutable: resolved)
+        }
+        #expect(ProcessIdentity.matches(
+            agent(resolved: "/Users/example/.grok/downloads/grok-1.0.77-macos-aarch64"),
+            names: ProcessIdentity.grokNames, recordedAt: record))
+        #expect(!ProcessIdentity.matches(
+            agent(resolved: "/Users/example/bin/grokker"),
+            names: ProcessIdentity.grokNames, recordedAt: record))
+        #expect(!ProcessIdentity.matches(
+            agent(resolved: nil), names: ProcessIdentity.grokNames, recordedAt: record))
+    }
+
     /// The live half, against the test runner's own process.
     @Test func theKernelDescribesALiveProcess() throws {
         let pid = Int(ProcessInfo.processInfo.processIdentifier)

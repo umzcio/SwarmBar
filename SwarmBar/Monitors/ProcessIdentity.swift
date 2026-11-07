@@ -30,6 +30,11 @@ enum ProcessIdentity {
         var argv0: String?
         var uid: uid_t
         var startedAt: Date
+        /// The executable path with its links followed. Grok installs one
+        /// versioned binary (grok-<version>-<platform>) reached through two
+        /// links, `grok` and `agent`, and the kernel and argv name the link,
+        /// so a Grok started as `agent` is known only by this.
+        var resolvedExecutable: String? = nil
     }
 
     /// Allowance between the kernel's start time and the tool's own
@@ -54,7 +59,11 @@ enum ProcessIdentity {
         let candidates = [facts.commandName, facts.argv0, facts.executablePath]
             .compactMap { $0 }
             .map { ($0 as NSString).lastPathComponent }
-        return candidates.contains { names.contains($0) }
+        if candidates.contains(where: { names.contains($0) }) { return true }
+        // The real file may carry a version after the name: grok-1.0.77-...
+        guard let resolved = facts.resolvedExecutable else { return false }
+        let file = (resolved as NSString).lastPathComponent
+        return names.contains { file == $0 || file.hasPrefix($0 + "-") }
     }
 
     /// The live check: `pid`'s facts, judged by `matches`.
@@ -87,7 +96,10 @@ enum ProcessIdentity {
             argv0: args?.argv0,
             uid: info.kp_eproc.e_ucred.cr_uid,
             startedAt: Date(timeIntervalSince1970:
-                TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1_000_000)
+                TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1_000_000),
+            resolvedExecutable: args.map {
+                URL(fileURLWithPath: $0.executable).resolvingSymlinksInPath().path
+            }
         )
     }
 
