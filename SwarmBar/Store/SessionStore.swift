@@ -298,9 +298,11 @@ final class SessionStore {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
-        holdAnsweredPrompts()
         pruneSessionRecords()
         reapplyHookOverrides()
+        // After the overrides: a sticky PermissionRequest pin reapplied
+        // here would otherwise put the answered prompt's Approve back.
+        holdAnsweredPrompts()
         pruneAlertRecords()
     }
 
@@ -309,7 +311,18 @@ final class SessionStore {
     /// so its rollout keeps describing the same prompt for as long as the
     /// command takes, and the row would offer Approve again under the same
     /// text: a second "y" lands on whatever is on screen by then.
-    @ObservationIgnored private var answeredPrompts: [UUID: (eventID: String, allow: Bool)] = [:]
+    ///
+    /// The same holds for every tool answered by keys. A selector press
+    /// left the row offering Approve under the same text until the next
+    /// poll, and a second click then approved whatever prompt the agent
+    /// had drawn next. A prompt with no event id is matched by its text.
+    @ObservationIgnored private var answeredPrompts:
+        [UUID: (eventID: String?, prompt: ApprovalPrompt, allow: Bool, tool: AgentTool)] = [:]
+
+    /// Local sessions whose keystroke answer is on its way. A second click
+    /// meanwhile would read the same screen and could press into whatever
+    /// the first answer left behind, so it sends nothing.
+    @ObservationIgnored private(set) var answersInFlight: Set<UUID> = []
 
     /// Keys answering a prompt reached its terminal. Until the session's
     /// own state moves past that prompt, the row says what was sent.
@@ -321,41 +334,65 @@ final class SessionStore {
     /// says it should (an approved long-running command keeps its row
     /// orange until its output line lands), with no second Approve, and
     /// points at the terminal in case Codex is still asking.
-    func noteKeysAnswered(_ sessionID: UUID, allow: Bool) {
+    ///
+    /// `answered` is the prompt the keys were aimed at. When the row has
+    /// already moved on to another prompt, that one was not answered and
+    /// keeps its buttons.
+    func noteKeysAnswered(_ sessionID: UUID, allow: Bool, answered: ApprovalPrompt? = nil) {
         guard let session = sessions.first(where: { $0.id == sessionID }),
-              case .waitingApproval = session.status,
-              let eventID = session.attentionEventID
+              case .waitingApproval(let prompt) = session.status,
+              answered == nil || answered == prompt
         else { return }
-        answeredPrompts[sessionID] = (eventID, allow)
-        noteKeysSent(sessionID, allow: allow)
+        answeredPrompts[sessionID] = (session.attentionEventID, prompt, allow, session.tool)
+        noteKeysSent(sessionID, allow: allow, tool: session.tool)
     }
 
     /// What a row whose answer went out by keystroke says until the
     /// session moves past the prompt.
-    nonisolated static func keysSentReason(allow: Bool) -> String {
-        allow
-            ? "Approve was sent to the terminal. Codex shows this request until the command finishes. If it is still asking, answer it in the terminal."
-            : "Deny was sent to the terminal. If Codex is still asking, answer it in the terminal."
+    nonisolated static func keysSentReason(allow: Bool, tool: AgentTool = .codex) -> String {
+        if tool == .codex {
+            return allow
+                ? "Approve was sent to the terminal. Codex shows this request until the command finishes. If it is still asking, answer it in the terminal."
+                : "Deny was sent to the terminal. If Codex is still asking, answer it in the terminal."
+        }
+        return allow
+            ? "Approve was sent to the terminal. If \(tool.label) is still asking, answer it in the terminal."
+            : "Deny was sent to the terminal. If \(tool.label) is still asking, answer it in the terminal."
     }
 
-    private func noteKeysSent(_ id: UUID, allow: Bool) {
+    private func noteKeysSent(_ id: UUID, allow: Bool, tool: AgentTool) {
         update(id: id) {
-            $0.status = .waitingApproval(command: .unreadable(Self.keysSentReason(allow: allow)))
+            $0.status = .waitingApproval(command: .unreadable(Self.keysSentReason(allow: allow, tool: tool)))
         }
     }
 
     private func holdAnsweredPrompts() {
         for (id, answered) in answeredPrompts {
             guard let session = sessions.first(where: { $0.id == id }),
-                  case .waitingApproval = session.status,
-                  session.attentionEventID == answered.eventID
+                  case .waitingApproval(let prompt) = session.status,
+                  answered.eventID.map({ $0 == session.attentionEventID })
+                    ?? (session.attentionEventID == nil && prompt == answered.prompt)
             else {
                 // The prompt settled, or a different one is asking.
                 answeredPrompts.removeValue(forKey: id)
                 continue
             }
-            noteKeysSent(id, allow: answered.allow)
+            noteKeysSent(id, allow: answered.allow, tool: answered.tool)
         }
+    }
+
+    /// Whether `session`, as a row showed it, is still the request the
+    /// store holds for that session and has not been answered. A click
+    /// lands on the row as it was drawn, which can be a poll behind: the
+    /// request it showed may have been answered, or replaced by another
+    /// whose options read the same, and an answer for the old one must
+    /// not land on the new one.
+    func isStillAsking(_ session: AgentSession) -> Bool {
+        guard case .waitingApproval(let shown) = session.status else { return false }
+        if let current = sessions.first(where: { $0.id == session.id }) {
+            guard case .waitingApproval(let prompt) = current.status, prompt == shown else { return false }
+        }
+        return answeredPrompts[session.id] == nil
     }
 
     /// Forgets bookkeeping for sessions the store no longer holds, so a
@@ -663,6 +700,8 @@ final class SessionStore {
     // when nothing can be answered remotely. Session state is never written.
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
+        // The row as drawn may be a poll behind the request it answers.
+        guard isStillAsking(session) else { return }
         // A request the row could not show whole is never approved from
         // it, whatever the caller: the row offers the terminal instead,
         // and this is the backstop for any path that forgets.
@@ -691,6 +730,7 @@ final class SessionStore {
 
     func deny(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
+        guard isStillAsking(session) else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: false) == true {
             noteAnswered(session.id, command: command, allow: false)
             return
@@ -729,12 +769,63 @@ final class SessionStore {
             return
         }
         switch route {
-        case .keys(let keys):       answerTuiPrompt(session, keys: keys, allow: allow)
-        case .numberedSelector:     answerNumberedPrompt(session, choose: choose)
-        case .navigateSelector:     answerByNavigation(session, choose: choose)
+        case .keys, .numberedSelector, .navigateSelector:
+            answerByKeys(session, route: route, allow: allow, choose: choose)
         case .focusTerminal:        openInTerminal(session)
         case .mockTransition:       update(id: session.id) { $0.status = mockStatus }
         }
+    }
+
+    /// Presses a keystroke answer into a session on this Mac. Carries out
+    /// a key route and reports whether the keys were confirmed sent.
+    typealias KeystrokeAnswerer = @Sendable (
+        AgentSession, ApprovalRoute, @escaping @Sendable (String) -> TuiPromptLayout.Option?
+    ) async -> Bool
+
+    /// Test seam: replaces the terminal with a stub, so the in-flight
+    /// guard and the answered hold can be exercised without iTerm2.
+    @ObservationIgnored var keystrokeAnswerer: KeystrokeAnswerer?
+
+    /// One keystroke answer per session at a time. Once the keys are
+    /// confirmed sent the row stops offering Approve and Deny for that
+    /// request, until the tool's own state shows a different one.
+    private func answerByKeys(
+        _ session: AgentSession, route: ApprovalRoute, allow: Bool,
+        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
+    ) {
+        guard case .waitingApproval(let command) = session.status,
+              answersInFlight.insert(session.id).inserted
+        else { return }
+        let answerer = keystrokeAnswerer ?? Self.answerAtTerminal
+        Task {
+            let sent = await answerer(session, route, choose)
+            answersInFlight.remove(session.id)
+            if sent { noteKeysAnswered(session.id, allow: allow, answered: command) }
+        }
+    }
+
+    /// The real answerer: the route's keys, pressed into the session's
+    /// own terminal, falling back to focusing it whenever the prompt
+    /// cannot be confirmed.
+    nonisolated static let answerAtTerminal: KeystrokeAnswerer = { session, route, choose in
+        await Task.detached {
+            let id = session.id, path = session.projectPath, tool = session.tool
+            func giveUp() -> Bool {
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
+                return false
+            }
+            switch route {
+            case .keys(let keys):
+                return TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys)
+                    ? true : giveUp()
+            case .numberedSelector:
+                return answerNumberedPrompt(session, choose: choose) ? true : giveUp()
+            case .navigateSelector:
+                return answerByNavigation(session, choose: choose) ? true : giveUp()
+            case .focusTerminal, .mockTransition:
+                return false
+            }
+        }.value
     }
 
     /// The row after an answer was delivered, by a held reply or by keys
@@ -757,23 +848,16 @@ final class SessionStore {
               case .waitingApproval(let command) = current.status,
               command == answered
         else { return }
-        if session.tool == .codex {
-            // Codex's prompt stays in its rollout until the command has
-            // run, here as on this Mac.
-            noteKeysAnswered(session.id, allow: allow)
-        } else {
-            noteAnswered(session.id, command: command, allow: allow)
-        }
+        // Held until the host's own state moves past the prompt, as on
+        // this Mac: the next snapshot can still describe it, and a second
+        // click would answer whatever the agent drew next.
+        noteKeysAnswered(session.id, allow: allow, answered: command)
     }
 
     private func running(_ command: ApprovalPrompt) -> String {
         "Running \(ApprovalPreviewText.firstWord(command))"
     }
 
-    /// Reads the session's terminal, picks the option matching the intent,
-    /// and presses that number. Falls back to focusing the terminal when
-    /// the screen can't be read or no matching option is on it, so a
-    /// misread never sends a keystroke to an unknown selector.
     /// The settings toggle for Grok's remote answers; off means Approve
     /// and Deny just focus the terminal.
     static var grokKeystrokesEnabled: Bool {
@@ -787,29 +871,24 @@ final class SessionStore {
         (UserDefaults.standard.object(forKey: "antigravityKeystrokeAnswers") as? Bool) ?? true
     }
 
-    private func answerNumberedPrompt(
+    /// Reads the session's terminal, picks the option matching the
+    /// intent, and presses that number, re-confirming the label at that
+    /// number in the same script. False when the screen can't be read or
+    /// no matching option is on it, so a misread never sends a keystroke
+    /// to an unknown selector.
+    private nonisolated static func answerNumberedPrompt(
         _ session: AgentSession,
-        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
-    ) {
-        let id = session.id
-        let path = session.projectPath
-        let tool = session.tool
-        Task.detached {
-            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
-                  let option = choose(screen)
-            else {
-                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
-                return
-            }
-            let outcome = TerminalFocuser.answerNumbered(
-                sessionID: id, tool: tool, projectPath: path,
-                number: option.number, expectedLabel: option.label)
-            if outcome != .sent {
-                // The prompt moved or the terminal is gone. Never press a
-                // digit into an unverified selector; bring the user to it.
-                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
-            }
-        }
+        choose: @Sendable (String) -> TuiPromptLayout.Option?
+    ) -> Bool {
+        let id = session.id, path = session.projectPath, tool = session.tool
+        guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
+              let option = choose(screen)
+        else { return false }
+        // The prompt moved or the terminal is gone: never press a digit
+        // into an unverified selector.
+        return TerminalFocuser.answerNumbered(
+            sessionID: id, tool: tool, projectPath: path,
+            number: option.number, expectedLabel: option.label) == .sent
     }
 
     /// Reads the selector, works out the distance from the cursor to the
@@ -822,43 +901,30 @@ final class SessionStore {
     /// which one the cursor is on, and therefore how far to move. Nothing
     /// about the layout is assumed, so a redesigned prompt falls through
     /// to focusing the terminal instead of pressing into the unknown.
-    private func answerByNavigation(
+    private nonisolated static func answerByNavigation(
         _ session: AgentSession,
-        choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?
-    ) {
-        let id = session.id
-        let path = session.projectPath
-        let tool = session.tool
-        Task.detached {
-            func giveUp() { TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path) }
-            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
-                  let option = choose(screen)
-            else { giveUp(); return }
-            let selector = TuiPromptLayout.selector(in: screen)
-            guard let cursor = selector.cursor,
-                  let cursorLine = selector.cursorLine,
-                  let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
-            else { giveUp(); return }
-
-            let outcome = TerminalFocuser.answerByNavigation(
-                sessionID: id, tool: tool, projectPath: path,
-                key: move.key, presses: move.presses,
-                expectedCursorLine: cursorLine, expectedLabel: option.label)
-            if outcome != .sent { giveUp() }
+        choose: @Sendable (String) -> TuiPromptLayout.Option?
+    ) -> Bool {
+        let id = session.id, path = session.projectPath, tool = session.tool
+        guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
+              let option = choose(screen)
+        else { return false }
+        if tool == .antigravity {
+            guard case .waitingApproval(let shown) = session.status,
+                  AntigravityAnswerCheck.mayAnswer(
+                    shown: shown, screen: screen,
+                    pending: AntigravityAnswerCheck.livePending(sessionID: id))
+            else { return false }
         }
-    }
-
-    private func answerTuiPrompt(_ session: AgentSession, keys: [String], allow: Bool) {
-        let id = session.id
-        let path = session.projectPath
-        let tool = session.tool
-        Task.detached {
-            if TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys) {
-                await MainActor.run { self.noteKeysAnswered(id, allow: allow) }
-            } else {
-                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
-            }
-        }
+        let selector = TuiPromptLayout.selector(in: screen)
+        guard let cursor = selector.cursor,
+              let cursorLine = selector.cursorLine,
+              let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
+        else { return false }
+        return TerminalFocuser.answerByNavigation(
+            sessionID: id, tool: tool, projectPath: path,
+            key: move.key, presses: move.presses,
+            expectedCursorLine: cursorLine, expectedLabel: option.label) == .sent
     }
 
     // MARK: - Inline reply

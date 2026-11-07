@@ -159,8 +159,10 @@ struct AntigravityMonitor: SessionMonitor {
             //
             // With no readable terminal the row stays Running tool, which
             // is the reading that was already being shown and is wrong
-            // only in being too quiet.
-            let showing = screen(pid).map { TuiPromptLayout.options(in: $0).count >= 2 } ?? false
+            // only in being too quiet. Only agy's own selector counts, at
+            // the bottom of the screen with its key hint under it: any
+            // numbered list once did, and the model writes those.
+            let showing = screen(pid).map(TuiPromptLayout.endsInAgyGate) ?? false
             return showing
                 ? .waitingApproval(command: pending.prompt)
                 : .runningTool(activity: pending.summary)

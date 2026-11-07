@@ -185,10 +185,29 @@ enum SetupCommand {
     /// runs usually goes to a shell as an argument (`bash -c ...`), and on
     /// Linux every local account can read any process's arguments, so the
     /// encoded contents must reach a shell only from a file.
-    static let saveScript = "Write: save the script below exactly as written to a new file with your "
-        + "file-writing tool, not with a shell command, so the encoded text never appears in a command's "
-        + "arguments, where other accounts on this host could read it. Then run that file with sh, the same "
-        + "way as the other commands, and delete it."
+    ///
+    /// The file goes in a folder only its user can enter, made and checked
+    /// before the first write. Left to the agent, it landed wherever the
+    /// agent liked under its umask, /tmp or a world-readable working
+    /// directory, and any account on the host could read the contents
+    /// there until it was deleted.
+    static let saveScript = "Write: save the script below exactly as written, with your file-writing tool and "
+        + "not with a shell command, to a new file in the private folder made above (its full path was printed). "
+        + "That way the encoded text never appears in a command's arguments or in a file other accounts on this "
+        + "host can read. Then run it with sh and the file's full path, the same way as the other commands, "
+        + "and delete it."
+    /// The private folder every write script is saved in.
+    static let scriptFolder = "\"$HOME/.swarmbar-setup\""
+    /// Made owner-only, then checked: owned by this account, not a link.
+    static let prepareFolder = "Before the first write, make a private folder for the write scripts and check it. "
+        + "It prints the folder's full path. If it prints nothing, stop and report.\n```sh\n"
+        + "(umask 077 && mkdir -p \(scriptFolder)) && chmod 700 \(scriptFolder) && [ -O \(scriptFolder) ] "
+        + "&& [ ! -L \(scriptFolder) ] && echo \(scriptFolder)\n```"
+    /// The first line of every write script: one saved anywhere else is
+    /// refused before it does anything.
+    static let scriptGuard = "case \"$0\" in \"$HOME\"/.swarmbar-setup/*) ;; *) "
+        + "echo 'SwarmBar: this script must be saved in the private folder. Delete it, then stop and report.'; "
+        + "exit 1;; esac"
     /// Ends the encoded contents in a write's script. Base64 never holds
     /// an underscore, so no line of it can end the here-document early.
     static let dataEnd = "SWARMBAR_DATA"
@@ -245,6 +264,7 @@ enum SetupCommand {
         var omitted: [Int] = []
         var tooLarge: Set<Int> = []
         var finalChecks: [String] = []
+        var madeFolder = false
         var number = 0
         for (index, change) in plan.changes.enumerated() where change.isSent {
             number += 1
@@ -275,6 +295,10 @@ enum SetupCommand {
             }
             switch change.action {
             case .write(let text, let mode):
+                if !madeFolder {
+                    out.append(prepareFolder)
+                    madeFolder = true
+                }
                 let after = HelperInstaller.sha256(Data(text.utf8))
                 let encoded = Data(text.utf8).base64EncodedString()
                 let folder = (change.path as NSString).deletingLastPathComponent
@@ -313,7 +337,8 @@ enum SetupCommand {
                     script += write
                     step.append("This runs as \(owner), the file's owner, and checks the file itself before it writes.")
                     step.append(saveScript)
-                    step.append(fenced(["sudo -u \(shellQuoted(owner)) -- sh -s <<'\(scriptEnd)'"] + script + [scriptEnd]))
+                    step.append(fenced([scriptGuard, "sudo -u \(shellQuoted(owner)) -- sh -s <<'\(scriptEnd)'"]
+                        + script + [scriptEnd]))
                     finalChecks.append(asOwner(owner, hashCheck(after, path)))
                 } else {
                     if new {
@@ -325,7 +350,7 @@ enum SetupCommand {
                     }
                     // One script, so it is followed whole or not at all.
                     step.append(saveScript)
-                    step.append(fenced(["umask 077", "\(temp) || exit 1"] + write))
+                    step.append(fenced([scriptGuard, "umask 077", "\(temp) || exit 1"] + write))
                     if new, let owner = Self.handOver(change, plan) {
                         step.append("Owner: chown \(shellQuoted(owner.user)): \(owner.paths.map(shellQuoted).joined(separator: " "))")
                     }
@@ -350,6 +375,9 @@ enum SetupCommand {
         if !byHand.isEmpty {
             out.append("These need a person, so leave them alone and mention them when you report:\n"
                 + byHand.map { "- \($0.description)" }.joined(separator: "\n"))
+        }
+        if madeFolder {
+            out.append("Then remove the private folder and anything left in it:\n```sh\nrm -rf \(scriptFolder)\n```")
         }
         if !finalChecks.isEmpty {
             out.append("When you are done, run this check and report its output. Every line must say OK or removed:\n```\n"

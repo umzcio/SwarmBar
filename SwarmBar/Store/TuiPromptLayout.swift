@@ -129,6 +129,38 @@ enum TuiPromptLayout {
         return chosen
     }
 
+    /// Whether the screen ends in agy's own selector: a block of numbered
+    /// options with exactly one marked line, followed by nothing but agy's
+    /// key hint ("↑/↓ Navigate · enter Select · esc Skip", or "· tab Amend"
+    /// on a tool gate) as the last line on screen.
+    ///
+    /// Any two numbered lines were proof enough before, and a model writes
+    /// numbered lists all the time: an unsettled call that was simply
+    /// running then showed Approve, and the click walked to whatever gate
+    /// agy drew next. Text the model writes or a command prints sits in
+    /// the transcript, with agy's own input chrome drawn below it, so it
+    /// cannot be the last thing on screen; agy's gate replaces that chrome
+    /// and is.
+    nonisolated static func endsInAgyGate(_ screen: String) -> Bool {
+        var lines = screen.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        guard let hint = lines.popLast(), hint.hasPrefix("↑/↓ Navigate") else { return false }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        guard let last = lines.last else { return false }
+        let body = lines.joined(separator: "\n")
+        let selector = selector(in: body)
+        guard selector.cursor != nil, selector.options.count >= 2 else { return false }
+        // The block the selector read must be the one right above the hint.
+        let option = last.trimmingCharacters(in: cursorMarkers.union(.whitespaces))
+        guard let dot = option.firstIndex(of: "."),
+              Int(option[option.startIndex..<dot]) == selector.options.count,
+              option[option.index(after: dot)...].trimmingCharacters(in: .whitespaces)
+                == selector.options.last?.label
+        else { return false }
+        return true
+    }
+
     /// Grok 1.0 draws "2 (●) Yes, proceed": the number, a radio button,
     /// the label, and on question prompts a description after a wide gap.
     /// The filled button, not a marker in front, is the cursor. The label

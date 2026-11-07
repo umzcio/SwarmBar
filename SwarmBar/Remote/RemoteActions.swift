@@ -270,9 +270,17 @@ extension RemoteMonitorSupervisor: RemoteActing {
             }
         }
         let choose = allow ? TuiPromptLayout.approveOnceOption(in:) : TuiPromptLayout.rejectOption(in:)
-        guard let command = RemoteAnswerPlan.command(route: route, screen: screen, choose: choose)
+        guard let command = RemoteAnswerPlan.command(
+            route: route, screen: screen, choose: choose, tool: session.tool)
         else {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
+            return false
+        }
+        // The capture was a round trip. A snapshot that landed meanwhile
+        // may show the request answered, or another in its place, and the
+        // keys must not answer that one.
+        guard store.isStillAsking(session) else {
+            remoteAnswerLog.notice("answer: the request on \(host, privacy: .public) changed while reading the prompt, nothing sent")
             return false
         }
         // The capture was a round trip, and the host may have gone dark or
