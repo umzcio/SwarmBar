@@ -1794,6 +1794,107 @@ class TmuxCommandTests(unittest.TestCase):
 
 
 
+class TmuxProgramTests(unittest.TestCase):
+    """Which tmux a root helper runs. Its PATH is pinned to directories only
+    root can change, which leaves Homebrew's tmux out on a macOS host, so
+    tmux is found in a fixed list and vetted against the uid the client
+    runs as: never one that anybody but root or that uid could replace."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.me = os.geteuid()
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        os.chmod(self.root, 0o755)
+        os.chmod(self.bin, 0o755)
+        self.tmux = os.path.join(self.bin, "tmux")
+        with open(self.tmux, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(self.tmux, 0o755)
+
+    def as_root(self, uid, directories):
+        with mock.patch.object(helper.os, "geteuid", return_value=0):
+            return helper.tmux_program(uid, directories)
+
+    def require_trusted_temp(self):
+        # Every directory above the temp dir must be root's or ours and
+        # writable by nobody else, as on macOS. Linux's /tmp is not.
+        if not helper.path_trusted_for(self.root, self.me):
+            self.skipTest("the temp dir sits under a directory others can write")
+
+    def test_a_login_user_helper_keeps_its_own_path(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        self.assertEqual(helper.tmux_program(self.me, [self.bin]), "tmux")
+
+    def test_root_runs_a_users_tmux_only_as_that_user(self):
+        self.require_trusted_temp()
+        if self.me == 0:
+            self.skipTest("runs as root")
+        self.assertEqual(self.as_root(self.me, [self.bin]), os.path.realpath(self.tmux))
+        # Not as root, and not as a third account.
+        self.assertIsNone(self.as_root(0, [self.bin]))
+        self.assertIsNone(self.as_root(self.me + 1, [self.bin]))
+
+    def test_a_directory_others_can_write_is_never_trusted(self):
+        self.require_trusted_temp()
+        os.chmod(self.bin, 0o777)
+        self.assertIsNone(self.as_root(self.me, [self.bin]))
+        os.chmod(self.bin, 0o755)
+        os.chmod(self.tmux, 0o757)
+        self.assertIsNone(self.as_root(self.me, [self.bin]))
+
+    def test_a_link_is_vetted_where_it_leads(self):
+        self.require_trusted_temp()
+        loose = os.path.join(self.root, "loose")
+        os.makedirs(loose)
+        os.chmod(loose, 0o777)
+        target = os.path.join(loose, "tmux")
+        with open(target, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(target, 0o755)
+        links = os.path.join(self.root, "links")
+        os.makedirs(links)
+        os.chmod(links, 0o755)
+        os.symlink(target, os.path.join(links, "tmux"))
+        self.assertIsNone(self.as_root(self.me, [links]))
+        # A link to a vetted file runs that file, by its real path.
+        os.remove(os.path.join(links, "tmux"))
+        os.symlink(self.tmux, os.path.join(links, "tmux"))
+        self.assertEqual(self.as_root(self.me, [links]), os.path.realpath(self.tmux))
+
+    def test_not_executable_or_missing_is_skipped(self):
+        self.require_trusted_temp()
+        os.chmod(self.tmux, 0o644)
+        self.assertIsNone(self.as_root(self.me, [self.bin, os.path.join(self.root, "none")]))
+
+    def test_root_runs_the_resolved_path_and_skips_a_server_without_one(self):
+        calls = []
+
+        def run(argv, timeout=5, input=None, **options):
+            calls.append(list(argv))
+            return completed(argv, 0, "")
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "run_command", run):
+            with mock.patch.object(helper, "tmux_program", lambda uid: "/opt/x/bin/tmux"):
+                helper.tmux_command("/tmp/tmux-1500/default", 1500, ["list-panes"])
+            with mock.patch.object(helper, "tmux_program", lambda uid: None):
+                self.assertIsNone(helper.tmux_command("/tmp/tmux-1500/default", 1500,
+                                                      ["list-panes"]))
+        self.assertEqual(calls, [["/opt/x/bin/tmux", "-S", "/tmp/tmux-1500/default",
+                                  "list-panes"]])
+
+    def test_the_root_path_is_not_consulted(self):
+        # A tmux the caller's PATH would find is never what root runs.
+        self.require_trusted_temp()
+        with mock.patch.dict(os.environ, {"PATH": self.bin}):
+            self.assertIsNone(self.as_root(0, []))
+
+
 class TmuxOwnerTests(unittest.TestCase):
     """A tmux client obeys its server, which can make it run a program or
     open a file, so the helper never connects as anyone but the server's
@@ -1875,6 +1976,7 @@ class TmuxOwnerTests(unittest.TestCase):
                 mock.patch.object(helper.os, "geteuid", return_value=0), \
                 mock.patch("pwd.getpwuid", return_value=entry), \
                 mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
                 mock.patch.object(helper, "run_command", run):
             panes = helper.tmux_panes()
         self.assertEqual(panes, {(42, 1500): {"socket": "/tmp/tmux-1500/default", "id": "%1"}})
@@ -1901,6 +2003,7 @@ class TmuxOwnerTests(unittest.TestCase):
         with mock.patch.object(helper.os, "geteuid", return_value=0), \
                 mock.patch("pwd.getpwuid", return_value=entry), \
                 mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
                 mock.patch.object(helper, "run_command", run), \
                 mock.patch.object(helper.time, "sleep"):
             self.assertEqual(helper.handle_tmux({"cmd": "capture", "pane": pane}),

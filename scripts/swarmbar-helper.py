@@ -1346,13 +1346,72 @@ def tmux_identity(uid):
             "extra_groups": supplementary_groups(entry.pw_name, entry.pw_gid), "cwd": "/"}
 
 
+# Where a root helper looks for tmux. The pinned root PATH holds only
+# directories nobody but root can change, and Homebrew's are not among
+# them (/opt/homebrew/bin belongs to the admin user who installed it), so a
+# macOS host would find no tmux at all. Each candidate here is vetted
+# against the uid the client will run as instead (tmux_program), so the
+# root-only directories come first and serve every server.
+TMUX_DIRECTORIES = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin",
+                    "/home/linuxbrew/.linuxbrew/bin")
+
+
+def path_trusted_for(path, uid):
+    """Whether only root or `uid` can have changed a file: it and every
+    directory above it belong to one of the two and nobody else can write
+    them (only_owner_can_write). For uid 0 this is root_only_path."""
+    current = path
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        if info.st_uid not in (0, uid) or not only_owner_can_write(info):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
+def tmux_program(uid, directories=TMUX_DIRECTORIES):
+    """The tmux to run a client with, as `uid`, the owner of the server it
+    connects to (tmux_identity).
+
+    Not root: "tmux", found on this process's own PATH, which is the login
+    user's and theirs to choose, as it always was. Root: an absolute path,
+    never a PATH lookup, to a tmux that nobody but root and `uid` can have
+    changed, resolved through links so the file that runs is the file that
+    was vetted. The client runs as `uid`, so a tmux that `uid` owns grants
+    nothing `uid` did not already have, while one anybody else could
+    replace would run as `uid` on their behalf. For root's own servers that
+    leaves root-only builds, exactly what the pinned PATH allows. None when
+    no candidate qualifies, and that server is not contacted."""
+    if os.geteuid() != 0:
+        return "tmux"
+    for directory in directories:
+        real = os.path.realpath(os.path.join(directory, "tmux"))
+        try:
+            info = os.stat(real)
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            continue
+        if path_trusted_for(real, uid):
+            return real
+    return None
+
+
 def tmux_command(socket_path, uid, args, input=None, timeout=5):
     """One tmux client call against the server at `socket_path`, owned by
     `uid`, run as that owner. None when it must not run or could not."""
     ids = tmux_identity(uid)
     if ids is None:
         return None
-    argv = ["tmux", "-S", socket_path] + args
+    program = tmux_program(uid)
+    if program is None:
+        return None
+    argv = [program, "-S", socket_path] + args
     options = dict(ids)
     if input is not None:
         options["input"] = input
