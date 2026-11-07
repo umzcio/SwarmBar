@@ -15,9 +15,9 @@ enum FocusLog {
 }
 
 enum TerminalFocuser {
-    nonisolated static func focus(sessionID: UUID, projectPath: URL?) {
+    nonisolated static func focus(sessionID: UUID, tool: AgentTool, projectPath: URL?) {
         let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-        let sessionTTY = tty(forSession: sessionID, projectPath: projectPath)
+        let sessionTTY = tty(forSession: sessionID, tool: tool, projectPath: projectPath)
         FocusLog.log.notice("focus: path=\(projectPath?.path ?? "none", privacy: .public) tty=\(sessionTTY ?? "none", privacy: .public) frontmost=\(front, privacy: .public)")
         if let sessionTTY, focusRunningTerminal(device: "/dev/\(sessionTTY)") {
             FocusLog.log.notice("focus: done via iTerm2/Terminal tty match")
@@ -232,8 +232,8 @@ enum TerminalFocuser {
     /// without a newline. Used to answer Grok's TUI permission selector
     /// remotely. Returns false when the session has no live tty or iTerm2
     /// isn't running.
-    nonisolated static func sendKeys(sessionID: UUID, projectPath: URL? = nil, keys: [String]) -> Bool {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+    nonisolated static func sendKeys(sessionID: UUID, tool: AgentTool, projectPath: URL?, keys: [String]) -> Bool {
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2") else { return false }
         return runScript(keyScript(tty: tty, keys: keys)) == "SENT"
     }
@@ -273,8 +273,8 @@ enum TerminalFocuser {
     /// The visible screen text of the session's terminal (iTerm2 only).
     /// Used to read a TUI selector's actual options before answering, so
     /// keystrokes target a verified choice instead of a guessed position.
-    nonisolated static func screenText(sessionID: UUID, projectPath: URL? = nil) -> String? {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath)
+    nonisolated static func screenText(sessionID: UUID, tool: AgentTool, projectPath: URL?) -> String? {
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath)
         else { return nil }
         return screenText(tty: tty)
     }
@@ -375,11 +375,11 @@ enum TerminalFocuser {
     /// composer is recoverable, a half-delivered prompt that was submitted is
     /// not.
     nonisolated static func sendReply(
-        sessionID: UUID, projectPath: URL?, text raw: String
+        sessionID: UUID, tool: AgentTool, projectPath: URL?, text raw: String
     ) -> ReplyOutcome {
         // What lands is the filtered text, so the probe is taken from it too.
         let text = RemoteAnswerPlan.pasteText(raw)
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2"),
               runScript(pasteScript(tty: tty, text: text)) == "PASTED"
         else { return .noTerminal }
@@ -387,7 +387,7 @@ enum TerminalFocuser {
         // Confirm on screen before submitting. A distinctive slice of the
         // reply is enough, and the last line is what sits nearest the cursor.
         guard let probe = verificationProbe(for: text),
-              let screen = screenText(sessionID: sessionID, projectPath: projectPath),
+              let screen = screenText(sessionID: sessionID, tool: tool, projectPath: projectPath),
               screen.contains(probe)
         else { return .pasteNotVisible }
 
@@ -414,9 +414,9 @@ enum TerminalFocuser {
     /// cannot advance in between: two round trips left a window in which a
     /// digit could land in a different selector.
     nonisolated static func answerNumbered(
-        sessionID: UUID, projectPath: URL?, number: Int, expectedLabel: String
+        sessionID: UUID, tool: AgentTool, projectPath: URL?, number: Int, expectedLabel: String
     ) -> AnswerOutcome {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2") else { return .noTerminal }
         let script = numberedAnswerScript(number: number)
         switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel]) {
@@ -479,6 +479,7 @@ enum TerminalFocuser {
     /// too.
     nonisolated static func answerByNavigation(
         sessionID: UUID,
+        tool: AgentTool,
         projectPath: URL?,
         key: String,
         presses: Int,
@@ -486,7 +487,7 @@ enum TerminalFocuser {
         expectedLabel: String
     ) -> AnswerOutcome {
         guard let script = navigationAnswerScript(key: key, presses: presses),
-              let tty = tty(forSession: sessionID, projectPath: projectPath),
+              let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2")
         else { return .noTerminal }
         switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel, expectedCursorLine]) {
@@ -582,19 +583,19 @@ enum TerminalFocuser {
 
     /// Live inputs for shouldSkipBanner. Local sessions only: a remote
     /// session's terminal cannot be matched to a tab on this Mac.
-    nonisolated static func isSessionOnScreen(sessionID: UUID, projectPath: URL?) -> Bool {
+    nonisolated static func isSessionOnScreen(sessionID: UUID, tool: AgentTool, projectPath: URL?) -> Bool {
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
         let anyInput = CGEventType(rawValue: UInt32.max)!
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
         switch frontmost {
         case "com.googlecode.iterm2":
-            guard let tty = tty(forSession: sessionID, projectPath: projectPath) else { return false }
+            guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath) else { return false }
             return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: true,
                 visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
         case ghosttyBundleID:
             return shouldSkipBanner(
-                sessionTTY: tty(forSession: sessionID, projectPath: projectPath),
+                sessionTTY: tty(forSession: sessionID, tool: tool, projectPath: projectPath),
                 sessionDirectory: projectPath?.path, frontmostIsGhostty: true,
                 visible: ghosttyVisibleTerminals(), secondsSinceInput: idle, screenLocked: locked)
         default:
@@ -622,18 +623,71 @@ enum TerminalFocuser {
 
     // MARK: - Session -> tty
 
-    nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
-        let pid = claudePid(forSession: id)
-            ?? grokPid(forSession: id)
-            ?? codexPid(forSession: id)
-            ?? antigravityPid(forSession: id)
-            ?? kimiPid(projectPath: projectPath)
-        if let pid {
-            let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let name, !name.isEmpty, name != "??" { return name }
+    /// Where each tool's session-to-terminal facts come from. Live by
+    /// default; a test hands in its own so the scoping rules below can be
+    /// proved without a process or a terminal.
+    struct SessionLookups: Sendable {
+        var claudePid: @Sendable (UUID) -> Int?
+        var grokPid: @Sendable (UUID) -> Int?
+        var codexPid: @Sendable (UUID) -> Int?
+        var antigravityPid: @Sendable (UUID) -> Int?
+        /// Every live Kimi Code (or BearCode, by the tool) process whose cwd
+        /// is the directory.
+        var kimiFamilyPids: @Sendable (AgentTool, String) -> [Int]
+        /// The controlling terminal's name ("ttys004"), or nil for none.
+        var tty: @Sendable (Int) -> String?
+
+        nonisolated static let live = SessionLookups(
+            claudePid: { TerminalFocuser.claudePid(forSession: $0) },
+            grokPid: { TerminalFocuser.grokPid(forSession: $0) },
+            codexPid: { TerminalFocuser.codexPid(forSession: $0) },
+            antigravityPid: { TerminalFocuser.antigravityPid(forSession: $0) },
+            kimiFamilyPids: { TerminalFocuser.kimiFamilyPids(tool: $0, cwd: $1) },
+            tty: { TerminalFocuser.ttyName(pid: $0) }
+        )
+    }
+
+    /// The terminal of the row's OWN process, found only by that tool's own
+    /// lookup, or nil.
+    ///
+    /// This used to try every tool's lookup in turn for every row and end
+    /// in a working-directory match for Kimi-family processes. A row whose
+    /// own lookup missed (its process had exited, or OpenCode, which has no
+    /// lookup at all) fell through to whatever Kimi process shared the
+    /// directory, and Approve, Deny and Reply typed into that session.
+    /// Every caller treats nil as "focus, never type", so a miss now stays
+    /// a miss.
+    ///
+    /// Kimi and BearCode have no session-to-pid registry, and their
+    /// processes are told apart only by working directory, which several
+    /// sessions can share. So the directory resolves to a terminal only
+    /// when every one of that tool's processes in it sits on the SAME tty
+    /// (one session, or a launcher and its child). Two terminals means two
+    /// sessions nothing here can tell apart, and the answer goes to neither.
+    nonisolated static func tty(
+        forSession id: UUID, tool: AgentTool, projectPath: URL?,
+        lookups: SessionLookups = .live
+    ) -> String? {
+        switch tool {
+        case .claudeCode:  return lookups.claudePid(id).flatMap(lookups.tty)
+        case .grokBuild:   return lookups.grokPid(id).flatMap(lookups.tty)
+        case .codex:       return lookups.codexPid(id).flatMap(lookups.tty)
+        case .antigravity: return lookups.antigravityPid(id).flatMap(lookups.tty)
+        case .kimiCode, .bearCode:
+            guard let path = projectPath?.path else { return nil }
+            let ttys = Set(lookups.kimiFamilyPids(tool, path).compactMap(lookups.tty))
+            return ttys.count == 1 ? ttys.first : nil
+        case .openCode:
+            // No session-to-process registry, and none was ever written.
+            return nil
         }
-        return nil
+    }
+
+    private nonisolated static func ttyName(pid: Int) -> String? {
+        let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let name, !name.isEmpty, name != "??" else { return nil }
+        return name
     }
 
     /// Antigravity publishes the cleanest session-to-pid map of any tool
@@ -648,19 +702,22 @@ enum TerminalFocuser {
     }
 
     /// Kimi (and its BearCode fork) have no session-to-pid registry, but
-    /// their processes keep the session's workDir as cwd, so match on
-    /// that (newest process wins when two sessions share a directory).
-    private nonisolated static func kimiPid(projectPath: URL?) -> Int? {
-        guard let path = projectPath?.path else { return nil }
-        return ProcessLiveness.pid(processNames: KimiMonitor.processNames, cwd: path)
+    /// their processes keep the session's workDir as cwd. Each tool's own
+    /// names only: a BearCode row never resolves to a Kimi process in the
+    /// same directory, or the other way round.
+    private nonisolated static func kimiFamilyPids(tool: AgentTool, cwd: String) -> [Int] {
+        switch tool {
+        case .kimiCode:
+            return ProcessLiveness.pids(processNames: KimiMonitor.processNames, cwd: cwd)
+        case .bearCode:
             // BearCode from 0.34.0 renames itself via process.title, so the
-            // command-line match alone stopped resolving a pid here. With no
-            // pid there is no tty, the selector cannot be read, and Approve
-            // degraded to opening an empty terminal window.
-            ?? ProcessLiveness.pid(
-                processName: KimiMonitor.BearCode.processName,
-                orCommandPattern: KimiMonitor.BearCode.commandPattern,
-                cwd: path)
+            // command-line match alone stopped finding it; older builds run
+            // as node and only the command line does. Both are asked.
+            return ProcessLiveness.pids(processNames: [KimiMonitor.BearCode.processName], cwd: cwd)
+                + ProcessLiveness.pids(commandPattern: KimiMonitor.BearCode.commandPattern, cwd: cwd)
+        default:
+            return []
+        }
     }
 
     /// The pid active_sessions.json names for the session, only while that

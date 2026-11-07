@@ -260,6 +260,18 @@ final class SessionStore {
         }
         let incomingIds = Set(incoming.map(\.id))
         for session in incoming { upsert(session) }
+        if host == nil, Self.provesProcessPerSession.contains(tool) {
+            // A pinned prompt for a tool answered at its terminal cannot
+            // outlive the process: nothing holds it, and the row would keep
+            // offering Approve and Deny for a terminal that is gone (or, by
+            // pid reuse, someone else's). These tools prove liveness per
+            // session, so a row this poll found dead lets its pin go.
+            for session in incoming where !session.processAlive {
+                if hookOverrides[session.id]?.sticky == true {
+                    hookOverrides.removeValue(forKey: session.id)
+                }
+            }
+        }
         sessions.removeAll {
             $0.tool == tool && $0.host == host
                 && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
@@ -322,6 +334,14 @@ final class SessionStore {
     // MARK: - Hook events
 
     static let hookGrace: TimeInterval = 15
+
+    /// Local tools whose discovery proves a process for each session (a
+    /// pid record held to its identity, a rollout or lock file held open),
+    /// and whose prompts nothing holds. Not Claude Code or OpenCode, whose
+    /// prompts are held decisions; not the Kimi family, whose liveness is a
+    /// count per directory and can read one live session of several as
+    /// dead.
+    static let provesProcessPerSession: Set<AgentTool> = [.grokBuild, .codex, .antigravity]
 
     struct HookOverride {
         var status: SessionStatus
@@ -704,20 +724,21 @@ final class SessionStore {
     ) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
                   let option = choose(screen)
             else {
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                 return
             }
             let outcome = TerminalFocuser.answerNumbered(
-                sessionID: id, projectPath: path,
+                sessionID: id, tool: tool, projectPath: path,
                 number: option.number, expectedLabel: option.label)
             if outcome != .sent {
                 // The prompt moved or the terminal is gone. Never press a
                 // digit into an unverified selector; bring the user to it.
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
             }
         }
     }
@@ -738,9 +759,10 @@ final class SessionStore {
     ) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            func giveUp() { TerminalFocuser.focus(sessionID: id, projectPath: path) }
-            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+            func giveUp() { TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path) }
+            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
                   let option = choose(screen)
             else { giveUp(); return }
             let selector = TuiPromptLayout.selector(in: screen)
@@ -750,7 +772,7 @@ final class SessionStore {
             else { giveUp(); return }
 
             let outcome = TerminalFocuser.answerByNavigation(
-                sessionID: id, projectPath: path,
+                sessionID: id, tool: tool, projectPath: path,
                 key: move.key, presses: move.presses,
                 expectedCursorLine: cursorLine, expectedLabel: option.label)
             if outcome != .sent { giveUp() }
@@ -760,9 +782,10 @@ final class SessionStore {
     private func answerTuiPrompt(_ session: AgentSession, keys: [String]) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            if !TerminalFocuser.sendKeys(sessionID: id, projectPath: path, keys: keys) {
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+            if !TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys) {
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
             }
         }
     }
@@ -831,16 +854,17 @@ final class SessionStore {
 
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
             let outcome = TerminalFocuser.sendReply(
-                sessionID: id, projectPath: path, text: text)
+                sessionID: id, tool: tool, projectPath: path, text: text)
             await MainActor.run {
                 switch outcome {
                 case .sent:
                     self.noteReplySent(id)
                     completion(.sent)
                 case .pasteNotVisible:
-                    TerminalFocuser.focus(sessionID: id, projectPath: path)
+                    TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                     completion(.failed(
                         "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
                 case .noTerminal:
@@ -888,8 +912,9 @@ final class SessionStore {
         }
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            TerminalFocuser.focus(sessionID: id, projectPath: path)
+            TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
         }
     }
 

@@ -178,9 +178,10 @@ extension SwarmBarApp {
     nonisolated static func postUnlessOnScreen(
         _ session: AgentSession, title: String, body: String, sound: AlertSound
     ) {
-        let id = session.id, path = session.projectPath, isLocal = session.host == nil
+        let id = session.id, tool = session.tool, path = session.projectPath
+        let isLocal = session.host == nil
         Task.detached {
-            if isLocal, TerminalFocuser.isSessionOnScreen(sessionID: id, projectPath: path) { return }
+            if isLocal, TerminalFocuser.isSessionOnScreen(sessionID: id, tool: tool, projectPath: path) { return }
             AgentNotifier.post(title: title, body: body, sound: sound, sessionID: id)
         }
     }

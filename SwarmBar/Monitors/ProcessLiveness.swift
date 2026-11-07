@@ -143,6 +143,24 @@ enum ProcessLiveness {
         pid(processName: processName, cwd: cwd) ?? pid(commandPattern: pattern, cwd: cwd)
     }
 
+    /// Every live process with one of the given names whose cwd is the
+    /// given directory, for a caller that must know whether the answer is
+    /// unique rather than take the newest.
+    nonisolated static func pids(processNames: [String], cwd: String) -> [Int] {
+        processNames.flatMap { pids(pgrepArgs: ["-x", $0], cwd: cwd) }
+    }
+
+    nonisolated static func pids(commandPattern: String, cwd: String) -> [Int] {
+        pids(pgrepArgs: ["-f", commandPattern], cwd: cwd)
+    }
+
+    private nonisolated static func pids(pgrepArgs: [String], cwd: String) -> [Int] {
+        guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return [] }
+        return pidText.split(separator: "\n")
+            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { cwds(pid: $0).contains(cwd) }
+    }
+
     private nonisolated static func pid(pgrepArgs: [String], cwd: String) -> Int? {
         guard let pidText = run("/usr/bin/pgrep", pgrepArgs) else { return nil }
         for line in pidText.split(separator: "\n").reversed() {

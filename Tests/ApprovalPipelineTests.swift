@@ -89,6 +89,86 @@ struct AnswerScriptTests {
     }
 }
 
+/// Which terminal a row's keys, paste and focus go to. Only the row's own
+/// tool's lookup may answer, and a directory shared by several Kimi-family
+/// sessions answers for none of them.
+@MainActor
+struct SessionTTYScopeTests {
+    private let id = UUID()
+    private let dir = URL(fileURLWithPath: "/tmp/example-proj")
+
+    /// A Kimi session at a prompt in the row's directory, on ttys009, and
+    /// every other lookup as given.
+    private func lookups(
+        own: Int? = nil,
+        kimi: [Int] = [900],
+        bear: [Int] = [],
+        ttys: [Int: String] = [900: "ttys009", 901: "ttys010", 902: "ttys009", 100: "ttys001"]
+    ) -> TerminalFocuser.SessionLookups {
+        TerminalFocuser.SessionLookups(
+            claudePid: { _ in own }, grokPid: { _ in own },
+            codexPid: { _ in own }, antigravityPid: { _ in own },
+            kimiFamilyPids: { tool, path in
+                guard path == "/tmp/example-proj" else { return [] }
+                return tool == .kimiCode ? kimi : tool == .bearCode ? bear : []
+            },
+            tty: { ttys[$0] })
+    }
+
+    @Test func aRowWhoseOwnLookupMissesNeverReachesAKimiInItsDirectory() {
+        for tool in [AgentTool.grokBuild, .codex, .antigravity, .claudeCode, .openCode] {
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, lookups: lookups()) == nil,
+                "\(tool)")
+        }
+    }
+
+    @Test func aRowsOwnProcessIsItsTerminal() {
+        for tool in [AgentTool.grokBuild, .codex, .antigravity, .claudeCode] {
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, lookups: lookups(own: 100)) == "ttys001")
+        }
+        // OpenCode has no lookup, so even a resolvable pid elsewhere is not its.
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir, lookups: lookups(own: 100)) == nil)
+    }
+
+    @Test func aKimiRowAloneInItsDirectoryResolves() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups()) == "ttys009")
+    }
+
+    /// Two sessions in one directory, at two terminals: nothing says which
+    /// is this row's, so neither gets the keys.
+    @Test func twoKimiSessionsInOneDirectoryResolveToNeither() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [900, 901])) == nil)
+    }
+
+    /// A launcher and its child share one terminal, which is unambiguous.
+    @Test func twoKimiProcessesOnOneTerminalResolve() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [900, 902])) == "ttys009")
+    }
+
+    /// A BearCode row never resolves to a Kimi process, or the reverse.
+    @Test func theKimiFamilyStaysWithinEachTool() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .bearCode, projectPath: dir, lookups: lookups()) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [], bear: [901])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .bearCode, projectPath: dir, lookups: lookups(kimi: [], bear: [901])) == "ttys010")
+    }
+
+    @Test func noDirectoryOrNoTerminalIsNoAnswer() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: nil, lookups: lookups()) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .grokBuild, projectPath: dir, lookups: lookups(own: 555)) == nil)
+    }
+}
+
 /// The per-tool answer table. Every entry was settled by a live round, and
 /// a wrong one does not fail loudly: it presses a key into a terminal.
 /// While this lived as a run of branches inside SessionStore it could only
