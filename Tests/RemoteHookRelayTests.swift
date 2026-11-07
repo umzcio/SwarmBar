@@ -135,6 +135,74 @@ struct RemoteHookRelayTests {
         #expect(decode(try #require(answers.first))["decision"] as? String == "deny")
     }
 
+    /// A second held request for a session that is already holding one,
+    /// too long to show and so not held itself, replaces the row. The
+    /// first hold must end then, failing open to the agent's own prompt,
+    /// or it waits out the whole hold with nothing on screen to answer it.
+    @Test func anUnshowableRequestEndsTheHoldItReplaces() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        var first: [Data] = []
+        var second: [Data] = []
+        server.handleRemote(
+            event: "PermissionRequest", body: permissionBody(raw), accountLabel: nil,
+            origin: origin(mirror: mirror), rid: "r1", held: true) { json, _ in first.append(json) }
+        #expect(server.isHolding(sessionID: rowID(raw)))
+
+        var huge = permissionBody(raw)
+        huge["tool_input"] = ["command": String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]
+        server.handleRemote(
+            event: "PermissionRequest", body: huge, accountLabel: nil,
+            origin: origin(mirror: mirror), rid: "r2", held: true) { json, _ in second.append(json) }
+
+        #expect(first.count == 1)
+        #expect(first.first.map(isEmptyAnswer) == true)
+        #expect(second.count == 1)
+        #expect(second.first.map(isEmptyAnswer) == true)
+        #expect(!server.isHolding(sessionID: rowID(raw)))
+        let row = try #require(store.sessions.first { $0.id == rowID(raw) })
+        guard case .waitingApproval(let prompt) = row.status else {
+            Issue.record("row is \(row.status)")
+            return
+        }
+        #expect(!prompt.offersApprove)
+    }
+
+    @Test func anUnshowableOpenCodeRequestEndsTheHoldItReplaces() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        var first: [Data] = []
+        var second: [Data] = []
+        let body: [String: Any] = [
+            "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
+            "patterns": ["ls -la"], "directory": "/home/u/web",
+        ]
+        server.handleRemote(
+            event: "OpenCodePermission", body: body, accountLabel: nil,
+            origin: origin(mirror: mirror, peer: []), rid: "r1", held: true) { json, _ in first.append(json) }
+        let id = RemoteIdentity.sessionID(
+            hostID: hostID, home: home, localID: StableID.uuid(for: "ses_abc"))
+        #expect(server.isHolding(sessionID: id))
+
+        var huge = body
+        huge["id"] = "per_2"
+        huge["patterns"] = [String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]
+        server.handleRemote(
+            event: "OpenCodePermission", body: huge, accountLabel: nil,
+            origin: origin(mirror: mirror, peer: []), rid: "r2", held: true) { json, _ in second.append(json) }
+
+        #expect(first.count == 1)
+        #expect(second.count == 1)
+        #expect(!server.isHolding(sessionID: id))
+        let row = try #require(store.sessions.first { $0.id == id })
+        guard case .waitingApproval(let prompt) = row.status else {
+            Issue.record("row is \(row.status)")
+            return
+        }
+        #expect(!prompt.offersApprove)
+    }
+
     // MARK: - Never held
 
     @Test func grokPeerIsNeverHeld() throws {

@@ -366,6 +366,15 @@ final class HookServer: ApprovalResponding {
                 return
             }
             let prompt = Self.approvalPrompt(body)
+            // This request replaces the row, so an earlier hold for the
+            // session can no longer be answered from it. A request held
+            // here supersedes that hold itself; one too long to show is
+            // not held, so the earlier one is let go now, failing open to
+            // the agent's own prompt, instead of waiting out the whole
+            // hold with nothing on screen to answer it.
+            if holding, !prompt.offersApprove {
+                cancelPending(sessionID: sessionID)
+            }
             apply(.waitingApproval(command: prompt), sticky: true)
             // A request the row cannot show whole is not offered for
             // approval there, so holding it would only keep the agent's
@@ -574,13 +583,24 @@ final class HookServer: ApprovalResponding {
         }
         let sessionID = context.rowID(StableID.uuid(for: rawSessionID))
         let prompt = Self.openCodePrompt(body)
+        let holding = mayHold(.openCodePlugin, .openCode, context)
+        // As for Claude: a request nobody holds must not replace a held
+        // row's text, and a held one that cannot be shown ends the hold it
+        // replaces rather than leaving it stranded.
+        if !holding, pendingApprovals[sessionID] != nil {
+            context.release()
+            return
+        }
+        if !prompt.offersApprove {
+            cancelPending(sessionID: sessionID)
+        }
         store.applyHookEvent(
             sessionID: sessionID, tool: .openCode,
             status: .waitingApproval(command: prompt),
             sticky: true, cwd: body["directory"] as? String, accountLabel: nil,
             host: context.host
         )
-        if prompt.offersApprove, mayHold(.openCodePlugin, .openCode, context) {
+        if prompt.offersApprove, holding {
             context.hold(sessionID, .openCodePlugin)
         } else {
             context.release()
@@ -618,9 +638,16 @@ final class HookServer: ApprovalResponding {
         let toolName = (body["tool_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "tool"
         let input = body["tool_input"] as? [String: Any] ?? [:]
         if toolName == "Bash", let command = input["command"] as? String {
-            // Bash's other arguments (description, timeout, background)
-            // change nothing about what runs.
-            return ApprovalPrompt(command)
+            // The description, timeout and background flag change nothing
+            // about what runs. Anything else might, and is shown after the
+            // command: dangerouslyDisableSandbox is what turns a sandboxed
+            // command into an unsandboxed one.
+            var rest = input
+            for key in ["command", "description", "timeout", "run_in_background"] {
+                rest.removeValue(forKey: key)
+            }
+            let extra = ApprovalPrompt.describeArguments(rest)
+            return ApprovalPrompt(extra.isEmpty ? command : command + "\n" + extra)
         }
         if toolName == Self.questionTool,
            let questions = input["questions"] as? [[String: Any]] {
