@@ -56,9 +56,27 @@ enum TuiPromptLayout {
         selector(in: screen).options
     }
 
+    /// The bottom-most block, anchored so that agent-written text cannot
+    /// pose as the selector:
+    ///
+    /// - The cursor is trusted only when exactly one option-shaped line on
+    ///   the whole screen is marked. Two marked lines means one of them was
+    ///   drawn by the agent, and a walk computed from the wrong one presses
+    ///   Enter on whatever the real cursor sits on. Without a cursor the
+    ///   walk is refused and the terminal is focused instead. Digit answers
+    ///   do not use the cursor, so they are unaffected.
+    /// - Nothing option-shaped may follow a radio option that opens with
+    ///   "Never". Grok 1.0 draws the command inside its last option,
+    ///   "Never allow: <command>", so any option line below it is the
+    ///   command's own text, shaped like options to forge a selector (a new
+    ///   block that wins by being lower, or a fifth option that extends the
+    ///   real four). The screen is then not read as a selector at all.
     nonisolated static func selector(in screen: String) -> Selector {
         var blocks: [Selector] = []
         var current = Selector(options: [], cursor: nil)
+        var markedLines = 0
+        var belowRadioNever = false
+        var forged = false
 
         func endBlock() {
             if current.options.count >= 2 { blocks.append(current) }
@@ -74,8 +92,10 @@ enum TuiPromptLayout {
                 .trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }          // blank lines do not break a block
             let number: Int, label: String, isCursor: Bool
+            var isRadio = false
             if let radio = radioOption(line) {
                 (number, label, isCursor) = (radio.number, radio.label, radio.marked)
+                isRadio = true
             } else if let dot = line.firstIndex(of: "."),
                       let digit = Int(line[line.startIndex..<dot]),
                       (1...9).contains(digit) {
@@ -86,6 +106,9 @@ enum TuiPromptLayout {
                 endBlock(); continue              // prose ends the block
             }
             guard !label.isEmpty else { endBlock(); continue }
+            if belowRadioNever { forged = true }
+            if isCursor { markedLines += 1 }
+            if isRadio, firstWord(label) == "never" { belowRadioNever = true }
             if number == 1 { endBlock() }
             if number == current.options.count + 1 {
                 current.options.append(Option(number: number, label: label))
@@ -98,7 +121,12 @@ enum TuiPromptLayout {
             }
         }
         endBlock()
-        return blocks.last ?? Selector(options: [], cursor: nil)
+        guard !forged, var chosen = blocks.last else { return Selector(options: [], cursor: nil) }
+        if markedLines != 1 {
+            chosen.cursor = nil
+            chosen.cursorLine = nil
+        }
+        return chosen
     }
 
     /// Grok 1.0 draws "2 (●) Yes, proceed": the number, a radio button,
