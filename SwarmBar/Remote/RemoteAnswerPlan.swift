@@ -88,7 +88,11 @@ enum RemoteAnswerPlan {
     /// the text that actually lands, not from text the helper will alter.
     /// By scalar, because "\r\n" is one Character and would otherwise be
     /// kept or dropped whole.
-    static func pasteText(_ text: String) -> String {
+    ///
+    /// The local reply path pastes through the same rule
+    /// (TerminalFocuser.sendReply), so there is one definition of what a
+    /// reply may carry into a terminal, not one per path.
+    nonisolated static func pasteText(_ text: String) -> String {
         var scalars = String.UnicodeScalarView()
         scalars.append(contentsOf: text.unicodeScalars.filter { scalar in
             scalar == "\n" || scalar == "\t" || (scalar.value >= 0x20 && scalar.value != 0x7F)

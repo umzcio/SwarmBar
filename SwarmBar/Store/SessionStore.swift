@@ -798,6 +798,10 @@ final class SessionStore {
         text: String,
         completion: @escaping @MainActor (ReplyResult) -> Void
     ) {
+        // Controls the composer cannot show (ESC above all) never reach a
+        // terminal, here or on a host, and a reply that was nothing else is
+        // empty.
+        let text = RemoteAnswerPlan.pasteText(text)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             completion(.failed("Nothing to send.")); return

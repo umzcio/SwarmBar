@@ -341,8 +341,16 @@ enum TerminalFocuser {
     ///
     /// Deliberately contains NO submit. Pasting and pressing Enter are
     /// separate steps so the paste can be verified on screen in between.
+    ///
+    /// The text goes through `RemoteAnswerPlan.pasteText` first, the remote
+    /// path's rule: C0 controls other than newline and tab, and DEL, are
+    /// removed. An ESC in the reply (pasted into the composer from a page
+    /// that put one on the clipboard, where it does not show) could
+    /// otherwise close the bracketed paste early with its own "[201~" and
+    /// turn the rest of the reply into keystrokes. The two markers here are
+    /// the only ESCs this script ever writes.
     nonisolated static func pasteScript(tty: String, text: String) -> String {
-        let payload = AppleScriptLiteral.expression(text)
+        let payload = AppleScriptLiteral.expression(RemoteAnswerPlan.pasteText(text))
         return """
         tell application "iTerm2"
           repeat with w in windows
@@ -367,8 +375,10 @@ enum TerminalFocuser {
     /// composer is recoverable, a half-delivered prompt that was submitted is
     /// not.
     nonisolated static func sendReply(
-        sessionID: UUID, projectPath: URL?, text: String
+        sessionID: UUID, projectPath: URL?, text raw: String
     ) -> ReplyOutcome {
+        // What lands is the filtered text, so the probe is taken from it too.
+        let text = RemoteAnswerPlan.pasteText(raw)
         guard let tty = tty(forSession: sessionID, projectPath: projectPath),
               isRunning("iTerm2"),
               runScript(pasteScript(tty: tty, text: text)) == "PASTED"
