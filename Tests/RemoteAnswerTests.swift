@@ -641,6 +641,42 @@ struct RemoteAnswerTests {
         #expect(rig.store.remoteAnswerability(for: row) == .terminalOnly)
     }
 
+    @Test func anUnheldRequestNeverRewritesWhatApproveAnswers() async throws {
+        let rig = Rig()
+        let mirrorRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-answer-rewrite-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mirrorRoot, withIntermediateDirectories: true)
+        let mirror = RemoteMirror(root: mirrorRoot)
+        let origin = RemoteHookOrigin(
+            hostID: rig.host.id, hostName: "devbox", home: "/home/u",
+            mirrorHome: mirror.local("/home/u"), peer: ["curl", "bash", "claude"], approvalsOff: [])
+        let raw = UUID().uuidString
+        func request(_ command: String, rid: String, held: Bool, answered: @escaping (Data) -> Void = { _ in }) {
+            rig.server.handleRemote(
+                event: "PermissionRequest",
+                body: ["session_id": raw, "tool_name": "Bash",
+                       "tool_input": ["command": command], "cwd": "/home/u/proj"],
+                accountLabel: nil, origin: origin, rid: rid, held: held) { data, _ in answered(data) }
+        }
+        var firstAnswers: [Data] = []
+        request("git status", rid: "r1", held: true) { firstAnswers.append($0) }
+        let row = try #require(rig.store.sessions.first)
+        #expect(row.status == .waitingApproval(command: "git status"))
+
+        // Not held, so nothing would answer it: it must not change the row
+        // while r1 is what Approve allows.
+        request("rm -rf /", rid: "r2", held: false)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "git status"))
+        #expect(rig.server.isHolding(sessionID: row.id))
+        #expect(firstAnswers.isEmpty)
+
+        // A new hold supersedes the old one, which is let go, and only then
+        // does the row show the new command.
+        request("git push", rid: "r3", held: true)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "git push"))
+        #expect(firstAnswers.count == 1)
+    }
+
     @Test func sentKeysMoveTheRowOn() async throws {
         let rig = Rig(replies: [
             "capture": #"{"text":"1. Approve once\n2. Reject"}"#,

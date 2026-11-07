@@ -2728,6 +2728,63 @@ class HookRelayTests(unittest.TestCase):
         self.assertIsNone(helper.parse_line(b"[" * 100000))
 
 
+class FollowerRelayTests(unittest.TestCase):
+    """A follower relays what its broker sends. The broker is whoever holds
+    the home's lock, possibly the home's own user, so it never decides
+    which home or user an event belongs to."""
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-follow-"))
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.sent = []
+        relay = mock.Mock()
+        relay.emit = self.sent.append
+        self.hub = helper.HookHome(relay, self.home)
+
+    def hook(self, **fields):
+        message = {"event": "hook", "rid": "r1", "home": "/root", "user": "root",
+                   "path": "/hook/PermissionRequest", "account": None,
+                   "peer": ["curl", "claude"], "body": {"session_id": "victim"}, "held": False}
+        message.update(fields)
+        return message
+
+    def test_event_is_attributed_to_the_followed_home(self):
+        self.hub.relay_message(self.hook(extra="x"))
+        self.assertEqual(len(self.sent), 1)
+        event = self.sent[0]
+        self.assertEqual(event["home"], self.home)
+        self.assertEqual(event["user"], self.hub.user)
+        self.assertNotIn("extra", event)
+        self.assertEqual(event["body"], {"session_id": "victim"})
+        self.assertIs(event["held"], False)
+
+    def test_held_only_when_announced(self):
+        self.hub.relay_message(self.hook(rid="r2", held=True))
+        self.assertIs(self.sent[-1]["held"], False)
+        self.hub.relay_message({"type": "held", "rid": "r3"})
+        self.hub.relay_message(self.hook(rid="r3", held=True))
+        self.assertIs(self.sent[-1]["held"], True)
+
+    def test_malformed_events_are_dropped(self):
+        for fields in ({"rid": 3}, {"rid": ""}, {"path": "/etc/passwd"}, {"path": None},
+                       {"body": "x"}, {"body": None}):
+            self.hub.relay_message(self.hook(**fields))
+        self.assertEqual(self.sent, [])
+
+    def test_peer_and_account_are_checked_for_shape(self):
+        self.hub.relay_message(self.hook(peer=["a", 3, None] + ["b"] * 20, account=7))
+        event = self.sent[0]
+        self.assertEqual(event["peer"], (["a"] + ["b"] * 20)[:helper.PEER_DEPTH])
+        self.assertIsNone(event["account"])
+
+    def test_only_announced_holds_can_be_resolved(self):
+        self.hub.relay_message({"event": "hook_resolved", "rid": "someone-elses"})
+        self.assertEqual(self.sent, [])
+        self.hub.relay_message({"type": "held", "rid": "r4"})
+        self.hub.relay_message({"event": "hook_resolved", "rid": "r4", "home": "/root"})
+        self.assertEqual(self.sent, [{"event": "hook_resolved", "rid": "r4"}])
+
+
 class PeerChainTests(unittest.TestCase):
     """peer_chain itself, against a fake process table."""
 

@@ -393,8 +393,18 @@ final class HookServer: ApprovalResponding {
 
         switch event {
         case "PermissionRequest", "PreToolUseHold":
+            let holding = mayHold(.claudeHook, tool, context)
+            // The command a row shows beside Approve is the command Approve
+            // answers. A request nobody holds cannot be answered from the
+            // row, so while one is held it must not replace that text:
+            // Approve would then allow a command the person never saw.
+            // Only a new hold, which supersedes the old one, changes it.
+            if !holding, pendingApprovals[sessionID] != nil {
+                context.release()
+                return
+            }
             apply(.waitingApproval(command: Self.commandDescription(body)), sticky: true)
-            if mayHold(.claudeHook, tool, context) {
+            if holding {
                 context.hold(sessionID, .claudeHook)
             } else {
                 context.release()

@@ -4060,10 +4060,47 @@ class HookHome(object):
             self.replayed.discard(rid)
             return
         if event == "hook_resolved":
+            # Only a hold this broker announced is its to end.
+            if not isinstance(rid, str) or rid not in self.relayed:
+                return
             self.relayed.discard(rid)
             self.replayed.discard(rid)
-        if event in ("hook", "hook_resolved"):
-            self.relay.emit(message)
+            self.relay.emit({"event": "hook_resolved", "rid": rid})
+            return
+        if event == "hook":
+            rebuilt = self.followed_hook(message)
+            if rebuilt is not None:
+                self.relay.emit(rebuilt)
+
+    def followed_hook(self, message):
+        """A hook event from the broker, rebuilt for this helper's Mac, or
+        None when it is malformed.
+
+        The broker is whoever holds this home's lock, which may be the
+        home's own user rather than another SwarmBar helper. So nothing it
+        says about whose event this is stands: the home and user are this
+        hub's own, and the event can reach only this home's rows. It is
+        held only when the broker announced the hold first, as the owner
+        does; the rest is checked for shape and taken as data."""
+        rid, path, body = message.get("rid"), message.get("path"), message.get("body")
+        if not isinstance(rid, str) or not rid or not isinstance(path, str) \
+                or not HOOK_PATH.match(path) or not isinstance(body, dict):
+            return None
+        peer = message.get("peer")
+        peer = [name for name in peer if isinstance(name, str)][:PEER_DEPTH] \
+            if isinstance(peer, list) else []
+        account = message.get("account")
+        return {
+            "event": "hook",
+            "rid": rid,
+            "home": self.home,
+            "user": self.user,
+            "path": path,
+            "account": account if isinstance(account, str) else None,
+            "peer": peer,
+            "body": body,
+            "held": message.get("held") is True and rid in self.relayed,
+        }
 
     def forward_reply(self, rid, body):
         conn = self.broker
