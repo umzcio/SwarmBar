@@ -353,6 +353,31 @@ class NotShipped(OSError):
     """A file the snapshot must not read, with the reason."""
 
 
+DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+
+
+def owned_dir_fd(real_home, uid, parts):
+    """A descriptor for real_home/parts..., reached one component at a time
+    with no link followed, every directory on the way `uid`'s own, checked
+    on the descriptors themselves. `real_home` must already be a realpath.
+    Raises OSError (NotShipped for a wrong owner); a link on the way is
+    ELOOP or ENOTDIR, and a missing one FileNotFoundError."""
+    fd = os.open(real_home, DIRECTORY_FLAGS)
+    try:
+        if os.fstat(fd).st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        for part in parts:
+            child = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if os.fstat(fd).st_uid != uid:
+                raise NotShipped(errno.EPERM, "not its home's owner's own")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def shipped_opener(home):
     """The `opener` every snapshot read of a file in `home` goes through.
 
@@ -392,15 +417,8 @@ def shipped_opener(home):
         if not inside(resolved, real_home):
             raise NotShipped(errno.EPERM, "leads outside its home")
         parts = resolved[len(real_home.rstrip("/")) + 1:].split("/")
-        directory = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
-        fd = os.open(real_home, directory)
+        fd = owned_dir_fd(real_home, foreign, parts[:-1])
         try:
-            check(fd, "dir")
-            for part in parts[:-1]:
-                child = os.open(part, directory, dir_fd=fd)
-                os.close(fd)
-                fd = child
-                check(fd, "dir")
             leaf = os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=fd)
         finally:
             os.close(fd)
@@ -2939,6 +2957,9 @@ def grok_session(home, session_id):
     if not isinstance(session_id, str) or not session_id or "/" in session_id \
             or "\0" in session_id or session_id in (".", ".."):
         return True
+    foreign = cross_user(home)
+    if foreign is not None:
+        return grok_session_walked(os.path.realpath(home), foreign, session_id)
     grok = os.path.join(home, ".grok")
     try:
         # Not followed, and never blocking on a FIFO: this may run as root
@@ -2975,6 +2996,77 @@ def grok_session(home, session_id):
     # even a dangling link.
     return any(os.path.lexists(os.path.join(sessions, name, session_id))
                for name in directories)
+
+
+def grok_session_walked(real_home, uid, session_id):
+    """grok_session for another user's home, run as root: every path is
+    reached from the home down with no link followed, through directories
+    that user owns. Their link to a directory only root can search is
+    never looked through, so whether a name exists there cannot change the
+    answer, or how soon it comes. Grok state that is there but not plainly
+    theirs counts as Grok, as unreadable state does."""
+    try:
+        grok = owned_dir_fd(real_home, uid, [".grok"])
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fd = os.open("active_sessions.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=grok)
+        except FileNotFoundError:
+            fd = None
+        except OSError:
+            return True
+        if fd is not None:
+            try:
+                info = os.fstat(fd)
+                if not stat_module.S_ISREG(info.st_mode) or info.st_uid != uid \
+                        or info.st_size > GROK_INDEX_MAX_BYTES:
+                    return True
+                data = os.read(fd, GROK_INDEX_MAX_BYTES + 1)
+            except OSError:
+                return True
+            finally:
+                os.close(fd)
+            try:
+                if names_session(json.loads(data.decode("utf-8")), session_id):
+                    return True
+            except (ValueError, RecursionError):
+                return True
+        try:
+            sessions = os.open("sessions", DIRECTORY_FLAGS, dir_fd=grok)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            if os.fstat(sessions).st_uid != uid:
+                return True
+            names = os.listdir(sessions)
+        except OSError:
+            return True
+        try:
+            for name in names:
+                try:
+                    directory = os.open(name, DIRECTORY_FLAGS, dir_fd=sessions)
+                except OSError:
+                    continue
+                try:
+                    # Any entry by that name counts, even a dangling link,
+                    # as lexists does for the user's own home.
+                    os.stat(session_id, dir_fd=directory, follow_symlinks=False)
+                    return True
+                except OSError:
+                    pass
+                finally:
+                    os.close(directory)
+            return False
+        finally:
+            os.close(sessions)
+    finally:
+        os.close(grok)
 
 
 def peer_pid(sock):
@@ -3083,8 +3175,24 @@ def bounded(work, seconds, default):
 
 def hook_homes():
     """Homes with a remote bridge installed, in home_dirs order."""
-    return [home for home in home_dirs()
-            if any(os.path.isfile(os.path.join(home, marker)) for marker in HOOK_MARKERS)]
+    return [home for home in home_dirs() if has_bridge_marker(home)]
+
+
+def has_bridge_marker(home):
+    """Whether one of HOOK_MARKERS is a regular file in `home`, opened the
+    way the snapshot opens files there (shipped_opener): in another user's
+    home, never through a link out of it and only their own file. A marker
+    they linked to a path only root can see is no marker, whether or not
+    that path exists."""
+    opener = shipped_opener(home)
+    for marker in HOOK_MARKERS:
+        try:
+            fd = opener(os.path.join(home, marker), os.O_RDONLY)
+        except OSError:
+            continue
+        os.close(fd)
+        return True
+    return False
 
 
 class HookHomeError(Exception):

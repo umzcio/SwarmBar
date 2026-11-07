@@ -764,6 +764,81 @@ class CrossUserReadTests(unittest.TestCase):
                              [os.path.join(self.a, ".claude", "projects")])
 
 
+class CrossUserProbeTests(unittest.TestCase):
+    """The root hook relay checks Grok state and bridge markers in other
+    users' homes. Their links must not let them learn, from whether or how
+    soon they are answered, what exists where only root can look."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-oracle-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.home = os.path.join(self.base, "home")
+        self.hidden = os.path.join(self.base, "hidden")
+        os.mkdir(self.home)
+        os.mkdir(self.hidden)
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def foreign(self, owner=None):
+        return mock.patch.object(helper, "cross_user",
+                                 return_value=os.geteuid() if owner is None else owner)
+
+    def answers(self, session_id):
+        with self.foreign():
+            return helper.grok_session(self.home, session_id)
+
+    def test_link_from_sessions_answers_the_same_whatever_is_behind_it(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions"))
+        os.symlink(self.hidden, os.path.join(self.home, ".grok", "sessions", "x"))
+        os.mkdir(os.path.join(self.hidden, "id_ed25519"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+        # The same tree as the helper's own home is looked through, as before.
+        self.assertTrue(helper.grok_session(self.home, "id_ed25519"))
+
+    def test_linked_grok_dir_answers_the_same_whatever_is_behind_it(self):
+        os.makedirs(os.path.join(self.hidden, "sessions", "x", "id_ed25519"))
+        os.symlink(self.hidden, os.path.join(self.home, ".grok"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+
+    def test_real_grok_state_still_counts(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))
+        with open(os.path.join(self.home, ".grok", "active_sessions.json"), "w") as handle:
+            json.dump({"sessions": [{"id": "g-listed"}]}, handle)
+        self.assertTrue(self.answers("g-dir"))
+        self.assertTrue(self.answers("g-listed"))
+        self.assertFalse(self.answers("claude-session"))
+
+    def test_no_grok_state_is_not_grok(self):
+        self.assertFalse(self.answers("claude-session"))
+
+    def test_grok_state_not_owned_by_the_homes_user_counts_as_grok(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions"))
+        with self.foreign(os.geteuid() + 1):
+            self.assertTrue(helper.grok_session(self.home, "claude-session"))
+
+    def marker(self):
+        return os.path.join(self.home, helper.HOOK_MARKERS[0])
+
+    def test_marker_linked_out_of_the_home_is_no_marker_either_way(self):
+        os.makedirs(os.path.dirname(self.marker()))
+        target = os.path.join(self.hidden, "secret")
+        os.symlink(target, self.marker())
+        with self.foreign():
+            absent = helper.has_bridge_marker(self.home)
+            open(target, "w").close()
+            present = helper.has_bridge_marker(self.home)
+        self.assertEqual((absent, present), (False, False))
+
+    def test_real_marker_is_a_marker(self):
+        os.makedirs(os.path.dirname(self.marker()))
+        open(self.marker(), "w").close()
+        with self.foreign():
+            self.assertTrue(helper.has_bridge_marker(self.home))
+            self.assertEqual(helper.hook_homes(), [self.home])
+        self.assertTrue(helper.has_bridge_marker(self.home))
+
+
 class MirrorEquivalenceTests(unittest.TestCase):
     """The property this protocol exists for: a sparse mirror built only
     from snapshot chunks reads, through the Mac's own tail reader, exactly
