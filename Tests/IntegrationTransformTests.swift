@@ -376,6 +376,50 @@ struct BridgeScriptRefreshTests {
         #expect(IntegrationManager.refreshedScript(installed: nil, bundled: "new") == nil)
     }
 
+    private func tempDir() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("script-refresh-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func mode(_ url: URL) throws -> Int {
+        try #require(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int)
+    }
+
+    /// A plugin linked into a checkout stays a link, and what it points to
+    /// is not written: the atomic write used to swap the link for a copy.
+    @Test func aLinkedScriptIsLeftAlone() throws {
+        let dir = try tempDir()
+        let target = dir.appendingPathComponent("checkout.js")
+        try "old".write(to: target, atomically: true, encoding: .utf8)
+        let link = dir.appendingPathComponent("swarmbar.js")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        #expect(IntegrationManager.refreshScript(at: link, bundled: "new") == .leftLinked)
+        let type = try FileManager.default.attributesOfItem(atPath: link.path)[.type] as? FileAttributeType
+        #expect(type == .typeSymbolicLink)
+        #expect(try String(contentsOf: target, encoding: .utf8) == "old")
+    }
+
+    /// The file keeps its mode: the plugin is not a program and was
+    /// installed 0644, while the bridge scripts were installed 0755.
+    @Test func aRefreshedScriptKeepsItsMode() throws {
+        let dir = try tempDir()
+        for wanted in [0o644, 0o755] {
+            let file = dir.appendingPathComponent("script-\(wanted)")
+            try "old".write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: wanted], ofItemAtPath: file.path)
+            #expect(IntegrationManager.refreshScript(at: file, bundled: "new") == .refreshed)
+            #expect(try String(contentsOf: file, encoding: .utf8) == "new")
+            #expect(try mode(file) == wanted)
+            #expect(IntegrationManager.refreshScript(at: file, bundled: "new") == .current)
+        }
+        let missing = dir.appendingPathComponent("missing")
+        #expect(IntegrationManager.refreshScript(at: missing, bundled: "new") == .absent)
+        #expect(!FileManager.default.fileExists(atPath: missing.path))
+    }
+
     /// The Kimi family never needs SwarmBar's reply: every event is
     /// fire-and-forget and approvals go through the terminal.
     @Test func theKimiBridgePrintsNothing() throws {

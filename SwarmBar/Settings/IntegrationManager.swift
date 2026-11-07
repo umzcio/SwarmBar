@@ -217,17 +217,46 @@ final class IntegrationManager {
             + [("swarmbar-opencode.js", plugin)]
         for (name, destination) in targets {
             guard let source = Bundle.main.url(forResource: name, withExtension: nil),
-                  let bundled = try? String(contentsOf: source, encoding: .utf8),
-                  let updated = refreshedScript(
-                    installed: try? String(contentsOf: destination, encoding: .utf8),
-                    bundled: bundled)
+                  let bundled = try? String(contentsOf: source, encoding: .utf8)
             else { continue }
-            do {
-                try updated.write(to: destination, atomically: true, encoding: .utf8)
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
-            } catch {
+            switch refreshScript(at: destination, bundled: bundled) {
+            case .leftLinked:
+                NSLog("SwarmBar: \(destination.path) is a symbolic link, so it was not refreshed. "
+                    + "Update what it points to, or switch the bridge off and on in Settings.")
+            case .failed(let error):
                 NSLog("SwarmBar: could not refresh \(name): \(error)")
+            case .absent, .current, .refreshed:
+                break
             }
+        }
+    }
+
+    enum ScriptRefresh: Equatable {
+        case absent, current, refreshed, leftLinked
+        case failed(String)
+    }
+
+    /// Replaces one installed script with the bundled text, if it exists
+    /// and differs. A symbolic link is left alone: the atomic write would
+    /// replace the link with a plain copy, and a linked plugin is someone
+    /// keeping that file elsewhere on purpose (a checkout of this repo, a
+    /// dotfiles folder), which SwarmBar has no business writing into. The
+    /// file keeps the mode it had, so a plugin installed 0644 stays 0644.
+    nonisolated static func refreshScript(at destination: URL, bundled: String) -> ScriptRefresh {
+        let fm = FileManager.default
+        guard let attributes = try? fm.attributesOfItem(atPath: destination.path) else { return .absent }
+        if attributes[.type] as? FileAttributeType == .typeSymbolicLink { return .leftLinked }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { return .absent }
+        guard let updated = refreshedScript(
+            installed: try? String(contentsOf: destination, encoding: .utf8), bundled: bundled)
+        else { return .current }
+        let mode = (attributes[.posixPermissions] as? NSNumber)?.int16Value ?? 0o644
+        do {
+            try updated.write(to: destination, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: destination.path)
+            return .refreshed
+        } catch {
+            return .failed("\(error)")
         }
     }
 
