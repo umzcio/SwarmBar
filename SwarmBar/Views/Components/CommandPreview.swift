@@ -40,6 +40,10 @@ struct CommandPreview: View {
             RoundedRectangle(cornerRadius: 7)
                 .strokeBorder(.orange.opacity(0.25))
         )
+        // Nothing drawn for the request may reach past its well: stacked
+        // marks that survive `visible` would otherwise paint over the
+        // buttons and rows around it.
+        .clipShape(.rect(cornerRadius: 7))
     }
 
     @ViewBuilder private var exact: some View {
@@ -74,7 +78,7 @@ struct CommandPreview: View {
             }
         }
         .help(collapsed.isCut
-            ? (full.count <= Self.tooltipLimit ? full : "Show all to review the full request")
+            ? (full.unicodeScalars.count <= Self.tooltipLimit ? full : "Show all to review the full request")
             : "")
     }
 

@@ -30,16 +30,18 @@ struct ApprovalPrompt: Equatable, Sendable, ExpressibleByStringLiteral {
     let text: String
     let fidelity: Fidelity
 
-    /// Past this the request is not shown in the popover at all, and the
-    /// row sends the person to the terminal. A real command is nowhere
-    /// near it; the cap is what keeps a hostile one from making the row
-    /// unusable instead.
-    static let maxCharacters = 32_000
+    /// Past this many scalars the request is not shown in the popover at
+    /// all, and the row sends the person to the terminal. A real command
+    /// is nowhere near it; the cap is what keeps a hostile one from making
+    /// the row unusable instead. Counted in scalars, not Characters: one
+    /// Character can carry megabytes of combining marks, and laying that
+    /// out stalls the main thread.
+    static let maxScalars = 32_000
 
     /// An exact request, unless it is too long to show, in which case it
     /// is not offered for approval here.
     init(_ text: String) {
-        if text.count > Self.maxCharacters {
+        if text.unicodeScalars.count > Self.maxScalars {
             self.text = ""
             self.fidelity = .unreadable(
                 reason: "This request is too long to show here. Review it in the terminal.")
@@ -89,7 +91,7 @@ struct ApprovalPrompt: Equatable, Sendable, ExpressibleByStringLiteral {
         var rest = arguments
         var head = tool
         if let key = primaryArguments.first(where: {
-            (arguments[$0] as? String).map { !$0.contains("\n") } ?? false
+            (arguments[$0] as? String).map { !hasLineFeed($0) } ?? false
         }), let value = rest.removeValue(forKey: key) as? String {
             head += " " + value
         }
@@ -117,8 +119,16 @@ struct ApprovalPrompt: Equatable, Sendable, ExpressibleByStringLiteral {
             if contentArguments.contains(key), text.count > longContent {
                 return "\(key): \(text.count) characters, not shown here"
             }
-            return text.contains("\n") ? "\(key):\n\(text)" : "\(key): \(text)"
+            return hasLineFeed(text) ? "\(key):\n\(text)" : "\(key): \(text)"
         }.joined(separator: "\n")
+    }
+
+    /// Whether the text breaks a line where the preview will. By scalar:
+    /// "\r\n" is one Character, so `contains("\n")` says no to it, and a
+    /// value holding one then read as a one-line value with its second
+    /// line passing for the next argument.
+    private static func hasLineFeed(_ text: String) -> Bool {
+        text.unicodeScalars.contains("\n")
     }
 }
 
@@ -133,9 +143,30 @@ enum ApprovalPreviewText {
     /// screen read differently from the bytes that run. Line feeds and
     /// tabs are kept as layout; everything else that does not draw is
     /// shown by name.
+    ///
+    /// Combining marks draw, but a long run of them stacks above and below
+    /// its letter, over the lines around it, so a command can be on screen
+    /// and painted over. Real text uses a few per letter at most, so a run
+    /// longer than `maxMarkRun` is shown as a count instead.
     static func visible(_ text: String) -> String {
         var out = String.UnicodeScalarView()
+        var marks: [Unicode.Scalar] = []
+        func flushMarks() {
+            if marks.count > maxMarkRun {
+                out.append(contentsOf: "<\(marks.count) combining marks>".unicodeScalars)
+            } else {
+                out.append(contentsOf: marks)
+            }
+            marks.removeAll()
+        }
         for scalar in text.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .nonspacingMark, .enclosingMark:
+                marks.append(scalar)
+                continue
+            default:
+                flushMarks()
+            }
             switch scalar.value {
             case 0x0A, 0x09:
                 out.append(scalar)
@@ -153,8 +184,12 @@ enum ApprovalPreviewText {
                 }
             }
         }
+        flushMarks()
         return String(out)
     }
+
+    /// The most combining marks in a row shown as drawn.
+    static let maxMarkRun = 3
 
     struct Collapsed: Equatable {
         /// What the collapsed row shows, already made visible.

