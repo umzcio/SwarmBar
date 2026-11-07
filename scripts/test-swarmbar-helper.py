@@ -946,7 +946,11 @@ class ProcessTableTests(unittest.TestCase):
     def setUp(self):
         patches = [
             mock.patch.object(helper, "process_cwd", return_value="/work"),
-            mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]),
+            mock.patch.object(helper, "tmux_sockets",
+                              return_value=[("/tmp/tmux-1000/default", 1000)]),
+            # As if this were root, which may run a client as any owner.
+            # TmuxOwnerTests covers who it runs as.
+            mock.patch.object(helper, "tmux_identity", return_value={}),
             # No uid in these samples names a real account, so the printed
             # user stands, whoever runs the tests.
             mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")),
@@ -990,7 +994,12 @@ class ProcessTableTests(unittest.TestCase):
             rows = helper.parse_ps("  10  1 1001 longuser+ pts/1 claude claude\n")
         lookup.assert_called_with(1001)
         self.assertEqual(rows[0]["user"], "longusername")
-        self.assertNotIn("uid", rows[0])
+        self.assertEqual(rows[0]["uid"], 1001)
+
+    def test_uid_is_never_shipped(self):
+        table, _ = self.run_table(FakeRunner())
+        self.assertTrue(table)
+        self.assertTrue(all("uid" not in p for p in table))
 
     def test_unknown_uid_keeps_the_printed_user(self):
         rows = helper.parse_ps("  10  1 4242 someone pts/1 claude claude\n")
@@ -1032,7 +1041,8 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_failing_socket_is_skipped_others_still_work(self):
         with mock.patch.object(helper, "tmux_sockets",
-                               return_value=["/tmp/tmux-0/default", "/tmp/tmux-1000/default"]):
+                               return_value=[("/tmp/tmux-0/default", 0),
+                                             ("/tmp/tmux-1000/default", 1000)]):
             runner = FakeRunner(panes={"/tmp/tmux-1000/default": "%3 500\n"})
             table, _ = self.run_table(runner)
         claude = [p for p in table if p["pid"] == 700][0]
@@ -1040,10 +1050,29 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_ancestry_walk_is_bounded(self):
         parents = {1: 2, 2: 3, 3: 1}
-        self.assertIsNone(helper.pane_for(1, parents, {99: {"socket": "s", "id": "%1"}}))
+        self.assertIsNone(helper.pane_for(1, parents, {(99, 7): {"socket": "s", "id": "%1"}}, 7))
         chain = dict((n, n + 1) for n in range(1, 100))
-        self.assertIsNone(helper.pane_for(1, chain, {40: {"socket": "s", "id": "%1"}}))
-        self.assertEqual(helper.pane_for(1, chain, {20: {"socket": "s", "id": "%1"}})["id"], "%1")
+        self.assertIsNone(helper.pane_for(1, chain, {(40, 7): {"socket": "s", "id": "%1"}}, 7))
+        self.assertEqual(helper.pane_for(1, chain, {(20, 7): {"socket": "s", "id": "%1"}}, 7)["id"],
+                         "%1")
+
+    def test_pane_only_from_a_server_of_the_agents_own_user(self):
+        # A server owned by uid 1001 claims uid 1000's agent, as the agent
+        # itself and as its shell. It never gets it, and the real server
+        # still does.
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1001/evil", 1001),
+                                             ("/tmp/tmux-1000/default", 1000)]):
+            runner = FakeRunner(panes={"/tmp/tmux-1001/evil": "%66 700\n%67 610\n",
+                                       "/tmp/tmux-1000/default": "%3 610\n"})
+            table, _ = self.run_table(runner)
+        claude = [p for p in table if p["pid"] == 700][0]
+        self.assertEqual(claude["pane"], {"socket": "/tmp/tmux-1000/default", "id": "%3"})
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1001/evil", 1001)]):
+            runner = FakeRunner(panes={"/tmp/tmux-1001/evil": "%66 700\n"})
+            table, _ = self.run_table(runner)
+        self.assertIsNone([p for p in table if p["pid"] == 700][0]["pane"])
 
     def test_ps_failure_sets_processes_failed(self):
         table, warnings = self.run_table(FakeRunner(ps_code=1))
@@ -1271,7 +1300,10 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(out, {"sent": False, "reason": "send failed", "sent_count": 1})
         self.assertEqual(len(rec.sent()), 2)
 
-    def target_recorder(self, ps=PS_SAMPLE, pane_line="%3 610\n"):
+    def target_recorder(self, ps=None, pane_line="%3 610\n"):
+        # The socket is this test's own, so the agent is too.
+        if ps is None:
+            ps = PS_SAMPLE.replace(" 1000 ", " %d " % os.geteuid())
         return TmuxRecorder(screen="1. Approve once", ps=ps, panes={self.sock: pane_line})
 
     def test_keys_sent_when_target_still_matches(self):
@@ -1441,9 +1473,12 @@ class TmuxCommandTests(unittest.TestCase):
     def test_paste_not_sent_when_target_changed(self):
         # The pid is gone, is another agent, or has left the pane, and so is
         # a failed ps: nothing is loaded or pasted.
-        for extra, pane_line, ps in (({"pid": 999, "comm": "claude"}, "%3 610\n", PS_SAMPLE),
-                                     ({"pid": 700, "comm": "codex"}, "%3 610\n", PS_SAMPLE),
-                                     ({"pid": 700, "comm": "claude"}, "%4 610\n", PS_SAMPLE),
+        mine = PS_SAMPLE.replace(" 1000 ", " %d " % os.geteuid())
+        for extra, pane_line, ps in (({"pid": 999, "comm": "claude"}, "%3 610\n", mine),
+                                     ({"pid": 700, "comm": "codex"}, "%3 610\n", mine),
+                                     ({"pid": 700, "comm": "claude"}, "%4 610\n", mine),
+                                     # Still in the pane, but another user's agent.
+                                     ({"pid": 700, "comm": "claude"}, "%3 610\n", PS_SAMPLE),
                                      ({"pid": 700, "comm": "claude"}, "%3 610\n", "")):
             request = {"cmd": "paste", "pane": self.pane, "text": "hi"}
             request.update(extra)
@@ -1524,6 +1559,141 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()),
                          {"ok": False, "error": "bad pane", "id": 9})
 
+
+
+class TmuxOwnerTests(unittest.TestCase):
+    """A tmux client obeys its server, which can make it run a program or
+    open a file, so the helper never connects as anyone but the server's
+    owner."""
+
+    def setUp(self):
+        import socket as socket_module
+        self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.dir = os.path.join(self.root, "tmux-1")
+        os.makedirs(self.dir)
+        self.sock = os.path.join(self.dir, "default")
+        self.server = socket_module.socket(socket_module.AF_UNIX)
+        self.addCleanup(self.server.close)
+        self.server.bind(self.sock)
+        patcher = mock.patch.dict(os.environ, {"TMUX_TMPDIR": self.root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.me = os.geteuid()
+
+    def ours(self):
+        return [entry for entry in helper.tmux_sockets() if entry[0].startswith(self.root + "/")]
+
+    def test_sockets_carry_their_owner(self):
+        self.assertEqual(self.ours(), [(self.sock, self.me)])
+
+    def test_plain_files_and_links_are_not_sockets(self):
+        open(os.path.join(self.dir, "plain"), "w").close()
+        os.symlink(self.sock, os.path.join(self.dir, "alias"))
+        os.symlink(self.dir, os.path.join(self.root, "tmux-2"))
+        self.assertEqual(self.ours(), [(self.sock, self.me)])
+
+    def test_socket_owned_by_someone_else_than_its_directory_is_left_out(self):
+        real_lstat = os.lstat
+
+        def fake(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if path == self.sock:
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                                       info.st_uid + 1, info.st_gid, info.st_size, 0, 0, 0))
+            return info
+        with mock.patch.object(helper.os, "lstat", fake):
+            self.assertEqual(self.ours(), [])
+
+    def test_identity(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        self.assertEqual(helper.tmux_identity(self.me), {})
+        if self.me != 0:
+            self.assertIsNone(helper.tmux_identity(self.me + 1))
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500, 27]):
+            self.assertEqual(helper.tmux_identity(0), {})
+            self.assertEqual(helper.tmux_identity(1501),
+                             {"user": 1501, "group": 1500, "extra_groups": [1500, 27], "cwd": "/"})
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")):
+            # No account to take groups from: not contacted at all.
+            self.assertIsNone(helper.tmux_identity(1501))
+
+    def recorder(self, panes=None):
+        calls = []
+
+        def run(argv, timeout=5, input=None, **options):
+            calls.append((list(argv), options))
+            if "list-panes" in argv:
+                return completed(argv, 0, (panes or {}).get(argv[2], ""))
+            if "capture-pane" in argv:
+                return completed(argv, 0, "screen")
+            return completed(argv, 0, "")
+        return run, calls
+
+    def test_root_lists_another_users_panes_as_that_user(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        run, calls = self.recorder({"/tmp/tmux-1500/default": "%1 42\n"})
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1500/default", 1500),
+                                             ("/tmp/tmux-0/default", 0)]), \
+                mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "run_command", run):
+            panes = helper.tmux_panes()
+        self.assertEqual(panes, {(42, 1500): {"socket": "/tmp/tmux-1500/default", "id": "%1"}})
+        by_socket = dict((argv[2], options) for argv, options in calls)
+        self.assertEqual(by_socket["/tmp/tmux-1500/default"],
+                         {"user": 1500, "group": 1500, "extra_groups": [1500], "cwd": "/"})
+        # Root's own server is root's: run as root, as before.
+        self.assertEqual(by_socket["/tmp/tmux-0/default"], {})
+
+    def test_login_user_never_contacts_another_users_server(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        run, calls = self.recorder()
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-x/default", self.me + 1)]), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertEqual(helper.tmux_panes(), {})
+        self.assertEqual(calls, [])
+
+    def test_drive_requests_run_as_the_sockets_owner(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        run, calls = self.recorder()
+        pane = {"socket": self.sock, "id": "%3"}
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "run_command", run), \
+                mock.patch.object(helper.time, "sleep"):
+            self.assertEqual(helper.handle_tmux({"cmd": "capture", "pane": pane}),
+                             {"text": "screen"})
+            self.assertEqual(helper.handle_tmux({"cmd": "keys", "pane": pane, "keys": ["1"],
+                                                 "expect": []}), {"sent": True})
+            self.assertEqual(helper.handle_tmux({"cmd": "paste", "pane": pane, "text": "x"}),
+                             {"sent": True})
+        self.assertTrue(calls)
+        for argv, options in calls:
+            self.assertEqual(options.get("user"), self.me, argv)
+            self.assertEqual(options.get("group"), 1500, argv)
+
+    def test_login_user_refuses_a_pane_on_another_users_server(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        run, calls = self.recorder()
+        pane = {"socket": self.sock, "id": "%3"}
+        with mock.patch.object(helper, "valid_pane",
+                               return_value={"socket": self.sock, "id": "%3", "uid": self.me + 1}), \
+                mock.patch.object(helper, "run_command", run):
+            for request in ({"cmd": "capture", "pane": pane},
+                            {"cmd": "keys", "pane": pane, "keys": ["1"], "expect": []},
+                            {"cmd": "paste", "pane": pane, "text": "x"}):
+                self.assertEqual(helper.handle_tmux(request), {"ok": False, "error": "bad pane"})
+        self.assertEqual(calls, [])
 
 
 class EventSink(object):
@@ -2658,7 +2828,9 @@ class ProbeTests(unittest.TestCase):
     def test_probe_never_captures_panes(self):
         runner = FakeRunner(ps="  700  1 1000 u pts/2 agy agy\n",
                             panes={"/tmp/tmux-1000/default": "%3 1\n"})
-        with mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]), \
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1000/default", 1000)]), \
+                mock.patch.object(helper, "tmux_identity", return_value={}), \
                 mock.patch.object(helper, "process_cwd", return_value="/work"):
             result = self.probe(runner)
         self.assertFalse(any("capture-pane" in call for call in runner.calls))

@@ -1085,7 +1085,9 @@ def parse_ps(text):
     and treats everything after as args. A comm with a space therefore bleeds
     its tail into args; no agent's comm has one. comm may be a full path on
     Darwin, so only its basename is kept. A tty of ? or ?? means none. The
-    user comes from the uid, and the printed name is only the fallback.
+    user comes from the uid, and the printed name is only the fallback. The
+    uid is kept for matching a process to a tmux server's owner and is never
+    shipped.
     """
     rows = []
     for line in text.splitlines():
@@ -1098,7 +1100,7 @@ def parse_ps(text):
             continue
         tty = parts[4]
         rows.append({
-            "pid": pid, "ppid": ppid, "user": user_for(uid, parts[3]),
+            "pid": pid, "ppid": ppid, "uid": uid, "user": user_for(uid, parts[3]),
             "tty": "" if tty in ("?", "??", "-") else tty,
             "comm": parts[5].split("/")[-1],
             "args": parts[6].strip() if len(parts) > 6 else "",
@@ -1128,12 +1130,21 @@ def agent_name(row):
 
 
 def tmux_sockets():
-    """Every tmux server socket this user can name, root's view included."""
+    """[(path, owner uid)] for every tmux server socket in a tmux-* directory
+    under /tmp or TMUX_TMPDIR.
+
+    The owner is read without following links, and a socket counts only
+    when it and its tmux-* directory are real (no links) and owned by the
+    same uid, as tmux itself lays them out. Which uid owns a socket decides
+    who a client of it runs as and which processes its panes may claim, so
+    a socket another user planted in someone else's directory, or a link to
+    one, is left out rather than trusted."""
     roots = ["/tmp"]
     custom = os.environ.get("TMUX_TMPDIR")
     if custom:
         roots.append(custom)
     found = []
+    seen = set()
     for root in roots:
         try:
             directories = sorted(os.listdir(root))
@@ -1144,52 +1155,111 @@ def tmux_sockets():
                 continue
             directory = os.path.join(root, name)
             try:
-                for entry in sorted(os.listdir(directory)):
-                    path = os.path.join(directory, entry)
-                    if path not in found:
-                        found.append(path)
+                dir_info = os.lstat(directory)
+                if not stat_module.S_ISDIR(dir_info.st_mode):
+                    continue
+                entries = sorted(os.listdir(directory))
             except OSError:
                 continue
+            for entry in entries:
+                path = os.path.join(directory, entry)
+                if path in seen:
+                    continue
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
+                    continue
+                seen.add(path)
+                found.append((path, info.st_uid))
     return found
 
 
-def tmux_panes():
-    """pane shell pid -> {"socket", "id"} across every reachable server.
+def tmux_identity(uid):
+    """subprocess options that run a tmux client as the owner of the server
+    it connects to, or None when this process must not connect at all.
 
-    tmux missing, a dead socket and another user's server (unreadable unless
-    root) all just contribute nothing. Panes being null is a normal state,
-    never processes_failed.
+    A tmux client does what its server tells it, up to running a program
+    and opening files the server names, so a client never has more
+    privilege than the server's owner. Root runs it as that owner (uid, gid
+    and the owner's groups, all three) unless the owner is root. Anyone
+    else connects only to their own servers. {} means run as this
+    process."""
+    euid = os.geteuid()
+    if uid == euid:
+        return {}
+    if euid != 0:
+        return None
+    try:
+        import pwd
+        entry = pwd.getpwuid(uid)
+    except (ImportError, KeyError, OverflowError):
+        return None
+    return {"user": uid, "group": entry.pw_gid,
+            "extra_groups": supplementary_groups(entry.pw_name, entry.pw_gid), "cwd": "/"}
+
+
+def tmux_command(socket_path, uid, args, input=None, timeout=5):
+    """One tmux client call against the server at `socket_path`, owned by
+    `uid`, run as that owner. None when it must not run or could not."""
+    ids = tmux_identity(uid)
+    if ids is None:
+        return None
+    argv = ["tmux", "-S", socket_path] + args
+    options = dict(ids)
+    if input is not None:
+        options["input"] = input
+    try:
+        return run_command(argv, **options)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def tmux_panes():
+    """(pane pid, server owner uid) -> {"socket", "id"} across every server
+    this process may contact.
+
+    A server's claim that a pid sits in one of its panes is only its word,
+    so each claim is filed under the uid that owns the server and only
+    ever matched to a process of that same uid (pane_for). One user's
+    server naming another user's agent therefore never routes that agent's
+    keys or replies to itself.
+
+    tmux missing, a dead socket and a server this process may not contact
+    all just contribute nothing. Panes being null is a normal state, never
+    processes_failed.
     """
     panes = {}
-    for socket in tmux_sockets():
-        try:
-            done = run_command(
-                ["tmux", "-S", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if done.returncode != 0:
+    for socket_path, uid in tmux_sockets():
+        done = tmux_command(socket_path, uid,
+                            ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+        if done is None or done.returncode != 0:
             continue
         for line in done.stdout.decode("utf-8", "replace").splitlines():
             fields = line.split()
             if len(fields) != 2:
                 continue
             try:
-                panes[int(fields[1])] = {"socket": socket, "id": fields[0]}
+                key = (int(fields[1]), uid)
             except ValueError:
                 continue
+            # The first server to claim a pid keeps it.
+            panes.setdefault(key, {"socket": socket_path, "id": fields[0]})
     return panes
 
 
-def pane_for(pid, parents, panes):
-    """The pane an agent lives in, found by walking up its parents.
+def pane_for(pid, parents, panes, uid):
+    """The pane an agent lives in, found by walking up its parents, from a
+    server owned by the agent's own uid only.
 
     Bounded so a ppid cycle (or a pathological chain) terminates.
     """
     current = pid
     for _ in range(ANCESTRY_LIMIT):
-        if current in panes:
-            return panes[current]
+        found = panes.get((current, uid))
+        if found is not None:
+            return found
         current = parents.get(current)
         if current is None:
             return None
@@ -1289,8 +1359,9 @@ def agent_processes(warnings, screens=True):
     processes = []
     for row in agents:
         pid = row["pid"]
-        pane = pane_for(pid, parents, panes)
+        pane = pane_for(pid, parents, panes, row["uid"])
         entry = dict(row)
+        del entry["uid"]
         paths, ok = held_files(row["comm"], pid)
         if not ok:
             warnings.append("cannot read open files of pid %d" % pid)
@@ -1301,7 +1372,8 @@ def agent_processes(warnings, screens=True):
             "open": paths,
         })
         if screens:
-            entry["screen"] = pane_screen(pane) if pane and row["comm"] == "agy" else None
+            entry["screen"] = pane_screen(dict(pane, uid=row["uid"])) \
+                if pane and row["comm"] == "agy" else None
         processes.append(entry)
     return processes
 
@@ -1873,6 +1945,8 @@ def valid_pane(pane):
     real socket, and be owned by whoever owns its tmux-* directory. The
     resolved path is what every later tmux call uses, so the path checked is
     the path run, with no window for a symlink to be swapped in between.
+    The socket's owner rides along as "uid": every tmux call runs as that
+    owner, and a pid named beside the pane must belong to it.
     """
     if not isinstance(pane, dict):
         return None
@@ -1900,19 +1974,14 @@ def valid_pane(pane):
         return None
     if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
         return None
-    return {"socket": real, "id": pane_id}
+    return {"socket": real, "id": pane_id, "uid": info.st_uid}
 
 
 def tmux_run(pane, args, input=None):
-    """One tmux call against the pane's own server. Returns the completed
-    process, or None when tmux could not run at all."""
-    argv = ["tmux", "-S", pane["socket"]] + args
-    try:
-        if input is None:
-            return run_command(argv)
-        return run_command(argv, input=input)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """One tmux call against the pane's own server, as the server's owner.
+    Returns the completed process, or None when tmux could not or must not
+    run at all."""
+    return tmux_command(pane["socket"], pane["uid"], args, input=input)
 
 
 def pane_text(pane):
@@ -1950,14 +2019,18 @@ def target_still_there(pid, comm, pane):
             break
     if row is None or agent_name(row) != comm:
         return False
+    # The pane's server must be the agent's own user's, the same rule the
+    # snapshot applies, or another user's server could take its keys.
+    if row["uid"] != pane.get("uid"):
+        return False
     parents = dict((r["pid"], r["ppid"]) for r in rows)
-    found = pane_for(pid, parents, tmux_panes())
+    found = pane_for(pid, parents, tmux_panes(), row["uid"])
     if found is None or found.get("id") != pane.get("id"):
         return False
     return os.path.realpath(found.get("socket", "")) == os.path.realpath(pane.get("socket", ""))
 
 
-def target_refusal(request, malformed):
+def target_refusal(request, pane, malformed):
     """The reply refusing a keys or paste request whose `pid` and `comm` no
     longer describe its pane, or None to go ahead. A request carrying
     neither is not checked; one carrying only one, or either of the wrong
@@ -1969,7 +2042,7 @@ def target_refusal(request, malformed):
     if not (has_pid and has_comm) or isinstance(pid, bool) \
             or not isinstance(pid, int) or not isinstance(comm, str):
         return {"ok": False, "error": malformed}
-    if not target_still_there(pid, comm, request.get("pane")):
+    if not target_still_there(pid, comm, pane):
         return {"sent": False, "reason": "changed"}
     return None
 
@@ -2004,7 +2077,8 @@ def handle_tmux(request):
     paste that never landed. A malformed list answers "bad keys".
     """
     pane = valid_pane(request.get("pane"))
-    if pane is None:
+    # A server this process may not contact as its owner is not drivable.
+    if pane is None or tmux_identity(pane["uid"]) is None:
         return {"ok": False, "error": "bad pane"}
     command = request.get("cmd")
     if command == "capture":
@@ -2018,7 +2092,7 @@ def handle_tmux(request):
             return {"ok": False, "error": "bad text"}
         # A reply pasted into a pane that now holds a shell or another agent
         # is text the Mac never meant there, so the target is re-read first.
-        refused = target_refusal(request, "bad target")
+        refused = target_refusal(request, pane, "bad target")
         if refused is not None:
             return refused
         # The local reply's form, verified live on all seven tools: the
@@ -2065,7 +2139,7 @@ def handle_tmux(request):
             or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect) \
             or not valid_expect_more(expect_more):
         return {"ok": False, "error": "bad keys"}
-    refused = target_refusal(request, "bad keys")
+    refused = target_refusal(request, pane, "bad keys")
     if refused is not None:
         return refused
     gap = request.get("gap", KEY_GAP_DEFAULT)
