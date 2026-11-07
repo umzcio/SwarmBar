@@ -1,4 +1,4 @@
-#!/usr/bin/env -S python3 -I
+#!/usr/bin/python3 -I
 """SwarmBar remote helper.
 
 Ships bytes, never verdicts. It lists agent state files for all seven tools
@@ -13,6 +13,12 @@ Constraints that are not negotiable:
     that reads exactly like "no sessions".
   * Read-only. This never writes to any agent's state. Its own files
     under ~/.swarmbar/ (the hook sockets and their lock) are the exception.
+
+The interpreter is named by absolute path, never found through env: the
+narrow sudo rule runs this file as root with the caller's PATH wherever
+sudoers sets no secure_path, as on stock macOS, so `env python3` would let
+the caller pick the program root runs. -I keeps PYTHON* variables, the
+user site and the script's directory off the module path.
 """
 
 import sys
@@ -4152,6 +4158,38 @@ NARROW_RULE_REFUSAL = {"ok": False, "error": "refused under the SwarmBar sudo ru
                        "run the setup command with sudo instead"}
 
 
+# Where a root helper looks for the programs it starts (ps, tmux, lsof,
+# visudo, sudo, a kimi doctor in root's own home). Only those of these
+# that nobody but root can change are kept.
+ROOT_PATH_CANDIDATES = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+                        "/sbin", "/bin", "/snap/bin")
+
+
+def trusted_root_path(candidates=ROOT_PATH_CANDIDATES):
+    """A PATH of the candidate directories only root can change: each one,
+    and every directory above it, root's and writable by nobody else. A
+    directory that is a link is left out, its target is listed in its own
+    right."""
+    def real_directory(path):
+        try:
+            return stat_module.S_ISDIR(os.lstat(path).st_mode)
+        except OSError:
+            return False
+    return ":".join(directory for directory in candidates
+                    if real_directory(directory) and root_only_path(directory))
+
+
+def pin_root_path():
+    """Replaces PATH with trusted_root_path() when this runs as root, before
+    anything starts a program. Under sudo the caller's PATH can arrive
+    intact, and every bare name the helper runs (ps, tmux, lsof, sudo,
+    visudo, and whatever those start) would otherwise be the caller's
+    choice of program, run as root."""
+    if os.geteuid() != 0:
+        return
+    os.environ["PATH"] = trusted_root_path() or "/usr/bin:/bin"
+
+
 def fsync_directory(directory):
     """Makes a rename in `directory` durable. Best effort: the file is in
     place either way, and a filesystem that cannot sync a directory is not
@@ -4717,6 +4755,9 @@ def serve_requests(stdin, relay):
 
 
 if __name__ == "__main__":
+    # First, before any program is started: as root, PATH came from the
+    # caller.
+    pin_root_path()
     # The probe runs before anything is installed and must leave no trace,
     # so it never reaches main(), which sets up hook homes and a writer
     # thread. Its program came from stdin, so stdin is not a request stream.

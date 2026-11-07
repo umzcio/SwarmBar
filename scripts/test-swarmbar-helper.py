@@ -3932,6 +3932,66 @@ class ApplyTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(dest))
 
 
+class RootPathTests(unittest.TestCase):
+    """Under the narrow sudo rule the caller's PATH can reach the root
+    helper whole. Nothing it names may choose a program root runs."""
+
+    def test_interpreter_is_named_by_absolute_path(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        with open(path, "rb") as handle:
+            first = handle.readline().decode("ascii").rstrip("\n")
+        self.assertTrue(first.startswith("#!/"), first)
+        interpreter = first[2:].split()
+        self.assertNotIn("env", os.path.basename(interpreter[0]))
+        self.assertEqual(interpreter, ["/usr/bin/python3", "-I"])
+
+    def test_only_directories_only_root_can_change_are_kept(self):
+        planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
+        self.addCleanup(shutil.rmtree, planted, True)
+        trusted = os.path.realpath(planted) + "/sys"
+        os.mkdir(trusted)
+        os.symlink(trusted, planted + "/link")
+        vetted = []
+
+        def root_only(path):
+            vetted.append(path)
+            return path == trusted or path == planted + "/link"
+        with mock.patch.object(helper, "root_only_path", root_only):
+            got = helper.trusted_root_path((planted, trusted, planted + "/link",
+                                            planted + "/missing"))
+        # Not the user's directory, not a link even to a trusted one, and
+        # not one that is not there.
+        self.assertEqual(got, trusted)
+
+    def test_root_replaces_the_callers_path(self):
+        planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
+        self.addCleanup(shutil.rmtree, planted, True)
+        for name in ("python3", "tmux", "ps"):
+            fake = os.path.join(planted, name)
+            with open(fake, "w") as handle:
+                handle.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake, 0o755)
+        with mock.patch.dict(os.environ, {"PATH": planted + ":/usr/bin:/bin"}):
+            with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                    mock.patch.object(helper, "trusted_root_path", return_value="/usr/bin:/bin"):
+                helper.pin_root_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin:/bin")
+            for name in ("tmux", "ps"):
+                found = shutil.which(name)
+                self.assertFalse(found and found.startswith(planted), found)
+
+    def test_login_user_keeps_their_path(self):
+        with mock.patch.dict(os.environ, {"PATH": "/opt/mine/bin:/usr/bin"}):
+            if os.geteuid() == 0:
+                self.skipTest("runs as root")
+            helper.pin_root_path()
+            self.assertEqual(os.environ["PATH"], "/opt/mine/bin:/usr/bin")
+
+    def test_real_system_directories_pass(self):
+        # /usr/bin is root's on every system the fleet runs.
+        self.assertIn("/usr/bin", helper.trusted_root_path().split(":"))
+
+
 class SudoersTests(unittest.TestCase):
     """The narrow sudo rule: one user, one command, checked by visudo."""
 
