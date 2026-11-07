@@ -269,6 +269,23 @@ def home_dirs():
     return [h for h in home_candidates() if owned_home(h)]
 
 
+def inside(path, directory):
+    """Whether `path` is strictly beneath `directory`, both already real."""
+    return path.startswith(directory.rstrip("/") + "/")
+
+
+def cross_user(home):
+    """The uid owning `home` when it is not this process's own, else None.
+    Reading another user's home as root is where that user decides what
+    root opens, so those reads are the ones held to the owner's own files.
+    A home that cannot be examined is treated as another user's, owned by
+    nobody, so nothing in it passes."""
+    _, uid, _ = home_owner(home)
+    if uid is None:
+        return -1
+    return uid if uid != os.geteuid() else None
+
+
 def claude_roots(warnings):
     """<home>/.claude*/projects, excluding backup directories and second
     names for a root already found.
@@ -278,14 +295,23 @@ def claude_roots(warnings):
     nothing at all, because that shell cannot read /root so the glob never
     expands and is passed through literally. Every literal path in the same
     command succeeds, which is what makes the failure so convincing.
+
+    In another user's home (cross_user) a root counts only when it resolves
+    inside that home to a directory that user owns, so a link cannot pass
+    off someone else's transcripts, or a root-only directory, as theirs.
+    Dedupe never drops a root that lives in its own home: such roots are
+    taken first, and one that resolves outside its home (only this
+    process's own home may have one) is a second name only when nothing
+    in its own home already holds that directory.
     """
-    roots = []
-    seen = set()
+    found = []
     for home in home_dirs():
         try:
             entries = sorted(os.listdir(home))
         except OSError:
             continue
+        real_home = os.path.realpath(home)
+        foreign = cross_user(home)
         for entry in entries:
             if not entry.startswith(".claude"):
                 continue
@@ -295,15 +321,96 @@ def claude_roots(warnings):
             projects = os.path.join(home, entry, "projects")
             if not os.path.isdir(projects):
                 continue
-            # Deduped by realpath, but returned as found: a root symlinked
-            # elsewhere still has to mirror under the home it was found
-            # in, or its files lose their place relative to that home.
             resolved = os.path.realpath(projects)
-            if resolved in seen:
-                continue
+            at_home = inside(resolved, real_home)
+            if foreign is not None:
+                try:
+                    owner = os.stat(resolved).st_uid
+                except OSError:
+                    continue
+                if not at_home or owner != foreign:
+                    warnings.append("skipped root that leads outside its user's own files: %s"
+                                    % projects)
+                    continue
+            found.append((projects, resolved, at_home))
+    # Deduped by realpath, but returned as found: a root symlinked elsewhere
+    # still has to mirror under the home it was found in, or its files lose
+    # their place relative to that home.
+    kept = set()
+    seen = set()
+    for projects, resolved, at_home in found:
+        if at_home and resolved not in seen:
             seen.add(resolved)
-            roots.append(projects)
-    return roots
+            kept.add(projects)
+    for projects, resolved, at_home in found:
+        if not at_home and resolved not in seen:
+            seen.add(resolved)
+            kept.add(projects)
+    return [projects for projects, _, _ in found if projects in kept]
+
+
+class NotShipped(OSError):
+    """A file the snapshot must not read, with the reason."""
+
+
+def shipped_opener(home):
+    """The `opener` every snapshot read of a file in `home` goes through.
+
+    Never blocking: a FIFO swapped in after the stat opens at once and is
+    refused, rather than stalling the one request loop every hook reply
+    waits on. Only a regular file is read.
+
+    In another user's home (cross_user), the file is reached from the home
+    down one component at a time, never following a link, through
+    directories that user owns, and must be their own regular file, all
+    checked on the descriptors actually opened. A link in the home that
+    leads anywhere else, to /etc/shadow or to another user's transcripts,
+    is not read. One leading elsewhere in the same home is: the walk is of
+    the path it resolves to.
+    """
+    foreign = cross_user(home)
+    real_home = os.path.realpath(home)
+
+    def check(fd, kind):
+        info = os.fstat(fd)
+        if kind == "file" and not stat_module.S_ISREG(info.st_mode):
+            raise NotShipped(errno.EINVAL, "not a regular file")
+        if foreign is not None and info.st_uid != foreign:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+
+    def opener(name, flags):
+        flags |= os.O_NONBLOCK
+        if foreign is None:
+            fd = os.open(name, flags)
+            try:
+                check(fd, "file")
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+        resolved = os.path.realpath(name)
+        if not inside(resolved, real_home):
+            raise NotShipped(errno.EPERM, "leads outside its home")
+        parts = resolved[len(real_home.rstrip("/")) + 1:].split("/")
+        directory = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+        fd = os.open(real_home, directory)
+        try:
+            check(fd, "dir")
+            for part in parts[:-1]:
+                child = os.open(part, directory, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                check(fd, "dir")
+            leaf = os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=fd)
+        finally:
+            os.close(fd)
+        try:
+            check(leaf, "file")
+        except BaseException:
+            os.close(leaf)
+            raise
+        return leaf
+    return opener
 
 
 def whole_lines(data):
@@ -320,7 +427,7 @@ def whole_lines(data):
     return data
 
 
-def tail_window(path, size, start=TAIL_BYTES):
+def tail_window(path, size, start=TAIL_BYTES, opener=None):
     """Locates the trailing complete records of a JSONL file.
 
     Starts at `start` bytes and doubles until the window holds at least one
@@ -339,9 +446,10 @@ def tail_window(path, size, start=TAIL_BYTES):
     OVERSIZED / INCOMPLETE sentinels when no complete record could be
     obtained. The read stops at `size` so the bytes always agree with the
     stat the caller reports, even while the file is being appended to.
+    `opener` is how the file is opened, as for open() (see shipped_opener).
     """
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             window = start
             while True:
                 offset = size - window if size > window else 0
@@ -378,7 +486,7 @@ def tail_of(path, size):
     return whole_lines(data[first:]).decode("utf-8", "replace")
 
 
-def tail_chunk(path, size, start=TAIL_BYTES):
+def tail_chunk(path, size, start=TAIL_BYTES, opener=None):
     """The tail as one chunk at its true offset: ((offset, bytes), covered).
 
     Unlike tail_of, the chunk runs through `size`, partial last line
@@ -394,7 +502,7 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     and the chunk, so a tail reader whose window starts anywhere from
     `covered` on sees the same lines in the mirror as in the file.
     """
-    found = tail_window(path, size, start)
+    found = tail_window(path, size, start, opener)
     if not isinstance(found, tuple):
         return found
     offset, data, first = found
@@ -403,7 +511,7 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     return (offset + first, data[first:]), offset
 
 
-def head_chunk(path, size):
+def head_chunk(path, size, opener=None):
     """The first line, newline included, as (0, bytes).
 
     Grows from HEAD_BYTES the way CodexMonitor.headText does. With no
@@ -411,7 +519,7 @@ def head_chunk(path, size):
     headText would have handed the parser locally.
     """
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             data = b""
             window = HEAD_BYTES
             limit = min(size, MAX_HEAD_BYTES)
@@ -442,7 +550,7 @@ def has_timestamp(line):
     return isinstance(record, dict) and isinstance(record.get("timestamp"), str)
 
 
-def stamped_head_chunk(path, size, limit=None):
+def stamped_head_chunk(path, size, limit=None, opener=None):
     """Claude's head: (0, bytes) from the start through the first complete
     line carrying a top-level timestamp, newline included.
 
@@ -455,7 +563,7 @@ def stamped_head_chunk(path, size, limit=None):
     """
     limit = MAX_HEAD_BYTES if limit is None else limit
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             data = handle.read(min(size, limit))
     except OSError:
         return None
@@ -467,12 +575,12 @@ def stamped_head_chunk(path, size, limit=None):
         if has_timestamp(data[start:newline]):
             return 0, data[:newline + 1]
         start = newline + 1
-    return head_chunk(path, size)
+    return head_chunk(path, size, opener)
 
 
-def whole_chunk(path, size):
+def whole_chunk(path, size, opener=None):
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             return 0, handle.read(size)
     except OSError:
         return None
@@ -626,9 +734,9 @@ def growth_is_mirrored(prev, size, data, start):
     return reader_offset(size, last_break, start) >= prev.covered
 
 
-def growth_chunk(path, start, size):
+def growth_chunk(path, start, size, opener=None):
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             handle.seek(start)
             return start, handle.read(size - start)
     except OSError:
@@ -656,9 +764,10 @@ def last_newline_in(chunks, fallback):
     return found
 
 
-def file_chunks(spec, path, size, mtime, prev):
+def file_chunks(spec, path, size, mtime, prev, opener=None):
     """(reset, [(offset, bytes)], Shipped or None) for one file, or a
-    reason string to omit it. `prev` is SHIPPED's entry, or None."""
+    reason string to omit it. `prev` is SHIPPED's entry, or None. Every
+    read opens the file through `opener` (see shipped_opener)."""
     if spec.mode == "listing":
         return False, [], None
     if spec.mode == "whole" and size > WHOLE_MAX_BYTES:
@@ -668,26 +777,26 @@ def file_chunks(spec, path, size, mtime, prev):
     if decision == "none":
         return False, [], prev
     if spec.mode == "whole":
-        found = whole_chunk(path, size)
+        found = whole_chunk(path, size, opener)
         return omission_reason(found) or (
             True, [found], Shipped(size, mtime, None, None))
     if decision == "growth":
-        found = growth_chunk(path, prev.size, size)
+        found = growth_chunk(path, prev.size, size, opener)
         reason = omission_reason(found)
         if reason:
             return reason
         if growth_is_mirrored(prev, size, found[1], spec.tail_start):
             return False, [found], Shipped(
                 size, mtime, prev.covered, last_newline_in([found], prev.last_newline))
-    tail = tail_chunk(path, size, spec.tail_start)
+    tail = tail_chunk(path, size, spec.tail_start, opener)
     reason = omission_reason(tail)
     if reason:
         return reason
     chunk, covered = tail
     chunks = [chunk]
     if spec.mode == "head_tail":
-        head = (stamped_head_chunk(path, size) if spec.stamped_head
-                else head_chunk(path, size))
+        head = (stamped_head_chunk(path, size, opener=opener) if spec.stamped_head
+                else head_chunk(path, size, opener))
         reason = omission_reason(head)
         if reason:
             return reason
@@ -830,9 +939,21 @@ def manifest(now, warnings, shipped_before):
     unreadable = {}
     seen = set()
     shipped = {}
+    openers, foreign = {}, {}
+    for home in homes:
+        openers[home] = shipped_opener(home)
+        if cross_user(home) is not None:
+            foreign[home] = os.path.realpath(home)
     for spec in SPECS:
         for home, path in expand(spec, homes, claude_dirs, unreadable):
             if path in seen:
+                continue
+            # Another user's link out of their home is never followed, not
+            # even to stat: what it leads to is not theirs to show.
+            if home in foreign and not inside(os.path.realpath(path), foreign[home]):
+                if os.path.lexists(path):
+                    seen.add(path)
+                    omitted.append({"path": path, "reason": "leads outside its home"})
                 continue
             info = stat_or_note(path, unreadable)
             if info is None:
@@ -855,7 +976,8 @@ def manifest(now, warnings, shipped_before):
                 # to blind the host for everyone.
                 try:
                     result = file_chunks(spec, path, info.st_size, info.st_mtime,
-                                         shipped_before.get(path))
+                                         shipped_before.get(path),
+                                         openers.get(home) or shipped_opener(home))
                 except Exception as error:
                     result = "cannot read: %s" % type(error).__name__
                 # Omitting the file says nothing about the session, which is

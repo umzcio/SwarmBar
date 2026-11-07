@@ -629,6 +629,141 @@ def reader_tail(data, start):
         window = min(window * 2, helper.MAX_TAIL_BYTES)
 
 
+class CrossUserReadTests(unittest.TestCase):
+    """Root reading another user's home: that user chooses every name in
+    it, so a link must not steer root's reads, or hide another user's
+    sessions, and a FIFO must not stall the snapshot. These run as an
+    ordinary user, so "another user's" is cross_user saying so, with the
+    owner being this process's own uid."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-cross-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.a = os.path.join(self.base, "a")
+        self.b = os.path.join(self.base, "b")
+        self.outside = os.path.join(self.base, "outside")
+        for directory in (self.a, self.b, self.outside):
+            os.mkdir(directory)
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.a + ":" + self.b})
+        env.start()
+        self.addCleanup(env.stop)
+        ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        ps.start()
+        self.addCleanup(ps.stop)
+        helper.SHIPPED.clear()
+        self.addCleanup(helper.SHIPPED.clear)
+        self.owner = os.geteuid()
+
+    def foreign(self, owner=None):
+        owner = self.owner if owner is None else owner
+        return mock.patch.object(helper, "cross_user", return_value=owner)
+
+    def put(self, path, data=b'{"x":1}\n'):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def paths(self, snap):
+        return [item["path"] for item in snap["files"]]
+
+    def test_link_out_of_the_home_is_omitted_not_shipped(self):
+        secret = self.put(os.path.join(self.outside, "shadow"), b"root:secret\n")
+        os.makedirs(os.path.join(self.a, ".grok"))
+        link = os.path.join(self.a, ".grok", "active_sessions.json")
+        os.symlink(secret, link)
+        with self.foreign():
+            snap = helper.snapshot()
+        self.assertNotIn(link, self.paths(snap))
+        self.assertIn({"path": link, "reason": "leads outside its home"}, snap["omitted"])
+        self.assertNotIn(base64.b64encode(b"root:secret\n").decode("ascii"), json.dumps(snap))
+
+    def test_own_home_still_follows_its_links(self):
+        # This process's own home is read as before: nothing it could be
+        # shown through a link is more than it can read itself.
+        secret = self.put(os.path.join(self.outside, "index.json"), b"{}")
+        os.makedirs(os.path.join(self.a, ".grok"))
+        link = os.path.join(self.a, ".grok", "active_sessions.json")
+        os.symlink(secret, link)
+        self.assertIn(link, self.paths(helper.snapshot()))
+
+    def test_link_inside_the_same_home_is_followed(self):
+        real = self.put(os.path.join(self.a, "dotfiles", "grok", "active_sessions.json"), b"{}")
+        os.symlink(os.path.dirname(real), os.path.join(self.a, ".grok"))
+        with self.foreign():
+            snap = helper.snapshot()
+        self.assertIn(os.path.join(self.a, ".grok", "active_sessions.json"), self.paths(snap))
+
+    def test_file_not_owned_by_the_homes_user_is_not_read(self):
+        path = self.put(os.path.join(self.a, ".grok", "active_sessions.json"), b"{}")
+        with self.foreign(self.owner + 1):
+            snap = helper.snapshot()
+        self.assertNotIn(path, self.paths(snap))
+
+    def test_walk_never_follows_a_link_that_appears_after_resolving(self):
+        # The path is resolved, then a directory on it becomes a link out.
+        real = self.put(os.path.join(self.a, "d", "f"), b"mine")
+        self.put(os.path.join(self.outside, "f"), b"secret")
+        with self.foreign():
+            opener = helper.shipped_opener(self.a)
+            shutil.rmtree(os.path.join(self.a, "d"))
+            os.symlink(self.outside, os.path.join(self.a, "d"))
+            with mock.patch.object(helper.os.path, "realpath", lambda p: p):
+                self.assertIsNone(helper.whole_chunk(real, 6, opener))
+
+    def test_fifo_swapped_in_after_the_stat_does_not_hang(self):
+        fifo = os.path.join(self.a, "events.jsonl")
+        os.mkfifo(fifo)
+        for patch in (self.foreign(), mock.patch.object(helper, "cross_user", return_value=None)):
+            with patch:
+                opener = helper.shipped_opener(self.a)
+            result = []
+            reader = threading.Thread(target=lambda: result.append(
+                helper.whole_chunk(fifo, 10, opener)))
+            reader.daemon = True
+            reader.start()
+            reader.join(5)
+            self.assertFalse(reader.is_alive(), "blocked opening a FIFO")
+            self.assertEqual(result, [None])
+
+    def claude_root(self, home):
+        projects = os.path.join(home, ".claude", "projects")
+        os.makedirs(projects)
+        return projects
+
+    def test_link_to_another_homes_claude_root_never_hides_it(self):
+        # a sorts first and links its root to b's. b keeps its own.
+        b_projects = self.claude_root(self.b)
+        os.makedirs(os.path.join(self.a, ".claude"))
+        os.symlink(b_projects, os.path.join(self.a, ".claude", "projects"))
+        with self.foreign():
+            roots = helper.claude_roots([])
+        self.assertEqual(roots, [b_projects])
+        # Read as this process's own homes, a's name for it is a second
+        # name and still never displaces b's.
+        self.assertEqual(helper.claude_roots([]), [b_projects])
+
+    def test_nothing_of_b_ships_under_a(self):
+        b_projects = self.claude_root(self.b)
+        transcript = self.put(os.path.join(b_projects, "p", "s.jsonl"),
+                              b'{"timestamp":"t"}\n')
+        os.makedirs(os.path.join(self.a, ".claude"))
+        os.symlink(b_projects, os.path.join(self.a, ".claude", "projects"))
+        with self.foreign():
+            snap = helper.snapshot()
+        paths = self.paths(snap)
+        self.assertIn(transcript, paths)
+        self.assertFalse([p for p in paths if p.startswith(self.a + "/")], paths)
+
+    def test_claude_root_in_its_own_home_by_link_counts(self):
+        real = os.path.join(self.a, "dotfiles", "claude", "projects")
+        os.makedirs(real)
+        os.symlink(os.path.dirname(real), os.path.join(self.a, ".claude"))
+        with self.foreign():
+            self.assertEqual(helper.claude_roots([]),
+                             [os.path.join(self.a, ".claude", "projects")])
+
+
 class MirrorEquivalenceTests(unittest.TestCase):
     """The property this protocol exists for: a sparse mirror built only
     from snapshot chunks reads, through the Mac's own tail reader, exactly
