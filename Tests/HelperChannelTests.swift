@@ -198,7 +198,9 @@ struct HelperChannelTests {
     func helperRunsIsolated() throws {
         let script = try #require(Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"))
         let source = try String(contentsOf: script, encoding: .utf8)
-        #expect(source.hasPrefix("#!/usr/bin/env -S python3 -I\n"))
+        // By absolute path, never through env: under the narrow sudo rule
+        // the caller's PATH can reach root, and would choose the python.
+        #expect(source.hasPrefix("#!/usr/bin/python3 -I\n"))
         #expect(HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser).arguments.last
             == #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#)
     }
