@@ -165,13 +165,13 @@ struct DiscoveryContextTests {
             "[{\"session_id\":\"\(id)\",\"pid\":999999}]",
             to: root.appendingPathComponent("active_sessions.json"))
 
-        let alive = GrokBuildMonitor.discover(root: root, now: .now, isAlive: { $0 == 999999 })
+        let alive = GrokBuildMonitor.discover(root: root, now: .now, isLive: { pid, _ in pid == 999999 })
         #expect(alive.count == 1)
         #expect(alive.first?.processAlive == true)
         #expect(alive.first?.pid == 999999)
         #expect(alive.first?.status == .working(activity: "Working…"))
 
-        let dead = GrokBuildMonitor.discover(root: root, now: .now, isAlive: { _ in false })
+        let dead = GrokBuildMonitor.discover(root: root, now: .now, isLive: { _, _ in false })
         #expect(dead.first?.processAlive == false)
         #expect(dead.first?.status == .idle)
     }

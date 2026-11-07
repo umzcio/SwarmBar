@@ -59,7 +59,10 @@ struct ClaudeCodeMonitor: SessionMonitor {
         var sessions: [AgentSession] = []
         var seenPaths = Set<String>()
         let livePids = TerminalFocuser.claudePidsBySession(
-            home: context.home, isAlive: { context.processes.isAlive($0) })
+            home: context.home,
+            isLive: {
+                context.processes.isAgent($0, names: ProcessIdentity.claudeNames, recordedAt: $1)
+            })
         let scanned = roots(home: context.home)
         for root in scanned {
             let projectDirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []

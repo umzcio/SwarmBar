@@ -53,25 +53,63 @@ enum GrokUpdatesParser {
         return sawStop ? .waitingInput(prompt: "") : nil
     }
 
-    /// The command (or title) of the most recent tool_call, used as the
-    /// approval row's command preview while a permission prompt is pending.
-    nonisolated static func pendingToolCommand(tail: String) -> String? {
-        for raw in tail.split(separator: "\n").reversed() {
+    /// The request a pending permission prompt is about, in full, for the
+    /// approval row.
+    ///
+    /// Not simply the newest tool_call: a call made after the gated one
+    /// (a read_file queued beside a gated run_command) would put a benign
+    /// request beside an Approve that answers the gated one. The call is
+    /// the one events.jsonl names: by id where it gives one, otherwise the
+    /// only unfinished call of the named tool. With no unique match the
+    /// row says so and offers the terminal instead of Approve.
+    nonisolated static func pendingToolPrompt(
+        tail: String, tool: String, callID: String?
+    ) -> ApprovalPrompt {
+        var calls: [(id: String?, title: String, rawInput: [String: Any]?)] = []
+        var finished = Set<String>()
+        for raw in tail.split(separator: "\n") {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let params = line["params"] as? [String: Any]
             else { continue }
             let update = (params["update"] as? [String: Any]) ?? params
-            guard (update["sessionUpdate"] as? String) == "tool_call" else { continue }
-            let rawInput = update["rawInput"] as? [String: Any]
-            if let command = rawInput?["command"] as? String { return firstLine(command) }
-            let title = update["title"] as? String ?? "tool"
-            if let path = (rawInput?["file_path"] ?? rawInput?["absolute_path"] ?? rawInput?["path"]) as? String {
-                return "\(title) \(URL(fileURLWithPath: path).lastPathComponent)"
+            let id = update["toolCallId"] as? String
+            switch update["sessionUpdate"] as? String {
+            case "tool_call":
+                calls.append((id, update["title"] as? String ?? "tool",
+                              update["rawInput"] as? [String: Any]))
+            case "tool_call_update":
+                if let id, let status = update["status"] as? String,
+                   ["completed", "failed", "cancelled"].contains(status) {
+                    finished.insert(id)
+                }
+            default:
+                continue
             }
-            return title
         }
-        return nil
+        let candidates: [(id: String?, title: String, rawInput: [String: Any]?)]
+        if let callID {
+            candidates = calls.filter { $0.id == callID }.suffix(1)
+        } else {
+            candidates = calls.filter { call in
+                call.title == tool && !(call.id.map(finished.contains) ?? false)
+            }
+        }
+        guard candidates.count == 1, let call = candidates.first else {
+            return .unreadable(
+                "SwarmBar cannot tell which \(tool) call Grok is asking about. Review it in the terminal.")
+        }
+        guard var input = call.rawInput else {
+            return .unreadable(
+                "Grok has not recorded what this \(tool) call would do. Review it in the terminal.")
+        }
+        if let command = input.removeValue(forKey: "command") as? String {
+            // The whole command, every line of it, with anything else the
+            // call carries (its working directory, say) after it.
+            let rest = ApprovalPrompt.describeArguments(input)
+            return ApprovalPrompt(rest.isEmpty ? command : command + "\n" + rest)
+        }
+        return ApprovalPrompt(ApprovalPrompt.describe(tool: call.title, arguments: input))
     }
 
     private nonisolated static func question(from update: [String: Any]) -> String? {

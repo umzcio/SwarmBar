@@ -1,4 +1,4 @@
-#!/usr/bin/env -S python3 -I
+#!/usr/bin/python3 -I
 """SwarmBar remote helper.
 
 Ships bytes, never verdicts. It lists agent state files for all seven tools
@@ -13,6 +13,12 @@ Constraints that are not negotiable:
     that reads exactly like "no sessions".
   * Read-only. This never writes to any agent's state. Its own files
     under ~/.swarmbar/ (the hook sockets and their lock) are the exception.
+
+The interpreter is named by absolute path, never found through env: the
+narrow sudo rule runs this file as root with the caller's PATH wherever
+sudoers sets no secure_path, as on stock macOS, so `env python3` would let
+the caller pick the program root runs. -I keeps PYTHON* variables, the
+user site and the script's directory off the module path.
 """
 
 import sys
@@ -67,9 +73,47 @@ _OUT = sys.stdout
 _WRITE_LOCK = threading.Lock()
 
 
+def valid_text(text):
+    """`text` as real Unicode. A name with a byte that is not UTF-8 comes
+    out of os.listdir, os.readlink and the like holding a lone surrogate
+    (surrogateescape), which json.dumps writes as an escape such as
+    \\udcff. Swift's JSONDecoder refuses that, and with it the whole line,
+    so one such name on a host would blind the Mac to every session there.
+    The escaped bytes go back to bytes and decode with U+FFFD for each one
+    that is not UTF-8; bytes that were valid all along come back as what
+    they were. Any other lone surrogate becomes U+FFFD too."""
+    if text.isascii():
+        return text
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        pass
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:
+        return "".join("\ufffd" if 0xD800 <= ord(c) <= 0xDFFF else c for c in text)
+
+
+def valid_unicode(value):
+    """`value` with every string in it, dict keys included, made valid."""
+    if isinstance(value, str):
+        return valid_text(value)
+    if isinstance(value, dict):
+        return dict((valid_unicode(key), valid_unicode(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return [valid_unicode(item) for item in value]
+    return value
+
+
+def json_line(obj):
+    """One line of JSON for the Mac, every string in it valid Unicode."""
+    return json.dumps(valid_unicode(obj)) + "\n"
+
+
 def write_line(obj):
     """The only function that writes to the output stream."""
-    text = json.dumps(obj) + "\n"
+    text = json_line(obj)
     with _WRITE_LOCK:
         _OUT.write(text)
         _OUT.flush()
@@ -225,6 +269,23 @@ def home_dirs():
     return [h for h in home_candidates() if owned_home(h)]
 
 
+def inside(path, directory):
+    """Whether `path` is strictly beneath `directory`, both already real."""
+    return path.startswith(directory.rstrip("/") + "/")
+
+
+def cross_user(home):
+    """The uid owning `home` when it is not this process's own, else None.
+    Reading another user's home as root is where that user decides what
+    root opens, so those reads are the ones held to the owner's own files.
+    A home that cannot be examined is treated as another user's, owned by
+    nobody, so nothing in it passes."""
+    _, uid, _ = home_owner(home)
+    if uid is None:
+        return -1
+    return uid if uid != os.geteuid() else None
+
+
 def claude_roots(warnings):
     """<home>/.claude*/projects, excluding backup directories and second
     names for a root already found.
@@ -234,14 +295,23 @@ def claude_roots(warnings):
     nothing at all, because that shell cannot read /root so the glob never
     expands and is passed through literally. Every literal path in the same
     command succeeds, which is what makes the failure so convincing.
+
+    In another user's home (cross_user) a root counts only when it resolves
+    inside that home to a directory that user owns, so a link cannot pass
+    off someone else's transcripts, or a root-only directory, as theirs.
+    Dedupe never drops a root that lives in its own home: such roots are
+    taken first, and one that resolves outside its home (only this
+    process's own home may have one) is a second name only when nothing
+    in its own home already holds that directory.
     """
-    roots = []
-    seen = set()
+    found = []
     for home in home_dirs():
         try:
             entries = sorted(os.listdir(home))
         except OSError:
             continue
+        real_home = os.path.realpath(home)
+        foreign = cross_user(home)
         for entry in entries:
             if not entry.startswith(".claude"):
                 continue
@@ -251,15 +321,114 @@ def claude_roots(warnings):
             projects = os.path.join(home, entry, "projects")
             if not os.path.isdir(projects):
                 continue
-            # Deduped by realpath, but returned as found: a root symlinked
-            # elsewhere still has to mirror under the home it was found
-            # in, or its files lose their place relative to that home.
             resolved = os.path.realpath(projects)
-            if resolved in seen:
-                continue
+            at_home = inside(resolved, real_home)
+            if foreign is not None:
+                try:
+                    owner = os.stat(resolved).st_uid
+                except OSError:
+                    continue
+                if not at_home or owner != foreign:
+                    warnings.append("skipped root that leads outside its user's own files: %s"
+                                    % projects)
+                    continue
+            found.append((projects, resolved, at_home))
+    # Deduped by realpath, but returned as found: a root symlinked elsewhere
+    # still has to mirror under the home it was found in, or its files lose
+    # their place relative to that home.
+    kept = set()
+    seen = set()
+    for projects, resolved, at_home in found:
+        if at_home and resolved not in seen:
             seen.add(resolved)
-            roots.append(projects)
-    return roots
+            kept.add(projects)
+    for projects, resolved, at_home in found:
+        if not at_home and resolved not in seen:
+            seen.add(resolved)
+            kept.add(projects)
+    return [projects for projects, _, _ in found if projects in kept]
+
+
+class NotShipped(OSError):
+    """A file the snapshot must not read, with the reason."""
+
+
+DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+
+
+def owned_dir_fd(real_home, uid, parts):
+    """A descriptor for real_home/parts..., reached one component at a time
+    with no link followed, every directory on the way `uid`'s own, checked
+    on the descriptors themselves. `real_home` must already be a realpath.
+    Raises OSError (NotShipped for a wrong owner); a link on the way is
+    ELOOP or ENOTDIR, and a missing one FileNotFoundError."""
+    fd = os.open(real_home, DIRECTORY_FLAGS)
+    try:
+        if os.fstat(fd).st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        for part in parts:
+            child = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if os.fstat(fd).st_uid != uid:
+                raise NotShipped(errno.EPERM, "not its home's owner's own")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def shipped_opener(home):
+    """The `opener` every snapshot read of a file in `home` goes through.
+
+    Never blocking: a FIFO swapped in after the stat opens at once and is
+    refused, rather than stalling the one request loop every hook reply
+    waits on. Only a regular file is read.
+
+    In another user's home (cross_user), the file is reached from the home
+    down one component at a time, never following a link, through
+    directories that user owns, and must be their own regular file, all
+    checked on the descriptors actually opened. A link in the home that
+    leads anywhere else, to /etc/shadow or to another user's transcripts,
+    is not read. One leading elsewhere in the same home is: the walk is of
+    the path it resolves to.
+    """
+    foreign = cross_user(home)
+    real_home = os.path.realpath(home)
+
+    def check(fd, kind):
+        info = os.fstat(fd)
+        if kind == "file" and not stat_module.S_ISREG(info.st_mode):
+            raise NotShipped(errno.EINVAL, "not a regular file")
+        if foreign is not None and info.st_uid != foreign:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+
+    def opener(name, flags):
+        flags |= os.O_NONBLOCK
+        if foreign is None:
+            fd = os.open(name, flags)
+            try:
+                check(fd, "file")
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+        resolved = os.path.realpath(name)
+        if not inside(resolved, real_home):
+            raise NotShipped(errno.EPERM, "leads outside its home")
+        parts = resolved[len(real_home.rstrip("/")) + 1:].split("/")
+        fd = owned_dir_fd(real_home, foreign, parts[:-1])
+        try:
+            leaf = os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=fd)
+        finally:
+            os.close(fd)
+        try:
+            check(leaf, "file")
+        except BaseException:
+            os.close(leaf)
+            raise
+        return leaf
+    return opener
 
 
 def whole_lines(data):
@@ -276,7 +445,7 @@ def whole_lines(data):
     return data
 
 
-def tail_window(path, size, start=TAIL_BYTES):
+def tail_window(path, size, start=TAIL_BYTES, opener=None):
     """Locates the trailing complete records of a JSONL file.
 
     Starts at `start` bytes and doubles until the window holds at least one
@@ -295,9 +464,10 @@ def tail_window(path, size, start=TAIL_BYTES):
     OVERSIZED / INCOMPLETE sentinels when no complete record could be
     obtained. The read stops at `size` so the bytes always agree with the
     stat the caller reports, even while the file is being appended to.
+    `opener` is how the file is opened, as for open() (see shipped_opener).
     """
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             window = start
             while True:
                 offset = size - window if size > window else 0
@@ -334,7 +504,7 @@ def tail_of(path, size):
     return whole_lines(data[first:]).decode("utf-8", "replace")
 
 
-def tail_chunk(path, size, start=TAIL_BYTES):
+def tail_chunk(path, size, start=TAIL_BYTES, opener=None):
     """The tail as one chunk at its true offset: ((offset, bytes), covered).
 
     Unlike tail_of, the chunk runs through `size`, partial last line
@@ -350,7 +520,7 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     and the chunk, so a tail reader whose window starts anywhere from
     `covered` on sees the same lines in the mirror as in the file.
     """
-    found = tail_window(path, size, start)
+    found = tail_window(path, size, start, opener)
     if not isinstance(found, tuple):
         return found
     offset, data, first = found
@@ -359,7 +529,7 @@ def tail_chunk(path, size, start=TAIL_BYTES):
     return (offset + first, data[first:]), offset
 
 
-def head_chunk(path, size):
+def head_chunk(path, size, opener=None):
     """The first line, newline included, as (0, bytes).
 
     Grows from HEAD_BYTES the way CodexMonitor.headText does. With no
@@ -367,7 +537,7 @@ def head_chunk(path, size):
     headText would have handed the parser locally.
     """
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             data = b""
             window = HEAD_BYTES
             limit = min(size, MAX_HEAD_BYTES)
@@ -386,15 +556,19 @@ def head_chunk(path, size):
 
 
 def has_timestamp(line):
-    """Whether a JSONL line is an object with a top-level string timestamp."""
+    """Whether a JSONL line is an object with a top-level string timestamp.
+
+    A line nested deeper than the decoder will go raises RecursionError,
+    not ValueError, and is just as malformed: one user's transcript must
+    not fail the whole host's snapshot."""
     try:
         record = json.loads(line.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     return isinstance(record, dict) and isinstance(record.get("timestamp"), str)
 
 
-def stamped_head_chunk(path, size, limit=None):
+def stamped_head_chunk(path, size, limit=None, opener=None):
     """Claude's head: (0, bytes) from the start through the first complete
     line carrying a top-level timestamp, newline included.
 
@@ -407,7 +581,7 @@ def stamped_head_chunk(path, size, limit=None):
     """
     limit = MAX_HEAD_BYTES if limit is None else limit
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             data = handle.read(min(size, limit))
     except OSError:
         return None
@@ -419,12 +593,12 @@ def stamped_head_chunk(path, size, limit=None):
         if has_timestamp(data[start:newline]):
             return 0, data[:newline + 1]
         start = newline + 1
-    return head_chunk(path, size)
+    return head_chunk(path, size, opener)
 
 
-def whole_chunk(path, size):
+def whole_chunk(path, size, opener=None):
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             return 0, handle.read(size)
     except OSError:
         return None
@@ -578,9 +752,9 @@ def growth_is_mirrored(prev, size, data, start):
     return reader_offset(size, last_break, start) >= prev.covered
 
 
-def growth_chunk(path, start, size):
+def growth_chunk(path, start, size, opener=None):
     try:
-        with open(path, "rb") as handle:
+        with open(path, "rb", opener=opener) as handle:
             handle.seek(start)
             return start, handle.read(size - start)
     except OSError:
@@ -608,9 +782,10 @@ def last_newline_in(chunks, fallback):
     return found
 
 
-def file_chunks(spec, path, size, mtime, prev):
+def file_chunks(spec, path, size, mtime, prev, opener=None):
     """(reset, [(offset, bytes)], Shipped or None) for one file, or a
-    reason string to omit it. `prev` is SHIPPED's entry, or None."""
+    reason string to omit it. `prev` is SHIPPED's entry, or None. Every
+    read opens the file through `opener` (see shipped_opener)."""
     if spec.mode == "listing":
         return False, [], None
     if spec.mode == "whole" and size > WHOLE_MAX_BYTES:
@@ -620,26 +795,26 @@ def file_chunks(spec, path, size, mtime, prev):
     if decision == "none":
         return False, [], prev
     if spec.mode == "whole":
-        found = whole_chunk(path, size)
+        found = whole_chunk(path, size, opener)
         return omission_reason(found) or (
             True, [found], Shipped(size, mtime, None, None))
     if decision == "growth":
-        found = growth_chunk(path, prev.size, size)
+        found = growth_chunk(path, prev.size, size, opener)
         reason = omission_reason(found)
         if reason:
             return reason
         if growth_is_mirrored(prev, size, found[1], spec.tail_start):
             return False, [found], Shipped(
                 size, mtime, prev.covered, last_newline_in([found], prev.last_newline))
-    tail = tail_chunk(path, size, spec.tail_start)
+    tail = tail_chunk(path, size, spec.tail_start, opener)
     reason = omission_reason(tail)
     if reason:
         return reason
     chunk, covered = tail
     chunks = [chunk]
     if spec.mode == "head_tail":
-        head = (stamped_head_chunk(path, size) if spec.stamped_head
-                else head_chunk(path, size))
+        head = (stamped_head_chunk(path, size, opener=opener) if spec.stamped_head
+                else head_chunk(path, size, opener))
         reason = omission_reason(head)
         if reason:
             return reason
@@ -672,13 +847,30 @@ def matching(directory, part, unreadable):
             and fnmatch.fnmatchcase(name, part)]
 
 
+# How far below its start a "**" walk goes. Codex nests sessions/YYYY/MM/DD,
+# three levels; anything this deep is not an agent's layout, and a tree
+# deep enough to overflow a recursive walk is one user's way to fail every
+# snapshot of a host watched as root.
+MAX_WALK_DEPTH = 32
+
+
 def subdirectories(directory, unreadable):
-    """`directory` and every directory beneath it, for "**". Symlinked
-    directories are not followed, so a link loop cannot run forever."""
-    found = [directory]
-    for path in matching(directory, "*", unreadable):
-        if os.path.isdir(path) and not os.path.islink(path):
-            found.extend(subdirectories(path, unreadable))
+    """`directory` and every directory beneath it, for "**", in the same
+    depth-first order a recursive walk gives. Symlinked directories are not
+    followed, so a link loop cannot run forever. Iterative and bounded at
+    MAX_WALK_DEPTH: a directory past it is recorded in `unreadable` and not
+    entered, so it reads as not looked at rather than as empty."""
+    found = []
+    pending = [(directory, 0)]
+    while pending:
+        current, depth = pending.pop()
+        found.append(current)
+        children = [path for path in matching(current, "*", unreadable)
+                    if os.path.isdir(path) and not os.path.islink(path)]
+        if children and depth >= MAX_WALK_DEPTH:
+            unreadable[current] = "deeper than %d levels, not walked" % MAX_WALK_DEPTH
+            continue
+        pending.extend((path, depth + 1) for path in reversed(children))
     return found
 
 
@@ -717,7 +909,14 @@ def expand(spec, homes, claude_dirs, unreadable):
         rest = spec.pattern
         bases = [(home, home) for home in homes]
     for home, base in bases:
-        for path in expand_pattern(base, rest, unreadable):
+        # Anything a hostile tree can make the walk raise costs this base
+        # this one pattern, reported as not looked at, never the snapshot.
+        try:
+            paths = expand_pattern(base, rest, unreadable)
+        except Exception as error:
+            unreadable[base] = "cannot expand %s: %s" % (rest, type(error).__name__)
+            continue
+        for path in paths:
             yield home, path
 
 
@@ -758,9 +957,21 @@ def manifest(now, warnings, shipped_before):
     unreadable = {}
     seen = set()
     shipped = {}
+    openers, foreign = {}, {}
+    for home in homes:
+        openers[home] = shipped_opener(home)
+        if cross_user(home) is not None:
+            foreign[home] = os.path.realpath(home)
     for spec in SPECS:
         for home, path in expand(spec, homes, claude_dirs, unreadable):
             if path in seen:
+                continue
+            # Another user's link out of their home is never followed, not
+            # even to stat: what it leads to is not theirs to show.
+            if home in foreign and not inside(os.path.realpath(path), foreign[home]):
+                if os.path.lexists(path):
+                    seen.add(path)
+                    omitted.append({"path": path, "reason": "leads outside its home"})
                 continue
             info = stat_or_note(path, unreadable)
             if info is None:
@@ -778,8 +989,15 @@ def manifest(now, warnings, shipped_before):
             if is_dir:
                 dirs[path] = stat_entry(path, info)
             else:
-                result = file_chunks(spec, path, info.st_size, info.st_mtime,
-                                     shipped_before.get(path))
+                # One file's failure is that file's omission, never the
+                # snapshot's: a user who can plant a file must not be able
+                # to blind the host for everyone.
+                try:
+                    result = file_chunks(spec, path, info.st_size, info.st_mtime,
+                                         shipped_before.get(path),
+                                         openers.get(home) or shipped_opener(home))
+                except Exception as error:
+                    result = "cannot read: %s" % type(error).__name__
                 # Omitting the file says nothing about the session, which is
                 # recoverable on the next poll. Shipping it empty would wipe
                 # the Mac's copy and delete its row, which is not.
@@ -1013,7 +1231,9 @@ def parse_ps(text):
     and treats everything after as args. A comm with a space therefore bleeds
     its tail into args; no agent's comm has one. comm may be a full path on
     Darwin, so only its basename is kept. A tty of ? or ?? means none. The
-    user comes from the uid, and the printed name is only the fallback.
+    user comes from the uid, and the printed name is only the fallback. The
+    uid is kept for matching a process to a tmux server's owner and is never
+    shipped.
     """
     rows = []
     for line in text.splitlines():
@@ -1026,7 +1246,7 @@ def parse_ps(text):
             continue
         tty = parts[4]
         rows.append({
-            "pid": pid, "ppid": ppid, "user": user_for(uid, parts[3]),
+            "pid": pid, "ppid": ppid, "uid": uid, "user": user_for(uid, parts[3]),
             "tty": "" if tty in ("?", "??", "-") else tty,
             "comm": parts[5].split("/")[-1],
             "args": parts[6].strip() if len(parts) > 6 else "",
@@ -1056,12 +1276,21 @@ def agent_name(row):
 
 
 def tmux_sockets():
-    """Every tmux server socket this user can name, root's view included."""
+    """[(path, owner uid)] for every tmux server socket in a tmux-* directory
+    under /tmp or TMUX_TMPDIR.
+
+    The owner is read without following links, and a socket counts only
+    when it and its tmux-* directory are real (no links) and owned by the
+    same uid, as tmux itself lays them out. Which uid owns a socket decides
+    who a client of it runs as and which processes its panes may claim, so
+    a socket another user planted in someone else's directory, or a link to
+    one, is left out rather than trusted."""
     roots = ["/tmp"]
     custom = os.environ.get("TMUX_TMPDIR")
     if custom:
         roots.append(custom)
     found = []
+    seen = set()
     for root in roots:
         try:
             directories = sorted(os.listdir(root))
@@ -1072,52 +1301,170 @@ def tmux_sockets():
                 continue
             directory = os.path.join(root, name)
             try:
-                for entry in sorted(os.listdir(directory)):
-                    path = os.path.join(directory, entry)
-                    if path not in found:
-                        found.append(path)
+                dir_info = os.lstat(directory)
+                if not stat_module.S_ISDIR(dir_info.st_mode):
+                    continue
+                entries = sorted(os.listdir(directory))
             except OSError:
                 continue
+            for entry in entries:
+                path = os.path.join(directory, entry)
+                if path in seen:
+                    continue
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
+                    continue
+                seen.add(path)
+                found.append((path, info.st_uid))
     return found
 
 
-def tmux_panes():
-    """pane shell pid -> {"socket", "id"} across every reachable server.
+def tmux_identity(uid):
+    """subprocess options that run a tmux client as the owner of the server
+    it connects to, or None when this process must not connect at all.
 
-    tmux missing, a dead socket and another user's server (unreadable unless
-    root) all just contribute nothing. Panes being null is a normal state,
-    never processes_failed.
+    A tmux client does what its server tells it, up to running a program
+    and opening files the server names, so a client never has more
+    privilege than the server's owner. Root runs it as that owner (uid, gid
+    and the owner's groups, all three) unless the owner is root. Anyone
+    else connects only to their own servers. {} means run as this
+    process."""
+    euid = os.geteuid()
+    if uid == euid:
+        return {}
+    if euid != 0:
+        return None
+    try:
+        import pwd
+        entry = pwd.getpwuid(uid)
+    except (ImportError, KeyError, OverflowError):
+        return None
+    return {"user": uid, "group": entry.pw_gid,
+            "extra_groups": supplementary_groups(entry.pw_name, entry.pw_gid), "cwd": "/"}
+
+
+# Where a root helper looks for tmux. The pinned root PATH holds only
+# directories nobody but root can change, and Homebrew's are not among
+# them (/opt/homebrew/bin belongs to the admin user who installed it), so a
+# macOS host would find no tmux at all. Each candidate here is vetted
+# against the uid the client will run as instead (tmux_program), so the
+# root-only directories come first and serve every server.
+TMUX_DIRECTORIES = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin",
+                    "/home/linuxbrew/.linuxbrew/bin")
+
+
+def path_trusted_for(path, uid):
+    """Whether only root or `uid` can have changed a file: it and every
+    directory above it belong to one of the two and nobody else can write
+    them (only_owner_can_write). For uid 0 this is root_only_path."""
+    current = path
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        if info.st_uid not in (0, uid) or not only_owner_can_write(info):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
+def tmux_program(uid, directories=TMUX_DIRECTORIES):
+    """The tmux to run a client with, as `uid`, the owner of the server it
+    connects to (tmux_identity).
+
+    Not root: "tmux", found on this process's own PATH, which is the login
+    user's and theirs to choose, as it always was. Root: an absolute path,
+    never a PATH lookup, to a tmux that nobody but root and `uid` can have
+    changed, resolved through links so the file that runs is the file that
+    was vetted. The client runs as `uid`, so a tmux that `uid` owns grants
+    nothing `uid` did not already have, while one anybody else could
+    replace would run as `uid` on their behalf. For root's own servers that
+    leaves root-only builds, exactly what the pinned PATH allows. None when
+    no candidate qualifies, and that server is not contacted."""
+    if os.geteuid() != 0:
+        return "tmux"
+    for directory in directories:
+        real = os.path.realpath(os.path.join(directory, "tmux"))
+        try:
+            info = os.stat(real)
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            continue
+        if path_trusted_for(real, uid):
+            return real
+    return None
+
+
+def tmux_command(socket_path, uid, args, input=None, timeout=5):
+    """One tmux client call against the server at `socket_path`, owned by
+    `uid`, run as that owner. None when it must not run or could not."""
+    ids = tmux_identity(uid)
+    if ids is None:
+        return None
+    program = tmux_program(uid)
+    if program is None:
+        return None
+    argv = [program, "-S", socket_path] + args
+    options = dict(ids)
+    if input is not None:
+        options["input"] = input
+    try:
+        return run_command(argv, **options)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def tmux_panes():
+    """(pane pid, server owner uid) -> {"socket", "id"} across every server
+    this process may contact.
+
+    A server's claim that a pid sits in one of its panes is only its word,
+    so each claim is filed under the uid that owns the server and only
+    ever matched to a process of that same uid (pane_for). One user's
+    server naming another user's agent therefore never routes that agent's
+    keys or replies to itself.
+
+    tmux missing, a dead socket and a server this process may not contact
+    all just contribute nothing. Panes being null is a normal state, never
+    processes_failed.
     """
     panes = {}
-    for socket in tmux_sockets():
-        try:
-            done = run_command(
-                ["tmux", "-S", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if done.returncode != 0:
+    for socket_path, uid in tmux_sockets():
+        done = tmux_command(socket_path, uid,
+                            ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+        if done is None or done.returncode != 0:
             continue
         for line in done.stdout.decode("utf-8", "replace").splitlines():
             fields = line.split()
             if len(fields) != 2:
                 continue
             try:
-                panes[int(fields[1])] = {"socket": socket, "id": fields[0]}
+                key = (int(fields[1]), uid)
             except ValueError:
                 continue
+            # The first server to claim a pid keeps it.
+            panes.setdefault(key, {"socket": socket_path, "id": fields[0]})
     return panes
 
 
-def pane_for(pid, parents, panes):
-    """The pane an agent lives in, found by walking up its parents.
+def pane_for(pid, parents, panes, uid):
+    """The pane an agent lives in, found by walking up its parents, from a
+    server owned by the agent's own uid only.
 
     Bounded so a ppid cycle (or a pathological chain) terminates.
     """
     current = pid
     for _ in range(ANCESTRY_LIMIT):
-        if current in panes:
-            return panes[current]
+        found = panes.get((current, uid))
+        if found is not None:
+            return found
         current = parents.get(current)
         if current is None:
             return None
@@ -1217,8 +1564,9 @@ def agent_processes(warnings, screens=True):
     processes = []
     for row in agents:
         pid = row["pid"]
-        pane = pane_for(pid, parents, panes)
+        pane = pane_for(pid, parents, panes, row["uid"])
         entry = dict(row)
+        del entry["uid"]
         paths, ok = held_files(row["comm"], pid)
         if not ok:
             warnings.append("cannot read open files of pid %d" % pid)
@@ -1229,7 +1577,8 @@ def agent_processes(warnings, screens=True):
             "open": paths,
         })
         if screens:
-            entry["screen"] = pane_screen(pane) if pane and row["comm"] == "agy" else None
+            entry["screen"] = pane_screen(dict(pane, uid=row["uid"])) \
+                if pane and row["comm"] == "agy" else None
         processes.append(entry)
     return processes
 
@@ -1359,16 +1708,54 @@ def claude_config_dirs(home):
             and os.path.isdir(os.path.join(home, entry))]
 
 
-def file_digest(path, limit=None):
+# The most the probe reads of any one file. Configs, bridges and the helper
+# are all far smaller. The probe runs as root over every home, and a home's
+# user decides how big their files are: a 1 TiB sparse config read whole
+# would fail the probe for the whole host. Past this a file is unreadable.
+PROBE_READ_MAX = WHOLE_MAX_BYTES
+PROBE_READ_BLOCK = 1024 * 1024
+
+
+def bounded_digest(handle, limit=None):
+    """(sha256, bytes or None) of what `handle` reads, hashed in blocks, or
+    None past PROBE_READ_MAX. The bytes come back only when there are at
+    most `limit` of them (any number up to the ceiling for None)."""
+    digest = hashlib.sha256()
+    kept = bytearray()
+    total = 0
+    while True:
+        block = handle.read(min(PROBE_READ_BLOCK, PROBE_READ_MAX + 1 - total))
+        if not block:
+            break
+        total += len(block)
+        if total > PROBE_READ_MAX:
+            return None
+        digest.update(block)
+        if kept is not None:
+            if limit is not None and total > limit:
+                kept = None
+            else:
+                kept.extend(block)
+    return digest.hexdigest(), bytes(kept) if kept is not None else None
+
+
+def file_digest(path, limit=None, opener=None, uid=None):
     """(sha256, bytes or None) of a regular file, or None when it cannot be
-    read. The bytes come back only when the file is at most `limit`."""
+    read, is not a regular file, is not `uid`'s when one is given, or is
+    larger than PROBE_READ_MAX. The bytes come back only when the file is
+    at most `limit`. Opened without blocking, so a FIFO is refused rather
+    than waited on, and through `opener` when one is given."""
+    if opener is None:
+        def opener(name, flags):
+            return os.open(name, flags | os.O_NONBLOCK)
     try:
-        with open(path, "rb") as handle:
-            data = handle.read()
+        with open(path, "rb", opener=opener) as handle:
+            info = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(info.st_mode) or (uid is not None and info.st_uid != uid):
+                return None
+            return bounded_digest(handle, limit)
     except OSError:
         return None
-    kept = data if limit is None or len(data) <= limit else None
-    return hashlib.sha256(data).hexdigest(), kept
 
 
 def lookup_state(path):
@@ -1424,12 +1811,13 @@ def read_owned_bytes(path, uid, size=-1):
 
 
 def read_owned(path, uid, limit=None):
-    """file_digest through read_owned_bytes."""
-    data = read_owned_bytes(path, uid)
-    if data is None:
-        return None
-    kept = data if limit is None or len(data) <= limit else None
-    return hashlib.sha256(data).hexdigest(), kept
+    """file_digest of `uid`'s own regular file, opened as read_owned_bytes
+    opens it: not through a final link, and never blocking. None as well
+    past PROBE_READ_MAX, read in blocks, so no user's file can make the
+    probe hold more than that."""
+    def opener(name, flags):
+        return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+    return file_digest(path, limit, opener, uid)
 
 
 def home_configs(home, warnings):
@@ -1660,12 +2048,31 @@ def home_installed(home, warnings):
 def installed_helpers(homes):
     """{"path", "sha256"} for each installed helper. sha256 is None when the
     file is there but cannot be read, as the root helper (root's, mode 700)
-    cannot be by anyone else."""
+    cannot be by anyone else, or is not its owner's own regular file, or
+    is larger than any helper. A user's copy is opened as the snapshot
+    opens files in that home (shipped_opener), so in another user's home a
+    link out of it, to a file that never ends, is never read. Hashed in
+    bounded blocks."""
     found = []
-    for path in list(HELPER_PATHS) + [os.path.join(home, USER_HELPER) for home in homes]:
-        if not os.path.isfile(path):
+    candidates = [(path, None, 0) for path in HELPER_PATHS]
+    for home in homes:
+        candidates.append((os.path.join(home, USER_HELPER), home, home_owner(home)[1]))
+    for path, home, uid in candidates:
+        try:
+            info = os.lstat(path)
+        except OSError:
             continue
-        digest = file_digest(path)
+        if stat_module.S_ISDIR(info.st_mode):
+            continue
+        if home is None:
+            if not stat_module.S_ISREG(info.st_mode):
+                continue
+
+            def opener(name, flags):
+                return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        else:
+            opener = shipped_opener(home)
+        digest = file_digest(path, opener=opener, uid=uid) if uid is not None else None
         found.append({"path": path, "sha256": digest[0] if digest else None})
     return found
 
@@ -1745,7 +2152,7 @@ def probe_main():
         result = {"ok": False, "protocol": PROTOCOL_VERSION,
                   "python": platform.python_version(),
                   "error": "probe failed: %s" % error}
-    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.write(json_line(result))
     sys.stdout.flush()
 
 
@@ -1783,6 +2190,38 @@ def valid_expect_more(entries):
     return True
 
 
+def valid_expect(entries):
+    """Whether `entries` is a list whose items are each a string, which must
+    be on the press-time screen, or {"once": non-empty str}, which must be
+    there exactly once (non-overlapping, as str.count counts).
+
+    Helpers older than the "once" form require every item to be a string
+    and answer "bad keys" to anything else, so a Mac that sends "once" to
+    one gets nothing pressed rather than a weaker check."""
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict) or set(entry) != {"once"}:
+            return False
+        if not isinstance(entry["once"], str) or not entry["once"]:
+            return False
+    return True
+
+
+def expectations_hold(screen, expect, expect_more):
+    """Whether the press-time screen still shows what the Mac read."""
+    for entry in expect:
+        if isinstance(entry, str):
+            if entry not in screen:
+                return False
+        elif screen.count(entry["once"]) != 1:
+            return False
+    # str.count is non-overlapping, as the Mac counts.
+    return not any(screen.count(m["text"]) <= m["before"] for m in expect_more)
+
+
 def tmux_key_args(key):
     """The send-keys arguments for one key. Anything unnamed is sent literally
     with -l, and "--" ends option parsing so a literal such as "-x" or "Up"
@@ -1801,6 +2240,8 @@ def valid_pane(pane):
     real socket, and be owned by whoever owns its tmux-* directory. The
     resolved path is what every later tmux call uses, so the path checked is
     the path run, with no window for a symlink to be swapped in between.
+    The socket's owner rides along as "uid": every tmux call runs as that
+    owner, and a pid named beside the pane must belong to it.
     """
     if not isinstance(pane, dict):
         return None
@@ -1828,19 +2269,14 @@ def valid_pane(pane):
         return None
     if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
         return None
-    return {"socket": real, "id": pane_id}
+    return {"socket": real, "id": pane_id, "uid": info.st_uid}
 
 
 def tmux_run(pane, args, input=None):
-    """One tmux call against the pane's own server. Returns the completed
-    process, or None when tmux could not run at all."""
-    argv = ["tmux", "-S", pane["socket"]] + args
-    try:
-        if input is None:
-            return run_command(argv)
-        return run_command(argv, input=input)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """One tmux call against the pane's own server, as the server's owner.
+    Returns the completed process, or None when tmux could not or must not
+    run at all."""
+    return tmux_command(pane["socket"], pane["uid"], args, input=input)
 
 
 def pane_text(pane):
@@ -1878,14 +2314,18 @@ def target_still_there(pid, comm, pane):
             break
     if row is None or agent_name(row) != comm:
         return False
+    # The pane's server must be the agent's own user's, the same rule the
+    # snapshot applies, or another user's server could take its keys.
+    if row["uid"] != pane.get("uid"):
+        return False
     parents = dict((r["pid"], r["ppid"]) for r in rows)
-    found = pane_for(pid, parents, tmux_panes())
+    found = pane_for(pid, parents, tmux_panes(), row["uid"])
     if found is None or found.get("id") != pane.get("id"):
         return False
     return os.path.realpath(found.get("socket", "")) == os.path.realpath(pane.get("socket", ""))
 
 
-def target_refusal(request, malformed):
+def target_refusal(request, pane, malformed):
     """The reply refusing a keys or paste request whose `pid` and `comm` no
     longer describe its pane, or None to go ahead. A request carrying
     neither is not checked; one carrying only one, or either of the wrong
@@ -1897,7 +2337,7 @@ def target_refusal(request, malformed):
     if not (has_pid and has_comm) or isinstance(pid, bool) \
             or not isinstance(pid, int) or not isinstance(comm, str):
         return {"ok": False, "error": malformed}
-    if not target_still_there(pid, comm, request.get("pane")):
+    if not target_still_there(pid, comm, pane):
         return {"sent": False, "reason": "changed"}
     return None
 
@@ -1925,6 +2365,12 @@ def handle_tmux(request):
     "changed". A malformed pair answers "bad keys" for keys and "bad target"
     for paste.
 
+    An `expect` item may be {"once": str} instead of a string: that text
+    must be on the screen exactly once. The cursor line of a walk is sent
+    this way, as the local path checks it, because a second copy is agent
+    text drawn to look like the selector. A malformed item answers "bad
+    keys".
+
     keys may also carry `expect_more`, a list of {"text": str, "before":
     int}: each text must occur more times on the press-time screen than
     `before`, the count the Mac read before it pasted. A short reply such
@@ -1932,7 +2378,8 @@ def handle_tmux(request):
     paste that never landed. A malformed list answers "bad keys".
     """
     pane = valid_pane(request.get("pane"))
-    if pane is None:
+    # A server this process may not contact as its owner is not drivable.
+    if pane is None or tmux_identity(pane["uid"]) is None:
         return {"ok": False, "error": "bad pane"}
     command = request.get("cmd")
     if command == "capture":
@@ -1946,7 +2393,7 @@ def handle_tmux(request):
             return {"ok": False, "error": "bad text"}
         # A reply pasted into a pane that now holds a shell or another agent
         # is text the Mac never meant there, so the target is re-read first.
-        refused = target_refusal(request, "bad target")
+        refused = target_refusal(request, pane, "bad target")
         if refused is not None:
             return refused
         # The local reply's form, verified live on all seven tools: the
@@ -1990,10 +2437,9 @@ def handle_tmux(request):
     keys, expect = request.get("keys"), request.get("expect") or []
     expect_more = request.get("expect_more", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) \
-            or not isinstance(expect, list) or not all(isinstance(e, str) for e in expect) \
-            or not valid_expect_more(expect_more):
+            or not valid_expect(expect) or not valid_expect_more(expect_more):
         return {"ok": False, "error": "bad keys"}
-    refused = target_refusal(request, "bad keys")
+    refused = target_refusal(request, pane, "bad keys")
     if refused is not None:
         return refused
     gap = request.get("gap", KEY_GAP_DEFAULT)
@@ -2004,10 +2450,7 @@ def handle_tmux(request):
         screen = pane_text(pane)
         if screen is None:
             return {"sent": False, "reason": "capture failed"}
-        if any(e not in screen for e in expect):
-            return {"sent": False, "reason": "changed"}
-        # str.count is non-overlapping, as the Mac counts.
-        if any(screen.count(m["text"]) <= m["before"] for m in expect_more):
+        if not expectations_hold(screen, expect, expect_more):
             return {"sent": False, "reason": "changed"}
     for index, key in enumerate(keys):
         if index:
@@ -2665,6 +3108,9 @@ def grok_session(home, session_id):
     if not isinstance(session_id, str) or not session_id or "/" in session_id \
             or "\0" in session_id or session_id in (".", ".."):
         return True
+    foreign = cross_user(home)
+    if foreign is not None:
+        return grok_session_walked(os.path.realpath(home), foreign, session_id)
     grok = os.path.join(home, ".grok")
     try:
         # Not followed, and never blocking on a FIFO: this may run as root
@@ -2701,6 +3147,117 @@ def grok_session(home, session_id):
     # even a dangling link.
     return any(os.path.lexists(os.path.join(sessions, name, session_id))
                for name in directories)
+
+
+def grok_dir_parts(real_home, uid):
+    """The components from `real_home` down to that user's Grok directory:
+    [".grok"], or, when ~/.grok is that user's link, the path its text
+    names. Nothing is followed to find it: the link is read, never looked
+    through, so where it leads cannot change how soon the hook is answered.
+    The text must name a place inside the home without "..", and the walk
+    of it (owned_dir_fd) then follows no further link and passes only
+    directories the user owns. Anything else raises NotShipped, which
+    counts as Grok, as before.
+
+    Lexical on purpose: without "..", and with no link on the way (the
+    walk refuses one), the path the text names is the path the kernel
+    would resolve, so nothing outside the home is ever touched."""
+    fd = os.open(real_home, DIRECTORY_FLAGS)
+    try:
+        if os.fstat(fd).st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        info = os.stat(".grok", dir_fd=fd, follow_symlinks=False)
+        if not stat_module.S_ISLNK(info.st_mode):
+            return [".grok"]
+        if info.st_uid != uid:
+            raise NotShipped(errno.EPERM, "not its home's owner's own")
+        target = os.readlink(".grok", dir_fd=fd)
+    finally:
+        os.close(fd)
+    if not target.startswith("/"):
+        target = real_home.rstrip("/") + "/" + target
+    parts = [part for part in target.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise NotShipped(errno.EPERM, "leads outside its home")
+    path = "/" + "/".join(parts)
+    if not inside(path, real_home):
+        raise NotShipped(errno.EPERM, "leads outside its home")
+    return path[len(real_home.rstrip("/")) + 1:].split("/")
+
+
+def grok_session_walked(real_home, uid, session_id):
+    """grok_session for another user's home, run as root: every path is
+    reached from the home down with no link followed, through directories
+    that user owns. Their link to a directory only root can search is
+    never looked through, so whether a name exists there cannot change the
+    answer, or how soon it comes. Grok state that is there but not plainly
+    theirs counts as Grok, as unreadable state does.
+
+    A ~/.grok that is a link to elsewhere in the same home (a dotfiles
+    checkout) is read where it points, so that user's Claude sessions still
+    get held approvals: see grok_dir_parts."""
+    try:
+        grok = owned_dir_fd(real_home, uid, grok_dir_parts(real_home, uid))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fd = os.open("active_sessions.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=grok)
+        except FileNotFoundError:
+            fd = None
+        except OSError:
+            return True
+        if fd is not None:
+            try:
+                info = os.fstat(fd)
+                if not stat_module.S_ISREG(info.st_mode) or info.st_uid != uid \
+                        or info.st_size > GROK_INDEX_MAX_BYTES:
+                    return True
+                data = os.read(fd, GROK_INDEX_MAX_BYTES + 1)
+            except OSError:
+                return True
+            finally:
+                os.close(fd)
+            try:
+                if names_session(json.loads(data.decode("utf-8")), session_id):
+                    return True
+            except (ValueError, RecursionError):
+                return True
+        try:
+            sessions = os.open("sessions", DIRECTORY_FLAGS, dir_fd=grok)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            if os.fstat(sessions).st_uid != uid:
+                return True
+            names = os.listdir(sessions)
+        except OSError:
+            return True
+        try:
+            for name in names:
+                try:
+                    directory = os.open(name, DIRECTORY_FLAGS, dir_fd=sessions)
+                except OSError:
+                    continue
+                try:
+                    # Any entry by that name counts, even a dangling link,
+                    # as lexists does for the user's own home.
+                    os.stat(session_id, dir_fd=directory, follow_symlinks=False)
+                    return True
+                except OSError:
+                    pass
+                finally:
+                    os.close(directory)
+            return False
+        finally:
+            os.close(sessions)
+    finally:
+        os.close(grok)
 
 
 def peer_pid(sock):
@@ -2809,8 +3366,24 @@ def bounded(work, seconds, default):
 
 def hook_homes():
     """Homes with a remote bridge installed, in home_dirs order."""
-    return [home for home in home_dirs()
-            if any(os.path.isfile(os.path.join(home, marker)) for marker in HOOK_MARKERS)]
+    return [home for home in home_dirs() if has_bridge_marker(home)]
+
+
+def has_bridge_marker(home):
+    """Whether one of HOOK_MARKERS is a regular file in `home`, opened the
+    way the snapshot opens files there (shipped_opener): in another user's
+    home, never through a link out of it and only their own file. A marker
+    they linked to a path only root can see is no marker, whether or not
+    that path exists."""
+    opener = shipped_opener(home)
+    for marker in HOOK_MARKERS:
+        try:
+            fd = opener(os.path.join(home, marker), os.O_RDONLY)
+        except OSError:
+            continue
+        os.close(fd)
+        return True
+    return False
 
 
 class HookHomeError(Exception):
@@ -3620,10 +4193,47 @@ class HookHome(object):
             self.replayed.discard(rid)
             return
         if event == "hook_resolved":
+            # Only a hold this broker announced is its to end.
+            if not isinstance(rid, str) or rid not in self.relayed:
+                return
             self.relayed.discard(rid)
             self.replayed.discard(rid)
-        if event in ("hook", "hook_resolved"):
-            self.relay.emit(message)
+            self.relay.emit({"event": "hook_resolved", "rid": rid})
+            return
+        if event == "hook":
+            rebuilt = self.followed_hook(message)
+            if rebuilt is not None:
+                self.relay.emit(rebuilt)
+
+    def followed_hook(self, message):
+        """A hook event from the broker, rebuilt for this helper's Mac, or
+        None when it is malformed.
+
+        The broker is whoever holds this home's lock, which may be the
+        home's own user rather than another SwarmBar helper. So nothing it
+        says about whose event this is stands: the home and user are this
+        hub's own, and the event can reach only this home's rows. It is
+        held only when the broker announced the hold first, as the owner
+        does; the rest is checked for shape and taken as data."""
+        rid, path, body = message.get("rid"), message.get("path"), message.get("body")
+        if not isinstance(rid, str) or not rid or not isinstance(path, str) \
+                or not HOOK_PATH.match(path) or not isinstance(body, dict):
+            return None
+        peer = message.get("peer")
+        peer = [name for name in peer if isinstance(name, str)][:PEER_DEPTH] \
+            if isinstance(peer, list) else []
+        account = message.get("account")
+        return {
+            "event": "hook",
+            "rid": rid,
+            "home": self.home,
+            "user": self.user,
+            "path": path,
+            "account": account if isinstance(account, str) else None,
+            "peer": peer,
+            "body": body,
+            "held": message.get("held") is True and rid in self.relayed,
+        }
 
     def forward_reply(self, rid, body):
         conn = self.broker
@@ -4004,6 +4614,38 @@ def narrow_rule_run():
 
 NARROW_RULE_REFUSAL = {"ok": False, "error": "refused under the SwarmBar sudo rule; "
                        "run the setup command with sudo instead"}
+
+
+# Where a root helper looks for the programs it starts (ps, tmux, lsof,
+# visudo, sudo, a kimi doctor in root's own home). Only those of these
+# that nobody but root can change are kept.
+ROOT_PATH_CANDIDATES = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+                        "/sbin", "/bin", "/snap/bin")
+
+
+def trusted_root_path(candidates=ROOT_PATH_CANDIDATES):
+    """A PATH of the candidate directories only root can change: each one,
+    and every directory above it, root's and writable by nobody else. A
+    directory that is a link is left out, its target is listed in its own
+    right."""
+    def real_directory(path):
+        try:
+            return stat_module.S_ISDIR(os.lstat(path).st_mode)
+        except OSError:
+            return False
+    return ":".join(directory for directory in candidates
+                    if real_directory(directory) and root_only_path(directory))
+
+
+def pin_root_path():
+    """Replaces PATH with trusted_root_path() when this runs as root, before
+    anything starts a program. Under sudo the caller's PATH can arrive
+    intact, and every bare name the helper runs (ps, tmux, lsof, sudo,
+    visudo, and whatever those start) would otherwise be the caller's
+    choice of program, run as root."""
+    if os.geteuid() != 0:
+        return
+    os.environ["PATH"] = trusted_root_path() or "/usr/bin:/bin"
 
 
 def fsync_directory(directory):
@@ -4452,14 +5094,45 @@ def decode_operations(blob):
     return operations
 
 
-def apply_main(args):
+# The most `apply -` reads from stdin. The Mac refuses a blob past 100 KB.
+MAX_BLOB_BYTES = 4 * 1024 * 1024
+
+
+def read_blob(stream):
+    """The blob from `stream`, or None past MAX_BLOB_BYTES or unreadable."""
+    try:
+        data = stream.read(MAX_BLOB_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if len(data) > MAX_BLOB_BYTES:
+        return None
+    return data
+
+
+def apply_main(args, stdin=None):
     """Runs every operation in order, printing a line for each, and stops at
-    the first failure. Returns the exit status."""
+    the first failure. Returns the exit status.
+
+    `apply -` reads the blob from stdin, which is how the setup command
+    sends it: the blob carries whole config files, and an argument would
+    sit in the process list, where on Linux every local account can read
+    it, for as long as sudo waits for a password and apply runs. `apply
+    <blob>` still works for a command an older SwarmBar printed."""
     if narrow_rule_run():
         sys.stdout.write("failed: %s\n" % NARROW_RULE_REFUSAL["error"])
         sys.stdout.flush()
         return 2
-    operations = decode_operations(args[0]) if len(args) == 1 else None
+    blob = None
+    if args == ["-"]:
+        blob = read_blob(stdin if stdin is not None else sys.stdin)
+    elif len(args) == 1:
+        blob = args[0]
+    operations = decode_operations(blob) if blob is not None else None
     if not operations:
         sys.stdout.write("failed: cannot read the setup operations\n")
         sys.stdout.flush()
@@ -4571,6 +5244,9 @@ def serve_requests(stdin, relay):
 
 
 if __name__ == "__main__":
+    # First, before any program is started: as root, PATH came from the
+    # caller.
+    pin_root_path()
     # The probe runs before anything is installed and must leave no trace,
     # so it never reaches main(), which sets up hook homes and a writer
     # thread. Its program came from stdin, so stdin is not a request stream.

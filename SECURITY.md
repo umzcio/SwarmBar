@@ -19,11 +19,14 @@ Use GitHub's [private vulnerability reporting](https://github.com/umzcio/SwarmBa
 for this repo instead. It opens a private draft advisory visible only to the
 maintainer until a fix is ready. This applies especially to anything touching:
 
-- The **loopback hook server** and its per-install token
-  (`SwarmBar/Monitors/HookServer.swift`, `SwarmBar/Settings/HookToken.swift`).
-  It listens on `127.0.0.1:48620` and can hold a Claude Code permission
-  prompt open, so anything that lets an unauthenticated caller plant a row,
-  resolve a decision, or exhaust the connection budget matters here.
+- The **hook server** (`SwarmBar/Monitors/HookServer.swift`,
+  `SwarmBar/Monitors/HookListener.swift`, `SwarmBar/Settings/HookToken.swift`).
+  The bridge scripts reach it through an owner-only Unix socket in
+  Application Support; `127.0.0.1:48620` still answers older bridges that
+  carry the per-install token. It can hold a Claude Code permission prompt
+  open, so anything that lets another account or process plant a row,
+  resolve a decision, pose as SwarmBar to a bridge, or exhaust the
+  connection budget matters here.
 - The **approve and deny paths** (`SwarmBar/Store/TerminalFocuser.swift`).
   These drive real terminals. A bug that sends the wrong keystroke can
   approve a command the user denied, which has happened before and is the

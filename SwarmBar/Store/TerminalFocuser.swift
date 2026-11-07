@@ -15,9 +15,9 @@ enum FocusLog {
 }
 
 enum TerminalFocuser {
-    nonisolated static func focus(sessionID: UUID, projectPath: URL?) {
+    nonisolated static func focus(sessionID: UUID, tool: AgentTool, projectPath: URL?) {
         let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-        let sessionTTY = tty(forSession: sessionID, projectPath: projectPath)
+        let sessionTTY = tty(forSession: sessionID, tool: tool, projectPath: projectPath)
         FocusLog.log.notice("focus: path=\(projectPath?.path ?? "none", privacy: .public) tty=\(sessionTTY ?? "none", privacy: .public) frontmost=\(front, privacy: .public)")
         if let sessionTTY, focusRunningTerminal(device: "/dev/\(sessionTTY)") {
             FocusLog.log.notice("focus: done via iTerm2/Terminal tty match")
@@ -232,8 +232,8 @@ enum TerminalFocuser {
     /// without a newline. Used to answer Grok's TUI permission selector
     /// remotely. Returns false when the session has no live tty or iTerm2
     /// isn't running.
-    nonisolated static func sendKeys(sessionID: UUID, projectPath: URL? = nil, keys: [String]) -> Bool {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+    nonisolated static func sendKeys(sessionID: UUID, tool: AgentTool, projectPath: URL?, keys: [String]) -> Bool {
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2") else { return false }
         return runScript(keyScript(tty: tty, keys: keys)) == "SENT"
     }
@@ -273,8 +273,8 @@ enum TerminalFocuser {
     /// The visible screen text of the session's terminal (iTerm2 only).
     /// Used to read a TUI selector's actual options before answering, so
     /// keystrokes target a verified choice instead of a guessed position.
-    nonisolated static func screenText(sessionID: UUID, projectPath: URL? = nil) -> String? {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath)
+    nonisolated static func screenText(sessionID: UUID, tool: AgentTool, projectPath: URL?) -> String? {
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath)
         else { return nil }
         return screenText(tty: tty)
     }
@@ -341,8 +341,16 @@ enum TerminalFocuser {
     ///
     /// Deliberately contains NO submit. Pasting and pressing Enter are
     /// separate steps so the paste can be verified on screen in between.
+    ///
+    /// The text goes through `RemoteAnswerPlan.pasteText` first, the remote
+    /// path's rule: C0 controls other than newline and tab, and DEL, are
+    /// removed. An ESC in the reply (pasted into the composer from a page
+    /// that put one on the clipboard, where it does not show) could
+    /// otherwise close the bracketed paste early with its own "[201~" and
+    /// turn the rest of the reply into keystrokes. The two markers here are
+    /// the only ESCs this script ever writes.
     nonisolated static func pasteScript(tty: String, text: String) -> String {
-        let payload = AppleScriptLiteral.expression(text)
+        let payload = AppleScriptLiteral.expression(RemoteAnswerPlan.pasteText(text))
         return """
         tell application "iTerm2"
           repeat with w in windows
@@ -367,9 +375,11 @@ enum TerminalFocuser {
     /// composer is recoverable, a half-delivered prompt that was submitted is
     /// not.
     nonisolated static func sendReply(
-        sessionID: UUID, projectPath: URL?, text: String
+        sessionID: UUID, tool: AgentTool, projectPath: URL?, text raw: String
     ) -> ReplyOutcome {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+        // What lands is the filtered text, so the probe is taken from it too.
+        let text = RemoteAnswerPlan.pasteText(raw)
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2"),
               runScript(pasteScript(tty: tty, text: text)) == "PASTED"
         else { return .noTerminal }
@@ -377,7 +387,7 @@ enum TerminalFocuser {
         // Confirm on screen before submitting. A distinctive slice of the
         // reply is enough, and the last line is what sits nearest the cursor.
         guard let probe = verificationProbe(for: text),
-              let screen = screenText(sessionID: sessionID, projectPath: projectPath),
+              let screen = screenText(sessionID: sessionID, tool: tool, projectPath: projectPath),
               screen.contains(probe)
         else { return .pasteNotVisible }
 
@@ -404,44 +414,54 @@ enum TerminalFocuser {
     /// cannot advance in between: two round trips left a window in which a
     /// digit could land in a different selector.
     nonisolated static func answerNumbered(
-        sessionID: UUID, projectPath: URL?, number: Int, expectedLabel: String
+        sessionID: UUID, tool: AgentTool, projectPath: URL?, number: Int, expectedLabel: String
     ) -> AnswerOutcome {
-        guard let tty = tty(forSession: sessionID, projectPath: projectPath),
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2") else { return .noTerminal }
-        // The label is read off the terminal, so it is whatever the agent
-        // printed. This used to delete quotes from it, which was the one
-        // interpolation site not using the escaper that exists for exactly
-        // this, and it was wrong twice over. A label carrying a quote no
-        // longer matched the screen it came from, so the answer always
-        // degraded to focusing the terminal. A label ending in a backslash
-        // unbalanced the string literal and broke the whole script. Both
-        // are silent: the button appears to do nothing but open a window.
-        let needle = AppleScriptLiteral.escape(expectedLabel)
-        let script = """
-        tell application "iTerm2"
-          repeat with w in windows
-            repeat with t in tabs of w
-              repeat with s in sessions of t
-                if tty of s is "/dev/\(AppleScriptLiteral.escape(tty))" then
-                  set screenText to (text of s)
-                  if screenText contains "\(needle)" then
-                    tell s to write text "\(number)" newline NO
-                    return "SENT"
-                  else
-                    return "CHANGED"
-                  end if
-                end if
-              end repeat
-            end repeat
-          end repeat
-          return "MISS"
-        end tell
-        """
-        switch runScript(script) {
+        let script = numberedAnswerScript(number: number)
+        switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel]) {
         case "SENT":    return .sent
         case "CHANGED": return .promptChanged
         default:        return .noTerminal
         }
+    }
+
+    /// The script `answerNumbered` runs. Pure, so what reaches osascript can
+    /// be asserted without driving a terminal.
+    ///
+    /// The label is read off the terminal, so it is whatever the agent
+    /// printed, and it never becomes part of the script's source: it arrives
+    /// as an argument, with the tty, and is only ever compared as data. An
+    /// escaper that misses one quote is a way into the script; an argument
+    /// has no quotes to miss. The digit is the only interpolated value, and
+    /// it is a number SwarmBar chose.
+    ///
+    /// Arguments: 1 is the tty device ("/dev/ttys004"), 2 the label.
+    nonisolated static func numberedAnswerScript(number: Int) -> String {
+        """
+        on run argv
+          set wantedDevice to item 1 of argv
+          set wantedLabel to item 2 of argv
+          tell application "iTerm2"
+            repeat with w in windows
+              repeat with t in tabs of w
+                repeat with s in sessions of t
+                  if tty of s is wantedDevice then
+                    set screenText to (text of s)
+                    if screenText contains wantedLabel then
+                      tell s to write text "\(number)" newline NO
+                      return "SENT"
+                    else
+                      return "CHANGED"
+                    end if
+                  end if
+                end repeat
+              end repeat
+            end repeat
+            return "MISS"
+          end tell
+        end run
+        """
     }
 
     /// Moves the selector's cursor to a labeled option and submits.
@@ -459,48 +479,68 @@ enum TerminalFocuser {
     /// too.
     nonisolated static func answerByNavigation(
         sessionID: UUID,
+        tool: AgentTool,
         projectPath: URL?,
         key: String,
         presses: Int,
         expectedCursorLine: String,
         expectedLabel: String
     ) -> AnswerOutcome {
-        guard presses >= 0, key == "UP" || key == "DOWN",
-              let tty = tty(forSession: sessionID, projectPath: projectPath),
+        guard let script = navigationAnswerScript(key: key, presses: presses),
+              let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
               isRunning("iTerm2")
         else { return .noTerminal }
-
-        let arrow = key == "UP" ? "[A" : "[B"
-        let moves = (0..<presses)
-            .map { _ in "tell s to write text ((character id 27) & \"\(arrow)\") newline NO" }
-            .joined(separator: "\n                    delay 0.08\n                    ")
-        let script = """
-        tell application "iTerm2"
-          repeat with w in windows
-            repeat with t in tabs of w
-              repeat with s in sessions of t
-                if tty of s is "/dev/\(tty)" then
-                  set screenText to (text of s)
-                  if screenText contains "\(AppleScriptLiteral.escape(expectedLabel))" ¬
-                    and screenText contains "\(AppleScriptLiteral.escape(expectedCursorLine))" then
-                    \(moves.isEmpty ? "" : moves + "\n                    delay 0.08")
-                    tell s to write text ""
-                    return "SENT"
-                  else
-                    return "CHANGED"
-                  end if
-                end if
-              end repeat
-            end repeat
-          end repeat
-          return "MISS"
-        end tell
-        """
-        switch runScript(script) {
+        switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel, expectedCursorLine]) {
         case "SENT":    return .sent
         case "CHANGED": return .promptChanged
         default:        return .noTerminal
         }
+    }
+
+    /// The script `answerByNavigation` runs, or nil for a move it will not
+    /// make. Pure, so what reaches osascript can be asserted.
+    ///
+    /// As with `numberedAnswerScript`, nothing read off the terminal is in
+    /// the source: the tty, the label and the marked line are arguments 1,
+    /// 2 and 3. The marked line must appear exactly once. It is the line
+    /// that moves, so a second copy on screen (agent text drawn to look
+    /// like the selector) means the one being confirmed may not be the one
+    /// the keys will move, and nothing is pressed.
+    nonisolated static func navigationAnswerScript(key: String, presses: Int) -> String? {
+        guard presses >= 0, key == "UP" || key == "DOWN" else { return nil }
+        let arrow = key == "UP" ? "[A" : "[B"
+        let moves = (0..<presses)
+            .map { _ in "tell s to write text ((character id 27) & \"\(arrow)\") newline NO" }
+            .joined(separator: "\n                      delay 0.08\n                      ")
+        return """
+        on run argv
+          set wantedDevice to item 1 of argv
+          set wantedLabel to item 2 of argv
+          set wantedCursorLine to item 3 of argv
+          tell application "iTerm2"
+            repeat with w in windows
+              repeat with t in tabs of w
+                repeat with s in sessions of t
+                  if tty of s is wantedDevice then
+                    set screenText to (text of s)
+                    set AppleScript's text item delimiters to wantedCursorLine
+                    set cursorLineCount to (count of text items of screenText) - 1
+                    set AppleScript's text item delimiters to ""
+                    if screenText contains wantedLabel and cursorLineCount is 1 then
+                      \(moves.isEmpty ? "" : moves + "\n                      delay 0.08")
+                      tell s to write text ""
+                      return "SENT"
+                    else
+                      return "CHANGED"
+                    end if
+                  end if
+                end repeat
+              end repeat
+            end repeat
+            return "MISS"
+          end tell
+        end run
+        """
     }
 
     // MARK: - Is the user already looking at it
@@ -543,19 +583,19 @@ enum TerminalFocuser {
 
     /// Live inputs for shouldSkipBanner. Local sessions only: a remote
     /// session's terminal cannot be matched to a tab on this Mac.
-    nonisolated static func isSessionOnScreen(sessionID: UUID, projectPath: URL?) -> Bool {
+    nonisolated static func isSessionOnScreen(sessionID: UUID, tool: AgentTool, projectPath: URL?) -> Bool {
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
         let anyInput = CGEventType(rawValue: UInt32.max)!
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
         switch frontmost {
         case "com.googlecode.iterm2":
-            guard let tty = tty(forSession: sessionID, projectPath: projectPath) else { return false }
+            guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath) else { return false }
             return shouldSkipBanner(sessionTTY: tty, frontmostIsITerm: true,
                 visibleTTYs: visibleTTYs(), secondsSinceInput: idle, screenLocked: locked)
         case ghosttyBundleID:
             return shouldSkipBanner(
-                sessionTTY: tty(forSession: sessionID, projectPath: projectPath),
+                sessionTTY: tty(forSession: sessionID, tool: tool, projectPath: projectPath),
                 sessionDirectory: projectPath?.path, frontmostIsGhostty: true,
                 visible: ghosttyVisibleTerminals(), secondsSinceInput: idle, screenLocked: locked)
         default:
@@ -583,18 +623,70 @@ enum TerminalFocuser {
 
     // MARK: - Session -> tty
 
-    nonisolated static func tty(forSession id: UUID, projectPath: URL? = nil) -> String? {
-        let pid = claudePid(forSession: id)
-            ?? grokPid(forSession: id)
-            ?? codexPid(forSession: id)
-            ?? antigravityPid(forSession: id)
-            ?? kimiPid(projectPath: projectPath)
-        if let pid {
-            let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let name, !name.isEmpty, name != "??" { return name }
+    /// Where each tool's session-to-terminal facts come from. Live by
+    /// default; a test hands in its own so the scoping rules below can be
+    /// proved without a process or a terminal.
+    struct SessionLookups: Sendable {
+        var claudePid: @Sendable (UUID) -> Int?
+        var grokPid: @Sendable (UUID) -> Int?
+        var codexPid: @Sendable (UUID) -> Int?
+        var antigravityPid: @Sendable (UUID) -> Int?
+        /// Every live process of the tool (Kimi Code, BearCode or OpenCode)
+        /// whose cwd is the directory.
+        var directoryPids: @Sendable (AgentTool, String) -> [Int]
+        /// The controlling terminal's name ("ttys004"), or nil for none.
+        var tty: @Sendable (Int) -> String?
+
+        nonisolated static let live = SessionLookups(
+            claudePid: { TerminalFocuser.claudePid(forSession: $0) },
+            grokPid: { TerminalFocuser.grokPid(forSession: $0) },
+            codexPid: { TerminalFocuser.codexPid(forSession: $0) },
+            antigravityPid: { TerminalFocuser.antigravityPid(forSession: $0) },
+            directoryPids: { TerminalFocuser.directoryPids(tool: $0, cwd: $1) },
+            tty: { TerminalFocuser.ttyName(pid: $0) }
+        )
+    }
+
+    /// The terminal of the row's OWN process, found only by that tool's own
+    /// lookup, or nil.
+    ///
+    /// This used to try every tool's lookup in turn for every row and end
+    /// in a working-directory match for Kimi-family processes. A row whose
+    /// own lookup missed (its process had exited, or OpenCode, which then
+    /// had no lookup of its own) fell through to whatever Kimi process shared the
+    /// directory, and Approve, Deny and Reply typed into that session.
+    /// Every caller treats nil as "focus, never type", so a miss now stays
+    /// a miss.
+    ///
+    /// Kimi, BearCode and OpenCode have no session-to-pid registry, and their
+    /// processes are told apart only by working directory, which several
+    /// sessions can share. So the directory resolves to a terminal only
+    /// when every one of that tool's processes in it sits on the SAME tty
+    /// (one session, or a launcher and its child). Two terminals means two
+    /// sessions nothing here can tell apart, and the answer goes to neither.
+    nonisolated static func tty(
+        forSession id: UUID, tool: AgentTool, projectPath: URL?,
+        lookups: SessionLookups = .live
+    ) -> String? {
+        switch tool {
+        case .claudeCode:  return lookups.claudePid(id).flatMap(lookups.tty)
+        case .grokBuild:   return lookups.grokPid(id).flatMap(lookups.tty)
+        case .codex:       return lookups.codexPid(id).flatMap(lookups.tty)
+        case .antigravity: return lookups.antigravityPid(id).flatMap(lookups.tty)
+        case .kimiCode, .bearCode, .openCode:
+            // No session-to-process registry, so the directory, under the
+            // one-terminal rule above.
+            guard let path = projectPath?.path else { return nil }
+            let ttys = Set(lookups.directoryPids(tool, path).compactMap(lookups.tty))
+            return ttys.count == 1 ? ttys.first : nil
         }
-        return nil
+    }
+
+    private nonisolated static func ttyName(pid: Int) -> String? {
+        let name = run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let name, !name.isEmpty, name != "??" else { return nil }
+        return name
     }
 
     /// Antigravity publishes the cleanest session-to-pid map of any tool
@@ -608,33 +700,43 @@ enum TerminalFocuser {
             .value
     }
 
-    /// Kimi (and its BearCode fork) have no session-to-pid registry, but
-    /// their processes keep the session's workDir as cwd, so match on
-    /// that (newest process wins when two sessions share a directory).
-    private nonisolated static func kimiPid(projectPath: URL?) -> Int? {
-        guard let path = projectPath?.path else { return nil }
-        return ProcessLiveness.pid(processNames: KimiMonitor.processNames, cwd: path)
+    /// Kimi, its BearCode fork and OpenCode have no session-to-pid
+    /// registry, but their processes keep the session's directory as cwd.
+    /// Each tool's own names only: a BearCode row never resolves to a Kimi
+    /// process in the same directory, nor an OpenCode row to either.
+    private nonisolated static func directoryPids(tool: AgentTool, cwd: String) -> [Int] {
+        switch tool {
+        case .openCode:
+            return ProcessLiveness.pids(processNames: [OpenCodeMonitor.processName], cwd: cwd)
+        case .kimiCode:
+            return ProcessLiveness.pids(processNames: KimiMonitor.processNames, cwd: cwd)
+        case .bearCode:
             // BearCode from 0.34.0 renames itself via process.title, so the
-            // command-line match alone stopped resolving a pid here. With no
-            // pid there is no tty, the selector cannot be read, and Approve
-            // degraded to opening an empty terminal window.
-            ?? ProcessLiveness.pid(
-                processName: KimiMonitor.BearCode.processName,
-                orCommandPattern: KimiMonitor.BearCode.commandPattern,
-                cwd: path)
+            // command-line match alone stopped finding it; older builds run
+            // as node and only the command line does. Both are asked.
+            return ProcessLiveness.pids(processNames: [KimiMonitor.BearCode.processName], cwd: cwd)
+                + ProcessLiveness.pids(commandPattern: KimiMonitor.BearCode.commandPattern, cwd: cwd)
+        default:
+            return []
+        }
     }
 
+    /// The pid active_sessions.json names for the session, only while that
+    /// pid is still the Grok process that opened it (ProcessIdentity). An
+    /// entry outlives a crashed process, and its pid can go to anything.
     private nonisolated static func grokPid(forSession id: UUID) -> Int? {
         let active = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".grok/active_sessions.json")
-        guard let data = try? Data(contentsOf: active),
+        guard let data = BoundedRead.data(of: active),
               let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
         else { return nil }
         for entry in entries {
             guard let sessionId = entry["session_id"] as? String,
                   sessionId.lowercased() == id.uuidString.lowercased(),
                   let pid = entry["pid"] as? Int,
-                  kill(pid_t(pid), 0) == 0
+                  ProcessIdentity.isProcess(
+                    pid, names: ProcessIdentity.grokNames,
+                    recordedAt: GrokBuildMonitor.openedAt(entry))
             else { continue }
             return pid
         }
@@ -660,56 +762,57 @@ enum TerminalFocuser {
         return nil
     }
 
+    /// The session's live Claude Code pid, from the same records and the
+    /// same identity test as discovery.
     nonisolated static func claudePid(forSession id: UUID) -> Int? {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
-        let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
-        for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
-            let sessionsDir = entry.appendingPathComponent("sessions")
-            let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
-            for record in records where record.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: record),
-                      let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                      let sessionId = json["sessionId"] as? String,
-                      sessionId.lowercased() == id.uuidString.lowercased(),
-                      let pid = json["pid"] as? Int,
-                      kill(pid_t(pid), 0) == 0
-                else { continue }
-                return pid
-            }
-        }
-        return nil
+        claudePidsBySession()[id.uuidString.lowercased()]
     }
 
     /// sessionId to pid for every live Claude session record, read once.
     /// Discovery calls this instead of `claudePid(forSession:)` per
     /// session: same walk and re-parse cost, paid once per poll instead of
-    /// once per session per poll. `claudePid(forSession:)` stays for the
-    /// answer path (TerminalFocuser.tty), where a single lookup is fine.
+    /// once per session per poll.
     ///
-    /// `home` and `isAlive` come from discovery's context, so the same walk
+    /// `home` and `isLive` come from discovery's context, so the same walk
     /// can read a remote host's mirrored records against its process table.
+    /// `isLive` gets the pid and when the record says its session started,
+    /// and locally holds the pid to being that Claude process
+    /// (ProcessIdentity): a record outlives its process, and the pid in it
+    /// can belong to anything by the time it is read.
     nonisolated static func claudePidsBySession(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        isLive: (Int, Date?) -> Bool = {
+            ProcessIdentity.isProcess($0, names: ProcessIdentity.claudeNames, recordedAt: $1)
+        }
     ) -> [String: Int] {
         let fm = FileManager.default
         var result: [String: Int] = [:]
         let entries = (try? fm.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
         for entry in entries where entry.lastPathComponent.hasPrefix(".claude") {
             let sessionsDir = entry.appendingPathComponent("sessions")
-            let records = (try? fm.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
+            let records = (try? fm.contentsOfDirectory(
+                at: sessionsDir, includingPropertiesForKeys: [.creationDateKey])) ?? []
             for record in records where record.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: record),
+                guard let data = BoundedRead.data(of: record),
                       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       let sessionId = (json["sessionId"] as? String)?.lowercased(),
                       let pid = json["pid"] as? Int,
-                      isAlive(pid)
+                      isLive(pid, claudeRecordTime(json, file: record))
                 else { continue }
                 result[sessionId] = pid
             }
         }
         return result
+    }
+
+    /// When a Claude session record was written by its process: its own
+    /// startedAt (milliseconds since 1970), or the file's creation time for
+    /// a record without one. Either is after the process started.
+    nonisolated static func claudeRecordTime(_ json: [String: Any], file: URL) -> Date? {
+        if let millis = json["startedAt"] as? Double, millis > 0 {
+            return Date(timeIntervalSince1970: millis / 1000)
+        }
+        return (try? file.resourceValues(forKeys: [.creationDateKey]))?.creationDate
     }
 
     /// pid for every codex rollout file currently held open, in one sweep.
@@ -838,8 +941,10 @@ enum TerminalFocuser {
         return process.terminationStatus == 0
     }
 
-    private nonisolated static func runScript(_ script: String) -> String? {
-        run("/usr/bin/osascript", ["-e", script])?
+    /// `arguments` reach the script's `on run argv` handler as data, never
+    /// as source, which is how anything read off a terminal gets in.
+    private nonisolated static func runScript(_ script: String, arguments: [String] = []) -> String? {
+        run("/usr/bin/osascript", ["-e", script] + arguments)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

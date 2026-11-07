@@ -17,7 +17,7 @@ enum CodexSessionParser {
 
     static func parseDetails(tail: String, now: Date = .now) -> ParsedStatus? {
         if let pending = pendingRequest(tail: tail) {
-            return ParsedStatus(status: .waitingApproval(command: pending.command),
+            return ParsedStatus(status: .waitingApproval(command: pending.prompt),
                 cwd: nil, attentionEventID: "call:\(pending.id)")
         }
         for raw in tail.split(separator: "\n").reversed() {
@@ -79,11 +79,11 @@ enum CodexSessionParser {
     /// The command of the newest escalated call that has no output line
     /// yet, meaning its permission prompt is on screen. Answered calls end
     /// the search: everything older is settled.
-    static func pendingApproval(tail: String) -> String? {
-        pendingRequest(tail: tail)?.command
+    static func pendingApproval(tail: String) -> ApprovalPrompt? {
+        pendingRequest(tail: tail)?.prompt
     }
 
-    private static func pendingRequest(tail: String) -> (command: String, id: String)? {
+    private static func pendingRequest(tail: String) -> (prompt: ApprovalPrompt, id: String)? {
         var answered = Set<String>()
         var lines: [[String: Any]] = []
         for raw in tail.split(separator: "\n") {
@@ -99,40 +99,93 @@ enum CodexSessionParser {
                 lines.append(payload)
             }
         }
-        guard let latest = lines.last else { return nil }
-        let input = (latest["input"] as? String) ?? (latest["arguments"] as? String) ?? ""
-        guard let callId = latest["call_id"] as? String,
-              !answered.contains(callId),
-              input.contains("require_escalated") || input.contains("\"with_escalated_permissions\":true")
+        guard let latest = lines.last,
+              let callId = latest["call_id"] as? String,
+              !answered.contains(callId)
         else { return nil }
-        return (field("cmd", in: input) ?? field("justification", in: input) ?? "escalated command", callId)
+        let input = (latest["input"] as? String) ?? (latest["arguments"] as? String) ?? ""
+
+        // The call's arguments, read as data. A function_call's arguments
+        // are JSON. A custom_tool_call ("code mode") is a JavaScript
+        // program, and only the one shape whose single exec_command call
+        // takes a literal object is read: anywhere else the command that
+        // runs can differ from any literal in the source (a comment, an
+        // earlier call, a variable), so no literal is shown as if it were.
+        let arguments = latest["type"] as? String == "function_call"
+            ? StrictJSONObject.parse(in: input, from: input.startIndex)
+                .flatMap { parsed in
+                    input.unicodeScalars[parsed.end...].allSatisfy(\.properties.isWhitespace)
+                        ? parsed.object : nil
+                }
+            : codeModeArguments(input)
+        guard let arguments else {
+            // Unreadable, but it may still be a prompt. Say so rather than
+            // either inventing a command or hiding a prompt that is there.
+            guard mentionsEscalation(input) else { return nil }
+            return (.unreadable(
+                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal."),
+                callId)
+        }
+        guard isEscalated(arguments) else { return nil }
+        guard let command = command(in: arguments) else {
+            return (.unreadable(
+                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal."),
+                callId)
+        }
+        let workdir = (arguments["workdir"] as? String).map { "\nworkdir: \($0)" } ?? ""
+        return (ApprovalPrompt(command + workdir), callId)
     }
 
-    /// Pulls a string field out of the call input, which is JS source for
-    /// custom_tool_call ("code mode") and plain JSON for function_call.
-    private static func field(_ name: String, in input: String) -> String? {
-        guard let range = input.range(of: "\"\(name)\":\"") else { return nil }
-        var value = ""
-        var escaped = false
-        for character in input[range.upperBound...] {
-            if escaped {
-                switch character {
-                case "n": value.append(" ")
-                case "t": value.append(" ")
-                default: value.append(character)
-                }
-                escaped = false
-            } else if character == "\\" {
-                escaped = true
-            } else if character == "\"" {
-                break
-            } else {
-                value.append(character)
-            }
+    private static func mentionsEscalation(_ input: String) -> Bool {
+        input.contains("require_escalated") || input.contains("with_escalated_permissions")
+    }
+
+    private static func isEscalated(_ arguments: [String: Any]) -> Bool {
+        arguments["sandbox_permissions"] as? String == "require_escalated"
+            || arguments["with_escalated_permissions"] as? Bool == true
+    }
+
+    /// The command the call runs: exec_command's `cmd`, or the legacy
+    /// shell tool's argv, whose `bash -lc <script>` form is shown as the
+    /// script itself.
+    private static func command(in arguments: [String: Any]) -> String? {
+        if let cmd = arguments["cmd"] as? String { return cmd }
+        guard let argv = arguments["command"] as? [String], !argv.isEmpty else { return nil }
+        let shells: Set<String> = ["bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh"]
+        if argv.count == 3, shells.contains(argv[0]), ["-lc", "-c"].contains(argv[1]) {
+            return argv[2]
         }
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return nil }
-        return trimmed.count <= 90 ? trimmed : String(trimmed.prefix(90)) + "…"
+        return argv.map(displayQuoted).joined(separator: " ")
+    }
+
+    /// A word as a shell would need it written. Quoted by scalar through
+    /// the shared `shellQuoted`: a quote fused with a combining mark is a
+    /// Character that is not "'", so a Character replace left it bare, and
+    /// the row then showed one argument as a quote, a `;` and a command.
+    private static func displayQuoted(_ word: String) -> String {
+        let plain = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:,+@%")
+        if !word.isEmpty, word.unicodeScalars.allSatisfy(plain.contains) { return word }
+        return shellQuoted(word)
+    }
+
+    /// The arguments of a code-mode program that is exactly
+    ///
+    ///     [const|let|var <name> =] await tools.exec_command({ ...JSON... });
+    ///     text(<name>.output);
+    ///
+    /// with nothing else in it, or nil. Any other program, including one
+    /// with a comment, a second call or a computed argument, is not read.
+    static func codeModeArguments(_ program: String) -> [String: Any]? {
+        let identifier = "[A-Za-z_$][A-Za-z0-9_$]*"
+        let head = "^\\s*(?:(?:const|let|var)\\s+\(identifier)\\s*=\\s*)?await\\s+tools\\.exec_command\\(\\s*"
+        guard let headRange = program.range(of: head, options: .regularExpression),
+              let parsed = StrictJSONObject.parse(in: program, from: headRange.upperBound)
+        else { return nil }
+        let tail = "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"
+        let rest = String(program.unicodeScalars[parsed.end...])
+        guard rest.range(of: tail, options: .regularExpression) != nil else { return nil }
+        return parsed.object
     }
 
     /// The first line of a rollout file is session_meta with cwd and id.

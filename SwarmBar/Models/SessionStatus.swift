@@ -3,7 +3,7 @@ import SwiftUI
 enum SessionStatus: Equatable, Sendable {
     case working(activity: String)
     case runningTool(activity: String)
-    case waitingApproval(command: String)
+    case waitingApproval(command: ApprovalPrompt)
     case waitingInput(prompt: String)
     case idle
     case done(summary: String)

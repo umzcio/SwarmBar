@@ -455,6 +455,83 @@ struct RemoteMirrorTests {
         #expect(!exists(target))
     }
 
+    // A Swift String splits by grapheme cluster, and a combining mark (Extend,
+    // ZWJ, SpacingMark) after a slash or a Prepend character before one fuses
+    // with it, so a grapheme split sees "A\u{0600}/.." as one component while
+    // the kernel, splitting on the byte, sees "A\u{0600}" and "..".
+    static let fusedSlashPaths = [
+        "/../\u{0301}x",                   // Extend after the slash
+        "/A\u{0600}/../../\u{0301}B",      // Prepend before, Extend after
+        "/../\u{200D}x",                   // ZWJ
+        "/../\u{0903}x",                   // SpacingMark
+        "/A\u{0600}/../x",                 // Prepend alone
+        "/home/u\u{0600}/./x",             // a single dot, fused the same way
+        "/home/./\u{0301}x",
+    ]
+
+    @Test("a dot component fused to a slash by a combining mark is still rejected",
+          arguments: fusedSlashPaths)
+    func fusedDotComponentIsRejected(_ path: String) {
+        #expect(makeMirror().local(path) == nil)
+    }
+
+    @Test("a path climbing out through slashes fused with combining marks writes nothing outside")
+    func fusedSlashCannotEscape() throws {
+        // The mirror root sits two levels inside a directory this test owns,
+        // so an escape of up to two levels lands somewhere it can look.
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mirror-escape-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let mirror = RemoteMirror(root: sandbox.appendingPathComponent("a/root", isDirectory: true))
+        try FileManager.default.createDirectory(at: mirror.root, withIntermediateDirectories: true)
+
+        try mirror.apply(snapshot(
+            homes: ["/home/u", "/../\u{0301}h"],
+            files: [
+                file("/../\u{0301}evil", size: 2, chunks: [(0, "{}")]),
+                file("/A\u{0600}/../../\u{0301}B", size: 2, chunks: [(0, "{}")]),
+                file("/A\u{0600}/../../\u{200D}C", size: 2, chunks: [(0, "{}")]),
+            ],
+            dirs: [
+                RemoteDirRecord(path: "/A\u{0600}", mtime: 0, created: nil),
+                RemoteDirRecord(path: "/../\u{0301}d", mtime: 0, created: nil),
+            ]))
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: sandbox.path) == ["a"])
+        #expect(try FileManager.default.contentsOfDirectory(
+            atPath: sandbox.appendingPathComponent("a").path) == ["root"])
+    }
+
+    @Test("a component opening with a combining mark still has an ancestor symlink cleared")
+    func combiningMarkAfterSlashStillClearsLinks() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mirror-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        try FileManager.default.createDirectory(at: mirror.root, withIntermediateDirectories: true)
+        let link = try #require(mirror.local("/\u{0301}h"))
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let path = "/\u{0301}h/u/x.json"
+        try mirror.apply(snapshot(homes: ["/\u{0301}h/u"], files: [file(path, size: 2, chunks: [(0, "{}")])]))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+        #expect(try bytes(try #require(mirror.local(path))) == Data("{}".utf8))
+    }
+
+    @Test("a file under a component opening with a combining mark survives the next sweep")
+    func combiningMarkAncestorIsKept() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/\u{0301}h/u/x.json"
+        let homes = ["/\u{0301}h"]
+        try mirror.apply(snapshot(homes: homes, files: [file(path, size: 2, chunks: [(0, "{}")])]))
+        try mirror.apply(snapshot(homes: homes, files: [file(path, size: 2, reset: false, chunks: [])]))
+        #expect(try bytes(try #require(mirror.local(path))) == Data("{}".utf8))
+    }
+
     @Test("the cache root lives under the app's Caches directory, one per host")
     func rootForHost() {
         let id = UUID()
@@ -514,6 +591,36 @@ struct RemoteMirrorTests {
         try whole.write(to: reference)
         defer { try? FileManager.default.removeItem(at: reference) }
         #expect(ClaudeCodeMonitor.tail(of: local) == ClaudeCodeMonitor.tail(of: reference))
+    }
+
+    @Test("a record over the per-file ceiling is an omission, and no file of that size is made")
+    func oversizedRecordIsOmitted() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let huge = "/home/u/.kimi-code/session_index.jsonl"
+        let farChunk = "/home/u/.grok/active_sessions.json"
+        let warnings = try mirror.apply(snapshot(files: [
+            file(huge, size: RemoteMirror.maxFileBytes + 1, chunks: [(0, "{}")]),
+            file(farChunk, size: 2, chunks: [(RemoteMirror.maxFileBytes - 1, "{}"), (0, "[]")]),
+        ]))
+        #expect(!exists(try #require(mirror.local(huge))))
+        // The chunk past the ceiling is skipped and never extends the file,
+        // while the rest of the record still lands.
+        #expect(try bytes(try #require(mirror.local(farChunk))) == Data("[]".utf8))
+        #expect(warnings.count == 2)
+    }
+
+    @Test("an oversized record keeps what the mirror already held for that path")
+    func oversizedRecordKeepsEarlierBytes() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.kimi-code/session_index.jsonl"
+        try mirror.apply(snapshot(files: [file(path, size: 3, chunks: [(0, "{}\n")])]))
+        try mirror.apply(snapshot(files: [
+            file(path, size: RemoteMirror.maxFileBytes + 1, reset: false, chunks: [])
+        ]))
+        let local = try #require(mirror.local(path))
+        #expect(try bytes(local) == Data("{}\n".utf8))
     }
 
     @Test("a file shipped whole is never trimmed, since a cut database is a corrupt one")

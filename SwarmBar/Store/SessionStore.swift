@@ -260,6 +260,18 @@ final class SessionStore {
         }
         let incomingIds = Set(incoming.map(\.id))
         for session in incoming { upsert(session) }
+        if host == nil, Self.provesProcessPerSession.contains(tool) {
+            // A pinned prompt for a tool answered at its terminal cannot
+            // outlive the process: nothing holds it, and the row would keep
+            // offering Approve and Deny for a terminal that is gone (or, by
+            // pid reuse, someone else's). These tools prove liveness per
+            // session, so a row this poll found dead lets its pin go.
+            for session in incoming where !session.processAlive {
+                if hookOverrides[session.id]?.sticky == true {
+                    hookOverrides.removeValue(forKey: session.id)
+                }
+            }
+        }
         sessions.removeAll {
             $0.tool == tool && $0.host == host
                 && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
@@ -286,9 +298,64 @@ final class SessionStore {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
+        holdAnsweredPrompts()
         pruneSessionRecords()
         reapplyHookOverrides()
         pruneAlertRecords()
+    }
+
+    /// Prompts answered by keystrokes, by row, with the request id they
+    /// answered. Codex records nothing until the approved command has run,
+    /// so its rollout keeps describing the same prompt for as long as the
+    /// command takes, and the row would offer Approve again under the same
+    /// text: a second "y" lands on whatever is on screen by then.
+    @ObservationIgnored private var answeredPrompts: [UUID: (eventID: String, allow: Bool)] = [:]
+
+    /// Keys answering a prompt reached its terminal. Until the session's
+    /// own state moves past that prompt, the row says what was sent.
+    ///
+    /// It does not say the command is running. The keys reaching the
+    /// terminal is iTerm2 or tmux writing a byte, not Codex accepting it:
+    /// a "y" that landed before the prompt was drawn, or in the composer,
+    /// leaves Codex waiting. So the row stays in Needs you, as the rollout
+    /// says it should (an approved long-running command keeps its row
+    /// orange until its output line lands), with no second Approve, and
+    /// points at the terminal in case Codex is still asking.
+    func noteKeysAnswered(_ sessionID: UUID, allow: Bool) {
+        guard let session = sessions.first(where: { $0.id == sessionID }),
+              case .waitingApproval = session.status,
+              let eventID = session.attentionEventID
+        else { return }
+        answeredPrompts[sessionID] = (eventID, allow)
+        noteKeysSent(sessionID, allow: allow)
+    }
+
+    /// What a row whose answer went out by keystroke says until the
+    /// session moves past the prompt.
+    nonisolated static func keysSentReason(allow: Bool) -> String {
+        allow
+            ? "Approve was sent to the terminal. Codex shows this request until the command finishes. If it is still asking, answer it in the terminal."
+            : "Deny was sent to the terminal. If Codex is still asking, answer it in the terminal."
+    }
+
+    private func noteKeysSent(_ id: UUID, allow: Bool) {
+        update(id: id) {
+            $0.status = .waitingApproval(command: .unreadable(Self.keysSentReason(allow: allow)))
+        }
+    }
+
+    private func holdAnsweredPrompts() {
+        for (id, answered) in answeredPrompts {
+            guard let session = sessions.first(where: { $0.id == id }),
+                  case .waitingApproval = session.status,
+                  session.attentionEventID == answered.eventID
+            else {
+                // The prompt settled, or a different one is asking.
+                answeredPrompts.removeValue(forKey: id)
+                continue
+            }
+            noteKeysSent(id, allow: answered.allow)
+        }
     }
 
     /// Forgets bookkeeping for sessions the store no longer holds, so a
@@ -322,6 +389,14 @@ final class SessionStore {
     // MARK: - Hook events
 
     static let hookGrace: TimeInterval = 15
+
+    /// Local tools whose discovery proves a process for each session (a
+    /// pid record held to its identity, a rollout or lock file held open),
+    /// and whose prompts nothing holds. Not Claude Code or OpenCode, whose
+    /// prompts are held decisions; not the Kimi family, whose liveness is a
+    /// count per directory and can read one live session of several as
+    /// dead.
+    static let provesProcessPerSession: Set<AgentTool> = [.grokBuild, .codex, .antigravity]
 
     struct HookOverride {
         var status: SessionStatus
@@ -588,6 +663,13 @@ final class SessionStore {
     // when nothing can be answered remotely. Session state is never written.
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
+        // A request the row could not show whole is never approved from
+        // it, whatever the caller: the row offers the terminal instead,
+        // and this is the backstop for any path that forgets.
+        guard command.offersApprove else {
+            if session.host == nil, session.projectPath != nil { openInTerminal(session) }
+            return
+        }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
             noteAnswered(session.id, command: command, allow: true)
             return
@@ -601,7 +683,7 @@ final class SessionStore {
         }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: true, in: environment(for: session)),
-            for: session,
+            for: session, allow: true,
             choose: TuiPromptLayout.approveOnceOption(in:),
             mockStatus: .runningTool(activity: running(command))
         )
@@ -619,7 +701,7 @@ final class SessionStore {
         }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: false, in: environment(for: session)),
-            for: session,
+            for: session, allow: false,
             choose: TuiPromptLayout.rejectOption(in:),
             mockStatus: .working(activity: "Rethinking approach without that command…")
         )
@@ -638,6 +720,7 @@ final class SessionStore {
     private func follow(
         _ route: ApprovalRoute,
         for session: AgentSession,
+        allow: Bool,
         choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?,
         mockStatus: SessionStatus
     ) {
@@ -646,7 +729,7 @@ final class SessionStore {
             return
         }
         switch route {
-        case .keys(let keys):       answerTuiPrompt(session, keys: keys)
+        case .keys(let keys):       answerTuiPrompt(session, keys: keys, allow: allow)
         case .numberedSelector:     answerNumberedPrompt(session, choose: choose)
         case .navigateSelector:     answerByNavigation(session, choose: choose)
         case .focusTerminal:        openInTerminal(session)
@@ -656,7 +739,7 @@ final class SessionStore {
 
     /// The row after an answer was delivered, by a held reply or by keys
     /// a helper confirmed it pressed.
-    private func noteAnswered(_ id: UUID, command: String, allow: Bool) {
+    private func noteAnswered(_ id: UUID, command: ApprovalPrompt, allow: Bool) {
         update(id: id) {
             $0.status = allow
                 ? .runningTool(activity: running(command))
@@ -674,11 +757,17 @@ final class SessionStore {
               case .waitingApproval(let command) = current.status,
               command == answered
         else { return }
-        noteAnswered(session.id, command: command, allow: allow)
+        if session.tool == .codex {
+            // Codex's prompt stays in its rollout until the command has
+            // run, here as on this Mac.
+            noteKeysAnswered(session.id, allow: allow)
+        } else {
+            noteAnswered(session.id, command: command, allow: allow)
+        }
     }
 
-    private func running(_ command: String) -> String {
-        "Running \(command.split(separator: " ").first.map(String.init) ?? command)"
+    private func running(_ command: ApprovalPrompt) -> String {
+        "Running \(ApprovalPreviewText.firstWord(command))"
     }
 
     /// Reads the session's terminal, picks the option matching the intent,
@@ -704,20 +793,21 @@ final class SessionStore {
     ) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
                   let option = choose(screen)
             else {
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                 return
             }
             let outcome = TerminalFocuser.answerNumbered(
-                sessionID: id, projectPath: path,
+                sessionID: id, tool: tool, projectPath: path,
                 number: option.number, expectedLabel: option.label)
             if outcome != .sent {
                 // The prompt moved or the terminal is gone. Never press a
                 // digit into an unverified selector; bring the user to it.
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
             }
         }
     }
@@ -738,9 +828,10 @@ final class SessionStore {
     ) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            func giveUp() { TerminalFocuser.focus(sessionID: id, projectPath: path) }
-            guard let screen = TerminalFocuser.screenText(sessionID: id, projectPath: path),
+            func giveUp() { TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path) }
+            guard let screen = TerminalFocuser.screenText(sessionID: id, tool: tool, projectPath: path),
                   let option = choose(screen)
             else { giveUp(); return }
             let selector = TuiPromptLayout.selector(in: screen)
@@ -750,19 +841,22 @@ final class SessionStore {
             else { giveUp(); return }
 
             let outcome = TerminalFocuser.answerByNavigation(
-                sessionID: id, projectPath: path,
+                sessionID: id, tool: tool, projectPath: path,
                 key: move.key, presses: move.presses,
                 expectedCursorLine: cursorLine, expectedLabel: option.label)
             if outcome != .sent { giveUp() }
         }
     }
 
-    private func answerTuiPrompt(_ session: AgentSession, keys: [String]) {
+    private func answerTuiPrompt(_ session: AgentSession, keys: [String], allow: Bool) {
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            if !TerminalFocuser.sendKeys(sessionID: id, projectPath: path, keys: keys) {
-                TerminalFocuser.focus(sessionID: id, projectPath: path)
+            if TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys) {
+                await MainActor.run { self.noteKeysAnswered(id, allow: allow) }
+            } else {
+                TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
             }
         }
     }
@@ -798,6 +892,10 @@ final class SessionStore {
         text: String,
         completion: @escaping @MainActor (ReplyResult) -> Void
     ) {
+        // Controls the composer cannot show (ESC above all) never reach a
+        // terminal, here or on a host, and a reply that was nothing else is
+        // empty.
+        let text = RemoteAnswerPlan.pasteText(text)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             completion(.failed("Nothing to send.")); return
@@ -827,16 +925,17 @@ final class SessionStore {
 
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
             let outcome = TerminalFocuser.sendReply(
-                sessionID: id, projectPath: path, text: text)
+                sessionID: id, tool: tool, projectPath: path, text: text)
             await MainActor.run {
                 switch outcome {
                 case .sent:
                     self.noteReplySent(id)
                     completion(.sent)
                 case .pasteNotVisible:
-                    TerminalFocuser.focus(sessionID: id, projectPath: path)
+                    TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                     completion(.failed(
                         "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
                 case .noTerminal:
@@ -884,8 +983,9 @@ final class SessionStore {
         }
         let id = session.id
         let path = session.projectPath
+        let tool = session.tool
         Task.detached {
-            TerminalFocuser.focus(sessionID: id, projectPath: path)
+            TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
         }
     }
 

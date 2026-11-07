@@ -376,6 +376,50 @@ struct BridgeScriptRefreshTests {
         #expect(IntegrationManager.refreshedScript(installed: nil, bundled: "new") == nil)
     }
 
+    private func tempDir() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("script-refresh-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func mode(_ url: URL) throws -> Int {
+        try #require(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int)
+    }
+
+    /// A plugin linked into a checkout stays a link, and what it points to
+    /// is not written: the atomic write used to swap the link for a copy.
+    @Test func aLinkedScriptIsLeftAlone() throws {
+        let dir = try tempDir()
+        let target = dir.appendingPathComponent("checkout.js")
+        try "old".write(to: target, atomically: true, encoding: .utf8)
+        let link = dir.appendingPathComponent("swarmbar.js")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        #expect(IntegrationManager.refreshScript(at: link, bundled: "new") == .leftLinked)
+        let type = try FileManager.default.attributesOfItem(atPath: link.path)[.type] as? FileAttributeType
+        #expect(type == .typeSymbolicLink)
+        #expect(try String(contentsOf: target, encoding: .utf8) == "old")
+    }
+
+    /// The file keeps its mode: the plugin is not a program and was
+    /// installed 0644, while the bridge scripts were installed 0755.
+    @Test func aRefreshedScriptKeepsItsMode() throws {
+        let dir = try tempDir()
+        for wanted in [0o644, 0o755] {
+            let file = dir.appendingPathComponent("script-\(wanted)")
+            try "old".write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: wanted], ofItemAtPath: file.path)
+            #expect(IntegrationManager.refreshScript(at: file, bundled: "new") == .refreshed)
+            #expect(try String(contentsOf: file, encoding: .utf8) == "new")
+            #expect(try mode(file) == wanted)
+            #expect(IntegrationManager.refreshScript(at: file, bundled: "new") == .current)
+        }
+        let missing = dir.appendingPathComponent("missing")
+        #expect(IntegrationManager.refreshScript(at: missing, bundled: "new") == .absent)
+        #expect(!FileManager.default.fileExists(atPath: missing.path))
+    }
+
     /// The Kimi family never needs SwarmBar's reply: every event is
     /// fire-and-forget and approvals go through the terminal.
     @Test func theKimiBridgePrintsNothing() throws {
@@ -383,5 +427,35 @@ struct BridgeScriptRefreshTests {
         let script = try String(contentsOf: url, encoding: .utf8)
         let curl = try #require(script.components(separatedBy: "curl ").last)
         #expect(curl.contains(">/dev/null") || curl.contains("> /dev/null"))
+    }
+}
+
+
+struct ShellQuotingTests {
+    /// Every U+0027 becomes '\'' whatever scalars sit beside it.
+    @Test func everyQuoteIsEscapedWhateverSitsBesideIt() {
+        for input in ["e'\u{0301}; id;#", "\u{0600}'; id", "'\u{200D}; id", "a'b", "''", "plain"] {
+            var expected: [Unicode.Scalar] = ["'"]
+            for scalar in input.unicodeScalars {
+                expected += scalar == "'" ? ["'", "\\", "'", "'"] : [scalar]
+            }
+            expected.append("'")
+            #expect(Array(shellQuoted(input).unicodeScalars) == expected, "\(input)")
+        }
+    }
+
+    /// The shell reads the quoted text back as exactly one word, the input.
+    @Test func shellReadsItBackAsOneWord() throws {
+        for input in ["e'\u{0301}; id;#", "\u{0600}'x", "'\u{200D}x", "a b'c\"d$e`f`\\g"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", "set -- \(shellQuoted(input)); printf '%s|%s' \"$#\" \"$1\""]
+            let out = Pipe()
+            process.standardOutput = out
+            try process.run()
+            process.waitUntilExit()
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            #expect(text == "1|" + input, "\(input)")
+        }
     }
 }

@@ -63,7 +63,7 @@ struct MockSessionMonitor: SessionMonitor {
                          status: .done(summary: "Merged PR #42 · 12 files"),
                          startedAt: .now.addingTimeInterval(-41 * 60)),
             AgentSession(tool: .claudeCode, projectName: "aif-scanner",
-                         status: .waitingApproval(command: Self.approvalCommands[0]),
+                         status: .waitingApproval(command: ApprovalPrompt(Self.approvalCommands[0])),
                          startedAt: .now.addingTimeInterval(-5 * 60)),
             AgentSession(tool: .openCode, projectName: "range-notes",
                          status: .working(activity: Self.workActivities[5]),
@@ -87,7 +87,7 @@ struct MockSessionMonitor: SessionMonitor {
                 }
             } else if roll < 0.45 {
                 store.update(id: session.id) {
-                    $0.status = .waitingApproval(command: Self.approvalCommands.randomElement()!)
+                    $0.status = .waitingApproval(command: ApprovalPrompt(Self.approvalCommands.randomElement()!))
                 }
             } else if roll < 0.52 {
                 store.update(id: session.id) {

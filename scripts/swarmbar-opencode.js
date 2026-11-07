@@ -1,3 +1,4 @@
+// swarmbar-bridge-v3
 // SwarmBar bridge for OpenCode. Install by copying to
 // ~/.config/opencode/plugins/swarmbar.js and declaring it in
 // ~/.config/opencode/opencode.jsonc:
@@ -13,25 +14,67 @@
 // resolves empty and nothing happens. permission.replied is forwarded so
 // SwarmBar clears its approval row no matter where the prompt was
 // answered.
-import { readFileSync } from "node:fs"
+//
+// It talks only to SwarmBar's own Unix socket, in a folder only this user
+// can enter, never to a network port: whatever held a port while SwarmBar
+// was not running would receive every prompt and could answer allow. No
+// token is sent; reaching the socket at all proves the caller is this
+// user. Anything other than this user's socket sends nothing, and the TUI
+// prompt stands alone.
+import { request } from "node:http"
+import { lstatSync } from "node:fs"
 import { homedir } from "node:os"
 
-const SWARMBAR = "http://127.0.0.1:48620"
+const DIR = `${homedir()}/Library/Application Support/SwarmBar/run`
+const SOCKET = `${DIR}/hook.sock`
 
-// Read once at plugin load. Fails open: if the file cannot be read (not
-// yet minted, permissions, different home directory), the token is just
-// empty and the request still goes out; the server decides from there.
-function loadToken() {
+// The socket and its folder must be this user's own, and not links.
+function ownSocket() {
   try {
-    return readFileSync(
-      `${homedir()}/Library/Application Support/SwarmBar/hook-token`,
-      "utf8"
-    ).trim()
+    const uid = process.getuid()
+    const dir = lstatSync(DIR)
+    const sock = lstatSync(SOCKET)
+    return dir.isDirectory() && dir.uid === uid && sock.isSocket() && sock.uid === uid
   } catch {
-    return ""
+    return false
   }
 }
-const TOKEN = loadToken()
+
+// Posts a JSON body and resolves with the parsed answer, or null for any
+// failure: no socket, a timeout, a body that is not JSON.
+function post(path, payload, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!ownSocket()) return resolve(null)
+    const data = JSON.stringify(payload)
+    const req = request(
+      {
+        socketPath: SOCKET,
+        path,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(data),
+        },
+      },
+      (res) => {
+        const chunks = []
+        res.on("data", (chunk) => chunks.push(chunk))
+        res.on("end", () => {
+          if (res.statusCode !== 200) return resolve(null)
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+          } catch {
+            resolve(null)
+          }
+        })
+        res.on("error", () => resolve(null))
+      }
+    )
+    req.setTimeout(timeoutMs, () => req.destroy())
+    req.on("error", () => resolve(null))
+    req.end(data)
+  })
+}
 
 export const SwarmBarPlugin = async ({ client, directory }) => {
   return {
@@ -40,11 +83,7 @@ export const SwarmBarPlugin = async ({ client, directory }) => {
         relay(client, event.properties ?? {}, directory)
       }
       if (event.type === "permission.replied") {
-        fetch(`${SWARMBAR}/hook/OpenCodeReplied`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-SwarmBar-Token": TOKEN },
-          body: JSON.stringify(event.properties ?? {}),
-        }).catch(() => {})
+        post("/hook/OpenCodeReplied", event.properties ?? {}, 5_000)
       }
     },
   }
@@ -52,14 +91,8 @@ export const SwarmBarPlugin = async ({ client, directory }) => {
 
 async function relay(client, input, directory) {
   try {
-    const res = await fetch(`${SWARMBAR}/hook/OpenCodePermission`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "X-SwarmBar-Token": TOKEN },
-      body: JSON.stringify({ ...input, directory }),
-      signal: AbortSignal.timeout(350_000),
-    })
-    if (!res.ok) return
-    const body = await res.json().catch(() => null)
+    const body = await post(
+      "/hook/OpenCodePermission", { ...input, directory }, 350_000)
     const decision = body && body.decision
     if (decision !== "allow" && decision !== "deny") return
     await client.postSessionIdPermissionsPermissionId({

@@ -44,6 +44,155 @@ struct KeyScriptTests {
     }
 }
 
+/// The read-and-press scripts. The label and the marked line come off the
+/// terminal, which means the agent wrote them, so they reach osascript as
+/// arguments and are never part of the script's source.
+@MainActor
+struct AnswerScriptTests {
+    @Test func theDigitScriptTakesTheTtyAndLabelAsArguments() {
+        let script = TerminalFocuser.numberedAnswerScript(number: 3)
+        #expect(script.hasPrefix("on run argv"))
+        #expect(script.contains("set wantedDevice to item 1 of argv"))
+        #expect(script.contains("set wantedLabel to item 2 of argv"))
+        #expect(script.contains("if screenText contains wantedLabel then"))
+        #expect(script.contains("write text \"3\" newline NO"))
+        // No literal is compared against the screen: the only quoted
+        // strings are the digit, the app name and the fixed replies.
+        let literals = script.components(separatedBy: "\"").enumerated()
+            .filter { $0.offset % 2 == 1 }.map(\.element)
+        #expect(Set(literals) == ["iTerm2", "3", "SENT", "CHANGED", "MISS"])
+    }
+
+    @Test func theWalkScriptTakesTheTtyLabelAndMarkedLineAsArguments() throws {
+        let script = try #require(TerminalFocuser.navigationAnswerScript(key: "DOWN", presses: 2))
+        #expect(script.hasPrefix("on run argv"))
+        #expect(script.contains("set wantedCursorLine to item 3 of argv"))
+        #expect(script.components(separatedBy: "\"[B\"").count - 1 == 2)
+        #expect(!script.contains("[A"))
+        let literals = script.components(separatedBy: "\"").enumerated()
+            .filter { $0.offset % 2 == 1 }.map(\.element)
+        #expect(Set(literals) == ["iTerm2", "[B", "", "SENT", "CHANGED", "MISS"])
+    }
+
+    /// The marked line is the thing that moves, so a second copy of it on
+    /// screen means the confirmation could be reading the wrong one.
+    @Test func theWalkScriptRequiresTheMarkedLineExactlyOnce() throws {
+        let script = try #require(TerminalFocuser.navigationAnswerScript(key: "UP", presses: 0))
+        #expect(script.contains("set AppleScript's text item delimiters to wantedCursorLine"))
+        #expect(script.contains("if screenText contains wantedLabel and cursorLineCount is 1 then"))
+        #expect(!script.contains("[A"))
+    }
+
+    @Test func theWalkScriptRefusesAMoveItWillNotMake() {
+        #expect(TerminalFocuser.navigationAnswerScript(key: "LEFT", presses: 1) == nil)
+        #expect(TerminalFocuser.navigationAnswerScript(key: "DOWN", presses: -1) == nil)
+    }
+}
+
+/// Which terminal a row's keys, paste and focus go to. Only the row's own
+/// tool's lookup may answer, and a directory shared by several Kimi-family
+/// sessions answers for none of them.
+@MainActor
+struct SessionTTYScopeTests {
+    private let id = UUID()
+    private let dir = URL(fileURLWithPath: "/tmp/example-proj")
+
+    /// A Kimi session at a prompt in the row's directory, on ttys009, and
+    /// every other lookup as given.
+    private func lookups(
+        own: Int? = nil,
+        kimi: [Int] = [900],
+        bear: [Int] = [],
+        open: [Int] = [],
+        ttys: [Int: String] = [900: "ttys009", 901: "ttys010", 902: "ttys009", 100: "ttys001"]
+    ) -> TerminalFocuser.SessionLookups {
+        TerminalFocuser.SessionLookups(
+            claudePid: { _ in own }, grokPid: { _ in own },
+            codexPid: { _ in own }, antigravityPid: { _ in own },
+            directoryPids: { tool, path in
+                guard path == "/tmp/example-proj" else { return [] }
+                switch tool {
+                case .kimiCode: return kimi
+                case .bearCode: return bear
+                case .openCode: return open
+                default: return []
+                }
+            },
+            tty: { ttys[$0] })
+    }
+
+    @Test func aRowWhoseOwnLookupMissesNeverReachesAKimiInItsDirectory() {
+        for tool in [AgentTool.grokBuild, .codex, .antigravity, .claudeCode, .openCode] {
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, lookups: lookups()) == nil,
+                "\(tool)")
+        }
+    }
+
+    @Test func aRowsOwnProcessIsItsTerminal() {
+        for tool in [AgentTool.grokBuild, .codex, .antigravity, .claudeCode] {
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, lookups: lookups(own: 100)) == "ttys001")
+        }
+        // OpenCode has no session-to-pid lookup, so another tool's pid is
+        // never its.
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir, lookups: lookups(own: 100)) == nil)
+    }
+
+    /// OpenCode is found the way the Kimi family is, by its own processes
+    /// in the row's directory, and only while they share one terminal.
+    @Test func anOpenCodeRowResolvesOnlyToItsOwnProcessesInItsDirectory() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [901])) == "ttys010")
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [900], open: [])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .openCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [900, 901])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir,
+            lookups: lookups(kimi: [], open: [901])) == nil)
+    }
+
+    @Test func aKimiRowAloneInItsDirectoryResolves() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups()) == "ttys009")
+    }
+
+    /// Two sessions in one directory, at two terminals: nothing says which
+    /// is this row's, so neither gets the keys.
+    @Test func twoKimiSessionsInOneDirectoryResolveToNeither() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [900, 901])) == nil)
+    }
+
+    /// A launcher and its child share one terminal, which is unambiguous.
+    @Test func twoKimiProcessesOnOneTerminalResolve() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [900, 902])) == "ttys009")
+    }
+
+    /// A BearCode row never resolves to a Kimi process, or the reverse.
+    @Test func theKimiFamilyStaysWithinEachTool() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .bearCode, projectPath: dir, lookups: lookups()) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: lookups(kimi: [], bear: [901])) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .bearCode, projectPath: dir, lookups: lookups(kimi: [], bear: [901])) == "ttys010")
+    }
+
+    @Test func noDirectoryOrNoTerminalIsNoAnswer() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: nil, lookups: lookups()) == nil)
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .grokBuild, projectPath: dir, lookups: lookups(own: 555)) == nil)
+    }
+}
+
 /// The per-tool answer table. Every entry was settled by a live round, and
 /// a wrong one does not fail loudly: it presses a key into a terminal.
 /// While this lived as a run of branches inside SessionStore it could only
@@ -184,7 +333,7 @@ struct ApprovalDispatchTests {
         AgentSession(
             tool: tool, projectName: "proj",
             projectPath: URL(fileURLWithPath: "/tmp"),
-            status: .waitingApproval(command: command))
+            status: .waitingApproval(command: ApprovalPrompt(command)))
     }
 
     @Test func approveUsesTheResponderWhenOneIsPending() {

@@ -35,7 +35,10 @@ struct GrokBuildMonitor: SessionMonitor {
     nonisolated static func discover(now: Date, context: DiscoveryContext) -> [AgentSession] {
         discover(
             root: defaultRoot(home: context.home), now: now,
-            isAlive: { context.processes.isAlive($0) })
+            isLive: {
+                context.processes.isAgent($0, names: ProcessIdentity.grokNames, recordedAt: $1)
+            },
+            isNamed: { context.processes.isNamedAgent($0, names: ProcessIdentity.grokNames) })
     }
 
     /// The session ids that are subagents of another session in the same
@@ -61,11 +64,21 @@ struct GrokBuildMonitor: SessionMonitor {
         return ids
     }
 
+    /// `isLive` gets an entry's pid and its opened_at, and by default holds
+    /// the pid to being the Grok process that opened the session
+    /// (ProcessIdentity): an entry outlives a crashed process, and kill(pid,
+    /// 0) passed whatever got the number next, reviving the dead session's
+    /// prompt with someone else's terminal behind it.
+    ///
+    /// `isNamed` gets a pid whose entry has no opened_at that reads, and
+    /// says whether it is at least a Grok process of this user. Such an
+    /// entry keeps its row alive and reports no pid (activeSessions).
     nonisolated static func discover(
-        root: URL, now: Date, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        root: URL, now: Date, isLive: (Int, Date?) -> Bool = defaultIsLive,
+        isNamed: (Int) -> Bool = defaultIsNamed
     ) -> [AgentSession] {
         let fm = FileManager.default
-        let active = activeSessions(root: root, isAlive: isAlive)
+        let active = activeSessions(root: root, isLive: isLive, isNamed: isNamed)
 
         let sessionsRoot = root.appendingPathComponent("sessions")
         let cwdDirs = (try? fm.contentsOfDirectory(
@@ -98,20 +111,28 @@ struct GrokBuildMonitor: SessionMonitor {
     /// phase is permission_prompt, nil once the prompt has been answered
     /// (a later phase_changed supersedes it).
     nonisolated static func pendingPermissionTool(dir: URL) -> String? {
+        pendingPermission(dir: dir)?.tool
+    }
+
+    /// The tool awaiting permission and, where events.jsonl records one,
+    /// the id of the call it is about.
+    nonisolated static func pendingPermission(dir: URL) -> (tool: String, callID: String?)? {
         guard let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("events.jsonl"))
         else { return nil }
-        var requestedTool: String?
+        var requested: (tool: String?, callID: String?)?
         for raw in tail.split(separator: "\n").reversed() {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let type = line["type"] as? String
             else { continue }
-            if type == "permission_requested", requestedTool == nil {
-                requestedTool = line["tool_name"] as? String
+            if type == "permission_requested", requested == nil {
+                let callID = ["tool_call_id", "toolCallId", "call_id"]
+                    .lazy.compactMap { line[$0] as? String }.first
+                requested = (line["tool_name"] as? String, callID)
             }
             if type == "phase_changed" {
                 guard (line["phase"] as? String) == "permission_prompt" else { return nil }
-                return requestedTool ?? "tool"
+                return (requested?.tool ?? "tool", requested?.callID)
             }
         }
         return nil
@@ -130,28 +151,73 @@ struct GrokBuildMonitor: SessionMonitor {
     /// the abandoned session still registered under the same pid. Only the
     /// newest opened_at per pid is genuinely attached.
     ///
-    /// `isAlive` is this Mac's kill(pid, 0) by default, and the context's
+    /// `isLive` is this Mac's identity check by default, and the context's
     /// process table when discovery reads a remote host.
     nonisolated static func activeSessionIDs(
-        root: URL, isAlive: (Int) -> Bool = { kill(pid_t($0), 0) == 0 }
+        root: URL, isLive: (Int, Date?) -> Bool = defaultIsLive,
+        isNamed: (Int) -> Bool = defaultIsNamed
     ) -> Set<String> {
-        activeSessions(root: root, isAlive: isAlive).ids
+        activeSessions(root: root, isLive: isLive, isNamed: isNamed).ids
+    }
+
+    nonisolated static func defaultIsLive(_ pid: Int, _ openedAt: Date?) -> Bool {
+        ProcessIdentity.isProcess(pid, names: ProcessIdentity.grokNames, recordedAt: openedAt)
+    }
+
+    nonisolated static func defaultIsNamed(_ pid: Int) -> Bool {
+        ProcessIdentity.isNamedProcess(pid, names: ProcessIdentity.grokNames)
+    }
+
+    /// An entry's opened_at, when it names an instant. The format has not
+    /// been sampled from a live Grok 1.x, so any unambiguous spelling is
+    /// read: ISO 8601 with a zone (a space for the T as well), or seconds
+    /// or milliseconds since 1970. A time with no zone is not an instant,
+    /// and reading it in the wrong zone would move the bound ProcessIdentity
+    /// holds a pid to by hours, so it stays unread.
+    nonisolated static func openedAt(_ entry: [String: Any]) -> Date? {
+        let value = entry["opened_at"]
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let raw = number.doubleValue
+            guard raw.isFinite, raw > 0 else { return nil }
+            return Date(timeIntervalSince1970: raw >= 100_000_000_000 ? raw / 1000 : raw)
+        }
+        guard var text = value as? String else { return nil }
+        if let parsed = ClaudeSessionParser.date(text) { return parsed }
+        let scalars = Array(text.unicodeScalars)
+        if scalars.count > 10, scalars[10] == " " {
+            text = String(String.UnicodeScalarView(scalars[..<10])) + "T"
+                + String(String.UnicodeScalarView(scalars[11...]))
+            return ClaudeSessionParser.date(text)
+        }
+        return nil
     }
 
     /// The active ids as above, plus the pid each one's entry names where
     /// it names one. Bare id strings and entries without a pid are active
     /// with no pid to report.
+    ///
+    /// An entry whose opened_at does not read cannot be held to a start
+    /// time. If its pid is at least a Grok process of this user (`isNamed`)
+    /// its id is active, so a real session is not marked dead over a guess
+    /// about a field, but it reports no pid: nothing proves that pid is
+    /// THIS session's rather than a newer Grok's that got the number, and
+    /// the pid is what terminals and signals are aimed by. Only a pid with
+    /// exactly one such entry and no entry with a time counts, since with
+    /// no times there is no telling which of two sessions is attached.
     private nonisolated static func activeSessions(
-        root: URL, isAlive: (Int) -> Bool
+        root: URL, isLive: (Int, Date?) -> Bool, isNamed: (Int) -> Bool
     ) -> (ids: Set<String>, pids: [String: Int]) {
         let path = root.appendingPathComponent("active_sessions.json")
-        guard let data = try? Data(contentsOf: path),
+        guard let data = BoundedRead.data(of: path),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
         else { return ([], [:]) }
         let idKeys = ["id", "session_id", "sessionId", "sessionID"]
 
         var ids = Set<String>()
         var newestPerPid: [Int: (id: String, openedAt: Date)] = [:]
+        var unprovenPerPid: [Int: [String]] = [:]
+        var claimedPids = Set<Int>()
         for element in array {
             if let string = element as? String {
                 ids.insert(string)
@@ -164,13 +230,21 @@ struct GrokBuildMonitor: SessionMonitor {
                 ids.insert(id)
                 continue
             }
-            guard isAlive(pid) else { continue }
-            let openedAt = (entry["opened_at"] as? String)
-                .flatMap { ClaudeSessionParser.date($0) } ?? .distantPast
+            let recorded = Self.openedAt(entry)
+            if recorded != nil { claimedPids.insert(pid) }
+            guard isLive(pid, recorded) else {
+                if recorded == nil, isNamed(pid) { unprovenPerPid[pid, default: []].append(id) }
+                continue
+            }
+            let openedAt = recorded ?? .distantPast
             if let current = newestPerPid[pid], current.openedAt >= openedAt { continue }
             newestPerPid[pid] = (id, openedAt)
         }
         ids.formUnion(newestPerPid.values.map(\.id))
+        for (pid, unproven) in unprovenPerPid
+        where unproven.count == 1 && newestPerPid[pid] == nil && !claimedPids.contains(pid) {
+            ids.insert(unproven[0])
+        }
         var pids: [String: Int] = [:]
         for (pid, entry) in newestPerPid { pids[entry.id] = pid }
         return (ids, pids)
@@ -180,7 +254,7 @@ struct GrokBuildMonitor: SessionMonitor {
         dir: URL, activeIds: Set<String>, pids: [String: Int], now: Date
     ) -> AgentSession? {
         let summaryPath = dir.appendingPathComponent("summary.json")
-        guard let data = try? Data(contentsOf: summaryPath),
+        guard let data = BoundedRead.data(of: summaryPath),
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return nil }
 
@@ -202,9 +276,12 @@ struct GrokBuildMonitor: SessionMonitor {
             // (phase_changed to permission_prompt + permission_requested);
             // otherwise the update stream carries the working state.
             let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
-            if let tool = pendingPermissionTool(dir: dir) {
-                let command = tail.flatMap { GrokUpdatesParser.pendingToolCommand(tail: $0) }
-                status = .waitingApproval(command: command ?? tool)
+            if let pending = pendingPermission(dir: dir) {
+                status = .waitingApproval(command: tail.map {
+                    GrokUpdatesParser.pendingToolPrompt(
+                        tail: $0, tool: pending.tool, callID: pending.callID)
+                } ?? .unreadable(
+                    "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal."))
             } else {
                 status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
                     ?? .working(activity: "Working…")

@@ -139,6 +139,88 @@ struct RemoteSnapshotTests {
         """
         #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
     }
+
+    @Test("a lone surrogate escape fails the whole decode, which is why the helper never sends one")
+    func loneSurrogateFailsTheDecode() throws {
+        func json(_ cwd: String) -> String {
+            """
+            {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+             "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],"processes_failed":false,
+             "processes":[{"pid":1,"ppid":0,"user":"u","comm":"claude","args":"claude",
+                           "cwd":"\(cwd)","tty":"","pane":null,"open":[]}]}
+            """
+        }
+        #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json(#"/home/u/\udcff"#).utf8)) }
+        // What the helper sends instead: the replacement character.
+        let snapshot = try RemoteSnapshot.decode(Data(json(#"/home/u/\ufffd"#).utf8))
+        #expect(snapshot.processes.first?.cwd == "/home/u/\u{FFFD}")
+    }
+
+    // MARK: Size limits
+
+    private static let tiny = RemoteSnapshot.Limits(lineBytes: 4096, records: 4, chunkBytes: 8)
+
+    private func isTooLarge(_ error: any Error) -> Bool {
+        if case RemoteSnapshotError.tooLarge = error { return true }
+        return false
+    }
+
+    @Test("a line over the ceiling is refused before anything decodes it")
+    func oversizedLineIsRefusedUndecoded() {
+        // Not JSON at all, so only a check made before decoding can name
+        // the size as the reason.
+        let line = Data(repeating: UInt8(ascii: "["), count: 4097)
+        #expect(throws: (any Error).self) { try RemoteSnapshot.decode(line, limits: Self.tiny) }
+        do {
+            _ = try RemoteSnapshot.decode(line, limits: Self.tiny)
+        } catch {
+            #expect(isTooLarge(error))
+        }
+    }
+
+    @Test("a snapshot with more records than the limit is refused")
+    func tooManyRecordsIsRefused() {
+        let dirs = (0..<5).map { #"{"path":"/home/u/d\#($0)","mtime":0,"created":null}"# }
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+         "homes":[],"files":[],"omitted":[],"warnings":[],"processes":[],"processes_failed":false,
+         "dirs":[\(dirs.joined(separator: ","))]}
+        """
+        do {
+            _ = try RemoteSnapshot.decode(Data(json.utf8), limits: Self.tiny)
+            Issue.record("five records must not pass a limit of four")
+        } catch {
+            #expect(isTooLarge(error))
+        }
+    }
+
+    @Test("a snapshot whose chunks hold more bytes than the limit is refused")
+    func tooManyChunkBytesIsRefused() {
+        // "YWJjZGVmZ2hp" is nine bytes, one over the limit of eight.
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+         "homes":[],"dirs":[],"omitted":[],"warnings":[],"processes":[],"processes_failed":false,
+         "files":[{"path":"/home/u/x","size":9,"mtime":0,"created":null,"reset":true,
+                   "chunks":[[0,"YWJjZGVmZ2hp"]]}]}
+        """
+        do {
+            _ = try RemoteSnapshot.decode(Data(json.utf8), limits: Self.tiny)
+            Issue.record("nine chunk bytes must not pass a limit of eight")
+        } catch {
+            #expect(isTooLarge(error))
+        }
+    }
+
+    @Test("the standard limits leave room for an honest snapshot")
+    func standardLimitsFitAnHonestSnapshot() throws {
+        let limits = RemoteSnapshot.Limits.standard
+        // Base64 inflates by four thirds, so the chunk budget must fit
+        // inside the line ceiling, and both must hold a helper's 16 MB
+        // whole-file ceiling several times over.
+        #expect(limits.chunkBytes * 4 / 3 <= limits.lineBytes)
+        #expect(limits.chunkBytes >= 8 * 16 * 1024 * 1024)
+        _ = try fixture()
+    }
 }
 
 /// Anchors `Bundle(for:)` to the test bundle so fixtures resolve.

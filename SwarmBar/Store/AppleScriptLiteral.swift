@@ -9,20 +9,35 @@ import Foundation
 /// a user-written reply is the first caller that can contain anything.
 enum AppleScriptLiteral {
     /// The contents of an AppleScript double-quoted string literal, escaped.
-    /// Backslash first: escaping it after the quote would double-escape the
-    /// backslashes this function just added.
+    ///
+    /// Scalar by scalar, never by Character. osascript ends a literal at any
+    /// U+0022, but a Character search only finds a quote standing alone: a
+    /// quote fused into one grapheme with a combining mark after it
+    /// (U+0301) or a prepending scalar before it (U+0600) is a Character
+    /// that is not a quote, so it went out unescaped and ended the literal.
+    /// A label read off a terminal is whatever the agent printed, so that
+    /// was a way out of the string and into the script.
     nonisolated static func escape(_ raw: String) -> String {
-        raw
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+        var out = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars {
+            if scalar == "\\" || scalar == "\"" { out.append("\\") }
+            out.append(scalar)
+        }
+        return String(out)
     }
 
     /// An AppleScript expression for `raw`, with newlines rejoined using the
     /// `linefeed` constant. A literal newline cannot appear inside an
     /// AppleScript string literal, so multi-line text has to be concatenated.
     /// Empty input yields an empty literal rather than an empty expression.
+    ///
+    /// Split by scalar for the same reason `escape` works by scalar: "\r\n",
+    /// or a newline with a combining mark after it, is one Character, and a
+    /// Character split would leave that newline inside a literal.
     nonisolated static func expression(_ raw: String) -> String {
-        let parts = raw.components(separatedBy: "\n")
+        let parts = raw.unicodeScalars
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String(String.UnicodeScalarView($0)) }
         guard parts.count > 1 else { return "\"\(escape(raw))\"" }
         return parts
             .map { "\"\(escape($0))\"" }

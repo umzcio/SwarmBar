@@ -7,12 +7,35 @@ import Foundation
 /// is what lets the same discovery code run in both places.
 protocol ProcessFacts: Sendable {
     func isAlive(_ pid: Int) -> Bool
+    /// Whether `pid`, read from a tool's own record written at
+    /// `recordedAt`, is still that tool's process (one of `names`) rather
+    /// than whatever got the number after it exited.
+    func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool
+    /// Whether `pid` is one of `names`, run by this user, with no record
+    /// time to hold its start to. Enough to keep a row alive, never to bind
+    /// a session to the pid.
+    func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool
     func directoryCounts(processNames: [String]) -> [String: Int]
     func directoryCounts(processName: String, orCommandPattern: String) -> [String: Int]
     func codexPidsBySessionSuffix(sessionsRoot: String) -> [String: Int]
     func heldFiles(processName: String, inDirectory: String) -> [String: Int]
     func cwd(pid: Int) -> String?
     func pid(processNames: [String], cwd: String) -> Int?
+}
+
+extension ProcessFacts {
+    /// A table that knows nothing of start times or names can only say the
+    /// pid is there. A remote host's table is read fresh from the helper on
+    /// each poll, and its keys are re-checked by pid and name on the host
+    /// at press time (target_still_there), so this default is what remote
+    /// discovery keeps.
+    nonisolated func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool {
+        isAlive(pid)
+    }
+
+    /// Nothing weaker than `isAgent` to offer, and `isAgent` already
+    /// ignores the record time here.
+    nonisolated func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool { false }
 }
 
 /// This Mac's process table. Each method calls the code discovery called
@@ -26,6 +49,15 @@ struct LocalProcessFacts: ProcessFacts {
     /// is how every liveness check here has always been made.
     nonisolated func isAlive(_ pid: Int) -> Bool {
         kill(pid_t(pid), 0) == 0
+    }
+
+    /// Name, owner and start time, not mere existence: see ProcessIdentity.
+    nonisolated func isAgent(_ pid: Int, names: Set<String>, recordedAt: Date?) -> Bool {
+        ProcessIdentity.isProcess(pid, names: names, recordedAt: recordedAt)
+    }
+
+    nonisolated func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool {
+        ProcessIdentity.isNamedProcess(pid, names: names)
     }
 
     nonisolated func directoryCounts(processNames: [String]) -> [String: Int] {

@@ -239,7 +239,7 @@ struct AttentionAlertTests {
         AgentSession(
             tool: .claudeCode, projectName: "proj",
             projectPath: URL(fileURLWithPath: "/tmp/proj"),
-            status: .waitingApproval(command: command))
+            status: .waitingApproval(command: ApprovalPrompt(command)))
     }
 
     @Test func alertsOnceWhileAnApprovalStaysPending() {
@@ -261,6 +261,46 @@ struct AttentionAlertTests {
             store.sync(tool: .claudeCode, sessions: [polled])
         }
         #expect(alerts.count == 1)
+    }
+
+    /// Grok's prompt is answered at its terminal, and its hook pins the row
+    /// at the prompt. Once discovery proves the process gone, the pin goes
+    /// with it, so the row stops offering keystrokes for a dead terminal.
+    @Test func aGrokPinDiesWithItsProcess() {
+        let store = SessionStore()
+        var session = AgentSession(
+            tool: .grokBuild, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .working(activity: "Working…"), processAlive: true)
+        store.sync(tool: .grokBuild, sessions: [session])
+        store.applyHookEvent(
+            sessionID: session.id, tool: .grokBuild,
+            status: .waitingApproval(command: "touch /tmp/x"),
+            sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+
+        store.sync(tool: .grokBuild, sessions: [session])
+        #expect(store.sessions.first?.status == .waitingApproval(command: "touch /tmp/x"))
+
+        session.processAlive = false
+        session.status = .idle
+        store.sync(tool: .grokBuild, sessions: [session])
+        #expect(store.sessions.first?.status == .idle)
+        #expect(store.hookOverrides[session.id] == nil)
+    }
+
+    /// A held Claude decision keeps its pin whatever a poll says.
+    @Test func aClaudePinIsNotDroppedByLiveness() {
+        let store = SessionStore()
+        let pending = approval("git push origin main")
+        store.applyHookEvent(
+            sessionID: pending.id, tool: .claudeCode,
+            status: .waitingApproval(command: "git push origin main"),
+            sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+        var polled = pending
+        polled.processAlive = false
+        polled.status = .idle
+        store.sync(tool: .claudeCode, sessions: [polled])
+        #expect(store.sessions.first?.status == .waitingApproval(command: "git push origin main"))
     }
 
     @Test func alertsAgainAfterTheApprovalResolves() {

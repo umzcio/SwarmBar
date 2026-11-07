@@ -21,11 +21,12 @@ import Foundation
 /// The summaries table is still read, for conversations that have ended
 /// recently enough to belong in Recent.
 ///
-/// Approve and deny are not wired. `agy --dangerously-skip-permissions`
-/// proves a permission prompt exists, and the conversation database has a
-/// `permissions` blob per step, but no sample of a pending one has been
-/// captured. Answering a real prompt wrongly is the one mistake in this app
-/// that cannot be taken back, so it waits for a live round.
+/// Approve and deny are keystrokes, walked to by label on the terminal's
+/// own selector (verified live on both prompt shapes), and on by default
+/// through `antigravityKeystrokeAnswers`. The approval row shows the gated
+/// call's real arguments from the conversation database, never the
+/// model's summary of them; where those cannot be read the row says so
+/// and offers the terminal instead of Approve.
 struct AntigravityMonitor: SessionMonitor {
     /// Matches the other monitors: a conversation untouched for longer than
     /// this is history, not status.
@@ -145,7 +146,7 @@ struct AntigravityMonitor: SessionMonitor {
         if let pending = AntigravityConversation.pending(dbPath: dbPath) {
             if let question = pending.question {
                 return pending.isApproval
-                    ? .waitingApproval(command: question)
+                    ? .waitingApproval(command: pending.prompt)
                     : .waitingInput(prompt: question)
             }
             // An ordinary tool call that has not settled. The database
@@ -161,7 +162,7 @@ struct AntigravityMonitor: SessionMonitor {
             // only in being too quiet.
             let showing = screen(pid).map { TuiPromptLayout.options(in: $0).count >= 2 } ?? false
             return showing
-                ? .waitingApproval(command: pending.summary)
+                ? .waitingApproval(command: pending.prompt)
                 : .runningTool(activity: pending.summary)
         }
         return AntigravityTranscript.status(for: steps)

@@ -70,14 +70,14 @@ struct RemoteAnswerTests {
         let command = RemoteAnswerPlan.command(
             route: .navigateSelector, screen: screen,
             choose: TuiPromptLayout.rejectOption(in:))
-        #expect(command == RemoteKeyCommand(keys: ["DOWN", "\n"], expect: ["Deny", "> 1. Approve"]))
+        #expect(command == RemoteKeyCommand(keys: ["DOWN", "\n"], expect: ["Deny"], expectOnce: ["> 1. Approve"]))
 
         // Already on the option: no arrows, just the submit, and the marked
         // line is still what is confirmed.
         let approve = RemoteAnswerPlan.command(
             route: .navigateSelector, screen: screen,
             choose: TuiPromptLayout.approveOnceOption(in:))
-        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Approve", "> 1. Approve"]))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Approve"], expectOnce: ["> 1. Approve"]))
     }
 
     @Test func fixedKeysPassThrough() {
@@ -99,14 +99,14 @@ struct RemoteAnswerTests {
         let approve = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: true, in: .init()),
             screen: screen, choose: TuiPromptLayout.approveOnceOption(in:))
-        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed", "┃  2 (●) Yes, proceed"]))
+        #expect(approve == RemoteKeyCommand(keys: ["\n"], expect: ["Yes, proceed"], expectOnce: ["┃  2 (●) Yes, proceed"]))
 
         let deny = RemoteAnswerPlan.command(
             route: ApprovalRouter.route(tool: .grokBuild, allow: false, in: .init()),
             screen: screen, choose: TuiPromptLayout.rejectOption(in:))
         #expect(deny == RemoteKeyCommand(
             keys: ["DOWN", "\n"],
-            expect: ["No, reject (type to add feedback)", "┃  2 (●) Yes, proceed"]))
+            expect: ["No, reject (type to add feedback)"], expectOnce: ["┃  2 (●) Yes, proceed"]))
         #expect(deny?.keys.contains { Int($0) != nil } == false)
     }
 
@@ -480,7 +480,12 @@ struct RemoteAnswerTests {
         let calls = await prompt.helper.calls
         #expect(calls.map(\.command) == ["capture", "keys"])
         #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
-        #expect(calls[1].arguments["expect"] == .array([.string("No, reject"), .string("2 (●) Yes, proceed")]))
+        // The marked line goes as {"once": ...}: the helper presses only
+        // if it is on screen exactly once, as the local path checks. An
+        // older helper answers "bad keys" to the object and presses nothing.
+        #expect(calls[1].arguments["expect"] == .array([
+            .string("No, reject"), .object(["once": .string("2 (●) Yes, proceed")]),
+        ]))
         #expect(calls[1].arguments["comm"] == .string("grok"))
     }
 
@@ -562,7 +567,9 @@ struct RemoteAnswerTests {
         let calls = await rig.helper.calls
         #expect(calls.map(\.command) == ["capture", "keys"])
         #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
-        #expect(calls[1].arguments["expect"] == .array([.string("Deny"), .string("> 1. Approve")]))
+        #expect(calls[1].arguments["expect"] == .array([
+            .string("Deny"), .object(["once": .string("> 1. Approve")]),
+        ]))
         #expect(calls[1].arguments["pid"] == .int(4242))
         #expect(calls[1].arguments["comm"] == .string("agy"))
         #expect(rig.store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
@@ -639,6 +646,42 @@ struct RemoteAnswerTests {
         #expect(rig.store.sessions.first?.status == row.status)
         #expect(rig.store.remoteHoldRevision != before)
         #expect(rig.store.remoteAnswerability(for: row) == .terminalOnly)
+    }
+
+    @Test func anUnheldRequestNeverRewritesWhatApproveAnswers() async throws {
+        let rig = Rig()
+        let mirrorRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-answer-rewrite-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mirrorRoot, withIntermediateDirectories: true)
+        let mirror = RemoteMirror(root: mirrorRoot)
+        let origin = RemoteHookOrigin(
+            hostID: rig.host.id, hostName: "devbox", home: "/home/u",
+            mirrorHome: mirror.local("/home/u"), peer: ["curl", "bash", "claude"], approvalsOff: [])
+        let raw = UUID().uuidString
+        func request(_ command: String, rid: String, held: Bool, answered: @escaping (Data) -> Void = { _ in }) {
+            rig.server.handleRemote(
+                event: "PermissionRequest",
+                body: ["session_id": raw, "tool_name": "Bash",
+                       "tool_input": ["command": command], "cwd": "/home/u/proj"],
+                accountLabel: nil, origin: origin, rid: rid, held: held) { data, _ in answered(data) }
+        }
+        var firstAnswers: [Data] = []
+        request("git status", rid: "r1", held: true) { firstAnswers.append($0) }
+        let row = try #require(rig.store.sessions.first)
+        #expect(row.status == .waitingApproval(command: "git status"))
+
+        // Not held, so nothing would answer it: it must not change the row
+        // while r1 is what Approve allows.
+        request("rm -rf /", rid: "r2", held: false)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "git status"))
+        #expect(rig.server.isHolding(sessionID: row.id))
+        #expect(firstAnswers.isEmpty)
+
+        // A new hold supersedes the old one, which is let go, and only then
+        // does the row show the new command.
+        request("git push", rid: "r3", held: true)
+        #expect(rig.store.sessions.first?.status == .waitingApproval(command: "git push"))
+        #expect(firstAnswers.count == 1)
     }
 
     @Test func sentKeysMoveTheRowOn() async throws {

@@ -340,6 +340,76 @@ class ManifestTests(unittest.TestCase):
                 mirror[offset:offset + len(data)] = data
             self.assertEqual(bytes(mirror), content.encode("utf-8"))
 
+    def make_deep_tree(self, relative, depth):
+        """`depth` nested one-letter directories under `relative`, made one
+        level at a time so no single call needs the whole path."""
+        path = os.path.join(self.home, relative)
+        os.makedirs(path, exist_ok=True)
+        for _ in range(depth):
+            path = os.path.join(path, "a")
+            os.mkdir(path)
+        return path
+
+    def test_deep_codex_tree_does_not_fail_the_snapshot(self):
+        # One user's tree must not blind the whole host. The recursion limit
+        # is lowered so the tree that would overflow it stays well inside
+        # macOS's PATH_MAX; on Linux the same failure needs ~1,000 levels.
+        good = self.put(".codex/sessions/2026/10/22/rollout-good.jsonl",
+                        record('{"type":"session_meta"}') + self.many_records(5))
+        deep = self.make_deep_tree(".codex/sessions/deep", 200)
+        self.put(os.path.relpath(os.path.join(deep, "rollout-deep.jsonl"), self.home),
+                 record('{"type":"session_meta"}'))
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(len(__import__("inspect").stack()) + 120)
+        try:
+            snap = helper.snapshot()
+        finally:
+            sys.setrecursionlimit(limit)
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        # Past the walk's depth bound the tree is reported, never read as
+        # empty, so the Mac keeps whatever it mirrors beneath it.
+        reasons = [item["reason"] for item in snap["omitted"]
+                   if item["path"].startswith(os.path.join(self.home, ".codex/sessions/deep/"))]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("deeper than", reasons[0])
+
+    def test_deeply_nested_first_line_ships_as_a_plain_head(self):
+        nested = "[" * 10000 + "\n"
+        content = nested + self.STAMPED.replace("timestamp", "ts") + self.many_records(5)
+        path = self.put(".claude/projects/-home-u-demo/nested.jsonl", content)
+        snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        # No line carries a timestamp, so the head is the first line alone.
+        self.assertEqual(decode_chunks(self.entry(snap, path))[0], (0, nested.encode("utf-8")))
+
+    def test_one_file_that_fails_is_omitted_and_the_rest_ship(self):
+        good = self.put(self.EVENTS, self.many_records(5))
+        bad = self.put(".grok/sessions/s1/abd/events.jsonl", self.many_records(5))
+        real = helper.file_chunks
+
+        def failing(spec, path, *rest):
+            if path == bad:
+                raise RuntimeError("synthetic")
+            return real(spec, path, *rest)
+
+        with mock.patch.object(helper, "file_chunks", side_effect=failing):
+            snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        self.assertIsNone(self.entry(snap, bad))
+        self.assertIn(bad, [item["path"] for item in snap["omitted"]])
+
+    def test_a_pattern_that_fails_to_expand_omits_its_base(self):
+        good = self.put(self.EVENTS, self.many_records(5))
+        with mock.patch.object(helper, "subdirectories", side_effect=RuntimeError("synthetic")):
+            snap = helper.snapshot()
+        self.assertTrue(snap["ok"])
+        self.assertIsNotNone(self.entry(snap, good))
+        # The codex walk under this home failed, which is "could not look",
+        # so the home is omitted rather than its sessions read as gone.
+        self.assertIn(self.home, [item["path"] for item in snap["omitted"]])
+
     def test_whole_file_reships_on_change(self):
         path = self.put(".grok/active_sessions.json", '{"sessions":[]}')
         first = self.entry(helper.snapshot(), path)
@@ -559,6 +629,250 @@ def reader_tail(data, start):
         window = min(window * 2, helper.MAX_TAIL_BYTES)
 
 
+class CrossUserReadTests(unittest.TestCase):
+    """Root reading another user's home: that user chooses every name in
+    it, so a link must not steer root's reads, or hide another user's
+    sessions, and a FIFO must not stall the snapshot. These run as an
+    ordinary user, so "another user's" is cross_user saying so, with the
+    owner being this process's own uid."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-cross-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.a = os.path.join(self.base, "a")
+        self.b = os.path.join(self.base, "b")
+        self.outside = os.path.join(self.base, "outside")
+        for directory in (self.a, self.b, self.outside):
+            os.mkdir(directory)
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.a + ":" + self.b})
+        env.start()
+        self.addCleanup(env.stop)
+        ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        ps.start()
+        self.addCleanup(ps.stop)
+        helper.SHIPPED.clear()
+        self.addCleanup(helper.SHIPPED.clear)
+        self.owner = os.geteuid()
+
+    def foreign(self, owner=None):
+        owner = self.owner if owner is None else owner
+        return mock.patch.object(helper, "cross_user", return_value=owner)
+
+    def put(self, path, data=b'{"x":1}\n'):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def paths(self, snap):
+        return [item["path"] for item in snap["files"]]
+
+    def test_link_out_of_the_home_is_omitted_not_shipped(self):
+        secret = self.put(os.path.join(self.outside, "shadow"), b"root:secret\n")
+        os.makedirs(os.path.join(self.a, ".grok"))
+        link = os.path.join(self.a, ".grok", "active_sessions.json")
+        os.symlink(secret, link)
+        with self.foreign():
+            snap = helper.snapshot()
+        self.assertNotIn(link, self.paths(snap))
+        self.assertIn({"path": link, "reason": "leads outside its home"}, snap["omitted"])
+        self.assertNotIn(base64.b64encode(b"root:secret\n").decode("ascii"), json.dumps(snap))
+
+    def test_own_home_still_follows_its_links(self):
+        # This process's own home is read as before: nothing it could be
+        # shown through a link is more than it can read itself.
+        secret = self.put(os.path.join(self.outside, "index.json"), b"{}")
+        os.makedirs(os.path.join(self.a, ".grok"))
+        link = os.path.join(self.a, ".grok", "active_sessions.json")
+        os.symlink(secret, link)
+        self.assertIn(link, self.paths(helper.snapshot()))
+
+    def test_link_inside_the_same_home_is_followed(self):
+        real = self.put(os.path.join(self.a, "dotfiles", "grok", "active_sessions.json"), b"{}")
+        os.symlink(os.path.dirname(real), os.path.join(self.a, ".grok"))
+        with self.foreign():
+            snap = helper.snapshot()
+        self.assertIn(os.path.join(self.a, ".grok", "active_sessions.json"), self.paths(snap))
+
+    def test_file_not_owned_by_the_homes_user_is_not_read(self):
+        path = self.put(os.path.join(self.a, ".grok", "active_sessions.json"), b"{}")
+        with self.foreign(self.owner + 1):
+            snap = helper.snapshot()
+        self.assertNotIn(path, self.paths(snap))
+
+    def test_walk_never_follows_a_link_that_appears_after_resolving(self):
+        # The path is resolved, then a directory on it becomes a link out.
+        real = self.put(os.path.join(self.a, "d", "f"), b"mine")
+        self.put(os.path.join(self.outside, "f"), b"secret")
+        with self.foreign():
+            opener = helper.shipped_opener(self.a)
+            shutil.rmtree(os.path.join(self.a, "d"))
+            os.symlink(self.outside, os.path.join(self.a, "d"))
+            with mock.patch.object(helper.os.path, "realpath", lambda p: p):
+                self.assertIsNone(helper.whole_chunk(real, 6, opener))
+
+    def test_fifo_swapped_in_after_the_stat_does_not_hang(self):
+        fifo = os.path.join(self.a, "events.jsonl")
+        os.mkfifo(fifo)
+        for patch in (self.foreign(), mock.patch.object(helper, "cross_user", return_value=None)):
+            with patch:
+                opener = helper.shipped_opener(self.a)
+            result = []
+            reader = threading.Thread(target=lambda: result.append(
+                helper.whole_chunk(fifo, 10, opener)))
+            reader.daemon = True
+            reader.start()
+            reader.join(5)
+            self.assertFalse(reader.is_alive(), "blocked opening a FIFO")
+            self.assertEqual(result, [None])
+
+    def claude_root(self, home):
+        projects = os.path.join(home, ".claude", "projects")
+        os.makedirs(projects)
+        return projects
+
+    def test_link_to_another_homes_claude_root_never_hides_it(self):
+        # a sorts first and links its root to b's. b keeps its own.
+        b_projects = self.claude_root(self.b)
+        os.makedirs(os.path.join(self.a, ".claude"))
+        os.symlink(b_projects, os.path.join(self.a, ".claude", "projects"))
+        with self.foreign():
+            roots = helper.claude_roots([])
+        self.assertEqual(roots, [b_projects])
+        # Read as this process's own homes, a's name for it is a second
+        # name and still never displaces b's.
+        self.assertEqual(helper.claude_roots([]), [b_projects])
+
+    def test_nothing_of_b_ships_under_a(self):
+        b_projects = self.claude_root(self.b)
+        transcript = self.put(os.path.join(b_projects, "p", "s.jsonl"),
+                              b'{"timestamp":"t"}\n')
+        os.makedirs(os.path.join(self.a, ".claude"))
+        os.symlink(b_projects, os.path.join(self.a, ".claude", "projects"))
+        with self.foreign():
+            snap = helper.snapshot()
+        paths = self.paths(snap)
+        self.assertIn(transcript, paths)
+        self.assertFalse([p for p in paths if p.startswith(self.a + "/")], paths)
+
+    def test_claude_root_in_its_own_home_by_link_counts(self):
+        real = os.path.join(self.a, "dotfiles", "claude", "projects")
+        os.makedirs(real)
+        os.symlink(os.path.dirname(real), os.path.join(self.a, ".claude"))
+        with self.foreign():
+            self.assertEqual(helper.claude_roots([]),
+                             [os.path.join(self.a, ".claude", "projects")])
+
+
+class CrossUserProbeTests(unittest.TestCase):
+    """The root hook relay checks Grok state and bridge markers in other
+    users' homes. Their links must not let them learn, from whether or how
+    soon they are answered, what exists where only root can look."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-oracle-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.home = os.path.join(self.base, "home")
+        self.hidden = os.path.join(self.base, "hidden")
+        os.mkdir(self.home)
+        os.mkdir(self.hidden)
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def foreign(self, owner=None):
+        return mock.patch.object(helper, "cross_user",
+                                 return_value=os.geteuid() if owner is None else owner)
+
+    def answers(self, session_id):
+        with self.foreign():
+            return helper.grok_session(self.home, session_id)
+
+    def test_link_from_sessions_answers_the_same_whatever_is_behind_it(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions"))
+        os.symlink(self.hidden, os.path.join(self.home, ".grok", "sessions", "x"))
+        os.mkdir(os.path.join(self.hidden, "id_ed25519"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+        # The same tree as the helper's own home is looked through, as before.
+        self.assertTrue(helper.grok_session(self.home, "id_ed25519"))
+
+    def test_linked_grok_dir_answers_the_same_whatever_is_behind_it(self):
+        os.makedirs(os.path.join(self.hidden, "sessions", "x", "id_ed25519"))
+        os.symlink(self.hidden, os.path.join(self.home, ".grok"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+
+    def dotfiles_grok(self, target):
+        real = os.path.join(self.home, "dotfiles", "grok")
+        os.makedirs(os.path.join(real, "sessions", "cwd-x", "g-dir"))
+        os.symlink(target, os.path.join(self.home, ".grok"))
+
+    def test_a_grok_dir_linked_within_the_home_is_read(self):
+        # A dotfiles setup: ~/.grok -> dotfiles/grok. Its sessions are
+        # Grok's and anything else is not, so a Claude session in that home
+        # still gets its held approval.
+        for target in ("dotfiles/grok", os.path.join(self.home, "dotfiles", "grok")):
+            self.dotfiles_grok(target)
+            self.assertTrue(self.answers("g-dir"), target)
+            self.assertFalse(self.answers("claude-session"), target)
+            os.remove(os.path.join(self.home, ".grok"))
+            shutil.rmtree(os.path.join(self.home, "dotfiles"))
+
+    def test_an_in_home_link_that_climbs_out_counts_as_grok(self):
+        # ".." is never resolved, even back into the home: the walk would
+        # have to pass through whatever is above it.
+        os.makedirs(os.path.join(self.hidden, "sessions"))
+        for target in ("../hidden", "dotfiles/../../hidden", "dotfiles/../dotfiles/grok"):
+            self.dotfiles_grok(target)
+            self.assertTrue(self.answers("claude-session"), target)
+            os.remove(os.path.join(self.home, ".grok"))
+            shutil.rmtree(os.path.join(self.home, "dotfiles"))
+
+    def test_a_link_inside_the_linked_dir_is_not_followed(self):
+        os.makedirs(os.path.join(self.home, "dotfiles"))
+        os.symlink(self.hidden, os.path.join(self.home, "dotfiles", "grok"))
+        os.symlink("dotfiles/grok", os.path.join(self.home, ".grok"))
+        os.makedirs(os.path.join(self.hidden, "sessions", "x", "id_ed25519"))
+        self.assertEqual(self.answers("id_ed25519"), self.answers("nothing_here"))
+        self.assertTrue(self.answers("nothing_here"))
+
+    def test_real_grok_state_still_counts(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions", "cwd-x", "g-dir"))
+        with open(os.path.join(self.home, ".grok", "active_sessions.json"), "w") as handle:
+            json.dump({"sessions": [{"id": "g-listed"}]}, handle)
+        self.assertTrue(self.answers("g-dir"))
+        self.assertTrue(self.answers("g-listed"))
+        self.assertFalse(self.answers("claude-session"))
+
+    def test_no_grok_state_is_not_grok(self):
+        self.assertFalse(self.answers("claude-session"))
+
+    def test_grok_state_not_owned_by_the_homes_user_counts_as_grok(self):
+        os.makedirs(os.path.join(self.home, ".grok", "sessions"))
+        with self.foreign(os.geteuid() + 1):
+            self.assertTrue(helper.grok_session(self.home, "claude-session"))
+
+    def marker(self):
+        return os.path.join(self.home, helper.HOOK_MARKERS[0])
+
+    def test_marker_linked_out_of_the_home_is_no_marker_either_way(self):
+        os.makedirs(os.path.dirname(self.marker()))
+        target = os.path.join(self.hidden, "secret")
+        os.symlink(target, self.marker())
+        with self.foreign():
+            absent = helper.has_bridge_marker(self.home)
+            open(target, "w").close()
+            present = helper.has_bridge_marker(self.home)
+        self.assertEqual((absent, present), (False, False))
+
+    def test_real_marker_is_a_marker(self):
+        os.makedirs(os.path.dirname(self.marker()))
+        open(self.marker(), "w").close()
+        with self.foreign():
+            self.assertTrue(helper.has_bridge_marker(self.home))
+            self.assertEqual(helper.hook_homes(), [self.home])
+        self.assertTrue(helper.has_bridge_marker(self.home))
+
+
 class MirrorEquivalenceTests(unittest.TestCase):
     """The property this protocol exists for: a sparse mirror built only
     from snapshot chunks reads, through the Mac's own tail reader, exactly
@@ -708,6 +1022,58 @@ class ProtocolTests(unittest.TestCase):
         helper.main(stdin, stdout)
         return [json.loads(l) for l in stdout.getvalue().splitlines()]
 
+    def assert_strict_unicode(self, line):
+        """Python's json reads a lone surrogate escape happily; Swift's
+        JSONDecoder refuses the whole line. Every string must be text."""
+        def walk(value):
+            if isinstance(value, str):
+                self.assertFalse(any(0xD800 <= ord(c) <= 0xDFFF for c in value), repr(value))
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    walk(key)
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        decoded = json.loads(line)
+        walk(decoded)
+        return decoded
+
+    def test_write_line_never_emits_a_lone_surrogate(self):
+        out = io.StringIO()
+        with mock.patch.object(helper, "_OUT", out):
+            helper.write_line({
+                "path": "/home/u/\udcff.json",
+                "nested": [{"cwd": "/srv/caf\udcc3\udca9"}, "\ud800"],
+                "k\udcfe": "smile \U0001F600",
+            })
+        decoded = self.assert_strict_unicode(out.getvalue())
+        self.assertEqual(decoded["path"], "/home/u/\ufffd.json")
+        # Bytes that were valid UTF-8 all along come back as what they were.
+        self.assertEqual(decoded["nested"][0]["cwd"], "/srv/caf\u00e9")
+        self.assertEqual(decoded["nested"][1], "\ufffd")
+        self.assertEqual(decoded["k\ufffd"], "smile \U0001F600")
+
+    def test_snapshot_with_an_undecodable_cwd_stays_decodable(self):
+        process = {"pid": 4242, "ppid": 1, "uid": 1000, "user": "u", "tty": "",
+                   "comm": "claude", "args": "claude \udcff", "cwd": "/home/u/\udcff",
+                   "pane": None, "open": ["/home/u/.claude/sessions/\udcff.json"]}
+        with mock.patch.object(helper, "agent_processes", return_value=[process]):
+            stdin = io.StringIO(json.dumps({"id": 1, "cmd": "snapshot"}) + "\n")
+            stdout = io.StringIO()
+            helper.main(stdin, stdout)
+        (line,) = stdout.getvalue().splitlines()
+        reply = self.assert_strict_unicode(line)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["processes"][0]["cwd"], "/home/u/\ufffd")
+
+    def test_probe_output_never_emits_a_lone_surrogate(self):
+        out = io.StringIO()
+        with mock.patch.object(helper, "probe", return_value={"ok": True, "home": "/home/\udcff"}), \
+                mock.patch.object(helper.sys, "stdout", out):
+            helper.probe_main()
+        self.assertEqual(self.assert_strict_unicode(out.getvalue())["home"], "/home/\ufffd")
+
     def test_ping_echoes_id(self):
         (reply,) = self.run_main({"id": 7, "cmd": "ping"})
         self.assertEqual(reply["id"], 7)
@@ -824,7 +1190,11 @@ class ProcessTableTests(unittest.TestCase):
     def setUp(self):
         patches = [
             mock.patch.object(helper, "process_cwd", return_value="/work"),
-            mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]),
+            mock.patch.object(helper, "tmux_sockets",
+                              return_value=[("/tmp/tmux-1000/default", 1000)]),
+            # As if this were root, which may run a client as any owner.
+            # TmuxOwnerTests covers who it runs as.
+            mock.patch.object(helper, "tmux_identity", return_value={}),
             # No uid in these samples names a real account, so the printed
             # user stands, whoever runs the tests.
             mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")),
@@ -868,7 +1238,12 @@ class ProcessTableTests(unittest.TestCase):
             rows = helper.parse_ps("  10  1 1001 longuser+ pts/1 claude claude\n")
         lookup.assert_called_with(1001)
         self.assertEqual(rows[0]["user"], "longusername")
-        self.assertNotIn("uid", rows[0])
+        self.assertEqual(rows[0]["uid"], 1001)
+
+    def test_uid_is_never_shipped(self):
+        table, _ = self.run_table(FakeRunner())
+        self.assertTrue(table)
+        self.assertTrue(all("uid" not in p for p in table))
 
     def test_unknown_uid_keeps_the_printed_user(self):
         rows = helper.parse_ps("  10  1 4242 someone pts/1 claude claude\n")
@@ -910,7 +1285,8 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_failing_socket_is_skipped_others_still_work(self):
         with mock.patch.object(helper, "tmux_sockets",
-                               return_value=["/tmp/tmux-0/default", "/tmp/tmux-1000/default"]):
+                               return_value=[("/tmp/tmux-0/default", 0),
+                                             ("/tmp/tmux-1000/default", 1000)]):
             runner = FakeRunner(panes={"/tmp/tmux-1000/default": "%3 500\n"})
             table, _ = self.run_table(runner)
         claude = [p for p in table if p["pid"] == 700][0]
@@ -918,10 +1294,29 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_ancestry_walk_is_bounded(self):
         parents = {1: 2, 2: 3, 3: 1}
-        self.assertIsNone(helper.pane_for(1, parents, {99: {"socket": "s", "id": "%1"}}))
+        self.assertIsNone(helper.pane_for(1, parents, {(99, 7): {"socket": "s", "id": "%1"}}, 7))
         chain = dict((n, n + 1) for n in range(1, 100))
-        self.assertIsNone(helper.pane_for(1, chain, {40: {"socket": "s", "id": "%1"}}))
-        self.assertEqual(helper.pane_for(1, chain, {20: {"socket": "s", "id": "%1"}})["id"], "%1")
+        self.assertIsNone(helper.pane_for(1, chain, {(40, 7): {"socket": "s", "id": "%1"}}, 7))
+        self.assertEqual(helper.pane_for(1, chain, {(20, 7): {"socket": "s", "id": "%1"}}, 7)["id"],
+                         "%1")
+
+    def test_pane_only_from_a_server_of_the_agents_own_user(self):
+        # A server owned by uid 1001 claims uid 1000's agent, as the agent
+        # itself and as its shell. It never gets it, and the real server
+        # still does.
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1001/evil", 1001),
+                                             ("/tmp/tmux-1000/default", 1000)]):
+            runner = FakeRunner(panes={"/tmp/tmux-1001/evil": "%66 700\n%67 610\n",
+                                       "/tmp/tmux-1000/default": "%3 610\n"})
+            table, _ = self.run_table(runner)
+        claude = [p for p in table if p["pid"] == 700][0]
+        self.assertEqual(claude["pane"], {"socket": "/tmp/tmux-1000/default", "id": "%3"})
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1001/evil", 1001)]):
+            runner = FakeRunner(panes={"/tmp/tmux-1001/evil": "%66 700\n"})
+            table, _ = self.run_table(runner)
+        self.assertIsNone([p for p in table if p["pid"] == 700][0]["pane"])
 
     def test_ps_failure_sets_processes_failed(self):
         table, warnings = self.run_table(FakeRunner(ps_code=1))
@@ -1149,7 +1544,10 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(out, {"sent": False, "reason": "send failed", "sent_count": 1})
         self.assertEqual(len(rec.sent()), 2)
 
-    def target_recorder(self, ps=PS_SAMPLE, pane_line="%3 610\n"):
+    def target_recorder(self, ps=None, pane_line="%3 610\n"):
+        # The socket is this test's own, so the agent is too.
+        if ps is None:
+            ps = PS_SAMPLE.replace(" 1000 ", " %d " % os.geteuid())
         return TmuxRecorder(screen="1. Approve once", ps=ps, panes={self.sock: pane_line})
 
     def test_keys_sent_when_target_still_matches(self):
@@ -1195,6 +1593,29 @@ class TmuxCommandTests(unittest.TestCase):
             request.update(extra)
             rec = self.target_recorder()
             self.assertEqual(self.call(request, rec), {"ok": False, "error": "bad keys"}, extra)
+            self.assertEqual(rec.sent(), [])
+
+    def test_expect_once_needs_exactly_one_copy(self):
+        # The marked line is the one that moves. A second copy on screen is
+        # agent text drawn to look like the selector, and zero means the
+        # cursor moved, so either sends nothing.
+        line = "> 1. Approve"
+        for screen, sent in (("> 1. Approve\n  2. Deny", True),
+                             ("> 1. Approve\n> 1. Approve\n  2. Deny", False),
+                             ("  1. Approve\n> 2. Deny", False)):
+            rec = TmuxRecorder(screen=screen)
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["DOWN", "\n"],
+                             "expect": ["Deny", {"once": line}]}, rec)
+            expected = {"sent": True} if sent else {"sent": False, "reason": "changed"}
+            self.assertEqual(out, expected, screen)
+            self.assertEqual(len(rec.sent()), 2 if sent else 0, screen)
+
+    def test_malformed_expect_once_is_bad_keys(self):
+        for bad in ({"once": 3}, {"once": ""}, {"once": "x", "more": 1}, {"twice": "x"}, {}, 3):
+            rec = TmuxRecorder(screen="x")
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect": [bad]}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
             self.assertEqual(rec.sent(), [])
 
     def test_expect_more_needs_the_count_to_rise(self):
@@ -1319,9 +1740,12 @@ class TmuxCommandTests(unittest.TestCase):
     def test_paste_not_sent_when_target_changed(self):
         # The pid is gone, is another agent, or has left the pane, and so is
         # a failed ps: nothing is loaded or pasted.
-        for extra, pane_line, ps in (({"pid": 999, "comm": "claude"}, "%3 610\n", PS_SAMPLE),
-                                     ({"pid": 700, "comm": "codex"}, "%3 610\n", PS_SAMPLE),
-                                     ({"pid": 700, "comm": "claude"}, "%4 610\n", PS_SAMPLE),
+        mine = PS_SAMPLE.replace(" 1000 ", " %d " % os.geteuid())
+        for extra, pane_line, ps in (({"pid": 999, "comm": "claude"}, "%3 610\n", mine),
+                                     ({"pid": 700, "comm": "codex"}, "%3 610\n", mine),
+                                     ({"pid": 700, "comm": "claude"}, "%4 610\n", mine),
+                                     # Still in the pane, but another user's agent.
+                                     ({"pid": 700, "comm": "claude"}, "%3 610\n", PS_SAMPLE),
                                      ({"pid": 700, "comm": "claude"}, "%3 610\n", "")):
             request = {"cmd": "paste", "pane": self.pane, "text": "hi"}
             request.update(extra)
@@ -1402,6 +1826,244 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()),
                          {"ok": False, "error": "bad pane", "id": 9})
 
+
+
+class TmuxProgramTests(unittest.TestCase):
+    """Which tmux a root helper runs. Its PATH is pinned to directories only
+    root can change, which leaves Homebrew's tmux out on a macOS host, so
+    tmux is found in a fixed list and vetted against the uid the client
+    runs as: never one that anybody but root or that uid could replace."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.me = os.geteuid()
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        os.chmod(self.root, 0o755)
+        os.chmod(self.bin, 0o755)
+        self.tmux = os.path.join(self.bin, "tmux")
+        with open(self.tmux, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(self.tmux, 0o755)
+
+    def as_root(self, uid, directories):
+        with mock.patch.object(helper.os, "geteuid", return_value=0):
+            return helper.tmux_program(uid, directories)
+
+    def require_trusted_temp(self):
+        # Every directory above the temp dir must be root's or ours and
+        # writable by nobody else, as on macOS. Linux's /tmp is not.
+        if not helper.path_trusted_for(self.root, self.me):
+            self.skipTest("the temp dir sits under a directory others can write")
+
+    def test_a_login_user_helper_keeps_its_own_path(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        self.assertEqual(helper.tmux_program(self.me, [self.bin]), "tmux")
+
+    def test_root_runs_a_users_tmux_only_as_that_user(self):
+        self.require_trusted_temp()
+        if self.me == 0:
+            self.skipTest("runs as root")
+        self.assertEqual(self.as_root(self.me, [self.bin]), os.path.realpath(self.tmux))
+        # Not as root, and not as a third account.
+        self.assertIsNone(self.as_root(0, [self.bin]))
+        self.assertIsNone(self.as_root(self.me + 1, [self.bin]))
+
+    def test_a_directory_others_can_write_is_never_trusted(self):
+        self.require_trusted_temp()
+        os.chmod(self.bin, 0o777)
+        self.assertIsNone(self.as_root(self.me, [self.bin]))
+        os.chmod(self.bin, 0o755)
+        os.chmod(self.tmux, 0o757)
+        self.assertIsNone(self.as_root(self.me, [self.bin]))
+
+    def test_a_link_is_vetted_where_it_leads(self):
+        self.require_trusted_temp()
+        loose = os.path.join(self.root, "loose")
+        os.makedirs(loose)
+        os.chmod(loose, 0o777)
+        target = os.path.join(loose, "tmux")
+        with open(target, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(target, 0o755)
+        links = os.path.join(self.root, "links")
+        os.makedirs(links)
+        os.chmod(links, 0o755)
+        os.symlink(target, os.path.join(links, "tmux"))
+        self.assertIsNone(self.as_root(self.me, [links]))
+        # A link to a vetted file runs that file, by its real path.
+        os.remove(os.path.join(links, "tmux"))
+        os.symlink(self.tmux, os.path.join(links, "tmux"))
+        self.assertEqual(self.as_root(self.me, [links]), os.path.realpath(self.tmux))
+
+    def test_not_executable_or_missing_is_skipped(self):
+        self.require_trusted_temp()
+        os.chmod(self.tmux, 0o644)
+        self.assertIsNone(self.as_root(self.me, [self.bin, os.path.join(self.root, "none")]))
+
+    def test_root_runs_the_resolved_path_and_skips_a_server_without_one(self):
+        calls = []
+
+        def run(argv, timeout=5, input=None, **options):
+            calls.append(list(argv))
+            return completed(argv, 0, "")
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "run_command", run):
+            with mock.patch.object(helper, "tmux_program", lambda uid: "/opt/x/bin/tmux"):
+                helper.tmux_command("/tmp/tmux-1500/default", 1500, ["list-panes"])
+            with mock.patch.object(helper, "tmux_program", lambda uid: None):
+                self.assertIsNone(helper.tmux_command("/tmp/tmux-1500/default", 1500,
+                                                      ["list-panes"]))
+        self.assertEqual(calls, [["/opt/x/bin/tmux", "-S", "/tmp/tmux-1500/default",
+                                  "list-panes"]])
+
+    def test_the_root_path_is_not_consulted(self):
+        # A tmux the caller's PATH would find is never what root runs.
+        self.require_trusted_temp()
+        with mock.patch.dict(os.environ, {"PATH": self.bin}):
+            self.assertIsNone(self.as_root(0, []))
+
+
+class TmuxOwnerTests(unittest.TestCase):
+    """A tmux client obeys its server, which can make it run a program or
+    open a file, so the helper never connects as anyone but the server's
+    owner."""
+
+    def setUp(self):
+        import socket as socket_module
+        self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.dir = os.path.join(self.root, "tmux-1")
+        os.makedirs(self.dir)
+        self.sock = os.path.join(self.dir, "default")
+        self.server = socket_module.socket(socket_module.AF_UNIX)
+        self.addCleanup(self.server.close)
+        self.server.bind(self.sock)
+        patcher = mock.patch.dict(os.environ, {"TMUX_TMPDIR": self.root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.me = os.geteuid()
+
+    def ours(self):
+        return [entry for entry in helper.tmux_sockets() if entry[0].startswith(self.root + "/")]
+
+    def test_sockets_carry_their_owner(self):
+        self.assertEqual(self.ours(), [(self.sock, self.me)])
+
+    def test_plain_files_and_links_are_not_sockets(self):
+        open(os.path.join(self.dir, "plain"), "w").close()
+        os.symlink(self.sock, os.path.join(self.dir, "alias"))
+        os.symlink(self.dir, os.path.join(self.root, "tmux-2"))
+        self.assertEqual(self.ours(), [(self.sock, self.me)])
+
+    def test_socket_owned_by_someone_else_than_its_directory_is_left_out(self):
+        real_lstat = os.lstat
+
+        def fake(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if path == self.sock:
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                                       info.st_uid + 1, info.st_gid, info.st_size, 0, 0, 0))
+            return info
+        with mock.patch.object(helper.os, "lstat", fake):
+            self.assertEqual(self.ours(), [])
+
+    def test_identity(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        self.assertEqual(helper.tmux_identity(self.me), {})
+        if self.me != 0:
+            self.assertIsNone(helper.tmux_identity(self.me + 1))
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500, 27]):
+            self.assertEqual(helper.tmux_identity(0), {})
+            self.assertEqual(helper.tmux_identity(1501),
+                             {"user": 1501, "group": 1500, "extra_groups": [1500, 27], "cwd": "/"})
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")):
+            # No account to take groups from: not contacted at all.
+            self.assertIsNone(helper.tmux_identity(1501))
+
+    def recorder(self, panes=None):
+        calls = []
+
+        def run(argv, timeout=5, input=None, **options):
+            calls.append((list(argv), options))
+            if "list-panes" in argv:
+                return completed(argv, 0, (panes or {}).get(argv[2], ""))
+            if "capture-pane" in argv:
+                return completed(argv, 0, "screen")
+            return completed(argv, 0, "")
+        return run, calls
+
+    def test_root_lists_another_users_panes_as_that_user(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        run, calls = self.recorder({"/tmp/tmux-1500/default": "%1 42\n"})
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1500/default", 1500),
+                                             ("/tmp/tmux-0/default", 0)]), \
+                mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
+                mock.patch.object(helper, "run_command", run):
+            panes = helper.tmux_panes()
+        self.assertEqual(panes, {(42, 1500): {"socket": "/tmp/tmux-1500/default", "id": "%1"}})
+        by_socket = dict((argv[2], options) for argv, options in calls)
+        self.assertEqual(by_socket["/tmp/tmux-1500/default"],
+                         {"user": 1500, "group": 1500, "extra_groups": [1500], "cwd": "/"})
+        # Root's own server is root's: run as root, as before.
+        self.assertEqual(by_socket["/tmp/tmux-0/default"], {})
+
+    def test_login_user_never_contacts_another_users_server(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        run, calls = self.recorder()
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-x/default", self.me + 1)]), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertEqual(helper.tmux_panes(), {})
+        self.assertEqual(calls, [])
+
+    def test_drive_requests_run_as_the_sockets_owner(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        run, calls = self.recorder()
+        pane = {"socket": self.sock, "id": "%3"}
+        with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
+                mock.patch.object(helper, "run_command", run), \
+                mock.patch.object(helper.time, "sleep"):
+            self.assertEqual(helper.handle_tmux({"cmd": "capture", "pane": pane}),
+                             {"text": "screen"})
+            self.assertEqual(helper.handle_tmux({"cmd": "keys", "pane": pane, "keys": ["1"],
+                                                 "expect": []}), {"sent": True})
+            self.assertEqual(helper.handle_tmux({"cmd": "paste", "pane": pane, "text": "x"}),
+                             {"sent": True})
+        self.assertTrue(calls)
+        for argv, options in calls:
+            self.assertEqual(options.get("user"), self.me, argv)
+            self.assertEqual(options.get("group"), 1500, argv)
+
+    def test_login_user_refuses_a_pane_on_another_users_server(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        run, calls = self.recorder()
+        pane = {"socket": self.sock, "id": "%3"}
+        with mock.patch.object(helper, "valid_pane",
+                               return_value={"socket": self.sock, "id": "%3", "uid": self.me + 1}), \
+                mock.patch.object(helper, "run_command", run):
+            for request in ({"cmd": "capture", "pane": pane},
+                            {"cmd": "keys", "pane": pane, "keys": ["1"], "expect": []},
+                            {"cmd": "paste", "pane": pane, "text": "x"}):
+                self.assertEqual(helper.handle_tmux(request), {"ok": False, "error": "bad pane"})
+        self.assertEqual(calls, [])
 
 
 class EventSink(object):
@@ -2226,6 +2888,63 @@ class HookRelayTests(unittest.TestCase):
         self.assertIsNone(helper.parse_line(b"[" * 100000))
 
 
+class FollowerRelayTests(unittest.TestCase):
+    """A follower relays what its broker sends. The broker is whoever holds
+    the home's lock, possibly the home's own user, so it never decides
+    which home or user an event belongs to."""
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-follow-"))
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.sent = []
+        relay = mock.Mock()
+        relay.emit = self.sent.append
+        self.hub = helper.HookHome(relay, self.home)
+
+    def hook(self, **fields):
+        message = {"event": "hook", "rid": "r1", "home": "/root", "user": "root",
+                   "path": "/hook/PermissionRequest", "account": None,
+                   "peer": ["curl", "claude"], "body": {"session_id": "victim"}, "held": False}
+        message.update(fields)
+        return message
+
+    def test_event_is_attributed_to_the_followed_home(self):
+        self.hub.relay_message(self.hook(extra="x"))
+        self.assertEqual(len(self.sent), 1)
+        event = self.sent[0]
+        self.assertEqual(event["home"], self.home)
+        self.assertEqual(event["user"], self.hub.user)
+        self.assertNotIn("extra", event)
+        self.assertEqual(event["body"], {"session_id": "victim"})
+        self.assertIs(event["held"], False)
+
+    def test_held_only_when_announced(self):
+        self.hub.relay_message(self.hook(rid="r2", held=True))
+        self.assertIs(self.sent[-1]["held"], False)
+        self.hub.relay_message({"type": "held", "rid": "r3"})
+        self.hub.relay_message(self.hook(rid="r3", held=True))
+        self.assertIs(self.sent[-1]["held"], True)
+
+    def test_malformed_events_are_dropped(self):
+        for fields in ({"rid": 3}, {"rid": ""}, {"path": "/etc/passwd"}, {"path": None},
+                       {"body": "x"}, {"body": None}):
+            self.hub.relay_message(self.hook(**fields))
+        self.assertEqual(self.sent, [])
+
+    def test_peer_and_account_are_checked_for_shape(self):
+        self.hub.relay_message(self.hook(peer=["a", 3, None] + ["b"] * 20, account=7))
+        event = self.sent[0]
+        self.assertEqual(event["peer"], (["a"] + ["b"] * 20)[:helper.PEER_DEPTH])
+        self.assertIsNone(event["account"])
+
+    def test_only_announced_holds_can_be_resolved(self):
+        self.hub.relay_message({"event": "hook_resolved", "rid": "someone-elses"})
+        self.assertEqual(self.sent, [])
+        self.hub.relay_message({"type": "held", "rid": "r4"})
+        self.hub.relay_message({"event": "hook_resolved", "rid": "r4", "home": "/root"})
+        self.assertEqual(self.sent, [{"event": "hook_resolved", "rid": "r4"}])
+
+
 class PeerChainTests(unittest.TestCase):
     """peer_chain itself, against a fake process table."""
 
@@ -2321,6 +3040,46 @@ class ProbeTests(unittest.TestCase):
         self.put(".swarmbar/swarmbar-remote-hook.sh", "#!/bin/sh\n", 0o700)
         self.put(".swarmbar/swarmbar-helper", "# helper\n", 0o700)
         self.put(".config/opencode/plugins/swarmbar-remote.js", "// plugin\n")
+
+    def test_huge_files_in_one_home_never_fail_the_probe(self):
+        # A user's 1 TiB sparse helper copy and config. Read whole, either
+        # would fail the root probe for every home on the host.
+        self.populate()
+        other = os.path.join(self.root, "home", "v")
+        os.makedirs(os.path.join(other, ".kimi-code"))
+        with open(os.path.join(other, ".kimi-code", "config.toml"), "w") as handle:
+            handle.write("[providers]\n")
+        for relative in (".swarmbar/swarmbar-helper", ".kimi-code/config.toml"):
+            with open(os.path.join(self.home, relative), "r+b") as handle:
+                handle.truncate(1 << 40)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home + ":" + other}):
+            result = self.probe()
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(result["ok"])
+        mine = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        self.assertIn({"path": mine, "sha256": None}, result["helper"])
+        config = [c for c in result["configs"][self.home] if c["tool"] == "kimi"][0]
+        self.assertIsNone(config["sha256"])
+        intact = [c for c in result["configs"][other] if c["tool"] == "kimi"][0]
+        self.assertEqual(intact["sha256"], hashlib.sha256(b"[providers]\n").hexdigest())
+
+    def test_another_users_helper_link_is_never_read(self):
+        # Linked to a file that never ends, as /proc/kmsg is.
+        os.makedirs(os.path.join(self.home, ".swarmbar"))
+        endless = os.path.join(self.root, "endless")
+        os.mkfifo(endless)
+        mine = os.path.join(self.home, ".swarmbar", "swarmbar-helper")
+        os.symlink(endless, mine)
+        result = []
+        with mock.patch.object(helper, "cross_user", return_value=os.geteuid()):
+            reader = threading.Thread(target=lambda: result.append(
+                helper.installed_helpers([self.home])))
+            reader.daemon = True
+            reader.start()
+            reader.join(5)
+        self.assertFalse(reader.is_alive(), "blocked reading a helper link")
+        self.assertIn({"path": mine, "sha256": None}, result[0])
 
     def test_probe_writes_nothing(self):
         self.populate()
@@ -2536,7 +3295,9 @@ class ProbeTests(unittest.TestCase):
     def test_probe_never_captures_panes(self):
         runner = FakeRunner(ps="  700  1 1000 u pts/2 agy agy\n",
                             panes={"/tmp/tmux-1000/default": "%3 1\n"})
-        with mock.patch.object(helper, "tmux_sockets", return_value=["/tmp/tmux-1000/default"]), \
+        with mock.patch.object(helper, "tmux_sockets",
+                               return_value=[("/tmp/tmux-1000/default", 1000)]), \
+                mock.patch.object(helper, "tmux_identity", return_value={}), \
                 mock.patch.object(helper, "process_cwd", return_value="/work"):
             result = self.probe(runner)
         self.assertFalse(any("capture-pane" in call for call in runner.calls))
@@ -3521,6 +4282,25 @@ class ApplyTests(unittest.TestCase):
         return {"op": "write_file", "path": path, "content_b64": encoded(text),
                 "expect_sha256": expect, "mode": 0o644}
 
+    def test_blob_read_from_stdin(self):
+        # The setup command pipes the blob in, so no config's contents sit
+        # in any process's arguments.
+        target = self.put(".claude/settings.json", "{}\n")
+        blob = apply_blob([self.write_op(target, "fresh\n", sha("{}\n"))])
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            code = helper.apply_main(["-"], stdin=io.StringIO(blob + "\n"))
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(self.read(target), "fresh\n")
+
+    def test_oversized_or_empty_stdin_is_refused(self):
+        for data in ("", "A" * (helper.MAX_BLOB_BYTES + 1)):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                code = helper.apply_main(["-"], stdin=io.StringIO(data))
+            self.assertEqual(code, 2)
+            self.assertIn("cannot read the setup operations", out.getvalue())
+
     def test_apply_runs_operations_in_order_and_stops_on_failure(self):
         first = self.put(".claude/settings.json", "{}\n")
         second = self.put(".kimi-code/config.toml", "edited by hand\n")
@@ -3636,6 +4416,66 @@ class ApplyTests(unittest.TestCase):
             result = helper.install_helper({"dest": dest})
         self.assertFalse(result["ok"])
         self.assertFalse(os.path.lexists(dest))
+
+
+class RootPathTests(unittest.TestCase):
+    """Under the narrow sudo rule the caller's PATH can reach the root
+    helper whole. Nothing it names may choose a program root runs."""
+
+    def test_interpreter_is_named_by_absolute_path(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+        with open(path, "rb") as handle:
+            first = handle.readline().decode("ascii").rstrip("\n")
+        self.assertTrue(first.startswith("#!/"), first)
+        interpreter = first[2:].split()
+        self.assertNotIn("env", os.path.basename(interpreter[0]))
+        self.assertEqual(interpreter, ["/usr/bin/python3", "-I"])
+
+    def test_only_directories_only_root_can_change_are_kept(self):
+        planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
+        self.addCleanup(shutil.rmtree, planted, True)
+        trusted = os.path.realpath(planted) + "/sys"
+        os.mkdir(trusted)
+        os.symlink(trusted, planted + "/link")
+        vetted = []
+
+        def root_only(path):
+            vetted.append(path)
+            return path == trusted or path == planted + "/link"
+        with mock.patch.object(helper, "root_only_path", root_only):
+            got = helper.trusted_root_path((planted, trusted, planted + "/link",
+                                            planted + "/missing"))
+        # Not the user's directory, not a link even to a trusted one, and
+        # not one that is not there.
+        self.assertEqual(got, trusted)
+
+    def test_root_replaces_the_callers_path(self):
+        planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
+        self.addCleanup(shutil.rmtree, planted, True)
+        for name in ("python3", "tmux", "ps"):
+            fake = os.path.join(planted, name)
+            with open(fake, "w") as handle:
+                handle.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake, 0o755)
+        with mock.patch.dict(os.environ, {"PATH": planted + ":/usr/bin:/bin"}):
+            with mock.patch.object(helper.os, "geteuid", return_value=0), \
+                    mock.patch.object(helper, "trusted_root_path", return_value="/usr/bin:/bin"):
+                helper.pin_root_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin:/bin")
+            for name in ("tmux", "ps"):
+                found = shutil.which(name)
+                self.assertFalse(found and found.startswith(planted), found)
+
+    def test_login_user_keeps_their_path(self):
+        with mock.patch.dict(os.environ, {"PATH": "/opt/mine/bin:/usr/bin"}):
+            if os.geteuid() == 0:
+                self.skipTest("runs as root")
+            helper.pin_root_path()
+            self.assertEqual(os.environ["PATH"], "/opt/mine/bin:/usr/bin")
+
+    def test_real_system_directories_pass(self):
+        # /usr/bin is root's on every system the fleet runs.
+        self.assertIn("/usr/bin", helper.trusted_root_path().split(":"))
 
 
 class SudoersTests(unittest.TestCase):

@@ -293,7 +293,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
             reply = try await requester.request("keys", [
                 "pane": pane,
                 "keys": .array(command.keys.map(JSONValue.string)),
-                "expect": .array(command.expect.map(JSONValue.string)),
+                "expect": command.expectJSON,
                 "pid": .int(target.process.pid),
                 "comm": .string(target.process.comm),
             ], timeout: .seconds(30))

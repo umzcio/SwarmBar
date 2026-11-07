@@ -31,11 +31,12 @@ final class IntegrationManager {
 
     private(set) var states: [AgentTool: InstallState] = [:]
 
-    /// Marks a bridge script that sends the SwarmBar-Token header. An
-    /// installed copy in Application Support without this marker predates
-    /// the token and would silently fail open, so it counts as not
-    /// installed until the toggle overwrites it.
-    static let bridgeMarker = "swarmbar-bridge-v2"
+    /// Marks a bridge script that posts to SwarmBar's owner-only Unix
+    /// socket. An installed copy in Application Support without this
+    /// marker predates the socket and posts to the loopback port, which
+    /// any process can hold while SwarmBar is not running, so it counts as
+    /// not installed until it is refreshed or the toggle overwrites it.
+    static let bridgeMarker = "swarmbar-bridge-v3"
 
     private let fm = FileManager.default
     private var home: URL { fm.homeDirectoryForCurrentUser }
@@ -53,8 +54,8 @@ final class IntegrationManager {
             ? .noSetupNeeded : .toolMissing
         states[.grokBuild] = fm.fileExists(atPath: home.appendingPathComponent(".grok").path)
             ? .noSetupNeeded : .toolMissing
-        // Read only for now: the conversation database gives status without
-        // any bridge, and approve/deny is not wired. See AntigravityMonitor.
+        // Nothing to install: the conversation database gives status, and
+        // approve/deny are terminal keystrokes. See AntigravityMonitor.
         states[.antigravity] = fm.fileExists(
             atPath: home.appendingPathComponent(".gemini/antigravity-cli").path)
             ? .noSetupNeeded : .toolMissing
@@ -207,20 +208,55 @@ final class IntegrationManager {
         let fm = FileManager.default
         let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SwarmBar")
-        for name in bridgeScripts {
-            let destination = dir.appendingPathComponent(name)
+        // The OpenCode plugin is SwarmBar's own file too, installed beside
+        // OpenCode's config rather than here. Only an existing copy is
+        // refreshed; its config entry is never touched.
+        let plugin = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/opencode/plugins/swarmbar.js")
+        let targets = bridgeScripts.map { ($0, dir.appendingPathComponent($0)) }
+            + [("swarmbar-opencode.js", plugin)]
+        for (name, destination) in targets {
             guard let source = Bundle.main.url(forResource: name, withExtension: nil),
-                  let bundled = try? String(contentsOf: source, encoding: .utf8),
-                  let updated = refreshedScript(
-                    installed: try? String(contentsOf: destination, encoding: .utf8),
-                    bundled: bundled)
+                  let bundled = try? String(contentsOf: source, encoding: .utf8)
             else { continue }
-            do {
-                try updated.write(to: destination, atomically: true, encoding: .utf8)
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
-            } catch {
+            switch refreshScript(at: destination, bundled: bundled) {
+            case .leftLinked:
+                NSLog("SwarmBar: \(destination.path) is a symbolic link, so it was not refreshed. "
+                    + "Update what it points to, or switch the bridge off and on in Settings.")
+            case .failed(let error):
                 NSLog("SwarmBar: could not refresh \(name): \(error)")
+            case .absent, .current, .refreshed:
+                break
             }
+        }
+    }
+
+    enum ScriptRefresh: Equatable {
+        case absent, current, refreshed, leftLinked
+        case failed(String)
+    }
+
+    /// Replaces one installed script with the bundled text, if it exists
+    /// and differs. A symbolic link is left alone: the atomic write would
+    /// replace the link with a plain copy, and a linked plugin is someone
+    /// keeping that file elsewhere on purpose (a checkout of this repo, a
+    /// dotfiles folder), which SwarmBar has no business writing into. The
+    /// file keeps the mode it had, so a plugin installed 0644 stays 0644.
+    nonisolated static func refreshScript(at destination: URL, bundled: String) -> ScriptRefresh {
+        let fm = FileManager.default
+        guard let attributes = try? fm.attributesOfItem(atPath: destination.path) else { return .absent }
+        if attributes[.type] as? FileAttributeType == .typeSymbolicLink { return .leftLinked }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { return .absent }
+        guard let updated = refreshedScript(
+            installed: try? String(contentsOf: destination, encoding: .utf8), bundled: bundled)
+        else { return .current }
+        let mode = (attributes[.posixPermissions] as? NSNumber)?.int16Value ?? 0o644
+        do {
+            try updated.write(to: destination, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: destination.path)
+            return .refreshed
+        } catch {
+            return .failed("\(error)")
         }
     }
 

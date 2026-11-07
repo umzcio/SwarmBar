@@ -17,7 +17,39 @@ struct CompactSessionRow: View {
         return RemoteRowLabel.terminalOnlyNote(host: host)
     }
 
+    /// Set when an approval whose request does not fit the compact line
+    /// has been opened for review, showing the full preview under it.
+    @State private var reviewing = false
+
+    private var approvalPrompt: ApprovalPrompt? {
+        if case .waitingApproval(let prompt) = session.status { return prompt }
+        return nil
+    }
+
+    /// Approve sits inline only when the compact line shows the whole
+    /// request. Anything longer is reviewed first, in the full preview.
+    private var approvesInline: Bool {
+        guard let prompt = approvalPrompt else { return false }
+        return prompt.offersApprove && ApprovalPreviewText.fitsOneLine(prompt.text)
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            line
+            if reviewing, let prompt = approvalPrompt, terminalOnlyNote == nil {
+                CommandPreview(prompt: prompt)
+                ApprovalActions(session: session)
+            }
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .contentShape(.rect(cornerRadius: 9))
+        .hoverHighlight()
+        .help(session.title ?? session.projectName)
+        .sessionRowInteractions(session, store: store)
+    }
+
+    private var line: some View {
         HStack(spacing: 8) {
             StatusDot(status: session.status)
                 .id(session.status.label)
@@ -54,10 +86,17 @@ struct CompactSessionRow: View {
 
             Group {
                 switch session.status {
-                case .waitingApproval(let command):
-                    Text("$ \(command)")
-                        .swarmFont(.monoCompact)
-                        .foregroundStyle(.orange)
+                case .waitingApproval(let prompt):
+                    if prompt.isExact {
+                        let first = ApprovalPreviewText.collapsed(prompt.text, maxLines: 1, columns: 40)
+                        Text("$ \(first.text)\(first.isCut ? "…" : "")")
+                            .swarmFont(.monoCompact)
+                            .foregroundStyle(.orange)
+                            .help(first.isCut ? "Open the full request to review it" : "")
+                    } else {
+                        Text("Request not readable here")
+                            .foregroundStyle(.orange)
+                    }
                 case .waitingInput(let prompt):
                     Text(prompt.isEmpty ? "Waiting on you" : "\u{201C}\(prompt)\u{201D}")
                         .foregroundStyle(.blue)
@@ -87,9 +126,15 @@ struct CompactSessionRow: View {
                         .swarmFont(.meta)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                } else {
+                } else if approvesInline {
                     MicroButton(.approve, help: "Approve") { store.approve(session) }
                     MicroButton(.deny, help: "Deny") { store.deny(session) }
+                } else if approvalPrompt?.offersApprove ?? false {
+                    MicroButton(.review, help: reviewing ? "Hide request" : "Review request") {
+                        reviewing.toggle()
+                    }
+                } else if session.host == nil, session.projectPath != nil {
+                    MicroButton(.terminal, help: "Open terminal") { store.openInTerminal(session) }
                 }
             }
             if case .waitingInput = session.status {
@@ -105,12 +150,6 @@ struct CompactSessionRow: View {
 
             ElapsedTimeText(since: session.elapsedAnchor, ago: session.status.timerReadsAgo)
         }
-        .padding(.vertical, 5)
-        .padding(.horizontal, 8)
-        .contentShape(.rect(cornerRadius: 9))
-        .hoverHighlight()
-        .help(session.title ?? session.projectName)
-        .sessionRowInteractions(session, store: store)
     }
 }
 
@@ -118,14 +157,16 @@ struct MicroButton: View {
     @Environment(\.swarmScale) private var scale
 
     enum Kind {
-        case approve, deny, reply, dismiss
+        case approve, deny, reply, dismiss, review, terminal
 
         var symbol: String {
             switch self {
-            case .approve: "checkmark"
-            case .deny:    "xmark"
-            case .reply:   "arrowshape.turn.up.left"
-            case .dismiss: "checkmark"
+            case .approve:  "checkmark"
+            case .deny:     "xmark"
+            case .reply:    "arrowshape.turn.up.left"
+            case .dismiss:  "checkmark"
+            case .review:   "chevron.down"
+            case .terminal: "terminal"
             }
         }
     }
@@ -161,16 +202,17 @@ struct MicroButton: View {
         case .approve: AnyShapeStyle(.black.opacity(0.85))
         case .deny:    AnyShapeStyle(.primary)
         case .reply:   AnyShapeStyle(.white)
-        case .dismiss: AnyShapeStyle(.primary)
+        case .dismiss, .terminal: AnyShapeStyle(.primary)
+        case .review:  AnyShapeStyle(.black.opacity(0.85))
         }
     }
 
     private var background: AnyShapeStyle {
         switch kind {
-        case .approve: AnyShapeStyle(.orange)
+        case .approve, .review: AnyShapeStyle(.orange)
         case .deny:    AnyShapeStyle(.primary.opacity(0.12))
         case .reply:   AnyShapeStyle(.blue)
-        case .dismiss: AnyShapeStyle(.primary.opacity(0.12))
+        case .dismiss, .terminal: AnyShapeStyle(.primary.opacity(0.12))
         }
     }
 }

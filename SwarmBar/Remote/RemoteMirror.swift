@@ -3,10 +3,12 @@ import Synchronization
 
 enum RemoteMirrorError: Error, CustomStringConvertible {
     case cannotCreate(String)
+    case outsideMirror(String)
 
     var description: String {
         switch self {
         case .cannotCreate(let path): "cannot create mirror file \(path)"
+        case .outsideMirror(let path): "refused a path outside the mirror: \(path)"
         }
     }
 }
@@ -37,6 +39,12 @@ struct RemoteMirror: Sendable {
     /// What trimming keeps from the end: the widest tail any local reader
     /// takes, so every reader sees the same lines after a trim as before.
     static let trimKeepBytes = ClaudeCodeMonitor.maxTailBytes
+    /// The largest logical size a mirror file may take. A sparse file of
+    /// any size costs the remote host nothing to name, so a record whose
+    /// size or chunk end passes this is treated as an omission and never
+    /// written. Far past any honest transcript, which the mirror holds
+    /// sparse anyway.
+    static let maxFileBytes = 4 * 1024 * 1024 * 1024
 
     init(root: URL) {
         self.root = root.standardizedFileURL
@@ -88,12 +96,64 @@ struct RemoteMirror: Sendable {
     /// could land outside `root`. The paths come from a remote host and are
     /// not trusted: a `..` component would let `/root/../../etc/x` climb
     /// out of the mirror and into the Mac's own files.
+    ///
+    /// Everything here works on bytes. A Swift String splits and compares by
+    /// grapheme cluster, and a combining mark after a slash (or a Prepend
+    /// character before one) fuses with it, so a grapheme split reads
+    /// `A\u{0600}/..` as one harmless component while the kernel, which
+    /// splits on the byte, reads `A\u{0600}` and then `..`.
     func local(_ remotePath: String) -> URL? {
-        guard remotePath.hasPrefix("/"), !remotePath.contains("\0") else { return nil }
-        let components = remotePath.split(separator: "/")
-        guard !components.contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        let bytes = Array(remotePath.utf8)
+        guard bytes.first == Self.slash, !bytes.contains(0) else { return nil }
+        let components = bytes.split(separator: Self.slash)
+        guard !components.contains(where: Self.isDotComponent) else { return nil }
         guard !components.isEmpty else { return root }
-        return URL(fileURLWithPath: root.path + "/" + components.joined(separator: "/"))
+        // Split on an ASCII byte, so every piece is still whole UTF-8.
+        let relative = String(decoding: Array(components.joined(separator: [Self.slash])), as: UTF8.self)
+        let url = URL(fileURLWithPath: root.path + "/" + relative)
+        return contains(url) ? url : nil
+    }
+
+    /// True when `url` lies strictly beneath `root`, checked on both byte
+    /// forms the kernel is handed: the path string, which lstat and friends
+    /// take as is, and the file system representation, which FileManager and
+    /// FileHandle take. Foundation decomposes accented characters in both,
+    /// and canonical decomposition never yields a slash or a dot, but the
+    /// proof is made on the bytes rather than on that argument.
+    func contains(_ url: URL) -> Bool {
+        guard Self.isBeneath(Array(url.path.utf8), Array(root.path.utf8)) else { return false }
+        let pathRepresentation = url.withUnsafeFileSystemRepresentation(Self.bytes)
+        let rootRepresentation = root.withUnsafeFileSystemRepresentation(Self.bytes)
+        guard let pathRepresentation, let rootRepresentation else { return false }
+        return Self.isBeneath(pathRepresentation, rootRepresentation)
+    }
+
+    private static let slash = UInt8(ascii: "/")
+
+    private static func isDotComponent(_ component: ArraySlice<UInt8>) -> Bool {
+        component.elementsEqual([UInt8(ascii: ".")]) || component.elementsEqual([UInt8(ascii: "."), UInt8(ascii: ".")])
+    }
+
+    private static func bytes(_ pointer: UnsafePointer<CChar>?) -> [UInt8]? {
+        guard let pointer else { return nil }
+        return Array(UnsafeBufferPointer(start: UnsafeRawPointer(pointer).assumingMemoryBound(to: UInt8.self),
+                                         count: strlen(pointer)))
+    }
+
+    /// The bytes of `path` after `base` and the slash that follows it, or
+    /// nil when `path` is not strictly beneath `base` or any byte-level
+    /// component of the rest is `.` or `..`.
+    private static func beneath(_ path: [UInt8], _ base: [UInt8]) -> ArraySlice<UInt8>? {
+        guard path.count > base.count + 1, path.starts(with: base), path[base.count] == slash else { return nil }
+        let rest = path[(base.count + 1)...]
+        guard !rest.contains(0),
+              !rest.split(separator: slash).contains(where: isDotComponent)
+        else { return nil }
+        return rest
+    }
+
+    private static func isBeneath(_ path: [UInt8], _ base: [UInt8]) -> Bool {
+        beneath(path, base) != nil
     }
 
     /// The remote path a mirror file stands for, or nil when `local` is not
@@ -110,9 +170,10 @@ struct RemoteMirror: Sendable {
     }
 
     private static func relative(_ path: String, to base: String) -> String? {
-        if path == base { return "/" }
-        guard path.hasPrefix(base + "/") else { return nil }
-        return String(path.dropFirst(base.count))
+        let pathBytes = Array(path.utf8), baseBytes = Array(base.utf8)
+        if pathBytes == baseBytes { return "/" }
+        guard let rest = beneath(pathBytes, baseBytes) else { return nil }
+        return "/" + String(decoding: rest, as: UTF8.self)
     }
 
     /// Discards the whole mirror. The next snapshot from a fresh helper
@@ -147,10 +208,21 @@ struct RemoteMirror: Sendable {
             guard let url = local(path), url.path != root.path else { return nil }
             return url
         }
-        let files = snapshot.files.compactMap { record in mapped(record.path).map { (record, $0) } }
-        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
-        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path })
         var warnings: [String] = []
+        var oversized: [String] = []
+        let files = snapshot.files.compactMap { record -> (RemoteFileRecord, URL)? in
+            guard let url = mapped(record.path) else { return nil }
+            if let reason = Self.oversizeReason(record) {
+                // An omission: the mirror keeps whatever it held for this
+                // path, and no file of the named size is ever made.
+                warnings.append("skipped \(record.path): \(reason)")
+                oversized.append(url.path)
+                return nil
+            }
+            return (record, url)
+        }
+        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
+        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path } + oversized)
 
         var keep = Set<String>()
         for path in files.map(\.1.path) + dirs.map(\.1.path) + omitted {
@@ -195,13 +267,18 @@ struct RemoteMirror: Sendable {
         return warnings
     }
 
-    /// Every directory between `path` and `root`, both excluded.
+    /// Every directory between `path` and `root`, both excluded. Cut at
+    /// the byte slash, like `local`, so a component that opens with a
+    /// combining mark still counts as one.
     private func ancestors(of path: String) -> [String] {
+        let base = Array(root.path.utf8)
+        guard let rest = Self.beneath(Array(path.utf8), base) else { return [] }
         var found: [String] = []
-        var current = (path as NSString).deletingLastPathComponent
-        while current.hasPrefix(root.path + "/") {
-            found.append(current)
-            current = (current as NSString).deletingLastPathComponent
+        var current = base
+        for component in rest.split(separator: Self.slash).dropLast() {
+            current.append(Self.slash)
+            current.append(contentsOf: component)
+            found.append(String(decoding: current, as: UTF8.self))
         }
         return found
     }
@@ -213,6 +290,9 @@ struct RemoteMirror: Sendable {
     /// subtree, because the helper could not look there this time and that
     /// is not the same as there being nothing to see.
     private func sweep(_ directory: String, keep: Set<String>, omitted: Set<String>) throws {
+        guard Self.isBeneath(Array(directory.utf8), Array(root.path.utf8)) else {
+            throw RemoteMirrorError.outsideMirror(directory)
+        }
         let fm = FileManager.default
         let names: [String]
         do {
@@ -239,6 +319,10 @@ struct RemoteMirror: Sendable {
     /// Creates a directory and any missing parents, once nothing on the
     /// way to it is a symlink.
     private func createDirectory(_ url: URL) throws {
+        // The root itself is allowed, as the parent of a top-level file.
+        guard Array(url.path.utf8) == Array(root.path.utf8) || contains(url) else {
+            throw RemoteMirrorError.outsideMirror(url.path)
+        }
         try clearLinks(to: url.path, including: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
@@ -253,12 +337,15 @@ struct RemoteMirror: Sendable {
     /// sit beneath.
     @discardableResult
     private func clearLinks(to path: String, including: Bool) throws -> Bool {
-        guard path.hasPrefix(root.path + "/") else { return false }
-        var components = path.dropFirst(root.path.count + 1).split(separator: "/")
+        let base = Array(root.path.utf8)
+        guard let rest = Self.beneath(Array(path.utf8), base) else { return false }
+        var components = rest.split(separator: Self.slash)
         if !including { components = components.dropLast() }
-        var current = root.path
+        var bytes = base
         for component in components {
-            current += "/" + component
+            bytes.append(Self.slash)
+            bytes.append(contentsOf: component)
+            let current = String(decoding: bytes, as: UTF8.self)
             var info = stat()
             guard lstat(current, &info) == 0 else { return true }
             switch info.st_mode & S_IFMT {
@@ -276,6 +363,7 @@ struct RemoteMirror: Sendable {
 
     private func write(_ record: RemoteFileRecord, to url: URL) throws -> [String] {
         let fm = FileManager.default
+        guard contains(url) else { throw RemoteMirrorError.outsideMirror(record.path) }
         try createDirectory(url.deletingLastPathComponent())
 
         var info = stat()
@@ -307,9 +395,13 @@ struct RemoteMirror: Sendable {
             var end = record.reset || !present ? 0 : UInt64(info.st_size)
             var gaps: [(UInt64, UInt64)] = []
             for chunk in record.chunks.sorted(by: { $0.offset < $1.offset }) {
-                guard !chunk.offset.addingReportingOverflow(chunk.data.count).overflow else {
-                    warnings.append("skipped a chunk of \(record.path) whose end overflows: "
-                        + "offset \(chunk.offset), \(chunk.data.count) bytes")
+                // Also catches an end that would overflow, since a chunk's
+                // data is never larger than the limit itself.
+                guard chunk.data.count <= Self.maxFileBytes,
+                      chunk.offset <= Self.maxFileBytes - chunk.data.count
+                else {
+                    warnings.append("skipped a chunk of \(record.path) whose end is past the mirror's "
+                        + "\(Self.maxFileBytes) byte limit: offset \(chunk.offset), \(chunk.data.count) bytes")
                     continue
                 }
                 let offset = UInt64(chunk.offset)
@@ -338,6 +430,14 @@ struct RemoteMirror: Sendable {
         }
         try fm.setAttributes(attributes, ofItemAtPath: url.path)
         return warnings
+    }
+
+    /// Why a record would make a mirror file past `maxFileBytes`, or nil
+    /// when it would not. A chunk ending past the limit is skipped in
+    /// `write` instead, like one whose end overflows.
+    private static func oversizeReason(_ record: RemoteFileRecord) -> String? {
+        guard record.size > maxFileBytes else { return nil }
+        return "\(record.size) bytes is over the mirror's \(maxFileBytes) byte limit"
     }
 
     /// True when one chunk carries the whole file. That is the helper's

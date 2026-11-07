@@ -198,7 +198,7 @@ struct ProvidersSettingsTab: View {
     private var bridgeDetail: String {
         switch store.hookServerState {
         case .starting:    "Starting up"
-        case .listening:   "Listening on 127.0.0.1:\(HookServer.port)"
+        case .listening:   "Listening for this Mac's agents"
         case .unavailable(let reason):
             "Not listening, so remote approve and deny will not reach your agents. \(reason)"
         }
