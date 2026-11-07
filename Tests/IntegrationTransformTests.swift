@@ -385,3 +385,33 @@ struct BridgeScriptRefreshTests {
         #expect(curl.contains(">/dev/null") || curl.contains("> /dev/null"))
     }
 }
+
+
+struct ShellQuotingTests {
+    /// Every U+0027 becomes '\'' whatever scalars sit beside it.
+    @Test func everyQuoteIsEscapedWhateverSitsBesideIt() {
+        for input in ["e'\u{0301}; id;#", "\u{0600}'; id", "'\u{200D}; id", "a'b", "''", "plain"] {
+            var expected: [Unicode.Scalar] = ["'"]
+            for scalar in input.unicodeScalars {
+                expected += scalar == "'" ? ["'", "\\", "'", "'"] : [scalar]
+            }
+            expected.append("'")
+            #expect(Array(shellQuoted(input).unicodeScalars) == expected, "\(input)")
+        }
+    }
+
+    /// The shell reads the quoted text back as exactly one word, the input.
+    @Test func shellReadsItBackAsOneWord() throws {
+        for input in ["e'\u{0301}; id;#", "\u{0600}'x", "'\u{200D}x", "a b'c\"d$e`f`\\g"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", "set -- \(shellQuoted(input)); printf '%s|%s' \"$#\" \"$1\""]
+            let out = Pipe()
+            process.standardOutput = out
+            try process.run()
+            process.waitUntilExit()
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            #expect(text == "1|" + input, "\(input)")
+        }
+    }
+}

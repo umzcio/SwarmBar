@@ -251,7 +251,7 @@ enum SetupPlanner {
                 all[index].needs.contains($0.change.path) && $0.change.action == .byHand
             })?.change.path else { continue }
             all[index].change.action = .byHand
-            all[index].change.description = "Edit by hand: \(all[index].change.path) would run \(bridge), "
+            all[index].change.description = "Edit by hand: \(all[index].change.path) would run \(proseQuoted(bridge)), "
                 + "which SwarmBar couldn't check. Sort that file out first, then set this host up again."
         }
         let narrow = watchAs == .everyUser && !probe.sudoOK
@@ -397,6 +397,42 @@ enum SetupPlanner {
         }
     }
 
+    /// Whether a host-reported path may go into the setup's shell lines at
+    /// all. A watched user names the folders in their own home, so a path
+    /// is planned as a sent change only when every scalar is on a
+    /// conservative list: ASCII letters and digits, a few punctuation marks
+    /// that mean nothing inside single quotes, and letters and digits from
+    /// other scripts. Quotes, backslashes, `$`, backticks, combining marks,
+    /// format scalars and anything else make it a hand edit, so quoting
+    /// never has to be right about them.
+    static func isShellSafe(_ path: String) -> Bool {
+        !path.isEmpty && path.unicodeScalars.allSatisfy { scalar in
+            if scalar.isASCII {
+                switch scalar {
+                case "a"..."z", "A"..."Z", "0"..."9", "/", ".", "_", "-", "+", ",", "@", ":", "~", "%", "=", " ":
+                    return true
+                default:
+                    return false
+                }
+            }
+            switch scalar.properties.generalCategory {
+            case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+                 .decimalNumber:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// A path for prose: as it is when isShellSafe, otherwise in double
+    /// quotes with every scalar outside printable ASCII escaped, so a
+    /// hostile name reaches no reader as anything but visibly quoted data.
+    static func proseQuoted(_ path: String) -> String {
+        if isShellSafe(path) { return path }
+        return "\"" + path.unicodeScalars.map { $0.escaped(asASCII: true) }.joined() + "\""
+    }
+
     // MARK: Pieces
 
     /// Every home for every user, or the login user's own. Either way an
@@ -540,14 +576,16 @@ enum SetupPlanner {
         return (try? JSONSerialization.jsonObject(with: data)) as? NSObject
     }
 
-    /// A path holding a control character becomes a hand edit: it would
-    /// turn the prompt's shell lines into something else.
+    /// A path that is not isShellSafe becomes a hand edit: a control
+    /// character, a quote or anything a shell reads specially could turn
+    /// the prompt's shell lines into something else. Its description
+    /// carries the path quoted and escaped, never as it came.
     private static func markUnwritablePaths(_ pending: inout [Pending]) {
-        for index in pending.indices where !isPrintable(pending[index].change.path) {
+        for index in pending.indices where !isShellSafe(pending[index].change.path) {
             pending[index].change.action = .byHand
             pending[index].change.expectSHA256 = ""
             pending[index].change.description =
-                "Edit by hand: SwarmBar won't write a path with control characters: \(String(reflecting: pending[index].change.path))"
+                "Edit by hand: SwarmBar won't write a path with control characters or characters a shell treats specially: \(proseQuoted(pending[index].change.path))"
         }
     }
 

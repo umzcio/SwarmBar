@@ -430,6 +430,45 @@ import Testing
         #expect(!SetupCommand.prompt(plan: plan, hostName: "devbox").text.contains(crafted))
     }
 
+    @Test func shellSpecialPathIsAHandEditAndNeverAShellLine() throws {
+        // A watched user names the folders in their own home. A quote fused
+        // with a combining mark once slipped past the quoting.
+        for crafted in ["/root/e'\u{0301}; id;/settings.json", "/root/\u{0600}'x/settings.json",
+                        "/root/'\u{200D}x/settings.json", "/root/a\\b/settings.json",
+                        "/root/$(id)/settings.json", "/root/`id`/settings.json",
+                        "/root/e\u{0301}/settings.json"] {
+            let probe = Self.probe(
+                tools: ["/root": ["claude"]], configs: ["/root": [Self.config("claude", crafted, "{}\n")]])
+            let plan = try Self.plan(probe)
+            let change = try #require(Self.change(plan, at: crafted))
+            #expect(change.action == .byHand, "\(crafted)")
+            // In prose only, quoted and escaped to ASCII.
+            let ascii = change.description.unicodeScalars.allSatisfy { $0.isASCII }
+            #expect(ascii, "\(crafted)")
+            #expect(change.description.hasSuffix(SetupPlanner.proseQuoted(crafted)), "\(crafted)")
+            #expect(SetupPlanner.proseQuoted(crafted).hasPrefix("\""), "\(crafted)")
+            let prompt = SetupCommand.prompt(plan: plan, hostName: "devbox").text
+            #expect(prompt.unicodeScalars.allSatisfy { $0.isASCII }, "\(crafted)")
+            // No shell line names it: the only line that may is the hand
+            // edit's own entry in the list for a person.
+            let naming = prompt.components(separatedBy: "\n").filter {
+                $0.contains(crafted) || $0.contains(SetupPlanner.proseQuoted(crafted))
+            }
+            #expect(naming == ["- " + change.description], "\(crafted)")
+        }
+    }
+
+    @Test func ordinaryPathsStayShellSafe() {
+        for path in ["/root/.claude/settings.json", "/home/u/.config/opencode/opencode.jsonc",
+                     "/Users/Jos\u{00E9}/Library/Application Support/x.json", "/home/a+b/c,d@e:f~g%h=i"] {
+            #expect(SetupPlanner.isShellSafe(path), "\(path)")
+        }
+        for path in ["", "/a'b", "/a\"b", "/a\\b", "/a$b", "/a`b", "/a;b", "/a\nb", "/a#b",
+                     "/e\u{0301}", "/x\u{200D}", "/\u{0600}x", "/a*b", "/a!b"] {
+            #expect(!SetupPlanner.isShellSafe(path), "\(path)")
+        }
+    }
+
     @Test func configAlreadySetUpNeedsNoChange() throws {
         let script = "/root/.swarmbar/swarmbar-remote-hook.sh"
         let done = try ClaudeHookTransform.install("{}\n", scriptPath: script, family: .remote)

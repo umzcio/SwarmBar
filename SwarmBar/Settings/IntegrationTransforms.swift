@@ -18,8 +18,23 @@ enum IntegrationTransformError: Error, LocalizedError {
 /// Wraps a path in single quotes so a shell runs it as one word even when it
 /// contains spaces. Embedded single quotes are closed, escaped, and reopened,
 /// which is the only sequence a POSIX shell accepts inside single quotes.
+///
+/// Scalar by scalar, never by Character: a quote fused with a combining
+/// mark (or after a prepending scalar) is one Character that is not "'",
+/// so a Character search leaves it unescaped, while the shell reads its
+/// 0x27 byte and ends the word there.
 func shellQuoted(_ path: String) -> String {
-    "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    var quoted = String.UnicodeScalarView()
+    quoted.append("'")
+    for scalar in path.unicodeScalars {
+        if scalar == "'" {
+            quoted.append(contentsOf: "'\\''".unicodeScalars)
+        } else {
+            quoted.append(scalar)
+        }
+    }
+    quoted.append("'")
+    return String(quoted)
 }
 
 /// Which set of SwarmBar bridge entries a transform manages. One Mac can be
