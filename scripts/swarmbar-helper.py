@@ -4961,14 +4961,45 @@ def decode_operations(blob):
     return operations
 
 
-def apply_main(args):
+# The most `apply -` reads from stdin. The Mac refuses a blob past 100 KB.
+MAX_BLOB_BYTES = 4 * 1024 * 1024
+
+
+def read_blob(stream):
+    """The blob from `stream`, or None past MAX_BLOB_BYTES or unreadable."""
+    try:
+        data = stream.read(MAX_BLOB_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if len(data) > MAX_BLOB_BYTES:
+        return None
+    return data
+
+
+def apply_main(args, stdin=None):
     """Runs every operation in order, printing a line for each, and stops at
-    the first failure. Returns the exit status."""
+    the first failure. Returns the exit status.
+
+    `apply -` reads the blob from stdin, which is how the setup command
+    sends it: the blob carries whole config files, and an argument would
+    sit in the process list, where on Linux every local account can read
+    it, for as long as sudo waits for a password and apply runs. `apply
+    <blob>` still works for a command an older SwarmBar printed."""
     if narrow_rule_run():
         sys.stdout.write("failed: %s\n" % NARROW_RULE_REFUSAL["error"])
         sys.stdout.flush()
         return 2
-    operations = decode_operations(args[0]) if len(args) == 1 else None
+    blob = None
+    if args == ["-"]:
+        blob = read_blob(stdin if stdin is not None else sys.stdin)
+    elif len(args) == 1:
+        blob = args[0]
+    operations = decode_operations(blob) if blob is not None else None
     if not operations:
         sys.stdout.write("failed: cannot read the setup operations\n")
         sys.stdout.flush()

@@ -4122,6 +4122,25 @@ class ApplyTests(unittest.TestCase):
         return {"op": "write_file", "path": path, "content_b64": encoded(text),
                 "expect_sha256": expect, "mode": 0o644}
 
+    def test_blob_read_from_stdin(self):
+        # The setup command pipes the blob in, so no config's contents sit
+        # in any process's arguments.
+        target = self.put(".claude/settings.json", "{}\n")
+        blob = apply_blob([self.write_op(target, "fresh\n", sha("{}\n"))])
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            code = helper.apply_main(["-"], stdin=io.StringIO(blob + "\n"))
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(self.read(target), "fresh\n")
+
+    def test_oversized_or_empty_stdin_is_refused(self):
+        for data in ("", "A" * (helper.MAX_BLOB_BYTES + 1)):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                code = helper.apply_main(["-"], stdin=io.StringIO(data))
+            self.assertEqual(code, 2)
+            self.assertIn("cannot read the setup operations", out.getvalue())
+
     def test_apply_runs_operations_in_order_and_stops_on_failure(self):
         first = self.put(".claude/settings.json", "{}\n")
         second = self.put(".kimi-code/config.toml", "edited by hand\n")
