@@ -309,17 +309,39 @@ final class SessionStore {
     /// so its rollout keeps describing the same prompt for as long as the
     /// command takes, and the row would offer Approve again under the same
     /// text: a second "y" lands on whatever is on screen by then.
-    @ObservationIgnored private var answeredPrompts: [UUID: (eventID: String, allow: Bool, prompt: ApprovalPrompt)] = [:]
+    @ObservationIgnored private var answeredPrompts: [UUID: (eventID: String, allow: Bool)] = [:]
 
     /// Keys answering a prompt reached its terminal. Until the session's
-    /// own state moves past that prompt, the row reads as answered.
+    /// own state moves past that prompt, the row says what was sent.
+    ///
+    /// It does not say the command is running. The keys reaching the
+    /// terminal is iTerm2 or tmux writing a byte, not Codex accepting it:
+    /// a "y" that landed before the prompt was drawn, or in the composer,
+    /// leaves Codex waiting. So the row stays in Needs you, as the rollout
+    /// says it should (an approved long-running command keeps its row
+    /// orange until its output line lands), with no second Approve, and
+    /// points at the terminal in case Codex is still asking.
     func noteKeysAnswered(_ sessionID: UUID, allow: Bool) {
         guard let session = sessions.first(where: { $0.id == sessionID }),
-              case .waitingApproval(let prompt) = session.status,
+              case .waitingApproval = session.status,
               let eventID = session.attentionEventID
         else { return }
-        answeredPrompts[sessionID] = (eventID, allow, prompt)
-        noteAnswered(sessionID, command: prompt, allow: allow)
+        answeredPrompts[sessionID] = (eventID, allow)
+        noteKeysSent(sessionID, allow: allow)
+    }
+
+    /// What a row whose answer went out by keystroke says until the
+    /// session moves past the prompt.
+    nonisolated static func keysSentReason(allow: Bool) -> String {
+        allow
+            ? "Approve was sent to the terminal. Codex shows this request until the command finishes. If it is still asking, answer it in the terminal."
+            : "Deny was sent to the terminal. If Codex is still asking, answer it in the terminal."
+    }
+
+    private func noteKeysSent(_ id: UUID, allow: Bool) {
+        update(id: id) {
+            $0.status = .waitingApproval(command: .unreadable(Self.keysSentReason(allow: allow)))
+        }
     }
 
     private func holdAnsweredPrompts() {
@@ -332,7 +354,7 @@ final class SessionStore {
                 answeredPrompts.removeValue(forKey: id)
                 continue
             }
-            noteAnswered(id, command: answered.prompt, allow: answered.allow)
+            noteKeysSent(id, allow: answered.allow)
         }
     }
 

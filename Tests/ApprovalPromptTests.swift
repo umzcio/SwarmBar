@@ -251,16 +251,32 @@ struct KeysAnsweredTests {
             processAlive: true, attentionEventID: event)
     }
 
+    /// What the row says once keys went out. Writing the byte to the
+    /// terminal is not Codex accepting it (it may have landed before the
+    /// prompt was drawn), so the row stays in Needs you, says what was
+    /// sent, offers no second Approve, and sends the person to the
+    /// terminal if Codex is still asking. That is also the live-verified
+    /// rule: an approved long-running command keeps its row orange until
+    /// its output line lands.
+    private func isSent(_ status: SessionStatus?, allow: Bool) -> Bool {
+        guard case .waitingApproval(let prompt) = status,
+              case .unreadable(let reason) = prompt.fidelity
+        else { return false }
+        return !prompt.offersApprove && prompt.text.isEmpty
+            && reason == SessionStore.keysSentReason(allow: allow)
+            && status?.needsAttention == true
+    }
+
     @Test func anAnsweredCallIsNotOfferedAgain() {
         let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
         let id = UUID()
         store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
         store.noteKeysAnswered(id, allow: true)
-        #expect(store.sessions.first?.status == .runningTool(activity: "Running make"))
+        #expect(isSent(store.sessions.first?.status, allow: true))
 
         // The next poll still reads the same prompt from the rollout.
         store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
-        #expect(store.sessions.first?.status == .runningTool(activity: "Running make"))
+        #expect(isSent(store.sessions.first?.status, allow: true))
 
         // A new call is a new prompt.
         store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c2", command: "rm -rf build")])
@@ -273,7 +289,7 @@ struct KeysAnsweredTests {
         store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
         store.noteKeysAnswered(id, allow: false)
         store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
-        #expect(store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+        #expect(isSent(store.sessions.first?.status, allow: false))
         var settled = codexRow(id, event: "call:c1")
         settled.status = .working(activity: "Working…")
         store.sync(tool: .codex, sessions: [settled])
