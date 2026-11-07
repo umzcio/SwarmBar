@@ -72,6 +72,8 @@ struct ApprovalPrompt: Equatable, Sendable, ExpressibleByStringLiteral {
     /// name. Every other argument follows on its own line.
     private static let primaryArguments = [
         "file_path", "notebook_path", "path", "url", "command", "pattern",
+        // Antigravity's argument names.
+        "CommandLine", "TargetFile", "AbsolutePath", "DirectoryPath", "Url",
     ]
 
     /// Arguments that carry a file's contents. Past `longContent`
@@ -79,6 +81,7 @@ struct ApprovalPrompt: Equatable, Sendable, ExpressibleByStringLiteral {
     /// else is always shown whole.
     private static let contentArguments: Set<String> = [
         "content", "new_string", "old_string", "new_source", "edits", "diff",
+        "CodeContent", "ReplacementContent", "ReplacementChunks",
     ]
     static let longContent = 8_000
 

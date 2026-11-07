@@ -53,8 +53,8 @@ final class IntegrationManager {
             ? .noSetupNeeded : .toolMissing
         states[.grokBuild] = fm.fileExists(atPath: home.appendingPathComponent(".grok").path)
             ? .noSetupNeeded : .toolMissing
-        // Read only for now: the conversation database gives status without
-        // any bridge, and approve/deny is not wired. See AntigravityMonitor.
+        // Nothing to install: the conversation database gives status, and
+        // approve/deny are terminal keystrokes. See AntigravityMonitor.
         states[.antigravity] = fm.fileExists(
             atPath: home.appendingPathComponent(".gemini/antigravity-cli").path)
             ? .noSetupNeeded : .toolMissing

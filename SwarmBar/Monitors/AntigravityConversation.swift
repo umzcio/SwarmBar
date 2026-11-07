@@ -47,7 +47,12 @@ enum AntigravityConversation {
         let question: String?
         let options: [String]
         /// What the agent wants to do, from the tool call's own summary.
+        /// The model writes it, so it is context, never the request.
         let summary: String
+        /// What Approve would allow: the question itself for
+        /// `ask_question`, and for a gated tool call its name and real
+        /// arguments, or a plain statement that they could not be read.
+        let prompt: ApprovalPrompt
 
         /// Approve and deny get the orange approval row with its own
         /// buttons; anything else is a question the user answers in words,
@@ -115,7 +120,8 @@ enum AntigravityConversation {
             return Pending(
                 question: prompt,
                 options: (first["options"] as? [String]) ?? [],
-                summary: (json["toolSummary"] as? String) ?? prompt
+                summary: (json["toolSummary"] as? String) ?? prompt,
+                prompt: ApprovalPrompt(prompt)
             )
         }
         // Any other tool call. Every argument object carries toolSummary
@@ -128,7 +134,81 @@ enum AntigravityConversation {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !summary.isEmpty
         else { return nil }
-        return Pending(question: nil, options: [], summary: summary)
+        return Pending(
+            question: nil, options: [], summary: summary,
+            prompt: gatedPrompt(in: text, summary: summary))
+    }
+
+    /// The gated call's own arguments, for the approval row. The summary
+    /// beside them is the model's description of the call, and a model
+    /// following injected text can describe `curl … | sh` as "Listing
+    /// files", so it is only ever shown as context.
+    ///
+    /// The call is read from the protobuf frame that names the tool and
+    /// carries its arguments, `<length><tool name>{…}` (sampled live as
+    /// `\u{0d}write_to_file{"CodeContent":…}`). Exactly one such frame
+    /// must be present: a second one, say inside other text the step
+    /// carries, makes the call ambiguous, and an ambiguous call is not
+    /// offered for approval.
+    nonisolated static func gatedPrompt(in text: String, summary: String) -> ApprovalPrompt {
+        let unreadable = ApprovalPrompt.unreadable(
+            "SwarmBar cannot read what Antigravity is asking to do. Review it in the terminal.",
+            context: summary)
+        let calls = framedCalls(in: text)
+        let call: (tool: String?, arguments: [String: Any])
+        if calls.count == 1 {
+            call = calls[0]
+        } else if calls.isEmpty,
+                  occurrences(of: "\"toolSummary\"", in: text) <= 1,
+                  occurrences(of: "\"toolAction\"", in: text) <= 1,
+                  let json = embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
+                    ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\"") {
+            // No frame, but only one argument object to choose from.
+            call = (nil, json)
+        } else {
+            return unreadable
+        }
+        var arguments = call.arguments
+        arguments.removeValue(forKey: "toolSummary")
+        arguments.removeValue(forKey: "toolAction")
+        guard !arguments.isEmpty else { return unreadable }
+        return ApprovalPrompt(ApprovalPrompt.describe(
+            tool: call.tool ?? "Tool call", arguments: arguments))
+    }
+
+    /// Every `<length><name>{json}` frame whose object carries a tool
+    /// summary or action, which is how a tool call's arguments sit in the
+    /// step's metadata.
+    nonisolated static func framedCalls(in text: String) -> [(tool: String?, arguments: [String: Any])] {
+        let scalars = text.unicodeScalars
+        var found: [(tool: String?, arguments: [String: Any])] = []
+        var index = scalars.startIndex
+        while index < scalars.endIndex {
+            defer { index = scalars.index(after: index) }
+            guard scalars[index] == "{" else { continue }
+            var nameStart = index
+            var length = 0
+            while nameStart > scalars.startIndex, length < 127 {
+                let previous = scalars.index(before: nameStart)
+                let scalar = scalars[previous]
+                guard scalar.isASCII, scalar.properties.isAlphabetic
+                        || ("0"..."9").contains(scalar) || scalar == "_"
+                else { break }
+                nameStart = previous
+                length += 1
+            }
+            guard length > 0, nameStart > scalars.startIndex,
+                  scalars[scalars.index(before: nameStart)].value == UInt32(length),
+                  let parsed = StrictJSONObject.parse(in: text, from: index),
+                  parsed.object["toolSummary"] != nil || parsed.object["toolAction"] != nil
+            else { continue }
+            found.append((String(scalars[nameStart..<index]), parsed.object))
+        }
+        return found
+    }
+
+    private nonisolated static func occurrences(of needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
     }
 
     /// Finds the JSON object that opens immediately before `key` and
