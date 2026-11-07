@@ -105,20 +105,28 @@ struct GrokBuildMonitor: SessionMonitor {
     /// phase is permission_prompt, nil once the prompt has been answered
     /// (a later phase_changed supersedes it).
     nonisolated static func pendingPermissionTool(dir: URL) -> String? {
+        pendingPermission(dir: dir)?.tool
+    }
+
+    /// The tool awaiting permission and, where events.jsonl records one,
+    /// the id of the call it is about.
+    nonisolated static func pendingPermission(dir: URL) -> (tool: String, callID: String?)? {
         guard let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("events.jsonl"))
         else { return nil }
-        var requestedTool: String?
+        var requested: (tool: String?, callID: String?)?
         for raw in tail.split(separator: "\n").reversed() {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let type = line["type"] as? String
             else { continue }
-            if type == "permission_requested", requestedTool == nil {
-                requestedTool = line["tool_name"] as? String
+            if type == "permission_requested", requested == nil {
+                let callID = ["tool_call_id", "toolCallId", "call_id"]
+                    .lazy.compactMap { line[$0] as? String }.first
+                requested = (line["tool_name"] as? String, callID)
             }
             if type == "phase_changed" {
                 guard (line["phase"] as? String) == "permission_prompt" else { return nil }
-                return requestedTool ?? "tool"
+                return (requested?.tool ?? "tool", requested?.callID)
             }
         }
         return nil
@@ -218,9 +226,12 @@ struct GrokBuildMonitor: SessionMonitor {
             // (phase_changed to permission_prompt + permission_requested);
             // otherwise the update stream carries the working state.
             let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
-            if let tool = pendingPermissionTool(dir: dir) {
-                let command = tail.flatMap { GrokUpdatesParser.pendingToolCommand(tail: $0) }
-                status = .waitingApproval(command: ApprovalPrompt(command ?? tool))
+            if let pending = pendingPermission(dir: dir) {
+                status = .waitingApproval(command: tail.map {
+                    GrokUpdatesParser.pendingToolPrompt(
+                        tail: $0, tool: pending.tool, callID: pending.callID)
+                } ?? .unreadable(
+                    "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal."))
             } else {
                 status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
                     ?? .working(activity: "Working…")

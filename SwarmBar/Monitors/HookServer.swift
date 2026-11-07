@@ -667,7 +667,7 @@ final class HookServer: ApprovalResponding {
             }.filter { !$0.isEmpty }
             if !lines.isEmpty { return ApprovalPrompt(lines.joined(separator: "\n")) }
         }
-        return ApprovalPrompt(describe(tool: toolName, arguments: input))
+        return ApprovalPrompt(ApprovalPrompt.describe(tool: toolName, arguments: input))
     }
 
     /// A permission.asked payload from the OpenCode plugin, in full: the
@@ -683,7 +683,7 @@ final class HookServer: ApprovalResponding {
             let command = (metadata.removeValue(forKey: "command") as? String)
                 ?? (patterns.isEmpty ? nil : patterns.joined(separator: "\n"))
             if let command {
-                let rest = describeArguments(metadata)
+                let rest = ApprovalPrompt.describeArguments(metadata)
                 return ApprovalPrompt(rest.isEmpty ? command : command + "\n" + rest)
             }
         }
@@ -693,58 +693,8 @@ final class HookServer: ApprovalResponding {
         } else if !patterns.isEmpty {
             head += "\n" + patterns.joined(separator: "\n")
         }
-        let rest = describeArguments(metadata)
+        let rest = ApprovalPrompt.describeArguments(metadata)
         return ApprovalPrompt(rest.isEmpty ? head : head + "\n" + rest)
-    }
-
-    /// The argument that names what a call acts on, shown beside the tool
-    /// name. Every other argument follows on its own line.
-    private nonisolated static let primaryArguments = [
-        "file_path", "notebook_path", "path", "url", "command", "pattern",
-    ]
-
-    /// Arguments that carry a file's contents. Past `longContent`
-    /// characters they are given as a size rather than inline; everything
-    /// else is always shown whole.
-    private nonisolated static let contentArguments: Set<String> = [
-        "content", "new_string", "old_string", "new_source", "edits", "diff",
-    ]
-    nonisolated static let longContent = 8_000
-
-    nonisolated static func describe(tool: String, arguments: [String: Any]) -> String {
-        var rest = arguments
-        var head = tool
-        if let key = primaryArguments.first(where: {
-            (arguments[$0] as? String).map { !$0.contains("\n") } ?? false
-        }), let value = rest.removeValue(forKey: key) as? String {
-            head += " " + value
-        }
-        let lines = describeArguments(rest)
-        return lines.isEmpty ? head : head + "\n" + lines
-    }
-
-    /// One `key: value` line per argument, in key order, strings verbatim
-    /// and anything else as JSON. A multi-line value starts on its own
-    /// line so its first line cannot pass for the key's whole value.
-    nonisolated static func describeArguments(_ arguments: [String: Any]) -> String {
-        arguments.keys.sorted().map { key in
-            let value = arguments[key]
-            let text: String
-            if let string = value as? String {
-                text = string
-            } else if let value, JSONSerialization.isValidJSONObject([value]),
-                      let data = try? JSONSerialization.data(
-                        withJSONObject: [value], options: [.sortedKeys, .withoutEscapingSlashes]),
-                      let array = String(data: data, encoding: .utf8) {
-                text = String(array.dropFirst().dropLast())
-            } else {
-                text = String(describing: value ?? "null")
-            }
-            if contentArguments.contains(key), text.count > longContent {
-                return "\(key): \(text.count) characters, not shown here"
-            }
-            return text.contains("\n") ? "\(key):\n\(text)" : "\(key): \(text)"
-        }.joined(separator: "\n")
     }
 
     /// The first question of an AskUserQuestion call, with a count when

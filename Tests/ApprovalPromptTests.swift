@@ -91,7 +91,7 @@ struct HookApprovalPromptTests {
     }
 
     @Test func hugeContentIsGivenAsASize() {
-        let body = String(repeating: "y", count: HookServer.longContent + 1)
+        let body = String(repeating: "y", count: ApprovalPrompt.longContent + 1)
         let prompt = HookServer.approvalPrompt([
             "tool_name": "Write",
             "tool_input": ["file_path": "/tmp/a.txt", "content": body],
