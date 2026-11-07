@@ -11,6 +11,16 @@ struct SwarmBarApp: App {
     /// the first time the wizard opens.
     @State private var remoteWizard: RemoteWizardLauncher
 
+    /// True when XCTest launched this process to host the unit tests. The
+    /// test bundle is injected after launch, so this reads the environment
+    /// XCTest sets up front rather than looking for a test class.
+    static let isUnitTestHost: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return env["XCTestConfigurationFilePath"] != nil
+            || env["XCTestBundlePath"] != nil
+            || env["XCTestSessionIdentifier"] != nil
+    }()
+
     init() {
         // A write to a pipe whose reader has already gone raises SIGPIPE,
         // and the default disposition kills the whole menu bar app. Every
@@ -26,6 +36,17 @@ struct SwarmBarApp: App {
         let hookServer = HookServer(store: store)
         self.hookServer = hookServer
         store.approvalResponder = hookServer
+        // The unit tests use this app as their host, so a test run launches
+        // it. It must start nothing a running copy owns: binding the hook
+        // port, rewriting the installed hook scripts, discarding the remote
+        // mirrors, or connecting to the hosts, where its helper version would
+        // fight the installed app's. The tests drive what they need directly.
+        if Self.isUnitTestHost {
+            remoteRegistry = nil
+            remoteSupervisor = nil
+            _remoteWizard = State(initialValue: RemoteWizardLauncher(makeModel: nil))
+            return
+        }
         hookServer.start()
         AgentNotifier.prepare()
         // Off the main thread: it reads and may rewrite two small files.
