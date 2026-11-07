@@ -298,9 +298,42 @@ final class SessionStore {
                 update(id: id) { $0.status = .done(summary: prompt) }
             }
         }
+        holdAnsweredPrompts()
         pruneSessionRecords()
         reapplyHookOverrides()
         pruneAlertRecords()
+    }
+
+    /// Prompts answered by keystrokes, by row, with the request id they
+    /// answered. Codex records nothing until the approved command has run,
+    /// so its rollout keeps describing the same prompt for as long as the
+    /// command takes, and the row would offer Approve again under the same
+    /// text: a second "y" lands on whatever is on screen by then.
+    @ObservationIgnored private var answeredPrompts: [UUID: (eventID: String, allow: Bool, prompt: ApprovalPrompt)] = [:]
+
+    /// Keys answering a prompt reached its terminal. Until the session's
+    /// own state moves past that prompt, the row reads as answered.
+    func noteKeysAnswered(_ sessionID: UUID, allow: Bool) {
+        guard let session = sessions.first(where: { $0.id == sessionID }),
+              case .waitingApproval(let prompt) = session.status,
+              let eventID = session.attentionEventID
+        else { return }
+        answeredPrompts[sessionID] = (eventID, allow, prompt)
+        noteAnswered(sessionID, command: prompt, allow: allow)
+    }
+
+    private func holdAnsweredPrompts() {
+        for (id, answered) in answeredPrompts {
+            guard let session = sessions.first(where: { $0.id == id }),
+                  case .waitingApproval = session.status,
+                  session.attentionEventID == answered.eventID
+            else {
+                // The prompt settled, or a different one is asking.
+                answeredPrompts.removeValue(forKey: id)
+                continue
+            }
+            noteAnswered(id, command: answered.prompt, allow: answered.allow)
+        }
     }
 
     /// Forgets bookkeeping for sessions the store no longer holds, so a
@@ -628,7 +661,7 @@ final class SessionStore {
         }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: true, in: environment(for: session)),
-            for: session,
+            for: session, allow: true,
             choose: TuiPromptLayout.approveOnceOption(in:),
             mockStatus: .runningTool(activity: running(command))
         )
@@ -646,7 +679,7 @@ final class SessionStore {
         }
         follow(
             ApprovalRouter.route(tool: session.tool, allow: false, in: environment(for: session)),
-            for: session,
+            for: session, allow: false,
             choose: TuiPromptLayout.rejectOption(in:),
             mockStatus: .working(activity: "Rethinking approach without that command…")
         )
@@ -665,6 +698,7 @@ final class SessionStore {
     private func follow(
         _ route: ApprovalRoute,
         for session: AgentSession,
+        allow: Bool,
         choose: @escaping @Sendable (String) -> TuiPromptLayout.Option?,
         mockStatus: SessionStatus
     ) {
@@ -673,7 +707,7 @@ final class SessionStore {
             return
         }
         switch route {
-        case .keys(let keys):       answerTuiPrompt(session, keys: keys)
+        case .keys(let keys):       answerTuiPrompt(session, keys: keys, allow: allow)
         case .numberedSelector:     answerNumberedPrompt(session, choose: choose)
         case .navigateSelector:     answerByNavigation(session, choose: choose)
         case .focusTerminal:        openInTerminal(session)
@@ -701,7 +735,13 @@ final class SessionStore {
               case .waitingApproval(let command) = current.status,
               command == answered
         else { return }
-        noteAnswered(session.id, command: command, allow: allow)
+        if session.tool == .codex {
+            // Codex's prompt stays in its rollout until the command has
+            // run, here as on this Mac.
+            noteKeysAnswered(session.id, allow: allow)
+        } else {
+            noteAnswered(session.id, command: command, allow: allow)
+        }
     }
 
     private func running(_ command: ApprovalPrompt) -> String {
@@ -786,12 +826,14 @@ final class SessionStore {
         }
     }
 
-    private func answerTuiPrompt(_ session: AgentSession, keys: [String]) {
+    private func answerTuiPrompt(_ session: AgentSession, keys: [String], allow: Bool) {
         let id = session.id
         let path = session.projectPath
         let tool = session.tool
         Task.detached {
-            if !TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys) {
+            if TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys) {
+                await MainActor.run { self.noteKeysAnswered(id, allow: allow) }
+            } else {
                 TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
             }
         }

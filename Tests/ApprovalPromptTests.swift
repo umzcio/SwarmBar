@@ -174,7 +174,7 @@ struct HookApprovalPromptTests {
 @MainActor
 struct ApproveGateTests {
     @Test func anUnreadablePromptIsNeverApproved() {
-        let store = SessionStore()
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
         var routed: [ApprovalRoute] = []
         store.localAnswerObserver = { _, route in routed.append(route) }
         let session = AgentSession(
@@ -185,5 +185,49 @@ struct ApproveGateTests {
         #expect(routed.isEmpty)
         store.deny(session)
         #expect(routed.count == 1)
+    }
+}
+
+/// Codex records nothing until an approved command has run, so its rollout
+/// keeps describing the answered prompt. The row must not offer Approve
+/// again for it.
+@MainActor
+struct KeysAnsweredTests {
+    private func codexRow(_ id: UUID, event: String, command: String = "make deploy") -> AgentSession {
+        AgentSession(
+            id: id, tool: .codex, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/proj"),
+            status: .waitingApproval(command: ApprovalPrompt(command)),
+            processAlive: true, attentionEventID: event)
+    }
+
+    @Test func anAnsweredCallIsNotOfferedAgain() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        let id = UUID()
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
+        store.noteKeysAnswered(id, allow: true)
+        #expect(store.sessions.first?.status == .runningTool(activity: "Running make"))
+
+        // The next poll still reads the same prompt from the rollout.
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
+        #expect(store.sessions.first?.status == .runningTool(activity: "Running make"))
+
+        // A new call is a new prompt.
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c2", command: "rm -rf build")])
+        #expect(store.sessions.first?.status == .waitingApproval(command: "rm -rf build"))
+    }
+
+    @Test func aDenyHoldsTooUntilThePromptSettles() {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        let id = UUID()
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
+        store.noteKeysAnswered(id, allow: false)
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
+        #expect(store.sessions.first?.status == .working(activity: "Rethinking after deny…"))
+        var settled = codexRow(id, event: "call:c1")
+        settled.status = .working(activity: "Working…")
+        store.sync(tool: .codex, sessions: [settled])
+        store.sync(tool: .codex, sessions: [codexRow(id, event: "call:c1")])
+        #expect(store.sessions.first?.status == .waitingApproval(command: "make deploy"))
     }
 }
