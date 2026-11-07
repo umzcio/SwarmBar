@@ -8,59 +8,84 @@ enum StrictJSONObject {
     /// A JSON object starting exactly at `start` (after whitespace), with
     /// where it ends. Refused when a top-level key is repeated or written
     /// with an escape: JavaScript and a JSON parser need not agree on
-    /// which of two `cmd` keys wins, and `"c\u006dd"` is `cmd` to both.
+    /// which of two `cmd` keys wins, and `"cmd"` is `cmd` to both.
+    /// `__proto__` is refused too, since in a JavaScript literal it sets
+    /// the prototype rather than naming a field.
+    ///
+    /// Scanned scalar by scalar, never by Character. Both parsers read a
+    /// quote wherever a U+0022 scalar is, but a quote fused into one
+    /// grapheme with a combining mark after it (U+0301, U+200D) or a
+    /// prepending scalar before it (U+0600) is a Character that is not a
+    /// quote. A Character scan then loses track of which text is inside a
+    /// string, and keys in between are never checked. Every character
+    /// that matters here is ASCII, so a scalar is exactly what both
+    /// parsers see. `end` is a scalar boundary and need not be a Character
+    /// boundary: read what follows through `unicodeScalars`.
+    ///
+    /// `checkingKeys: false` keeps the scalar scan and drops the key rules,
+    /// for text that is only ever context (a summary), never the request.
     nonisolated static func parse(
-        in text: String, from start: String.Index
+        in text: String, from start: String.Index, checkingKeys: Bool = true
     ) -> (object: [String: Any], end: String.Index)? {
+        let scalars = text.unicodeScalars
         var index = start
-        while index < text.endIndex, text[index].isWhitespace { index = text.index(after: index) }
-        guard index < text.endIndex, text[index] == "{" else { return nil }
+        while index < scalars.endIndex, scalars[index].properties.isWhitespace {
+            index = scalars.index(after: index)
+        }
+        guard index < scalars.endIndex, scalars[index] == "{" else { return nil }
         let open = index
         var depth = 0
         var inString = false
         var escaped = false
         var stringStart = index
         var stringHasEscape = false
+        // Compared as Strings, which match by canonical equivalence: a
+        // superset of scalar equality, so two keys that differ only in
+        // normalization are refused too rather than left to the bridge
+        // into a Swift dictionary to pick between.
         var keys = Set<String>()
-        while index < text.endIndex {
-            let character = text[index]
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
             if inString {
                 if escaped {
                     escaped = false
-                } else if character == "\\" {
+                } else if scalar == "\\" {
                     escaped = true
                     stringHasEscape = true
-                } else if character == "\"" {
+                } else if scalar == "\"" {
                     inString = false
-                    if depth == 1 {
+                    if depth == 1, checkingKeys {
                         // A top-level string followed by a colon is a key.
-                        var next = text.index(after: index)
-                        while next < text.endIndex, text[next].isWhitespace {
-                            next = text.index(after: next)
+                        var next = scalars.index(after: index)
+                        while next < scalars.endIndex, scalars[next].properties.isWhitespace {
+                            next = scalars.index(after: next)
                         }
-                        if next < text.endIndex, text[next] == ":" {
-                            let key = String(text[text.index(after: stringStart)..<index])
-                            guard !stringHasEscape, keys.insert(key).inserted else { return nil }
+                        if next < scalars.endIndex, scalars[next] == ":" {
+                            let key = String(scalars[scalars.index(after: stringStart)..<index])
+                            guard !stringHasEscape,
+                                  key != "__proto__",
+                                  keys.insert(key).inserted
+                            else { return nil }
                         }
                     }
                 }
-            } else if character == "\"" {
+            } else if scalar == "\"" {
                 inString = true
                 stringStart = index
                 stringHasEscape = false
-            } else if character == "{" || character == "[" {
+            } else if scalar == "{" || scalar == "[" {
                 depth += 1
-            } else if character == "}" || character == "]" {
+            } else if scalar == "}" || scalar == "]" {
                 depth -= 1
                 if depth == 0 {
-                    let end = text.index(after: index)
-                    guard let data = String(text[open..<end]).data(using: .utf8),
-                          let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                    let end = scalars.index(after: index)
+                    let data = Data(String(scalars[open..<end]).utf8)
+                    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
                     else { return nil }
                     return (object, end)
                 }
             }
-            index = text.index(after: index)
+            index = scalars.index(after: index)
         }
         return nil
     }

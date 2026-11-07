@@ -113,7 +113,10 @@ enum CodexSessionParser {
         // earlier call, a variable), so no literal is shown as if it were.
         let arguments = latest["type"] as? String == "function_call"
             ? StrictJSONObject.parse(in: input, from: input.startIndex)
-                .flatMap { input[$0.end...].allSatisfy(\.isWhitespace) ? $0.object : nil }
+                .flatMap { parsed in
+                    input.unicodeScalars[parsed.end...].allSatisfy(\.properties.isWhitespace)
+                        ? parsed.object : nil
+                }
             : codeModeArguments(input)
         guard let arguments else {
             // Unreadable, but it may still be a prompt. Say so rather than
@@ -152,14 +155,18 @@ enum CodexSessionParser {
         if argv.count == 3, shells.contains(argv[0]), ["-lc", "-c"].contains(argv[1]) {
             return argv[2]
         }
-        return argv.map(shellQuoted).joined(separator: " ")
+        return argv.map(displayQuoted).joined(separator: " ")
     }
 
-    private static func shellQuoted(_ word: String) -> String {
+    /// A word as a shell would need it written. Quoted by scalar through
+    /// the shared `shellQuoted`: a quote fused with a combining mark is a
+    /// Character that is not "'", so a Character replace left it bare, and
+    /// the row then showed one argument as a quote, a `;` and a command.
+    private static func displayQuoted(_ word: String) -> String {
         let plain = CharacterSet(charactersIn:
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:,+@%")
         if !word.isEmpty, word.unicodeScalars.allSatisfy(plain.contains) { return word }
-        return "'" + word.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return shellQuoted(word)
     }
 
     /// The arguments of a code-mode program that is exactly
@@ -176,7 +183,7 @@ enum CodexSessionParser {
               let parsed = StrictJSONObject.parse(in: program, from: headRange.upperBound)
         else { return nil }
         let tail = "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"
-        let rest = String(program[parsed.end...])
+        let rest = String(program.unicodeScalars[parsed.end...])
         guard rest.range(of: tail, options: .regularExpression) != nil else { return nil }
         return parsed.object
     }

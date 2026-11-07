@@ -161,8 +161,8 @@ enum AntigravityConversation {
         } else if calls.isEmpty,
                   occurrences(of: "\"toolSummary\"", in: text) <= 1,
                   occurrences(of: "\"toolAction\"", in: text) <= 1,
-                  let json = embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
-                    ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\"") {
+                  let json = embeddedJSONObject(in: text, containingKey: "\"toolSummary\"", strict: true)
+                    ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\"", strict: true) {
             // No frame, but only one argument object to choose from.
             call = (nil, json)
         } else {
@@ -208,46 +208,36 @@ enum AntigravityConversation {
     }
 
     private nonisolated static func occurrences(of needle: String, in text: String) -> Int {
-        text.components(separatedBy: needle).count - 1
+        var count = 0
+        var searchStart = text.startIndex
+        while let found = text.range(of: needle, options: .literal, range: searchStart..<text.endIndex) {
+            count += 1
+            searchStart = found.upperBound
+        }
+        return count
     }
 
     /// Finds the JSON object that opens immediately before `key` and
     /// returns it parsed. Brace counting has to respect strings, since the
-    /// questions themselves contain braces and quotes.
+    /// questions themselves contain braces and quotes, so it goes through
+    /// `StrictJSONObject`'s scalar scan. Searched literally, so a quote or
+    /// brace with a mark fused onto it is still found.
+    ///
+    /// `strict` applies the key rules too, and is what the fallback that
+    /// reads an unframed argument object for Approve uses: it must refuse
+    /// what the frame reader refuses, or a frame refused for a repeated key
+    /// would be read here instead, with JSONSerialization picking the first
+    /// of the two. The summary lookups are context only and stay lenient,
+    /// so a malformed call still shows as a prompt, just not an approvable
+    /// one.
     nonisolated static func embeddedJSONObject(
-        in text: String, containingKey key: String
+        in text: String, containingKey key: String, strict: Bool = false
     ) -> [String: Any]? {
-        guard let keyRange = text.range(of: key) else { return nil }
+        guard let keyRange = text.range(of: key, options: .literal) else { return nil }
         // The object opens at the last `{` at or before the key.
         guard let open = text.range(
-            of: "{", options: .backwards, range: text.startIndex..<keyRange.upperBound
+            of: "{", options: [.backwards, .literal], range: text.startIndex..<keyRange.upperBound
         )?.lowerBound else { return nil }
-
-        var depth = 0
-        var inString = false
-        var escaped = false
-        var index = open
-        while index < text.endIndex {
-            let character = text[index]
-            if escaped {
-                escaped = false
-            } else if character == "\\" && inString {
-                escaped = true
-            } else if character == "\"" {
-                inString.toggle()
-            } else if !inString {
-                if character == "{" { depth += 1 }
-                if character == "}" {
-                    depth -= 1
-                    if depth == 0 {
-                        let slice = text[open...index]
-                        guard let data = slice.data(using: .utf8) else { return nil }
-                        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                    }
-                }
-            }
-            index = text.index(after: index)
-        }
-        return nil
+        return StrictJSONObject.parse(in: text, from: open, checkingKeys: strict)?.object
     }
 }
