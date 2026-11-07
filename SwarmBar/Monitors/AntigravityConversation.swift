@@ -112,11 +112,17 @@ enum AntigravityConversation {
 
     nonisolated static func pending(inText text: String) -> Pending? {
         // An ask_question call: the question and its options are right
-        // there, so no corroboration is needed.
-        if let json = embeddedJSONObject(in: text, containingKey: "\"questions\""),
-           let questions = json["questions"] as? [[String: Any]],
+        // there, so no corroboration is needed. Only when the step's one
+        // framed call NAMES that tool: going by a `questions` key alone let
+        // a model add one to a gated run_command's arguments, and the row
+        // then showed a harmless question while Approve answered the gate
+        // for the command.
+        let calls = framedCalls(in: text)
+        if calls.count == 1, calls[0].tool == "ask_question",
+           let questions = calls[0].arguments["questions"] as? [[String: Any]],
            let first = questions.first,
            let prompt = first["question"] as? String, !prompt.isEmpty {
+            let json = calls[0].arguments
             return Pending(
                 question: prompt,
                 options: (first["options"] as? [String]) ?? [],
@@ -126,8 +132,11 @@ enum AntigravityConversation {
         }
         // Any other tool call. Every argument object carries toolSummary
         // and toolAction, so one of them describes what is being asked of
-        // the user, or what is simply running.
-        guard let json = embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
+        // the user, or what is simply running. The framed call's own
+        // object when there is one: the last brace before the key can be a
+        // nested object inside the arguments.
+        guard let json = (calls.count == 1 ? calls[0].arguments : nil)
+                ?? embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
                 ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\""),
               let summary = ((json["toolSummary"] as? String)
                 ?? (json["toolAction"] as? String))?
@@ -239,5 +248,37 @@ enum AntigravityConversation {
             of: "{", options: [.backwards, .literal], range: text.startIndex..<keyRange.upperBound
         )?.lowerBound else { return nil }
         return StrictJSONObject.parse(in: text, from: open, checkingKeys: strict)?.object
+    }
+}
+
+/// Whether an Antigravity Approve or Deny may be pressed into the screen
+/// read at click time.
+///
+/// The row is a poll behind the terminal. In the seconds between, the call
+/// it showed can settle and agy can gate the next one, and the press-time
+/// script confirms only an option label and the marked line, which read the
+/// same on every gate. So the press goes ahead only when the conversation's
+/// newest unsettled step, read again now, is the very call the row showed,
+/// and the screen ends in agy's own selector rather than a list the model
+/// wrote.
+enum AntigravityAnswerCheck {
+    nonisolated static func mayAnswer(
+        shown: ApprovalPrompt, screen: String, pending: AntigravityConversation.Pending?
+    ) -> Bool {
+        guard TuiPromptLayout.endsInAgyGate(screen),
+              let pending, pending.prompt == shown
+        else { return false }
+        return pending.question == nil || pending.isApproval
+    }
+
+    /// The newest unsettled step of the live conversation behind a row on
+    /// this Mac, read from its database now.
+    nonisolated static func livePending(sessionID: UUID) -> AntigravityConversation.Pending? {
+        let home = AntigravityReader.defaultHome()
+        guard let id = AntigravityReader.liveConversations(home: home).keys
+            .first(where: { StableID.uuid(for: $0) == sessionID })
+        else { return nil }
+        return AntigravityConversation.pending(
+            dbPath: AntigravityConversation.conversationPath(home: home, conversationID: id).path)
     }
 }

@@ -622,7 +622,20 @@ import Testing
 
     /// The scripts a prompt asks the agent to save and run, each without
     /// its fences.
-    static func scripts(in prompt: String) -> [String] {
+    /// The prompt's fenced scripts. By default without the private-folder
+    /// guard that opens each write script, and without the blocks that
+    /// make and remove the folder, so a test can run a script from
+    /// anywhere; `raw` keeps them all.
+    static func scripts(in prompt: String, raw: Bool = false) -> [String] {
+        let all = rawScripts(in: prompt)
+        guard !raw else { return all }
+        return all
+            .filter { !$0.hasPrefix("(umask 077 && mkdir -p ") && !$0.hasPrefix("rm -rf \"$HOME/.swarmbar-setup\"") }
+            .map { $0.hasPrefix(SetupCommand.scriptGuard + "\n")
+                ? String($0.dropFirst(SetupCommand.scriptGuard.count + 1)) : $0 }
+    }
+
+    private static func rawScripts(in prompt: String) -> [String] {
         var found: [String] = []
         var current: [String]?
         for line in prompt.components(separatedBy: "\n") {
@@ -825,6 +838,38 @@ import Testing
             #expect(script.contains("; fi\n\(blob)\nSWARMBAR_DATA\n"))
         }
         #expect(text.contains(SetupCommand.saveScript))
+    }
+
+    /// The script holding the contents is saved only in a folder its user
+    /// alone can enter, made and checked before the first write, and a
+    /// script saved anywhere else refuses to run.
+    @Test func writeScriptsLiveInAPrivateFolder() throws {
+        let probe = Self.probe(
+            homes: ["/root": "root", "/home/v": "v"],
+            tools: ["/root": ["claude"], "/home/v": ["opencode"]],
+            configs: ["/home/v": [Self.config("opencode", "/home/v/.config/opencode/opencode.json", "{}\n")]],
+            claudeDirs: ["/root": Self.missing("/root/.claude")])
+        let plan = try SetupPlanner.plan(probe: probe, watchAs: .everyUser, bundled: Self.bridges,
+                                         kimiEvents: [:], loginEUID: 1000, loginUser: "u")
+        let text = SetupCommand.prompt(plan: plan, hostName: "devbox").text
+        let prepare = try #require(text.range(of: SetupCommand.prepareFolder))
+        let encoded = plan.changes.compactMap(Self.newText).map { Data($0.utf8).base64EncodedString() }
+        #expect(!encoded.isEmpty)
+        for blob in encoded {
+            let at = try #require(text.range(of: blob))
+            #expect(prepare.upperBound <= at.lowerBound)
+        }
+        let scripts = Self.scripts(in: text, raw: true).filter { script in encoded.contains { script.contains($0) } }
+        #expect(!scripts.isEmpty)
+        for script in scripts {
+            #expect(script.hasPrefix(SetupCommand.scriptGuard + "\n"))
+        }
+        #expect(SetupCommand.prepareFolder.contains("umask 077"))
+        #expect(SetupCommand.prepareFolder.contains("chmod 700"))
+        #expect(SetupCommand.prepareFolder.contains("[ -O "))
+        #expect(SetupCommand.prepareFolder.contains("[ ! -L "))
+        #expect(text.contains("rm -rf \"$HOME/.swarmbar-setup\""))
+        #expect(!text.contains("\u{2014}"))
     }
 
     @Test func promptNeverWritesTheSudoRule() throws {
@@ -1349,6 +1394,50 @@ import Testing
     }
 
     /// A script run the way the prompt says: saved to a file, then sh on it.
+    /// The guard, run by a real shell: a script saved outside the private
+    /// folder stops before its first command, one saved inside runs.
+    @Test func aWriteScriptSavedOutsideThePrivateFolderRefusesToRun() throws {
+        let home = try Home()
+        defer { try? FileManager.default.removeItem(at: home.url) }
+        let marker = "\(home.path)/ran"
+        let script = SetupCommand.scriptGuard + "\ntouch '\(marker)'\n"
+        func run(at file: String) throws -> Int32 {
+            try script.write(toFile: file, atomically: true, encoding: .utf8)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [file]
+            process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+            process.standardOutput = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+        #expect(try run(at: "\(home.path)/write.sh") != 0)
+        #expect(!FileManager.default.fileExists(atPath: marker))
+
+        // The prompt's own prepare line makes the folder owner-only.
+        let prepare = try #require(Self.scriptLines(SetupCommand.prepareFolder).first)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", prepare]
+        process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        let printed = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(printed == "\(home.path)/.swarmbar-setup\n")
+        let mode = try FileManager.default.attributesOfItem(atPath: "\(home.path)/.swarmbar-setup")[.posixPermissions] as? Int
+        #expect(mode == 0o700)
+        #expect(try run(at: "\(home.path)/.swarmbar-setup/write.sh") == 0)
+        #expect(FileManager.default.fileExists(atPath: marker))
+    }
+
+    private static func scriptLines(_ text: String) -> [String] {
+        SetupPlannerTests.scripts(in: text, raw: true)
+            .flatMap { $0.components(separatedBy: "\n") }.filter { !$0.isEmpty }
+    }
+
     private static func shFile(_ script: String) throws -> Int32 {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("swarmbar-prompt-\(UUID().uuidString).sh")

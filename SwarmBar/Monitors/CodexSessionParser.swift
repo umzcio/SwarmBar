@@ -111,7 +111,8 @@ enum CodexSessionParser {
         // takes a literal object is read: anywhere else the command that
         // runs can differ from any literal in the source (a comment, an
         // earlier call, a variable), so no literal is shown as if it were.
-        let arguments = latest["type"] as? String == "function_call"
+        let isFunctionCall = latest["type"] as? String == "function_call"
+        let arguments = isFunctionCall
             ? StrictJSONObject.parse(in: input, from: input.startIndex)
                 .flatMap { parsed in
                     input.unicodeScalars[parsed.end...].allSatisfy(\.properties.isWhitespace)
@@ -127,7 +128,9 @@ enum CodexSessionParser {
                 callId)
         }
         guard isEscalated(arguments) else { return nil }
-        guard let command = command(in: arguments) else {
+        // Code mode is only ever read as its one exec_command call.
+        let tool = isFunctionCall ? latest["name"] as? String : "exec_command"
+        guard let tool, let command = command(in: arguments, tool: tool) else {
             return (.unreadable(
                 "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal."),
                 callId)
@@ -145,11 +148,27 @@ enum CodexSessionParser {
             || arguments["with_escalated_permissions"] as? Bool == true
     }
 
-    /// The command the call runs: exec_command's `cmd`, or the legacy
-    /// shell tool's argv, whose `bash -lc <script>` form is shown as the
-    /// script itself.
-    private static func command(in arguments: [String: Any]) -> String? {
-        if let cmd = arguments["cmd"] as? String { return cmd }
+    /// The command the named tool runs: exec_command's `cmd`,
+    /// shell_command's `command` string, or the legacy shell tool's argv,
+    /// whose `bash -lc <script>` form is shown as the script itself.
+    ///
+    /// Chosen by the tool's name, never by which keys are present. Each
+    /// tool ignores the others' fields, so a call to `shell` carrying a
+    /// decoy `cmd` beside its real `command` would show the decoy while
+    /// Approve ran the command. A call holding both fields, or a tool not
+    /// named here, has no command SwarmBar can vouch for.
+    private static func command(in arguments: [String: Any], tool: String) -> String? {
+        guard (arguments["cmd"] == nil) != (arguments["command"] == nil) else { return nil }
+        switch tool {
+        case "exec_command":
+            return arguments["cmd"] as? String
+        case "shell_command":
+            return arguments["command"] as? String
+        case "shell":
+            break
+        default:
+            return nil
+        }
         guard let argv = arguments["command"] as? [String], !argv.isEmpty else { return nil }
         let shells: Set<String> = ["bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh"]
         if argv.count == 3, shells.contains(argv[0]), ["-lc", "-c"].contains(argv[1]) {

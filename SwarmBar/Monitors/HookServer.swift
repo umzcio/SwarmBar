@@ -102,9 +102,10 @@ final class HookServer: ApprovalResponding {
     static let retryDelay: Duration = .seconds(5)
 
     func start() {
-        // Must exist before any bridge script needs it: hand-installed
-        // scripts start looking for the file immediately, not only after a
-        // Settings toggle. nil is fail open, not a startup failure.
+        // Must exist before any old bridge script needs it: hand-installed
+        // scripts read the file on every run. A token from before the
+        // owner-only socket is replaced here, since those bridges sent it
+        // in clear to whatever held the port.
         tokenForRequests = HookToken.loadOrCreate()
         let listener = HookListener(
             deliver: { [weak self] delivery in
@@ -115,7 +116,10 @@ final class HookServer: ApprovalResponding {
             })
         hookListener = listener
         startOwnerSocket(listener)
-        startLoopback(listener)
+        // With no persisted token the port would take requests from every
+        // account and every web page with no check at all. The owner-only
+        // socket, whose peer uid is checked, is the only way in then.
+        if tokenForRequests != nil { startLoopback(listener) }
     }
 
     /// The bridges' way in. Its state is the one Settings shows, since a

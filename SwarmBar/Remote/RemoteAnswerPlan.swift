@@ -33,7 +33,8 @@ enum RemoteAnswerPlan {
     /// it is rather than guessing at a prompt nobody read.
     static func command(
         route: ApprovalRoute, screen: String?,
-        choose: (String) -> TuiPromptLayout.Option?
+        choose: (String) -> TuiPromptLayout.Option?,
+        tool: AgentTool? = nil
     ) -> RemoteKeyCommand? {
         switch route {
         case .keys(let keys):
@@ -61,6 +62,9 @@ enum RemoteAnswerPlan {
             // TerminalFocuser.answerByNavigation: the Mac's read refused two
             // marked lines, but the pane can change before the press.
             guard let screen, let option = choose(screen) else { return nil }
+            // Antigravity's gate is its own selector last on screen, never a
+            // list the model wrote, as on this Mac.
+            if tool == .antigravity, !TuiPromptLayout.endsInAgyGate(screen) { return nil }
             let selector = TuiPromptLayout.selector(in: screen)
             guard let cursor = selector.cursor,
                   let cursorLine = selector.cursorLine,
