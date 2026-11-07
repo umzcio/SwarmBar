@@ -90,6 +90,49 @@ final class StderrTail: Sendable {
     }
 }
 
+/// The helper's stdout bytes that have arrived but not yet been split off
+/// as complete lines: chunks queued between the pipe's handler and the
+/// reader, plus the reader's unfinished line. The handler admits each chunk
+/// against the limit and the reader releases each line it takes, so a
+/// helper that streams without a newline, or faster than the reader keeps
+/// up, cannot make the Mac hold more than the limit however long it runs,
+/// with or without a request waiting. Once over, it stays over: the stream
+/// is cut and the process goes.
+final class StdoutBudget: Sendable {
+    private struct State {
+        var held = 0
+        var exceeded = false
+    }
+
+    let limit: Int
+    private let state = Mutex(State())
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    /// True when `count` more bytes fit. False, and latched, otherwise.
+    func admit(_ count: Int) -> Bool {
+        state.withLock { state in
+            guard !state.exceeded else { return false }
+            guard state.held + count <= limit else {
+                state.exceeded = true
+                return false
+            }
+            state.held += count
+            return true
+        }
+    }
+
+    func release(_ count: Int) {
+        state.withLock { $0.held = max(0, $0.held - count) }
+    }
+
+    var exceeded: Bool {
+        state.withLock { $0.exceeded }
+    }
+}
+
 /// One long-lived helper process per host, with the helper as the remote
 /// command. No listening ports anywhere: the ssh connection is the
 /// authentication, which removes the token, the port collision and the
@@ -141,8 +184,15 @@ actor SSHChannel {
     nonisolated let events: AsyncStream<HelperEvent>
     private nonisolated let eventSink: AsyncStream<HelperEvent>.Continuation
 
-    init(launch: HelperLaunch) {
+    /// The most stdout a helper may have in flight without ending a line.
+    /// The reply line is the largest thing an honest helper sends, so this
+    /// is the snapshot's own line ceiling.
+    static let defaultStdoutLimit = RemoteSnapshot.Limits.standard.lineBytes
+    private nonisolated let stdoutLimit: Int
+
+    init(launch: HelperLaunch, stdoutLimit: Int = SSHChannel.defaultStdoutLimit) {
         self.launch = launch
+        self.stdoutLimit = stdoutLimit
         (events, eventSink) = AsyncStream.makeStream(of: HelperEvent.self)
     }
 
@@ -198,7 +248,9 @@ actor SSHChannel {
             // noteFailure for a request error or `failures` double-counts.
             // A reply that does not decode is the one failure only this
             // caller can see.
-            let failure = SSHChannelError.badResponse(String(decoding: reply.line.prefix(200), as: UTF8.self))
+            let detail = (error as? RemoteSnapshotError)?.description
+                ?? String(decoding: reply.line.prefix(200), as: UTF8.self)
+            let failure = SSHChannelError.badResponse(detail)
             noteFailure(String(describing: failure))
             throw failure
         }
@@ -358,6 +410,7 @@ actor SSHChannel {
         }
 
         let (chunks, sink) = AsyncStream.makeStream(of: Data.self)
+        let budget = StdoutBudget(limit: stdoutLimit)
         stdout.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty {
@@ -365,8 +418,13 @@ actor SSHChannel {
                 // again with nothing.
                 handle.readabilityHandler = nil
                 sink.finish()
-            } else {
+            } else if budget.admit(chunk.count) {
                 sink.yield(chunk)
+            } else {
+                // Over the ceiling: stop reading, so nothing more is held,
+                // and let the reader end and report it.
+                handle.readabilityHandler = nil
+                sink.finish()
             }
         }
 
@@ -392,6 +450,7 @@ actor SSHChannel {
                 // start on every piece.
                 guard chunk.contains(UInt8(ascii: "\n")) else { continue }
                 while let line = Self.takeLine(from: &buffer) {
+                    budget.release(line.count + 1)
                     switch Self.frame(of: line) {
                     case .response(let id, let ok):
                         guard let self else { return }
@@ -405,9 +464,20 @@ actor SSHChannel {
                     }
                 }
             }
+            if budget.exceeded {
+                await self?.overflowed(generation: generation)
+            }
             await tail.waitForEnd(limit: .milliseconds(250))
             await self?.readerEnded(generation: generation)
         }
+    }
+
+    /// The helper sent more than the ceiling without ending a line. Counted
+    /// as a failure like any other broken helper, which tears the process
+    /// down and backs off before the next one.
+    private func overflowed(generation: Int) {
+        guard generation == self.generation, process != nil else { return }
+        noteFailure("\(label) sent more output than SwarmBar accepts")
     }
 
     private enum Frame {

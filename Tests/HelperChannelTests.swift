@@ -22,7 +22,8 @@ private func localHelper() throws -> HelperLaunch {
 /// A stand-in helper whose timing the test controls. It answers every
 /// request after sleeping for the request's `delay`, and pushes one event
 /// first when asked to `emit`. It never answers `hang`, exits on `die`, and
-/// answers `snapshot` with `ok: false`.
+/// answers `snapshot` with `ok: false`. `flood` answers and then writes
+/// forever with no newline; `bigline` answers with one line padded to `size`.
 private func scriptedHelper() throws -> HelperLaunch {
     let source = """
     import json, sys, time
@@ -40,6 +41,14 @@ private func scriptedHelper() throws -> HelperLaunch {
             continue
         if command == "emit":
             print(json.dumps({"event": "hook", "detail": "synthetic"}), flush=True)
+        if command == "flood":
+            print(json.dumps({"ok": True, "id": request["id"]}), flush=True)
+            while True:
+                sys.stdout.write("x" * 65536)
+                sys.stdout.flush()
+        if command == "bigline":
+            print(json.dumps({"ok": True, "id": request["id"], "pad": "x" * request["size"]}), flush=True)
+            continue
         time.sleep(request.get("delay", 0))
         print(json.dumps({"ok": True, "id": request["id"], "cmd": request.get("cmd")}), flush=True)
     """
@@ -360,6 +369,58 @@ struct HelperChannelTests {
         // the backoff never grows and the reinstall at the cap never fires.
         #expect(backoffs == [2, 4, 8])
         await channel.shutdown()
+    }
+
+    @Test("a helper that streams without a newline is torn down with no request waiting",
+          .enabled(if: pythonAvailable))
+    func endlessLineIsCutOff() async throws {
+        let channel = SSHChannel(launch: try scriptedHelper(), stdoutLimit: 1024 * 1024)
+        _ = try await channel.request("flood")
+        // Nothing is pending now, so no request timer can end this: only
+        // the stdout ceiling can.
+        let deadline = ContinuousClock.now + .seconds(10)
+        while await channel.reachability == .reachable && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard case .unreachable = await channel.reachability else {
+            Issue.record("a helper past the stdout ceiling must leave the host unreachable")
+            return
+        }
+        #expect(await channel.currentBackoff == 2)
+        await channel.shutdown()
+    }
+
+    @Test("a reply line over the ceiling fails its request rather than being decoded",
+          .enabled(if: pythonAvailable))
+    func oversizedReplyFailsTheRequest() async throws {
+        let channel = SSHChannel(launch: try scriptedHelper(), stdoutLimit: 64 * 1024)
+        _ = try await channel.request("bigline", ["size": .int(1024)])
+        await #expect {
+            _ = try await channel.request("bigline", ["size": .int(256 * 1024)], timeout: .seconds(10))
+        } throws: { error in
+            guard case SSHChannelError.closed = error else { return false }
+            return true
+        }
+        guard case .unreachable = await channel.reachability else {
+            Issue.record("a helper past the stdout ceiling must leave the host unreachable")
+            return
+        }
+        await channel.shutdown()
+    }
+
+    @Test("the stdout budget admits up to its limit, frees what lines release, and latches once over")
+    func stdoutBudgetLatches() {
+        let budget = StdoutBudget(limit: 10)
+        #expect(budget.admit(6))
+        #expect(budget.admit(4))
+        budget.release(5)
+        #expect(budget.admit(5))
+        #expect(!budget.exceeded)
+        #expect(!budget.admit(1))
+        #expect(budget.exceeded)
+        budget.release(10)
+        // Once over, the stream is already cut and stays cut.
+        #expect(!budget.admit(1))
     }
 
     @Test("a helper that exits on its own fails every waiting request once", .enabled(if: pythonAvailable))

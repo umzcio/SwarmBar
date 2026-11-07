@@ -172,7 +172,59 @@ struct RemoteSnapshot: Decodable, Sendable {
         case processesFailed = "processes_failed"
     }
 
-    static func decode(_ data: Data) throws -> RemoteSnapshot {
-        try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+    /// Fixed ceilings on what one snapshot may hold. The remote host decides
+    /// every byte of a reply, so without them it would decide how much
+    /// memory the Mac allocates too.
+    struct Limits: Sendable {
+        /// The whole reply line, checked before anything decodes it.
+        let lineBytes: Int
+        /// Every listed thing: homes, files, chunks, dirs, omissions,
+        /// warnings, processes and their open files.
+        let records: Int
+        /// Every chunk's decoded bytes, summed.
+        let chunkBytes: Int
+
+        /// Far above an honest snapshot, which runs to a few megabytes on a
+        /// busy host. The helper ships a whole file only up to 16 MB and a
+        /// tail only up to 4 MB, so even a first snapshot of a host with
+        /// dozens of live sessions sits well inside these, while a hostile
+        /// host can no longer ask for gigabytes.
+        static let standard = Limits(
+            lineBytes: 256 * 1024 * 1024,
+            records: 200_000,
+            chunkBytes: 192 * 1024 * 1024)
+    }
+
+    static func decode(_ data: Data, limits: Limits = .standard) throws -> RemoteSnapshot {
+        guard data.count <= limits.lineBytes else {
+            throw RemoteSnapshotError.tooLarge(
+                "reply of \(data.count) bytes is over the \(limits.lineBytes) byte limit")
+        }
+        let snapshot = try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+        let records = snapshot.homes.count + snapshot.files.count + snapshot.dirs.count
+            + snapshot.omitted.count + snapshot.warnings.count + snapshot.processes.count
+            + snapshot.files.reduce(0) { $0 + $1.chunks.count }
+            + snapshot.processes.reduce(0) { $0 + $1.open.count }
+        guard records <= limits.records else {
+            throw RemoteSnapshotError.tooLarge("\(records) records is over the \(limits.records) limit")
+        }
+        let chunkBytes = snapshot.files.reduce(0) { total, file in
+            file.chunks.reduce(total) { $0 + $1.data.count }
+        }
+        guard chunkBytes <= limits.chunkBytes else {
+            throw RemoteSnapshotError.tooLarge(
+                "\(chunkBytes) chunk bytes is over the \(limits.chunkBytes) byte limit")
+        }
+        return snapshot
+    }
+}
+
+enum RemoteSnapshotError: Error, CustomStringConvertible {
+    case tooLarge(String)
+
+    var description: String {
+        switch self {
+        case .tooLarge(let detail): "snapshot too large: \(detail)"
+        }
     }
 }
