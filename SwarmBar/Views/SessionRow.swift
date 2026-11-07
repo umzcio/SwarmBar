@@ -66,8 +66,8 @@ struct SessionRow: View {
                 }
 
                 switch session.status {
-                case .waitingApproval(let command):
-                    CommandPreview(command: command)
+                case .waitingApproval(let prompt):
+                    CommandPreview(prompt: prompt)
                     // A remote prompt is answered by its held request or
                     // in its own tmux pane on its host, never on this Mac.
                     // When neither is possible the row says where to go.

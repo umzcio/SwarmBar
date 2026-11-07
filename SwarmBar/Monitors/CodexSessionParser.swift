@@ -17,7 +17,7 @@ enum CodexSessionParser {
 
     static func parseDetails(tail: String, now: Date = .now) -> ParsedStatus? {
         if let pending = pendingRequest(tail: tail) {
-            return ParsedStatus(status: .waitingApproval(command: pending.command),
+            return ParsedStatus(status: .waitingApproval(command: ApprovalPrompt(pending.command)),
                 cwd: nil, attentionEventID: "call:\(pending.id)")
         }
         for raw in tail.split(separator: "\n").reversed() {

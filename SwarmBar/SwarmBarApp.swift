@@ -81,7 +81,7 @@ struct SwarmBarApp: App {
             guard wantsIt else { return }
             let body: String
             switch session.status {
-            case .waitingApproval(let command): body = command
+            case .waitingApproval(let prompt): body = ApprovalPreviewText.bannerBody(prompt)
             case .waitingInput(let prompt): body = prompt.isEmpty ? session.tool.label : prompt
             default: return
             }

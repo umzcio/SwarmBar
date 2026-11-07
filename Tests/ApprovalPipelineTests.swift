@@ -333,7 +333,7 @@ struct ApprovalDispatchTests {
         AgentSession(
             tool: tool, projectName: "proj",
             projectPath: URL(fileURLWithPath: "/tmp"),
-            status: .waitingApproval(command: command))
+            status: .waitingApproval(command: ApprovalPrompt(command)))
     }
 
     @Test func approveUsesTheResponderWhenOneIsPending() {

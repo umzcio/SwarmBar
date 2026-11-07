@@ -239,7 +239,7 @@ struct AttentionAlertTests {
         AgentSession(
             tool: .claudeCode, projectName: "proj",
             projectPath: URL(fileURLWithPath: "/tmp/proj"),
-            status: .waitingApproval(command: command))
+            status: .waitingApproval(command: ApprovalPrompt(command)))
     }
 
     @Test func alertsOnceWhileAnApprovalStaysPending() {

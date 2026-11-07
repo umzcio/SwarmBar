@@ -608,6 +608,13 @@ final class SessionStore {
     // when nothing can be answered remotely. Session state is never written.
     func approve(_ session: AgentSession) {
         guard case .waitingApproval(let command) = session.status else { return }
+        // A request the row could not show whole is never approved from
+        // it, whatever the caller: the row offers the terminal instead,
+        // and this is the backstop for any path that forgets.
+        guard command.offersApprove else {
+            if session.host == nil, session.projectPath != nil { openInTerminal(session) }
+            return
+        }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
             noteAnswered(session.id, command: command, allow: true)
             return
@@ -676,7 +683,7 @@ final class SessionStore {
 
     /// The row after an answer was delivered, by a held reply or by keys
     /// a helper confirmed it pressed.
-    private func noteAnswered(_ id: UUID, command: String, allow: Bool) {
+    private func noteAnswered(_ id: UUID, command: ApprovalPrompt, allow: Bool) {
         update(id: id) {
             $0.status = allow
                 ? .runningTool(activity: running(command))
@@ -697,8 +704,8 @@ final class SessionStore {
         noteAnswered(session.id, command: command, allow: allow)
     }
 
-    private func running(_ command: String) -> String {
-        "Running \(command.split(separator: " ").first.map(String.init) ?? command)"
+    private func running(_ command: ApprovalPrompt) -> String {
+        "Running \(ApprovalPreviewText.firstWord(command))"
     }
 
     /// Reads the session's terminal, picks the option matching the intent,

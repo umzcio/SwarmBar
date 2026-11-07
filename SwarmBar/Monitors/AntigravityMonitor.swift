@@ -145,7 +145,7 @@ struct AntigravityMonitor: SessionMonitor {
         if let pending = AntigravityConversation.pending(dbPath: dbPath) {
             if let question = pending.question {
                 return pending.isApproval
-                    ? .waitingApproval(command: question)
+                    ? .waitingApproval(command: ApprovalPrompt(question))
                     : .waitingInput(prompt: question)
             }
             // An ordinary tool call that has not settled. The database
@@ -161,7 +161,7 @@ struct AntigravityMonitor: SessionMonitor {
             // only in being too quiet.
             let showing = screen(pid).map { TuiPromptLayout.options(in: $0).count >= 2 } ?? false
             return showing
-                ? .waitingApproval(command: pending.summary)
+                ? .waitingApproval(command: ApprovalPrompt(pending.summary))
                 : .runningTool(activity: pending.summary)
         }
         return AntigravityTranscript.status(for: steps)

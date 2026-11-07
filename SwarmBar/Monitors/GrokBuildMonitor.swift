@@ -220,7 +220,7 @@ struct GrokBuildMonitor: SessionMonitor {
             let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
             if let tool = pendingPermissionTool(dir: dir) {
                 let command = tail.flatMap { GrokUpdatesParser.pendingToolCommand(tail: $0) }
-                status = .waitingApproval(command: command ?? tool)
+                status = .waitingApproval(command: ApprovalPrompt(command ?? tool))
             } else {
                 status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
                     ?? .working(activity: "Working…")

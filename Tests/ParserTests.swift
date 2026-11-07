@@ -703,13 +703,13 @@ struct HookCommandDescriptionTests {
         ]) == "Which database? (+2 more)")
     }
 
-    /// Read by shape, not by tool name, so a renamed tool with the same
-    /// input still reads properly.
-    @Test func theQuestionIsFoundWithoutMatchingTheToolName() {
+    /// Read by tool name, not by shape: any call can carry a `questions`
+    /// field, and its question must never stand in for the tool's name.
+    @Test func onlyTheQuestionToolShowsAQuestion() {
         #expect(HookServer.commandDescription([
             "tool_name": "AskTheHuman",
             "tool_input": ["questions": [["question": "Ship it?"]]],
-        ]) == "Ship it?")
+        ]) == "AskTheHuman")
     }
 
     /// Anything without a question falls back to what it did before.

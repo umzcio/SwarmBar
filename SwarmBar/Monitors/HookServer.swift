@@ -403,8 +403,12 @@ final class HookServer: ApprovalResponding {
                 context.release()
                 return
             }
-            apply(.waitingApproval(command: Self.commandDescription(body)), sticky: true)
-            if holding {
+            let prompt = Self.approvalPrompt(body)
+            apply(.waitingApproval(command: prompt), sticky: true)
+            // A request the row cannot show whole is not offered for
+            // approval there, so holding it would only keep the agent's
+            // own prompt off screen for the whole hold.
+            if holding, prompt.offersApprove {
                 context.hold(sessionID, .claudeHook)
             } else {
                 context.release()
@@ -607,53 +611,144 @@ final class HookServer: ApprovalResponding {
             return
         }
         let sessionID = context.rowID(StableID.uuid(for: rawSessionID))
-        let permission = body["permission"] as? String ?? "tool"
-        let metadata = body["metadata"] as? [String: Any]
-        let pattern = (metadata?["command"] as? String)
-            ?? (body["patterns"] as? [Any])?.first as? String
-        let command: String = {
-            guard let pattern else { return permission }
-            if permission == "bash" {
-                let flattened = pattern.replacingOccurrences(of: "\n", with: " ")
-                return flattened.count <= 80 ? flattened : String(flattened.prefix(80)) + "…"
-            }
-            return "\(permission) \(URL(fileURLWithPath: pattern).lastPathComponent)"
-        }()
+        let prompt = Self.openCodePrompt(body)
         store.applyHookEvent(
             sessionID: sessionID, tool: .openCode,
-            status: .waitingApproval(command: command),
+            status: .waitingApproval(command: prompt),
             sticky: true, cwd: body["directory"] as? String, accountLabel: nil,
             host: context.host
         )
-        if mayHold(.openCodePlugin, .openCode, context) {
+        if prompt.offersApprove, mayHold(.openCodePlugin, .openCode, context) {
             context.hold(sessionID, .openCodePlugin)
         } else {
             context.release()
         }
     }
 
+    /// The one line a "Running …" activity shows while a tool runs. Never
+    /// used for an approval, which shows `approvalPrompt` in full.
     static func commandDescription(_ body: [String: Any]) -> String {
         let toolName = body["tool_name"] as? String ?? "tool"
         let input = body["tool_input"] as? [String: Any]
         if toolName == "Bash", let command = input?["command"] as? String {
             return shorten(command)
         }
-        // A question the agent wants to put to the user. The row used to
-        // read "$ AskUserQuestion", which names the mechanism and says
-        // nothing about what is being asked, and the question is the
-        // entire content of the request. Approving lets the agent ask it;
-        // the answer still happens wherever the session is.
-        if let question = questionText(input) { return shorten(question) }
+        if toolName == Self.questionTool, let question = questionText(input) {
+            return shorten(question)
+        }
         if let path = input?["file_path"] as? String {
             return "\(toolName) \(URL(fileURLWithPath: path).lastPathComponent)"
         }
         return toolName
     }
 
+    /// Claude Code's own question tool. Its questions stand in for the
+    /// tool name only for this tool: an agent can put a `questions` field
+    /// on any call, and reading it by shape let any tool show a question
+    /// where its name and arguments belonged.
+    nonisolated static let questionTool = "AskUserQuestion"
+
+    /// Everything a held PermissionRequest allows, for the row to show
+    /// before Approve: the whole command for Bash, the questions for the
+    /// question tool, and for anything else the tool's name and every
+    /// argument it was called with, full paths and URLs included.
+    nonisolated static func approvalPrompt(_ body: [String: Any]) -> ApprovalPrompt {
+        let toolName = (body["tool_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "tool"
+        let input = body["tool_input"] as? [String: Any] ?? [:]
+        if toolName == "Bash", let command = input["command"] as? String {
+            // Bash's other arguments (description, timeout, background)
+            // change nothing about what runs.
+            return ApprovalPrompt(command)
+        }
+        if toolName == Self.questionTool,
+           let questions = input["questions"] as? [[String: Any]] {
+            let lines = questions.compactMap {
+                ($0["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+            if !lines.isEmpty { return ApprovalPrompt(lines.joined(separator: "\n")) }
+        }
+        return ApprovalPrompt(describe(tool: toolName, arguments: input))
+    }
+
+    /// A permission.asked payload from the OpenCode plugin, in full: the
+    /// bash command itself, or the permission with every pattern and
+    /// metadata field it carries.
+    nonisolated static func openCodePrompt(_ body: [String: Any]) -> ApprovalPrompt {
+        let permission = (body["permission"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "tool"
+        var metadata = body["metadata"] as? [String: Any] ?? [:]
+        let patterns = (body["patterns"] as? [Any])?.compactMap { $0 as? String } ?? []
+        if permission == "bash" {
+            // The command itself where the plugin has it, otherwise every
+            // pattern, which for bash are the commands.
+            let command = (metadata.removeValue(forKey: "command") as? String)
+                ?? (patterns.isEmpty ? nil : patterns.joined(separator: "\n"))
+            if let command {
+                let rest = describeArguments(metadata)
+                return ApprovalPrompt(rest.isEmpty ? command : command + "\n" + rest)
+            }
+        }
+        var head = permission
+        if patterns.count == 1 {
+            head += " " + patterns[0]
+        } else if !patterns.isEmpty {
+            head += "\n" + patterns.joined(separator: "\n")
+        }
+        let rest = describeArguments(metadata)
+        return ApprovalPrompt(rest.isEmpty ? head : head + "\n" + rest)
+    }
+
+    /// The argument that names what a call acts on, shown beside the tool
+    /// name. Every other argument follows on its own line.
+    private nonisolated static let primaryArguments = [
+        "file_path", "notebook_path", "path", "url", "command", "pattern",
+    ]
+
+    /// Arguments that carry a file's contents. Past `longContent`
+    /// characters they are given as a size rather than inline; everything
+    /// else is always shown whole.
+    private nonisolated static let contentArguments: Set<String> = [
+        "content", "new_string", "old_string", "new_source", "edits", "diff",
+    ]
+    nonisolated static let longContent = 8_000
+
+    nonisolated static func describe(tool: String, arguments: [String: Any]) -> String {
+        var rest = arguments
+        var head = tool
+        if let key = primaryArguments.first(where: {
+            (arguments[$0] as? String).map { !$0.contains("\n") } ?? false
+        }), let value = rest.removeValue(forKey: key) as? String {
+            head += " " + value
+        }
+        let lines = describeArguments(rest)
+        return lines.isEmpty ? head : head + "\n" + lines
+    }
+
+    /// One `key: value` line per argument, in key order, strings verbatim
+    /// and anything else as JSON. A multi-line value starts on its own
+    /// line so its first line cannot pass for the key's whole value.
+    nonisolated static func describeArguments(_ arguments: [String: Any]) -> String {
+        arguments.keys.sorted().map { key in
+            let value = arguments[key]
+            let text: String
+            if let string = value as? String {
+                text = string
+            } else if let value, JSONSerialization.isValidJSONObject([value]),
+                      let data = try? JSONSerialization.data(
+                        withJSONObject: [value], options: [.sortedKeys, .withoutEscapingSlashes]),
+                      let array = String(data: data, encoding: .utf8) {
+                text = String(array.dropFirst().dropLast())
+            } else {
+                text = String(describing: value ?? "null")
+            }
+            if contentArguments.contains(key), text.count > longContent {
+                return "\(key): \(text.count) characters, not shown here"
+            }
+            return text.contains("\n") ? "\(key):\n\(text)" : "\(key): \(text)"
+        }.joined(separator: "\n")
+    }
+
     /// The first question of an AskUserQuestion call, with a count when
-    /// there are more. Read structurally rather than by tool name, so a
-    /// renamed tool with the same shape still reads properly, and anything
-    /// without a question falls through to the old description.
+    /// there are more.
     nonisolated static func questionText(_ input: [String: Any]?) -> String? {
         guard let questions = input?["questions"] as? [[String: Any]],
               let first = questions.first,
