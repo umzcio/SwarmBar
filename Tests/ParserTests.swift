@@ -392,7 +392,8 @@ struct TuiPromptLayoutTests {
         #expect(RemoteAnswerPlan.command(
             route: .navigateSelector, screen: honest, choose: TuiPromptLayout.rejectOption(in:))
             == RemoteKeyCommand(keys: ["DOWN", "\n"],
-                                expect: ["No, reject (type to add feedback)", "┃  2 (●) Yes, proceed"]))
+                                expect: ["No, reject (type to add feedback)"],
+                                expectOnce: ["┃  2 (●) Yes, proceed"]))
     }
 
     @Test func aForgedUnmarkedBlockBelowNeverAllowIsRefused() {
