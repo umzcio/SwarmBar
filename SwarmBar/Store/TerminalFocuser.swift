@@ -408,40 +408,50 @@ enum TerminalFocuser {
     ) -> AnswerOutcome {
         guard let tty = tty(forSession: sessionID, projectPath: projectPath),
               isRunning("iTerm2") else { return .noTerminal }
-        // The label is read off the terminal, so it is whatever the agent
-        // printed. This used to delete quotes from it, which was the one
-        // interpolation site not using the escaper that exists for exactly
-        // this, and it was wrong twice over. A label carrying a quote no
-        // longer matched the screen it came from, so the answer always
-        // degraded to focusing the terminal. A label ending in a backslash
-        // unbalanced the string literal and broke the whole script. Both
-        // are silent: the button appears to do nothing but open a window.
-        let needle = AppleScriptLiteral.escape(expectedLabel)
-        let script = """
-        tell application "iTerm2"
-          repeat with w in windows
-            repeat with t in tabs of w
-              repeat with s in sessions of t
-                if tty of s is "/dev/\(AppleScriptLiteral.escape(tty))" then
-                  set screenText to (text of s)
-                  if screenText contains "\(needle)" then
-                    tell s to write text "\(number)" newline NO
-                    return "SENT"
-                  else
-                    return "CHANGED"
-                  end if
-                end if
-              end repeat
-            end repeat
-          end repeat
-          return "MISS"
-        end tell
-        """
-        switch runScript(script) {
+        let script = numberedAnswerScript(number: number)
+        switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel]) {
         case "SENT":    return .sent
         case "CHANGED": return .promptChanged
         default:        return .noTerminal
         }
+    }
+
+    /// The script `answerNumbered` runs. Pure, so what reaches osascript can
+    /// be asserted without driving a terminal.
+    ///
+    /// The label is read off the terminal, so it is whatever the agent
+    /// printed, and it never becomes part of the script's source: it arrives
+    /// as an argument, with the tty, and is only ever compared as data. An
+    /// escaper that misses one quote is a way into the script; an argument
+    /// has no quotes to miss. The digit is the only interpolated value, and
+    /// it is a number SwarmBar chose.
+    ///
+    /// Arguments: 1 is the tty device ("/dev/ttys004"), 2 the label.
+    nonisolated static func numberedAnswerScript(number: Int) -> String {
+        """
+        on run argv
+          set wantedDevice to item 1 of argv
+          set wantedLabel to item 2 of argv
+          tell application "iTerm2"
+            repeat with w in windows
+              repeat with t in tabs of w
+                repeat with s in sessions of t
+                  if tty of s is wantedDevice then
+                    set screenText to (text of s)
+                    if screenText contains wantedLabel then
+                      tell s to write text "\(number)" newline NO
+                      return "SENT"
+                    else
+                      return "CHANGED"
+                    end if
+                  end if
+                end repeat
+              end repeat
+            end repeat
+            return "MISS"
+          end tell
+        end run
+        """
     }
 
     /// Moves the selector's cursor to a labeled option and submits.
@@ -465,42 +475,61 @@ enum TerminalFocuser {
         expectedCursorLine: String,
         expectedLabel: String
     ) -> AnswerOutcome {
-        guard presses >= 0, key == "UP" || key == "DOWN",
+        guard let script = navigationAnswerScript(key: key, presses: presses),
               let tty = tty(forSession: sessionID, projectPath: projectPath),
               isRunning("iTerm2")
         else { return .noTerminal }
-
-        let arrow = key == "UP" ? "[A" : "[B"
-        let moves = (0..<presses)
-            .map { _ in "tell s to write text ((character id 27) & \"\(arrow)\") newline NO" }
-            .joined(separator: "\n                    delay 0.08\n                    ")
-        let script = """
-        tell application "iTerm2"
-          repeat with w in windows
-            repeat with t in tabs of w
-              repeat with s in sessions of t
-                if tty of s is "/dev/\(tty)" then
-                  set screenText to (text of s)
-                  if screenText contains "\(AppleScriptLiteral.escape(expectedLabel))" ¬
-                    and screenText contains "\(AppleScriptLiteral.escape(expectedCursorLine))" then
-                    \(moves.isEmpty ? "" : moves + "\n                    delay 0.08")
-                    tell s to write text ""
-                    return "SENT"
-                  else
-                    return "CHANGED"
-                  end if
-                end if
-              end repeat
-            end repeat
-          end repeat
-          return "MISS"
-        end tell
-        """
-        switch runScript(script) {
+        switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel, expectedCursorLine]) {
         case "SENT":    return .sent
         case "CHANGED": return .promptChanged
         default:        return .noTerminal
         }
+    }
+
+    /// The script `answerByNavigation` runs, or nil for a move it will not
+    /// make. Pure, so what reaches osascript can be asserted.
+    ///
+    /// As with `numberedAnswerScript`, nothing read off the terminal is in
+    /// the source: the tty, the label and the marked line are arguments 1,
+    /// 2 and 3. The marked line must appear exactly once. It is the line
+    /// that moves, so a second copy on screen (agent text drawn to look
+    /// like the selector) means the one being confirmed may not be the one
+    /// the keys will move, and nothing is pressed.
+    nonisolated static func navigationAnswerScript(key: String, presses: Int) -> String? {
+        guard presses >= 0, key == "UP" || key == "DOWN" else { return nil }
+        let arrow = key == "UP" ? "[A" : "[B"
+        let moves = (0..<presses)
+            .map { _ in "tell s to write text ((character id 27) & \"\(arrow)\") newline NO" }
+            .joined(separator: "\n                      delay 0.08\n                      ")
+        return """
+        on run argv
+          set wantedDevice to item 1 of argv
+          set wantedLabel to item 2 of argv
+          set wantedCursorLine to item 3 of argv
+          tell application "iTerm2"
+            repeat with w in windows
+              repeat with t in tabs of w
+                repeat with s in sessions of t
+                  if tty of s is wantedDevice then
+                    set screenText to (text of s)
+                    set AppleScript's text item delimiters to wantedCursorLine
+                    set cursorLineCount to (count of text items of screenText) - 1
+                    set AppleScript's text item delimiters to ""
+                    if screenText contains wantedLabel and cursorLineCount is 1 then
+                      \(moves.isEmpty ? "" : moves + "\n                      delay 0.08")
+                      tell s to write text ""
+                      return "SENT"
+                    else
+                      return "CHANGED"
+                    end if
+                  end if
+                end repeat
+              end repeat
+            end repeat
+            return "MISS"
+          end tell
+        end run
+        """
     }
 
     // MARK: - Is the user already looking at it
@@ -838,8 +867,10 @@ enum TerminalFocuser {
         return process.terminationStatus == 0
     }
 
-    private nonisolated static func runScript(_ script: String) -> String? {
-        run("/usr/bin/osascript", ["-e", script])?
+    /// `arguments` reach the script's `on run argv` handler as data, never
+    /// as source, which is how anything read off a terminal gets in.
+    private nonisolated static func runScript(_ script: String, arguments: [String] = []) -> String? {
+        run("/usr/bin/osascript", ["-e", script] + arguments)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

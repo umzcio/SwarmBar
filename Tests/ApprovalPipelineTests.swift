@@ -44,6 +44,51 @@ struct KeyScriptTests {
     }
 }
 
+/// The read-and-press scripts. The label and the marked line come off the
+/// terminal, which means the agent wrote them, so they reach osascript as
+/// arguments and are never part of the script's source.
+@MainActor
+struct AnswerScriptTests {
+    @Test func theDigitScriptTakesTheTtyAndLabelAsArguments() {
+        let script = TerminalFocuser.numberedAnswerScript(number: 3)
+        #expect(script.hasPrefix("on run argv"))
+        #expect(script.contains("set wantedDevice to item 1 of argv"))
+        #expect(script.contains("set wantedLabel to item 2 of argv"))
+        #expect(script.contains("if screenText contains wantedLabel then"))
+        #expect(script.contains("write text \"3\" newline NO"))
+        // No literal is compared against the screen: the only quoted
+        // strings are the digit, the app name and the fixed replies.
+        let literals = script.components(separatedBy: "\"").enumerated()
+            .filter { $0.offset % 2 == 1 }.map(\.element)
+        #expect(Set(literals) == ["iTerm2", "3", "SENT", "CHANGED", "MISS"])
+    }
+
+    @Test func theWalkScriptTakesTheTtyLabelAndMarkedLineAsArguments() throws {
+        let script = try #require(TerminalFocuser.navigationAnswerScript(key: "DOWN", presses: 2))
+        #expect(script.hasPrefix("on run argv"))
+        #expect(script.contains("set wantedCursorLine to item 3 of argv"))
+        #expect(script.components(separatedBy: "\"[B\"").count - 1 == 2)
+        #expect(!script.contains("[A"))
+        let literals = script.components(separatedBy: "\"").enumerated()
+            .filter { $0.offset % 2 == 1 }.map(\.element)
+        #expect(Set(literals) == ["iTerm2", "[B", "", "SENT", "CHANGED", "MISS"])
+    }
+
+    /// The marked line is the thing that moves, so a second copy of it on
+    /// screen means the confirmation could be reading the wrong one.
+    @Test func theWalkScriptRequiresTheMarkedLineExactlyOnce() throws {
+        let script = try #require(TerminalFocuser.navigationAnswerScript(key: "UP", presses: 0))
+        #expect(script.contains("set AppleScript's text item delimiters to wantedCursorLine"))
+        #expect(script.contains("if screenText contains wantedLabel and cursorLineCount is 1 then"))
+        #expect(!script.contains("[A"))
+    }
+
+    @Test func theWalkScriptRefusesAMoveItWillNotMake() {
+        #expect(TerminalFocuser.navigationAnswerScript(key: "LEFT", presses: 1) == nil)
+        #expect(TerminalFocuser.navigationAnswerScript(key: "DOWN", presses: -1) == nil)
+    }
+}
+
 /// The per-tool answer table. Every entry was settled by a live round, and
 /// a wrong one does not fail loudly: it presses a key into a terminal.
 /// While this lived as a run of branches inside SessionStore it could only

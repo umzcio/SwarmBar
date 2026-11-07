@@ -515,6 +515,56 @@ struct AppleScriptEscapingTests {
         #expect(escaped.filter { $0 == "\\" }.count % 2 == 0)
     }
 
+    /// Where a literal built from `escaped` would end, the way osascript
+    /// reads it: by scalar, a backslash taking the next scalar with it, the
+    /// first bare U+0022 closing the string. Nil when nothing closes it.
+    private func closingQuoteOffset(_ escaped: String) -> Int? {
+        let scalars = Array(("\"" + escaped + "\"").unicodeScalars)
+        var index = 1
+        while index < scalars.count {
+            if scalars[index] == "\\" { index += 2; continue }
+            if scalars[index] == "\"" { return index }
+            index += 1
+        }
+        return nil
+    }
+
+    /// A quote fused into one grapheme with its neighbour is a Character
+    /// that is not a quote, so a Character search skipped it and it ended
+    /// the literal. Every one of these must leave the literal closed only
+    /// by its own final quote.
+    @Test func quotesAndBackslashesFusedWithANeighbourAreEscaped() {
+        let cases = [
+            "Yes\u{0600}\" and (do shell script \"touch /tmp/x\") and \"",
+            "\"\u{0301}",
+            "\u{0D4E}\"",
+            "\"\u{200D}",
+            "\\\u{0301}",
+            "\r\n\"\u{0301}",
+        ]
+        for raw in cases {
+            let escaped = AppleScriptLiteral.escape(raw)
+            let scalars = Array(escaped.unicodeScalars)
+            #expect(closingQuoteOffset(escaped) == scalars.count + 1, "literal ends early for \(raw.debugDescription)")
+            // Unescaping by scalar gives the input back, so nothing was lost.
+            var back = String.UnicodeScalarView(), index = 0
+            while index < scalars.count {
+                if scalars[index] == "\\" { index += 1 }
+                if index < scalars.count { back.append(scalars[index]) }
+                index += 1
+            }
+            #expect(String(back) == raw)
+        }
+    }
+
+    /// A newline fused with a mark is still a newline, and must not stay
+    /// inside one literal.
+    @Test func aFusedNewlineStillSplitsTheExpression() {
+        let out = AppleScriptLiteral.expression("a\n\u{0301}b")
+        #expect(out.contains("linefeed"))
+        #expect(!out.unicodeScalars.contains("\n"))
+    }
+
     @Test func multiLineTextIsJoinedWithLinefeed() {
         #expect(AppleScriptLiteral.expression("a\nb") == "\"a\" & linefeed & \"b\"")
         #expect(AppleScriptLiteral.expression("plain") == "\"plain\"")
