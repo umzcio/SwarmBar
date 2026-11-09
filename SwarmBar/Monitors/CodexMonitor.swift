@@ -50,12 +50,84 @@ struct CodexMonitor: SessionMonitor {
     /// one poll in ten. Those records never change status, so the newest
     /// readable line further back is still the session's current state.
     nonisolated static func parsedStatus(of file: URL, tail: String, now: Date) -> ParsedStatus? {
-        if let parsed = CodexSessionParser.parseDetails(tail: tail, now: now) { return parsed }
+        if let parsed = CodexSessionParser.parseDetails(tail: tail, now: now) {
+            return reviewed(parsed, of: file, tail: tail, now: now)
+        }
         for start in [1 << 20, ClaudeCodeMonitor.maxTailBytes] {
             guard let wider = ClaudeCodeMonitor.tail(of: file, startingAt: start),
                   let parsed = CodexSessionParser.parseDetails(tail: wider, now: now)
             else { continue }
-            return parsed
+            return reviewed(parsed, of: file, tail: wider, now: now)
+        }
+        return nil
+    }
+
+    /// A Codex prompt re-read with the session's reviewer, which usually
+    /// sits far behind the tail. Under auto_review nobody is asked, and
+    /// showing each escalation as "needs your approval" sent a notification
+    /// for every one Codex's reviewer approved by itself seconds later.
+    private nonisolated static func reviewed(
+        _ parsed: ParsedStatus, of file: URL, tail: String, now: Date
+    ) -> ParsedStatus {
+        guard case .waitingApproval = parsed.status,
+              parsed.attentionEventID?.hasPrefix("call:") == true
+        else { return parsed }
+        let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let reviewer = reviewerCache.value(
+            for: file, size: values?.fileSize ?? 0,
+            modified: values?.contentModificationDate ?? .distantPast,
+            compute: { latestReviewer(of: file) ?? "" })
+        guard let reviewer, !reviewer.isEmpty else { return parsed }
+        return CodexSessionParser.parseDetails(tail: tail, now: now, reviewer: reviewer) ?? parsed
+    }
+
+    /// The reviewer named by the newest turn_context, cached per file
+    /// version. "" records that none was found within the scan.
+    nonisolated static let reviewerCache = TailCache<String>()
+
+    /// How far back the reviewer is looked for. Codex writes a turn_context
+    /// once per turn and a turn can run long: on the machine where this was
+    /// measured the longest was 33 MB, the median about 1 MB. Past this the
+    /// reviewer is unknown and the call is treated as the person's, as it
+    /// was before the reviewer was read at all.
+    nonisolated static let maxReviewerScanBytes = 64 << 20
+
+    /// The reviewer named by the newest turn_context in the file, read
+    /// backwards from the end a megabyte at a time. Only called for a row
+    /// that would otherwise show a Codex prompt, so it stays off the
+    /// common path, and cached while the file does not change, which is
+    /// the whole time a prompt is on screen.
+    nonisolated static func latestReviewer(of file: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard var offset = try? handle.seekToEnd() else { return nil }
+        let marker = Data("\"turn_context\"".utf8)
+        let chunk: UInt64 = 1 << 20
+        var carry = Data()
+        var scanned = 0
+        while offset > 0, scanned < maxReviewerScanBytes {
+            let start = offset > chunk ? offset - chunk : 0
+            try? handle.seek(toOffset: start)
+            guard let read = try? handle.read(upToCount: Int(offset - start)), !read.isEmpty
+            else { return nil }
+            scanned += read.count
+            offset = start
+            let buffer = read + carry
+            // Everything before the first newline may be the end of a line
+            // that starts in the next chunk back, unless this is the file's
+            // start.
+            var lines = buffer.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
+            if offset > 0 {
+                carry = Data(lines.removeFirst())
+            } else {
+                carry = Data()
+            }
+            for line in lines.reversed() where line.range(of: marker) != nil {
+                let text = String(decoding: line, as: UTF8.self)
+                if let reviewer = CodexSessionParser.reviewer(inTurnContext: Substring(text)) {
+                    return reviewer
+                }
+            }
         }
         return nil
     }
@@ -129,6 +201,7 @@ struct CodexMonitor: SessionMonitor {
         let scanned = [root.path, realPath(root.path) ?? root.path]
         tailCache.retain(paths: seenPaths, under: scanned)
         headCache.retain(paths: seenPaths, under: scanned)
+        reviewerCache.retain(paths: seenPaths, under: scanned)
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
 
