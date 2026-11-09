@@ -89,4 +89,109 @@ enum StrictJSONObject {
         }
         return nil
     }
+
+    /// A JavaScript object literal starting at `start`, read only where it
+    /// means exactly what the same text means as JSON once each bare
+    /// identifier key is quoted. Codex writes its code-mode calls this way
+    /// (`{cmd:"make",sandbox_permissions:"require_escalated"}`).
+    ///
+    /// Outside strings only JSON's own punctuation, digits, the literals
+    /// true, false and null, and a bare key directly after `{` or `,` are
+    /// allowed, so a variable, a template or single-quoted string, a
+    /// comment, a spread, a computed key or an escaped identifier is
+    /// refused rather than guessed at. Strings are copied as written and
+    /// left to the JSON parser, which refuses every escape JavaScript reads
+    /// differently. The quoted text then goes through `parse`, whose key
+    /// rules apply to bare keys too: `cmd` and `"cmd"` are one key twice,
+    /// and a bare `__proto__` is refused as the quoted one is.
+    ///
+    /// `end` is where the literal ends in `text`, a scalar boundary.
+    nonisolated static func parseJavaScriptLiteral(
+        in text: String, from start: String.Index
+    ) -> (object: [String: Any], end: String.Index)? {
+        let scalars = text.unicodeScalars
+        var index = start
+        while index < scalars.endIndex, scalars[index].properties.isWhitespace {
+            index = scalars.index(after: index)
+        }
+        guard index < scalars.endIndex, scalars[index] == "{" else { return nil }
+        func isIdentifierStart(_ s: Unicode.Scalar) -> Bool {
+            s.isASCII && (s.properties.isAlphabetic || s == "_" || s == "$")
+        }
+        func isIdentifierPart(_ s: Unicode.Scalar) -> Bool {
+            isIdentifierStart(s) || ("0"..."9").contains(s)
+        }
+        let punctuation = Set<Unicode.Scalar>(["{", "}", "[", "]", ",", ":", "-", "+", "."])
+        var json = String.UnicodeScalarView()
+        var depth = 0
+        var inString = false
+        var escaped = false
+        // True where a key may start: after `{` or `,`, whitespace aside.
+        var keyPosition = false
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
+            if inString {
+                json.append(scalar)
+                if escaped {
+                    escaped = false
+                } else if scalar == "\\" {
+                    escaped = true
+                } else if scalar == "\"" {
+                    inString = false
+                }
+                index = scalars.index(after: index)
+                continue
+            }
+            if scalar.properties.isWhitespace {
+                json.append(scalar)
+            } else if scalar == "\"" {
+                inString = true
+                keyPosition = false
+                json.append(scalar)
+            } else if (scalar == "e" || scalar == "E"),
+                      let last = json.last, ("0"..."9").contains(last) || last == "." {
+                // A number's exponent, left to the JSON parser to judge.
+                json.append(scalar)
+            } else if isIdentifierStart(scalar) {
+                var end = index
+                while end < scalars.endIndex, isIdentifierPart(scalars[end]) {
+                    end = scalars.index(after: end)
+                }
+                let word = String(scalars[index..<end])
+                var next = end
+                while next < scalars.endIndex, scalars[next].properties.isWhitespace {
+                    next = scalars.index(after: next)
+                }
+                if keyPosition, next < scalars.endIndex, scalars[next] == ":" {
+                    json.append(contentsOf: "\"\(word)\"".unicodeScalars)
+                } else {
+                    guard ["true", "false", "null"].contains(word) else { return nil }
+                    json.append(contentsOf: word.unicodeScalars)
+                }
+                keyPosition = false
+                index = end
+                continue
+            } else if ("0"..."9").contains(scalar) || punctuation.contains(scalar) {
+                json.append(scalar)
+                keyPosition = scalar == "{" || scalar == ","
+                if scalar == "{" || scalar == "[" {
+                    depth += 1
+                } else if scalar == "}" || scalar == "]" {
+                    depth -= 1
+                    if depth == 0 {
+                        let end = scalars.index(after: index)
+                        let quoted = String(json)
+                        guard let parsed = parse(in: quoted, from: quoted.startIndex),
+                              parsed.end == quoted.endIndex
+                        else { return nil }
+                        return (parsed.object, end)
+                    }
+                }
+            } else {
+                return nil
+            }
+            index = scalars.index(after: index)
+        }
+        return nil
+    }
 }

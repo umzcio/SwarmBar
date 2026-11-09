@@ -15,8 +15,8 @@ import Foundation
 enum CodexSessionParser {
     static let staleAfter: TimeInterval = 30 * 60
 
-    static func parseDetails(tail: String, now: Date = .now) -> ParsedStatus? {
-        if let pending = pendingRequest(tail: tail) {
+    static func parseDetails(tail: String, now: Date = .now, reviewer: String? = nil) -> ParsedStatus? {
+        if let pending = pendingRequest(tail: tail, reviewer: reviewer) {
             return ParsedStatus(status: .waitingApproval(command: pending.prompt),
                 cwd: nil, attentionEventID: "call:\(pending.id)")
         }
@@ -83,10 +83,34 @@ enum CodexSessionParser {
         pendingRequest(tail: tail)?.prompt
     }
 
-    private static func pendingRequest(tail: String) -> (prompt: ApprovalPrompt, id: String)? {
+    /// The reviewer the newest turn_context in this text names, if any.
+    /// Codex writes one per turn, with `approvals_reviewer` set by
+    /// /permissions: `user` asks the person, `auto_review` has Codex's own
+    /// reviewer approve or reject every escalation without asking anyone.
+    static func reviewer(inTurnContext raw: Substring) -> String? {
+        guard let data = raw.data(using: .utf8),
+              let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              line["type"] as? String == "turn_context",
+              let payload = line["payload"] as? [String: Any]
+        else { return nil }
+        return payload["approvals_reviewer"] as? String
+    }
+
+    /// `reviewer` is what the newest turn_context names when the tail
+    /// holds none; a turn_context in the tail is newer and wins. Under
+    /// `auto_review` an unanswered escalation is waiting on Codex's own
+    /// reviewer, which settles it in seconds and never asks the person
+    /// (a rejection goes back to the model), so it is no prompt. Any other
+    /// or unknown reviewer is treated as the person, as before.
+    private static func pendingRequest(tail: String, reviewer: String? = nil) -> (prompt: ApprovalPrompt, id: String)? {
         var answered = Set<String>()
         var lines: [[String: Any]] = []
+        var reviewer = reviewer
         for raw in tail.split(separator: "\n") {
+            if raw.contains("\"turn_context\""), let named = Self.reviewer(inTurnContext: raw) {
+                reviewer = named
+                continue
+            }
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   line["type"] as? String == "response_item",
@@ -101,7 +125,8 @@ enum CodexSessionParser {
         }
         guard let latest = lines.last,
               let callId = latest["call_id"] as? String,
-              !answered.contains(callId)
+              !answered.contains(callId),
+              reviewer != "auto_review"
         else { return nil }
         let input = (latest["input"] as? String) ?? (latest["arguments"] as? String) ?? ""
 
@@ -188,23 +213,35 @@ enum CodexSessionParser {
         return shellQuoted(word)
     }
 
-    /// The arguments of a code-mode program that is exactly
+    /// The arguments of a code-mode program that is exactly one of
     ///
-    ///     [const|let|var <name> =] await tools.exec_command({ ...JSON... });
+    ///     [const|let|var <name> =] await tools.exec_command({ ... });
     ///     text(<name>.output);
     ///
-    /// with nothing else in it, or nil. Any other program, including one
-    /// with a comment, a second call or a computed argument, is not read.
+    ///     text(await tools.exec_command({ ... }));
+    ///
+    /// with nothing else in it, or nil. The second is what Codex 0.167
+    /// writes. The object may use bare keys as Codex does, read by
+    /// StrictJSONObject.parseJavaScriptLiteral only where it means what the
+    /// JSON shown means. Any other program, including one with a comment,
+    /// a second call or a computed argument, is not read.
     static func codeModeArguments(_ program: String) -> [String: Any]? {
         let identifier = "[A-Za-z_$][A-Za-z0-9_$]*"
-        let head = "^\\s*(?:(?:const|let|var)\\s+\(identifier)\\s*=\\s*)?await\\s+tools\\.exec_command\\(\\s*"
-        guard let headRange = program.range(of: head, options: .regularExpression),
-              let parsed = StrictJSONObject.parse(in: program, from: headRange.upperBound)
-        else { return nil }
-        let tail = "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"
-        let rest = String(program.unicodeScalars[parsed.end...])
-        guard rest.range(of: tail, options: .regularExpression) != nil else { return nil }
-        return parsed.object
+        let shapes = [
+            (head: "^\\s*(?:(?:const|let|var)\\s+\(identifier)\\s*=\\s*)?await\\s+tools\\.exec_command\\(\\s*",
+             tail: "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"),
+            (head: "^\\s*text\\(\\s*await\\s+tools\\.exec_command\\(\\s*",
+             tail: "^\\s*\\)\\s*\\)\\s*;?\\s*$"),
+        ]
+        for shape in shapes {
+            guard let headRange = program.range(of: shape.head, options: .regularExpression),
+                  let parsed = StrictJSONObject.parseJavaScriptLiteral(in: program, from: headRange.upperBound)
+            else { continue }
+            let rest = String(program.unicodeScalars[parsed.end...])
+            guard rest.range(of: shape.tail, options: .regularExpression) != nil else { continue }
+            return parsed.object
+        }
+        return nil
     }
 
     /// The first line of a rollout file is session_meta with cwd and id.
