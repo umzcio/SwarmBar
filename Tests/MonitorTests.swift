@@ -207,6 +207,104 @@ struct OpenCodeReaderTests {
                 == .working(activity: "Working…"))
         #expect(sessions.first(where: { $0.projectName == "proj-dead" })?.status == .idle)
     }
+
+    // MARK: - OpenCode 2
+
+    /// OpenCode 2 writes session_v2 and session_message and leaves the old
+    /// tables as they were, so on 2.x every session was invisible.
+    private func addV2Tables(_ path: String) {
+        insert(dbPath: path, sql: """
+        CREATE TABLE session_v2(id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_archived INTEGER, time_suspended INTEGER, time_idle INTEGER, idle_outcome TEXT,
+            time_busy INTEGER);
+        CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL);
+        """)
+    }
+
+    private func ms(_ date: Date) -> Int64 { Int64((date.timeIntervalSince1970 * 1000).rounded()) }
+
+    private func v2Session(
+        _ id: String, dir: String, now: Date, busy: TimeInterval?, idle: TimeInterval?,
+        outcome: String? = nil, parent: String? = nil, archived: Bool = false, suspended: TimeInterval? = nil
+    ) -> String {
+        func col(_ ago: TimeInterval?) -> String { ago.map { "\(ms(now.addingTimeInterval(-$0)))" } ?? "NULL" }
+        let updated = min(busy ?? .infinity, idle ?? .infinity, suspended ?? .infinity)
+        return """
+        INSERT INTO session_v2 (id, parent_id, directory, title, time_created, time_updated, time_archived,
+            time_suspended, time_idle, idle_outcome, time_busy)
+        VALUES ('\(id)', \(parent.map { "'\($0)'" } ?? "NULL"), '\(dir)', 't', \(ms(now.addingTimeInterval(-3600))),
+            \(col(updated.isFinite ? updated : 0)), \(archived ? "\(ms(now))" : "NULL"), \(col(suspended)),
+            \(col(idle)), \(outcome.map { "'\($0)'" } ?? "NULL"), \(col(busy)));
+        """
+    }
+
+    private func assistant(_ session: String, seq: Int, text: String, now: Date) -> String {
+        let data = #"{"time":{"created":1},"agent":"build","content":[{"type":"reasoning","text":"hidden"},{"type":"text","text":"\#(text)"}],"finish":"stop"}"#
+        return """
+        INSERT INTO session_message VALUES ('m\(session)\(seq)', '\(session)', 'assistant', \(seq), \(ms(now)), \(ms(now)), '\(data)');
+        """
+    }
+
+    @Test func aBusyOpenCode2SessionIsWorking() throws {
+        let path = try makeDB()
+        addV2Tables(path)
+        let now = Date.now
+        insert(dbPath: path, sql: v2Session("ses_busy", dir: "/tmp/v2-busy", now: now, busy: 5, idle: 60, outcome: "succeeded"))
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.status == .working(activity: "Working…"))
+        #expect(sessions.first?.projectName == "v2-busy")
+        #expect(sessions.first?.id == StableID.uuid(for: "ses_busy"))
+    }
+
+    @Test func aFinishedOpenCode2TurnShowsTheLastAnswer() throws {
+        let path = try makeDB()
+        addV2Tables(path)
+        let now = Date.now
+        insert(dbPath: path, sql: v2Session("ses_done", dir: "/tmp/v2-done", now: now, busy: 120, idle: 60, outcome: "succeeded")
+            + assistant("ses_done", seq: 1, text: "First answer.", now: now)
+            + assistant("ses_done", seq: 3, text: "Done, want me to continue?", now: now))
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.first?.status == .waitingInput(prompt: "Done, want me to continue?"))
+    }
+
+    @Test func aFailedOrInterruptedOpenCode2TurnIsIdle() throws {
+        let path = try makeDB()
+        addV2Tables(path)
+        let now = Date.now
+        insert(dbPath: path, sql: v2Session("ses_f", dir: "/tmp/v2-f", now: now, busy: 120, idle: 60, outcome: "failed")
+            + v2Session("ses_i", dir: "/tmp/v2-i", now: now, busy: 120, idle: 60, outcome: "interrupted")
+            + v2Session("ses_s", dir: "/tmp/v2-s", now: now, busy: 120, idle: nil, suspended: 60))
+        let sessions = OpenCodeReader.sessions(dbPath: path, now: now)
+        #expect(sessions.count == 3)
+        #expect(sessions.allSatisfy { $0.status == .idle })
+    }
+
+    @Test func openCode2SubagentsAndArchivedSessionsAreNotRows() throws {
+        let path = try makeDB()
+        addV2Tables(path)
+        let now = Date.now
+        insert(dbPath: path, sql: v2Session("ses_child", dir: "/tmp/v2-c", now: now, busy: 5, idle: nil, parent: "ses_p")
+            + v2Session("ses_old", dir: "/tmp/v2-a", now: now, busy: 5, idle: nil, archived: true))
+        #expect(OpenCodeReader.sessions(dbPath: path, now: now).isEmpty)
+    }
+
+    @Test func openCode1And2SessionsAreReadTogether() throws {
+        let path = try makeDB()
+        addV2Tables(path)
+        let now = Date.now
+        let updated = ms(now)
+        insert(dbPath: path, sql: """
+        INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('s1', '/tmp/v1-proj', 'title', \(updated - 1000), \(updated));
+        INSERT INTO message VALUES ('m1', 's1', \(updated));
+        INSERT INTO part VALUES ('p1', 'm1', '{"type":"step-start"}');
+        """ + v2Session("ses_two", dir: "/tmp/v2-proj", now: now, busy: 5, idle: nil))
+        let names = Set(OpenCodeReader.sessions(dbPath: path, now: now).map(\.projectName))
+        #expect(names == ["v1-proj", "v2-proj"])
+    }
 }
 
 @MainActor

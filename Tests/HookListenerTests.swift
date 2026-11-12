@@ -291,4 +291,22 @@ struct OwnerSocketBridgeTests {
             #expect(!text.contains("hook-token"), "\(name) reads the token")
         }
     }
+
+    /// OpenCode 2 loads only `export default { id, setup }` and refused the
+    /// old named plugin function outright ("Plugin must export a default
+    /// definition with an id and an effect or setup function"). OpenCode
+    /// 1.17+ reads the same default's server(). Both plugins carry both.
+    @Test func openCodePluginsLoadInBothPluginSystems() throws {
+        for name in ["swarmbar-opencode", "swarmbar-remote-opencode"] {
+            let url = try #require(Bundle.main.url(forResource: name, withExtension: "js"))
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let exports = text.split(separator: "\n").filter { $0.hasPrefix("export ") }
+            #expect(exports.contains { $0.hasPrefix("export default { id: \"swarmbar") && $0.contains("server") && $0.contains("setup") },
+                "\(name): \(exports)")
+            #expect(!exports.contains { $0.contains("Plugin = async") }, "\(name) still has a 1.x-only export")
+            #expect(text.contains("async function setup(opencode)"), "\(name)")
+            #expect(text.contains("async function server({ client, directory })"), "\(name)")
+            #expect(text.contains("opencode.permission.reply("), "\(name)")
+        }
+    }
 }
