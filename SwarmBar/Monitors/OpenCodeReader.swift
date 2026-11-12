@@ -11,7 +11,8 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 /// callers should treat a missing or unreadable database as "no sessions"
 /// rather than an error.
 ///
-/// Schema (only the columns this reader touches):
+/// OpenCode 2 moved to session_v2 and session_message; see
+/// openCode2Sessions. OpenCode 1's schema (only the columns read):
 ///   session(id TEXT, directory TEXT, title TEXT,
 ///           time_created INTEGER ms, time_updated INTEGER ms)
 ///   message(id TEXT, session_id TEXT, time_created INTEGER ms)
@@ -95,6 +96,7 @@ enum OpenCodeReader {
                 lastActivityAt: updatedAt
             ))
         }
+        results += openCode2Sessions(db: db, now: now)
         var deduped = demoteSuperseded(results)
         if let liveDirectories {
             deduped = deduped.map { session in
@@ -108,6 +110,99 @@ enum OpenCodeReader {
             }
         }
         return deduped.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// OpenCode 2 sessions. 2.x writes session_v2 and session_message and
+    /// leaves the 1.x tables as they were, so read alone those made every
+    /// 2.x session invisible. A database without session_v2 (OpenCode 1)
+    /// has none, which is not a read failure.
+    ///
+    /// The session row records its own state: time_busy when a turn
+    /// starts, time_idle and idle_outcome (succeeded, failed, interrupted)
+    /// when it ends, time_suspended when its runner stops mid-turn. A
+    /// succeeded turn shows its last assistant text, as a finished 1.x turn
+    /// does; a failed, interrupted or suspended one asks nothing.
+    /// Subagents (parent_id) and archived sessions are never rows.
+    private nonisolated static func openCode2Sessions(db: OpaquePointer, now: Date) -> [AgentSession] {
+        let sql = """
+            SELECT id, directory, time_created, time_updated, time_busy, time_idle,
+                   idle_outcome, time_suspended
+            FROM session_v2
+            WHERE parent_id IS NULL AND time_archived IS NULL
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        func optionalInt(_ column: Int32) -> Int64? {
+            sqlite3_column_type(stmt, column) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, column)
+        }
+        var results: [AgentSession] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let idText = sqlite3_column_text(stmt, 0) else { continue }
+            let id = String(cString: idText)
+            let directory = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
+            let timeCreated = sqlite3_column_int64(stmt, 2)
+            let timeUpdated = sqlite3_column_int64(stmt, 3)
+            guard timeUpdated > 0 else { continue }
+            let updatedAt = Date(timeIntervalSince1970: TimeInterval(timeUpdated) / 1000)
+            let age = now.timeIntervalSince(updatedAt)
+            guard age < discoveryWindow else { continue }
+            let createdAt = timeCreated > 0
+                ? Date(timeIntervalSince1970: TimeInterval(timeCreated) / 1000)
+                : updatedAt
+
+            let busy = optionalInt(4) ?? 0
+            let idle = optionalInt(5) ?? 0
+            let outcome = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
+            let suspended = optionalInt(7) ?? 0
+            let status: SessionStatus
+            if suspended >= max(busy, idle), suspended > 0 {
+                status = .idle
+            } else if busy > idle {
+                status = .working(activity: "Working…")
+            } else if outcome == "succeeded", age < waitingAfter {
+                let text = lastAssistantText(db: db, sessionId: id)
+                status = .finishedTurn(fullText: text ?? "", preview: text.map(firstLine) ?? "")
+            } else {
+                status = .idle
+            }
+            let projectPath = directory.map { URL(fileURLWithPath: $0) }
+            results.append(AgentSession(
+                id: StableID.uuid(for: id),
+                tool: .openCode,
+                projectName: projectPath?.lastPathComponent ?? id,
+                projectPath: projectPath,
+                status: status,
+                startedAt: createdAt,
+                lastActivityAt: updatedAt
+            ))
+        }
+        return results
+    }
+
+    /// The text of the newest assistant message: its text content items,
+    /// joined, leaving out reasoning and tool calls.
+    private nonisolated static func lastAssistantText(db: OpaquePointer, sessionId: String) -> String? {
+        let sql = """
+            SELECT data FROM session_message
+            WHERE session_id = ? AND type = 'assistant'
+            ORDER BY seq DESC LIMIT 1
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, sessionId, -1, sqliteTransient)
+        guard sqlite3_step(stmt) == SQLITE_ROW,
+              let dataText = sqlite3_column_text(stmt, 0),
+              let object = (try? JSONSerialization.jsonObject(
+                with: Data(String(cString: dataText).utf8))) as? [String: Any],
+              let content = object["content"] as? [[String: Any]]
+        else { return nil }
+        let texts = content.compactMap { item -> String? in
+            guard item["type"] as? String == "text" else { return nil }
+            return item["text"] as? String
+        }
+        return texts.isEmpty ? nil : texts.joined(separator: "\n")
     }
 
     /// Every opencode launch auto-creates a session in its directory, and
