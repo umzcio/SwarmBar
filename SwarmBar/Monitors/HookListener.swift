@@ -15,6 +15,14 @@ protocol HookClient: AnyObject, Sendable {
     func cancel()
     /// True once the client can no longer take an answer.
     var isGone: Bool { get }
+    /// The processes above the one at the other end of a local Unix
+    /// socket, nearest first, read when it connected. Empty for every
+    /// other transport.
+    var peerAncestry: [Int] { get }
+}
+
+extension HookClient {
+    var peerAncestry: [Int] { [] }
 }
 
 /// A request read incrementally, so a client trickling bytes costs work in
@@ -304,7 +312,12 @@ final class UnixHookClient: HookClient {
     }
     private let state: Mutex<State>
 
-    init(fd: Int32) { state = Mutex(State(fd: fd)) }
+    let peerAncestry: [Int]
+
+    init(fd: Int32, peerAncestry: [Int] = []) {
+        state = Mutex(State(fd: fd))
+        self.peerAncestry = peerAncestry
+    }
 
     func start(on queue: DispatchQueue, onData: @escaping @Sendable (Data?, Bool) -> Void) {
         state.withLock { current in
@@ -465,7 +478,12 @@ final class UnixHookSocket: Sendable {
                     close(client)
                     continue
                 }
-                accept(UnixHookClient(fd: client))
+                var pid: pid_t = 0
+                var length = socklen_t(MemoryLayout<pid_t>.size)
+                let ancestry = getsockopt(client, SOL_LOCAL, LOCAL_PEERPID, &pid, &length) == 0 && pid > 0
+                    ? SessionProcessRegistry.ancestry(ofPeer: Int(pid), parent: SessionProcessRegistry.parent(of:))
+                    : []
+                accept(UnixHookClient(fd: client, peerAncestry: ancestry))
             }
         }
         source.setCancelHandler { close(fd) }

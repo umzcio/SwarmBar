@@ -269,7 +269,8 @@ final class HookServer: ApprovalResponding {
                     },
                     isGone: { client.isGone },
                     remote: nil)
-            })
+            },
+            peerAncestry: client.peerAncestry)
         dispatch(event: event, body: body, context: context)
     }
 
@@ -300,6 +301,9 @@ final class HookServer: ApprovalResponding {
         let release: () -> Void
         /// Parks the request for the popover to answer.
         let hold: (UUID, ApprovalKind) -> Void
+        /// The processes above the bridge that sent a local request,
+        /// nearest first. Empty for remote.
+        var peerAncestry: [Int] = []
     }
 
     /// A tool switched off in Settings shows no row, so a held request
@@ -359,6 +363,16 @@ final class HookServer: ApprovalResponding {
 
         switch event {
         case "PermissionRequest", "PreToolUseHold":
+            if context.host == nil, tool == .kimiCode || tool == .bearCode,
+               !context.peerAncestry.isEmpty, let cwd {
+                // The prompt's own process, so a keystroke answer can only
+                // ever reach this session's terminal. Off the main actor:
+                // matching the tool's processes runs ps.
+                let ancestry = context.peerAncestry
+                Task.detached {
+                    SessionProcessRegistry.bind(sessionID: sessionID, tool: tool, ancestry: ancestry, cwd: cwd)
+                }
+            }
             let holding = mayHold(.claudeHook, tool, context)
             // The command a row shows beside Approve is the command Approve
             // answers. A request nobody holds cannot be answered from the
@@ -413,6 +427,7 @@ final class HookServer: ApprovalResponding {
             context.release()
 
         case "SessionEnd":
+            SessionProcessRegistry.forget(sessionID)
             cancelPending(sessionID: sessionID)
             store.markSessionEnded(sessionID)
             context.release()
