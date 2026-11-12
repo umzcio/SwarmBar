@@ -288,6 +288,35 @@ struct AttentionAlertTests {
         #expect(store.hookOverrides[session.id] == nil)
     }
 
+    /// A Kimi-family prompt is pinned by its hook and answered at its
+    /// terminal. Its liveness is a count per directory, so a dead session
+    /// can read as alive while another one shares its directory. The pin
+    /// goes once the process its hook came from is gone, and stays while
+    /// that process lives or when no process was ever bound.
+    @Test func aKimiPinDiesWithItsOwnBoundProcess() {
+        for tool in [AgentTool.kimiCode, .bearCode] {
+            let store = SessionStore()
+            var gone: Set<UUID> = []
+            store.boundProcessGone = { gone.contains($0) }
+            let session = AgentSession(
+                tool: tool, projectName: "proj",
+                projectPath: URL(fileURLWithPath: "/tmp/proj"),
+                status: .working(activity: "Working…"), processAlive: true)
+            store.sync(tool: tool, sessions: [session])
+            store.applyHookEvent(
+                sessionID: session.id, tool: tool,
+                status: .waitingApproval(command: "touch /tmp/x"),
+                sticky: true, cwd: "/tmp/proj", accountLabel: nil)
+            store.sync(tool: tool, sessions: [session])
+            #expect(store.sessions.first?.status == .waitingApproval(command: "touch /tmp/x"), "\(tool)")
+
+            gone = [session.id]
+            store.sync(tool: tool, sessions: [session])
+            #expect(store.hookOverrides[session.id] == nil, "\(tool)")
+            #expect(store.sessions.first?.status.needsAttention == false, "\(tool)")
+        }
+    }
+
     /// A held Claude decision keeps its pin whatever a poll says.
     @Test func aClaudePinIsNotDroppedByLiveness() {
         let store = SessionStore()

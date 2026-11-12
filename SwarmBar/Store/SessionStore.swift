@@ -272,6 +272,16 @@ final class SessionStore {
                 }
             }
         }
+        if host == nil, tool == .kimiCode || tool == .bearCode {
+            // The Kimi family's liveness is a count per directory, so a
+            // session that died at its prompt can still read as alive
+            // beside another. Its pin goes once the process its own hook
+            // came from is gone (SessionProcessRegistry).
+            let rows = Set(sessions.filter { $0.tool == tool && $0.host == nil }.map(\.id))
+            for (id, pin) in hookOverrides where pin.sticky && rows.contains(id) && boundProcessGone(id) {
+                hookOverrides.removeValue(forKey: id)
+            }
+        }
         sessions.removeAll {
             $0.tool == tool && $0.host == host
                 && !incomingIds.contains($0.id) && hookOverrides[$0.id] == nil
@@ -443,6 +453,9 @@ final class SessionStore {
     }
 
     @ObservationIgnored private(set) var hookOverrides: [UUID: HookOverride] = [:]
+    /// Whether a Kimi-family session's own process, proved by its hook,
+    /// is gone. A seam for tests.
+    @ObservationIgnored var boundProcessGone: (UUID) -> Bool = { SessionProcessRegistry.isGone($0) }
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
     /// Test seam. When set, a local answer is reported here instead of

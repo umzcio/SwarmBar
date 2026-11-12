@@ -233,7 +233,7 @@ enum TerminalFocuser {
     /// remotely. Returns false when the session has no live tty or iTerm2
     /// isn't running.
     nonisolated static func sendKeys(sessionID: UUID, tool: AgentTool, projectPath: URL?, keys: [String]) -> Bool {
-        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath, forAnswer: true),
               isRunning("iTerm2") else { return false }
         return runScript(keyScript(tty: tty, keys: keys)) == "SENT"
     }
@@ -416,7 +416,7 @@ enum TerminalFocuser {
     nonisolated static func answerNumbered(
         sessionID: UUID, tool: AgentTool, projectPath: URL?, number: Int, expectedLabel: String
     ) -> AnswerOutcome {
-        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
+        guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath, forAnswer: true),
               isRunning("iTerm2") else { return .noTerminal }
         let script = numberedAnswerScript(number: number)
         switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel]) {
@@ -487,7 +487,7 @@ enum TerminalFocuser {
         expectedLabel: String
     ) -> AnswerOutcome {
         guard let script = navigationAnswerScript(key: key, presses: presses),
-              let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
+              let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath, forAnswer: true),
               isRunning("iTerm2")
         else { return .noTerminal }
         switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel, expectedCursorLine]) {
@@ -636,6 +636,9 @@ enum TerminalFocuser {
         var directoryPids: @Sendable (AgentTool, String) -> [Int]
         /// The controlling terminal's name ("ttys004"), or nil for none.
         var tty: @Sendable (Int) -> String?
+        /// The Kimi-family session's own process, proved by its hook
+        /// (SessionProcessRegistry), while it is still that process.
+        var boundPid: @Sendable (UUID) -> Int? = { _ in nil }
 
         nonisolated static let live = SessionLookups(
             claudePid: { TerminalFocuser.claudePid(forSession: $0) },
@@ -643,7 +646,8 @@ enum TerminalFocuser {
             codexPid: { TerminalFocuser.codexPid(forSession: $0) },
             antigravityPid: { TerminalFocuser.antigravityPid(forSession: $0) },
             directoryPids: { TerminalFocuser.directoryPids(tool: $0, cwd: $1) },
-            tty: { TerminalFocuser.ttyName(pid: $0) }
+            tty: { TerminalFocuser.ttyName(pid: $0) },
+            boundPid: { SessionProcessRegistry.livePid($0) }
         )
     }
 
@@ -664,8 +668,17 @@ enum TerminalFocuser {
     /// when every one of that tool's processes in it sits on the SAME tty
     /// (one session, or a launcher and its child). Two terminals means two
     /// sessions nothing here can tell apart, and the answer goes to neither.
+    ///
+    /// Even one terminal says only that ONE session is there, not that it
+    /// is this row's: a session that died at its prompt left its row
+    /// pinned, and the directory then resolved to whichever session
+    /// remained, so Approve typed into that one's prompt. A Kimi-family
+    /// session whose hook proved its process uses that process, and a
+    /// keystroke answer (`forAnswer`) uses nothing else. Looking at a
+    /// terminal, or pasting a reply the person typed for it, still falls
+    /// back to the directory.
     nonisolated static func tty(
-        forSession id: UUID, tool: AgentTool, projectPath: URL?,
+        forSession id: UUID, tool: AgentTool, projectPath: URL?, forAnswer: Bool = false,
         lookups: SessionLookups = .live
     ) -> String? {
         switch tool {
@@ -674,6 +687,10 @@ enum TerminalFocuser {
         case .codex:       return lookups.codexPid(id).flatMap(lookups.tty)
         case .antigravity: return lookups.antigravityPid(id).flatMap(lookups.tty)
         case .kimiCode, .bearCode, .openCode:
+            if tool != .openCode {
+                if let pid = lookups.boundPid(id) { return lookups.tty(pid) }
+                if forAnswer { return nil }
+            }
             // No session-to-process registry, so the directory, under the
             // one-terminal rule above.
             guard let path = projectPath?.path else { return nil }
@@ -704,7 +721,7 @@ enum TerminalFocuser {
     /// registry, but their processes keep the session's directory as cwd.
     /// Each tool's own names only: a BearCode row never resolves to a Kimi
     /// process in the same directory, nor an OpenCode row to either.
-    private nonisolated static func directoryPids(tool: AgentTool, cwd: String) -> [Int] {
+    nonisolated static func directoryPids(tool: AgentTool, cwd: String) -> [Int] {
         switch tool {
         case .openCode:
             return ProcessLiveness.pids(processNames: [OpenCodeMonitor.processName], cwd: cwd)

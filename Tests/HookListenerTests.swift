@@ -39,6 +39,7 @@ private func request(_ event: String = "Stop", body: String = "{}", token: Strin
 private final class Deliveries: Sendable {
     let paths = Mutex<[String]>([])
     let clients = Mutex<[ObjectIdentifier]>([])
+    let ancestries = Mutex<[[Int]]>([])
 }
 
 @MainActor
@@ -186,6 +187,7 @@ struct OwnerSocketBridgeTests {
         let listener = HookListener(
             deliver: { delivery in
                 deliveries.paths.withLock { $0.append(delivery.request.path) }
+                deliveries.ancestries.withLock { $0.append(delivery.client.peerAncestry) }
                 delivery.client.respond(Data(answer.utf8), completion: nil)
             },
             clientGone: {})
@@ -242,6 +244,23 @@ struct OwnerSocketBridgeTests {
         let out = try run("swarmbar-kimi-hook", ext: "sh", home: home, event: "Stop")
         #expect(out.isEmpty)
         #expect(deliveries.paths.withLock { $0 } == ["/hook/Stop"])
+    }
+
+    /// The kernel names the bridge's own process as the socket's peer, and
+    /// the bridge descends from whatever ran the hook, here this test as
+    /// Kimi would be. That chain is what binds a Kimi-family row to its own
+    /// session's process.
+    @Test func theBridgesProcessLeadsBackToWhatRanTheHook() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let deliveries = Deliveries()
+        let (socket, _) = try serve(at: socketPath(home), answer: "{}", into: deliveries)
+        defer { socket.stop() }
+        _ = try run("swarmbar-kimi-hook", ext: "sh", home: home, event: "PermissionRequest")
+        let chain = try #require(deliveries.ancestries.withLock { $0.first })
+        // curl's own shell, then this process, which ran the bridge.
+        #expect(chain.first != Int(getpid()))
+        #expect(SessionProcessRegistry.agent(in: chain, isAgent: { $0 == Int(getpid()) }) == Int(getpid()))
     }
 
     /// With no socket of this user's, the bridges send nothing anywhere

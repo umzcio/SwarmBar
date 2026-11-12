@@ -191,6 +191,82 @@ struct SessionTTYScopeTests {
         #expect(TerminalFocuser.tty(
             forSession: id, tool: .grokBuild, projectPath: dir, lookups: lookups(own: 555)) == nil)
     }
+
+    // MARK: - A Kimi-family answer and its own session
+
+    private func bound(_ pid: Int?, kimi: [Int], bear: [Int] = []) -> TerminalFocuser.SessionLookups {
+        var lookups = lookups(kimi: kimi, bear: bear)
+        lookups.boundPid = { _ in pid }
+        return lookups
+    }
+
+    /// The finding: session K1 died at its prompt with its row still
+    /// pinned, and K2, alone in the same directory, is at a prompt of its
+    /// own. The directory resolves to K2's terminal, so Approve on K1's
+    /// row typed the digit into K2. An answer now goes only to the row's
+    /// own process, proved by the hook that raised the prompt.
+    @Test func anAnswerGoesOnlyToTheRowsOwnBoundProcess() {
+        for tool in [AgentTool.kimiCode, .bearCode] {
+            let others = tool == .kimiCode ? (kimi: [901], bear: [Int]()) : (kimi: [Int](), bear: [901])
+            // Unbound, or bound to a process that is gone: no terminal.
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, forAnswer: true,
+                lookups: bound(nil, kimi: others.kimi, bear: others.bear)) == nil, "\(tool)")
+            // Bound to its own live process: that process's terminal, even
+            // with another session in the directory.
+            #expect(TerminalFocuser.tty(
+                forSession: id, tool: tool, projectPath: dir, forAnswer: true,
+                lookups: bound(900, kimi: others.kimi, bear: others.bear)) == "ttys009", "\(tool)")
+        }
+    }
+
+    /// Focus, screen reads and Reply keep the directory rule when nothing
+    /// is bound, and prefer the bound process when something is.
+    @Test func lookingAtATerminalStillUsesTheDirectory() {
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: bound(nil, kimi: [901])) == "ttys010")
+        #expect(TerminalFocuser.tty(
+            forSession: id, tool: .kimiCode, projectPath: dir, lookups: bound(900, kimi: [901])) == "ttys009")
+    }
+}
+
+/// Which process a Kimi-family hook came from, and whether it is still
+/// that process.
+struct SessionProcessRegistryTests {
+    /// curl, the bridge's shell, the hook runner's shell, then the agent.
+    private let parents: [Int: Int] = [50: 40, 40: 35, 35: 30, 30: 1]
+
+    @Test func theAgentIsFoundAboveTheBridge() {
+        let chain = SessionProcessRegistry.ancestry(ofPeer: 50, parent: { parents[$0] })
+        #expect(chain == [40, 35, 30])
+        #expect(SessionProcessRegistry.agent(in: chain, isAgent: { $0 == 30 }) == 30)
+    }
+
+    @Test func noAgentAboveTheBridgeIsNoBinding() {
+        let chain = SessionProcessRegistry.ancestry(ofPeer: 50, parent: { parents[$0] })
+        #expect(SessionProcessRegistry.agent(in: chain, isAgent: { $0 == 999 }) == nil)
+        // A loop in the table ends the walk rather than spinning.
+        #expect(SessionProcessRegistry.ancestry(ofPeer: 7, parent: { $0 == 7 ? 8 : 7 }) == [8])
+    }
+
+    /// The bridge itself is never the agent, however it is named.
+    @Test func thePeerItselfIsNotTheAgent() {
+        let chain = SessionProcessRegistry.ancestry(ofPeer: 50, parent: { parents[$0] })
+        #expect(!chain.contains(50))
+        #expect(SessionProcessRegistry.agent(in: chain, isAgent: { _ in true }) == 40)
+    }
+
+    @Test func aReusedPidIsNotTheBoundProcess() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let bound = SessionProcessRegistry.Bound(pid: 30, startedAt: start)
+        func facts(_ started: Date, uid: uid_t = getuid()) -> ProcessIdentity.Facts {
+            ProcessIdentity.Facts(commandName: "kimi", uid: uid, startedAt: started)
+        }
+        #expect(SessionProcessRegistry.isSame(bound, facts(start)))
+        #expect(!SessionProcessRegistry.isSame(bound, facts(start.addingTimeInterval(30))))
+        #expect(!SessionProcessRegistry.isSame(bound, facts(start, uid: getuid() + 1)))
+        #expect(!SessionProcessRegistry.isSame(bound, nil))
+    }
 }
 
 /// The per-tool answer table. Every entry was settled by a live round, and
