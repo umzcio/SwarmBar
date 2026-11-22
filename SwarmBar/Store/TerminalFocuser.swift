@@ -326,6 +326,11 @@ enum TerminalFocuser {
         /// The paste did not appear on screen, so Enter was NOT sent. The
         /// text may be partially there; the user finishes at the terminal.
         case pasteNotVisible
+        /// The terminal shows a selector or a permission dialog, which
+        /// takes arrows and Enter rather than text. Enter would confirm
+        /// whatever option the cursor sits on, so it was NOT sent, and
+        /// nothing was pasted when the selector was there beforehand.
+        case selectorShown
         /// No live tty, or iTerm2 is not running.
         case noTerminal
     }
@@ -373,27 +378,96 @@ enum TerminalFocuser {
     /// by reading the screen back, and only then submits. Never presses Enter
     /// on text it could not see: a half-delivered prompt left sitting in the
     /// composer is recoverable, a half-delivered prompt that was submitted is
-    /// not.
+    /// not. See `deliverReply` for the checks.
     nonisolated static func sendReply(
         sessionID: UUID, tool: AgentTool, projectPath: URL?, text raw: String
     ) -> ReplyOutcome {
         // What lands is the filtered text, so the probe is taken from it too.
         let text = RemoteAnswerPlan.pasteText(raw)
         guard let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath),
-              isRunning("iTerm2"),
-              runScript(pasteScript(tty: tty, text: text)) == "PASTED"
+              isRunning("iTerm2")
         else { return .noTerminal }
+        return deliverReply(
+            text: text,
+            readScreen: { screenText(tty: tty) },
+            paste: { runScript(pasteScript(tty: tty, text: text)) == "PASTED" },
+            pressEnter: { runScript(keyScript(tty: tty, keys: ["\n"])) == "SENT" })
+    }
 
-        // Confirm on screen before submitting. A distinctive slice of the
-        // reply is enough, and the last line is what sits nearest the cursor.
-        guard let probe = verificationProbe(for: text),
-              let screen = screenText(sessionID: sessionID, tool: tool, projectPath: projectPath),
-              screen.contains(probe)
+    /// `sendReply`'s steps with the terminal taken out, so their order and
+    /// every refusal can be tested: read the screen, paste, read it again,
+    /// and only then press Enter.
+    ///
+    /// The screen is read BEFORE the paste as well, for two reasons. A
+    /// selector or a permission dialog takes arrows and Enter, not text: a
+    /// pasted digit could pick an option, and Enter confirms whatever the
+    /// cursor sits on, so nothing is pasted while one is up. And a short
+    /// reply ("main", "yes", an option's own label) is usually on screen
+    /// already, so its mere presence afterwards proved nothing: a paste the
+    /// TUI threw away passed, and Enter went in. The probe now has to occur
+    /// more often after the paste than before it, as on the remote path.
+    nonisolated static func deliverReply(
+        text: String,
+        readScreen: () -> String?,
+        paste: () -> Bool,
+        pressEnter: () -> Bool
+    ) -> ReplyOutcome {
+        // A distinctive slice of the reply is enough, and the last line is
+        // what sits nearest the cursor.
+        guard let probe = verificationProbe(for: text) else { return .pasteNotVisible }
+        guard let before = readScreen() else { return .noTerminal }
+        guard !showsSelector(before) else { return .selectorShown }
+        let seen = RemoteAnswerPlan.occurrences(of: probe, in: before)
+        guard paste() else { return .noTerminal }
+
+        // From here the text may be in the composer, so every refusal
+        // leaves it there unsent rather than submitting it.
+        guard let after = readScreen(),
+              RemoteAnswerPlan.occurrences(of: probe, in: after) > seen
         else { return .pasteNotVisible }
+        guard !showsSelector(after, typed: text) else { return .selectorShown }
+        return pressEnter() ? .sent : .pasteNotVisible
+    }
 
-        return runScript(keyScript(tty: tty, keys: ["\n"])) == "SENT"
-            ? .sent
-            : .pasteNotVisible
+    /// Whether the screen shows a selector or a permission dialog rather
+    /// than a composer: a highlighted option line ("❯ 1. Yes", "> 1.
+    /// Approve", Grok's "2 (●) Yes, proceed"), or a key hint for arrows as
+    /// the last line (Kimi's "↑/↓ select", agy's "↑/↓ Navigate"). Prose
+    /// with a numbered list has neither. Deliberately broader than
+    /// `TuiPromptLayout.selector`, which needs exactly one marked line to
+    /// trust a cursor: here a second marked line drawn by the agent must
+    /// not make a real selector read as a composer.
+    ///
+    /// `typed` is the reply just pasted. A composer draws it after its own
+    /// prompt marker, so a reply that opens "1. rebase first" reads as a
+    /// highlighted option; a marked line that is one of the reply's own
+    /// lines is the composer, not a selector.
+    nonisolated static func showsSelector(_ screen: String, typed: String = "") -> Bool {
+        let lines = screen.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        let typedLines = Set(typed.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty })
+        if let last = lines.last(where: { !$0.isEmpty }), last.hasPrefix("↑/↓"),
+           !typedLines.contains(last) {
+            return true
+        }
+        let edges = CharacterSet(charactersIn: "\u{2502}\u{2503}\u{258F}").union(.whitespaces)
+        return lines.contains { raw in
+            let line = raw.trimmingCharacters(in: edges)
+            if let radio = TuiPromptLayout.radioOption(line) {
+                return radio.marked && !typedLines.contains(line)
+            }
+            guard let first = line.unicodeScalars.first,
+                  TuiPromptLayout.cursorMarkers.contains(first)
+            else { return false }
+            let option = line.trimmingCharacters(in: TuiPromptLayout.cursorMarkers.union(.whitespaces))
+            guard let dot = option.firstIndex(of: "."),
+                  let number = Int(option[option.startIndex..<dot]), (1...9).contains(number),
+                  !option[option.index(after: dot)...].trimmingCharacters(in: .whitespaces).isEmpty
+            else { return false }
+            return !typedLines.contains(option)
+        }
     }
 
     /// A slice of the reply to look for on screen. The composer may wrap or

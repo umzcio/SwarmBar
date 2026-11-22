@@ -640,8 +640,8 @@ struct RemoteHookRelayTests {
         await settle { server.isHolding(sessionID: rowID(raw)) }
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
         store.approve(row)
-        let undelivered = SessionStatus.waitingInput(
-            prompt: "Answer at the terminal, SwarmBar could not deliver")
+        let undelivered = SessionStatus.waitingApproval(
+            command: .unreadable(SessionStore.undeliveredReason))
         await settle { store.sessions.first { $0.id == rowID(raw) }?.status == undelivered }
         #expect(replier.replies.count == 1)
         #expect(store.sessions.first { $0.id == rowID(raw) }?.status == undelivered)

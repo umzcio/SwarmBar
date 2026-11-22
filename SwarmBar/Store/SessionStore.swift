@@ -700,11 +700,20 @@ final class SessionStore {
     /// The held hook connection broke before the decision reached the agent.
     /// The row said "Running"; say plainly that it did not land, so the user
     /// goes to the terminal instead of trusting a false confirmation.
+    ///
+    /// The agent is still asking, in its own permission dialog, so the row
+    /// asks too, as an approval it cannot answer. It used to say so as a
+    /// waiting question, and a waiting question offers Reply: the reply was
+    /// pasted into that dialog and Enter confirmed whichever option the
+    /// cursor was on.
     func noteApprovalDeliveryFailed(sessionID: UUID) {
         update(id: sessionID) { session in
-            session.status = .waitingInput(prompt: "Answer at the terminal, SwarmBar could not deliver")
+            session.status = .waitingApproval(command: .unreadable(Self.undeliveredReason))
         }
     }
+
+    nonisolated static let undeliveredReason =
+        "SwarmBar could not deliver that answer. Answer it in the terminal."
 
     // Called by row buttons. Mock sessions (no projectPath) transition state
     // directly. Real sessions are answered through their tool's own control
@@ -1019,6 +1028,10 @@ final class SessionStore {
                     TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                     completion(.failed(
                         "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
+                case .selectorShown:
+                    TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
+                    completion(.failed(
+                        "This session is showing a list of choices, so nothing was submitted. Answer it in the terminal."))
                 case .noTerminal:
                     completion(.failed(
                         "Could not reach this session's terminal. Inline reply needs iTerm2."))
