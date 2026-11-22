@@ -116,11 +116,15 @@ struct RemoteProcessRecord: Sendable, Equatable {
     /// an empty `open` means unknown rather than none.
     let openFailed: Bool
     let screen: String?
+    /// When the process started, as the helper's process_start token. Sent
+    /// only for the Kimi family, whose sessions are bound to a process by
+    /// pid and start time (RemoteProcessBinding). Nil from an older helper.
+    var started: String? = nil
 }
 
 extension RemoteProcessRecord: Decodable {
     enum CodingKeys: String, CodingKey {
-        case pid, ppid, user, comm, args, cwd, tty, pane, open, screen
+        case pid, ppid, user, comm, args, cwd, tty, pane, open, screen, started
         case openFailed = "open_failed"
     }
 
@@ -153,7 +157,10 @@ extension RemoteProcessRecord: Decodable {
             open: try container.decode([String].self, forKey: .open),
             // The helper only sends the key when the read failed.
             openFailed: try container.decodeIfPresent(Bool.self, forKey: .openFailed) ?? false,
-            screen: try container.decodeIfPresent(String.self, forKey: .screen))
+            screen: try container.decodeIfPresent(String.self, forKey: .screen),
+            // Anything but a string is no start time, never a failed
+            // snapshot: it only decides whether keys may be aimed.
+            started: (try? container.decodeIfPresent(String.self, forKey: .started)) ?? nil)
     }
 }
 

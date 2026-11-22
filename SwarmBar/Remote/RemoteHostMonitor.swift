@@ -246,6 +246,11 @@ struct RemoteHostMonitor: SessionMonitor {
         if Task.isCancelled { return pollInterval }
 
         if connection.noteApplied(snapshot) { store.noteRemotePanesChanged() }
+        // A full process table says which bound Kimi-family processes are
+        // gone, before the sync that lets a gone one's pinned prompt go.
+        if !snapshot.processesFailed {
+            RemoteProcessBinding.noteProcesses(hostID: hostID, snapshot.processes)
+        }
         // A tool this pass cannot vouch for keeps its previous rows. Its
         // sessions may only be missing because the evidence could not be
         // read, and syncing would turn "could not look" into "nothing there".

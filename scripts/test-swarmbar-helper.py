@@ -755,6 +755,41 @@ class CrossUserReadTests(unittest.TestCase):
         self.assertIn(transcript, paths)
         self.assertFalse([p for p in paths if p.startswith(self.a + "/")], paths)
 
+    def test_probe_never_reports_another_homes_claude_dir(self):
+        # a links a .claude* name to b's profile, which has no settings.json
+        # yet. Reported under a, setup would create b's settings running
+        # a's script as b.
+        os.makedirs(os.path.join(self.b, ".claude-work", "projects"))
+        os.symlink(os.path.join(self.b, ".claude-work"), os.path.join(self.a, ".claude-work"))
+        warnings = []
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, warnings), [])
+            self.assertNotIn("claude", helper.home_tools(self.a))
+            self.assertEqual(helper.home_claude_dirs(self.b, []),
+                             [{"path": os.path.join(self.b, ".claude-work"), "settings": "missing"}])
+        self.assertTrue(warnings)
+
+    def test_probe_never_reports_a_tool_whose_state_leads_out(self):
+        os.makedirs(os.path.join(self.b, ".kimi-code"))
+        os.symlink(os.path.join(self.b, ".kimi-code"), os.path.join(self.a, ".kimi-code"))
+        with self.foreign():
+            self.assertNotIn("kimi", helper.home_tools(self.a))
+            self.assertIn("kimi", helper.home_tools(self.b))
+
+    def test_probe_claude_dir_its_user_does_not_own_is_not_reported(self):
+        os.makedirs(os.path.join(self.a, ".claude", "projects"))
+        with self.foreign(self.owner + 1):
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [])
+            self.assertEqual(helper.home_tools(self.a), [])
+
+    def test_probe_claude_dir_linked_within_its_home_counts(self):
+        real = os.path.join(self.a, "dotfiles", "claude")
+        os.makedirs(os.path.join(real, "projects"))
+        os.symlink(real, os.path.join(self.a, ".claude"))
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [{"path": real, "settings": "missing"}])
+            self.assertIn("claude", helper.home_tools(self.a))
+
     def test_claude_root_in_its_own_home_by_link_counts(self):
         real = os.path.join(self.a, "dotfiles", "claude", "projects")
         os.makedirs(real)
@@ -1251,6 +1286,15 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_parse_ps_skips_malformed_lines(self):
         self.assertEqual(helper.parse_ps("garbage\n  x 1 0 u t c a\n  5 1 x u t c a\n"), [])
+
+    def test_kimi_family_carries_its_start_time(self):
+        # A Kimi-family session is bound to the process its hook came from,
+        # held to this start time, so a reused pid is never taken for it.
+        with mock.patch.object(helper, "process_start", side_effect=lambda pid: "start-%d" % pid):
+            table, _ = self.run_table(FakeRunner())
+        by_pid = dict((p["pid"], p) for p in table)
+        self.assertEqual(by_pid[800]["started"], "start-800")
+        self.assertNotIn("started", by_pid[700])
 
     def test_bearcode_found_by_args(self):
         table, _ = self.run_table(FakeRunner())
@@ -2328,12 +2372,14 @@ class HookRelayTests(unittest.TestCase):
         open(os.path.join(self.bridge_dir, "swarmbar-remote-hook.sh"), "w").close()
         self.sock_path = os.path.join(self.bridge_dir, "hook.sock")
         self.peer = ["curl", "bash", "claude"]
+        self.agent = None
         self.patches = [
             mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home}),
             mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.05),
             mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "peer_chain", side_effect=self.fake_peer),
+            mock.patch.object(helper, "peer_agent", side_effect=lambda sock: self.agent),
             mock.patch.object(helper, "peer_uid", side_effect=lambda sock: os.getuid(),
                               create=True),
             mock.patch.object(helper, "agent_processes", return_value=[]),
@@ -2816,6 +2862,30 @@ class HookRelayTests(unittest.TestCase):
             self.peer = peer
             self.assert_answered_at_once(relay, sink, {"session_id": "s1"})
 
+    def test_kimi_permission_names_the_process_that_asked(self):
+        # A remote Kimi row is answered only into the process its own hook
+        # came from, never one found by directory.
+        relay, sink = self.relay()
+        self.peer = ["curl", "sh", "kimi-code", "bash", "tmux: server"]
+        self.agent = {"pid": 4242, "name": "kimi-code", "start": "12345"}
+        client = self.post("PermissionRequest", {"session_id": "session_k1"})
+        self.assertEqual(read_response(client, timeout=1)[2], {})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertEqual(event["agent"], self.agent)
+        self.assertIs(event["held"], False)
+
+    def test_only_a_kimi_permission_looks_up_its_agent(self):
+        relay, sink = self.relay()
+        self.agent = {"pid": 4242, "name": "kimi-code", "start": "12345"}
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        relay.handle_reply({"rid": event["rid"], "body": {}})
+        read_response(client)
+        self.assertIsNone(event.get("agent"))
+        self.peer = ["curl", "sh", "kimi"]
+        read_response(self.post("Stop", {"session_id": "session_k1"}))
+        self.assertIsNone(sink.wait_for(is_hook("/hook/Stop")).get("agent"))
+
     def test_slow_peer_lookup_is_answered_empty(self):
         release = threading.Event()
         self.addCleanup(release.set)
@@ -3044,6 +3114,19 @@ class FollowerRelayTests(unittest.TestCase):
         self.assertEqual(event["peer"], (["a"] + ["b"] * 20)[:helper.PEER_DEPTH])
         self.assertIsNone(event["account"])
 
+    def test_agent_is_checked_for_shape(self):
+        good = {"pid": 4242, "name": "bearcode", "start": "12345"}
+        self.hub.relay_message(self.hook(agent=good))
+        self.assertEqual(self.sent[-1]["agent"], good)
+        for bad in (None, 7, {"pid": True, "name": "kimi", "start": "1"},
+                    {"pid": 1, "name": "kimi", "start": "1"},
+                    {"pid": 42, "name": "claude", "start": "1"},
+                    {"pid": 42, "name": "kimi", "start": ""},
+                    {"pid": 42, "name": "kimi", "start": "x" * 200},
+                    {"pid": 42, "name": "kimi"}):
+            self.hub.relay_message(self.hook(agent=bad))
+            self.assertIsNone(self.sent[-1]["agent"], bad)
+
     def test_only_announced_holds_can_be_resolved(self):
         self.hub.relay_message({"event": "hook_resolved", "rid": "someone-elses"})
         self.assertEqual(self.sent, [])
@@ -3070,6 +3153,45 @@ class PeerChainTests(unittest.TestCase):
             chain = helper.peer_chain(None)
         self.assertEqual(chain, ["curl", "swarmbar-remote", "claude", "bash", "tmux:", "Terminal"])
         self.assertEqual(runner.calls[0][:2], ["ps", "-axo"])
+
+    KIMI_TABLE = (
+        "  900   800 curl            curl -s --unix-socket x\n"
+        "  800   700 sh              /bin/sh /home/u/.swarmbar/swarmbar-remote-kimi-hook.sh PermissionRequest\n"
+        "  700   600 kimi-code       kimi-code\n"
+        "  600   500 bash            -bash\n"
+        "  500     1 claude          claude --resume\n"
+    )
+
+    def test_peer_agent_is_the_kimi_process_above_the_hook(self):
+        runner = FakeRunner(ps=self.KIMI_TABLE)
+        with mock.patch.object(helper, "run_command", side_effect=runner), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value="12345"):
+            self.assertEqual(helper.peer_agent(None),
+                             {"pid": 700, "name": "kimi-code", "start": "12345"})
+
+    def test_peer_agent_is_only_ever_the_nearest_agent(self):
+        # The nearest agent ran the hook. A Kimi further up is not it.
+        table = self.KIMI_TABLE.replace("kimi-code       kimi-code", "codex           codex")
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps=table)), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value="12345"):
+            self.assertIsNone(helper.peer_agent(None))
+
+    def test_peer_agent_without_a_start_time_is_none(self):
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps=self.KIMI_TABLE)), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value=None):
+            self.assertIsNone(helper.peer_agent(None))
+        with mock.patch.object(helper, "peer_pid", return_value=None):
+            self.assertIsNone(helper.peer_agent(None))
+
+    def test_process_start_of_this_process_is_stable(self):
+        first = helper.process_start(os.getpid())
+        self.assertIsInstance(first, str)
+        self.assertTrue(first)
+        self.assertEqual(helper.process_start(os.getpid()), first)
+        self.assertIsNone(helper.process_start(0))
 
     def test_peer_uid_of_a_socketpair_is_ours(self):
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3323,6 +3445,11 @@ class ProbeTests(unittest.TestCase):
             {"path": os.path.join(real, ".claude"), "settings": "present"},
             {"path": os.path.join(real, ".claude-work"), "settings": "missing"},
         ])
+
+    def test_probe_reports_each_homes_realpath(self):
+        # Every file path it reports is a realpath, so the Mac needs the
+        # home's own to tell which home a path is in.
+        self.assertEqual(self.probe()["real_homes"], {self.home: os.path.realpath(self.home)})
 
     def test_probe_reports_unreadable_claude_settings(self):
         self.put(".claude/projects/p/s.jsonl", "{}\n")

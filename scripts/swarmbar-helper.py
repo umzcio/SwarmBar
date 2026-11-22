@@ -1201,6 +1201,11 @@ def process_cwd(pid):
 
 AGENT_COMMANDS = ("claude", "codex", "kimi", "kimi-code", "opencode", "grok", "agy",
                   "bearcode")
+# The Kimi family, whose processes are told apart only by working directory.
+# A session of theirs is answered only into the process its own hook came
+# from, so their processes carry a start time (process_start) and their
+# PermissionRequest names that process (peer_agent).
+KIMI_AGENTS = ("kimi", "kimi-code", "bearcode")
 # BearCode runs as a bare node process, so its comm says nothing. Its command
 # line is the only thing that identifies it.
 BEARCODE_ARGS = "bearcode-cli/apps/kimi-code/dist/main.mjs"
@@ -1524,6 +1529,39 @@ def pane_screen(pane):
     return "\n".join(text.splitlines()[-SCREEN_LINES:])
 
 
+def process_start(pid):
+    """A token for when `pid` started: the same for the life of the process,
+    and different for a later process handed the same pid. None when it
+    cannot be read. Only ever compared with another token made here, on
+    the same host.
+
+    Linux's is starttime from /proc/<pid>/stat, in clock ticks since boot.
+    Darwin has no /proc, so its is ps's lstart."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            data = handle.read(4096)
+    except OSError:
+        data = None
+    if data is not None:
+        # comm sits in parentheses and may hold spaces or a ")" itself, so
+        # fields are counted from the last ")": starttime, field 22, is the
+        # 20th after it.
+        fields = data[data.rfind(b")") + 1:].split()
+        if len(fields) > 19 and fields[19].isdigit():
+            return fields[19].decode("ascii")
+        return None
+    if platform.system() != "Darwin":
+        return None
+    try:
+        done = run_command(["ps", "-o", "lstart=", "-p", str(pid)], timeout=PEER_PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = " ".join(done.stdout.decode("utf-8", "replace").split())
+    return text if done.returncode == 0 and text else None
+
+
 def agent_processes(warnings, screens=True):
     """Live agent processes. `ps -axo` is portable; GNU long flags are not.
 
@@ -1576,6 +1614,8 @@ def agent_processes(warnings, screens=True):
             "pane": pane,
             "open": paths,
         })
+        if row["comm"] in KIMI_AGENTS:
+            entry["started"] = process_start(pid)
         if screens:
             entry["screen"] = pane_screen(dict(pane, uid=row["uid"])) \
                 if pane and row["comm"] == "agy" else None
@@ -1950,10 +1990,19 @@ def home_claude_dirs(home, warnings):
     "unreadable"}. A profile with no settings.json still needs hooks, and
     only this says where it is."""
     uid = home_owner(home)[1]
+    foreign = cross_user(home)
     found = []
     seen = set()
     for directory in claude_config_dirs(home):
         if not os.path.isdir(os.path.join(directory, "projects")):
+            continue
+        if not own_state_dir(home, directory, foreign):
+            # A link to another account's profile, reported here, would
+            # have setup create that account's settings.json running this
+            # home's script as them. Only after this holds is a missing
+            # settings.json this home's to create.
+            warnings.append("skipped Claude config dir that leads outside its user's own files: %s"
+                            % directory)
             continue
         real = os.path.realpath(directory)
         if real in seen:
@@ -1983,13 +2032,34 @@ def mentions_bridge(home, path, uid):
     return BRIDGE_MARK in data
 
 
+def own_state_dir(home, directory, foreign):
+    """Whether a tool's state directory belongs to the home it was found
+    in. In another user's home (`foreign`, from cross_user) it must resolve
+    inside that home to a directory that user owns, the rule claude_roots
+    applies, so a link cannot pass off someone else's profile as theirs and
+    have setup write there in their name. This process's own home is taken
+    as it is."""
+    if foreign is None:
+        return os.path.isdir(directory)
+    resolved = os.path.realpath(directory)
+    try:
+        info = os.stat(resolved)
+    except OSError:
+        return False
+    return stat_module.S_ISDIR(info.st_mode) and info.st_uid == foreign \
+        and inside(resolved, os.path.realpath(home))
+
+
 def home_tools(home):
-    """Which tools have their state directory in a home, in TOOL_ORDER."""
+    """Which tools have their state directory in a home, in TOOL_ORDER.
+    Each directory counts only where own_state_dir says it is the home's."""
+    foreign = cross_user(home)
     present = set()
-    if any(os.path.isdir(os.path.join(d, "projects")) for d in claude_config_dirs(home)):
+    if any(os.path.isdir(os.path.join(d, "projects")) and own_state_dir(home, d, foreign)
+           for d in claude_config_dirs(home)):
         present.add("claude")
     for tool, relative in TOOL_STATE_DIRS:
-        if os.path.isdir(os.path.join(home, relative)):
+        if own_state_dir(home, os.path.join(home, relative), foreign):
             present.add(tool)
     return [tool for tool in TOOL_ORDER if tool in present]
 
@@ -2135,6 +2205,10 @@ def probe():
         "configs": configs,
         "bridges": bridges,
         "claude_dirs": claude_dirs,
+        # Every path above is a realpath. The Mac relates each to its home
+        # by these, since a home can be spelled through a link (Darwin's
+        # /var/root is /private/var/root).
+        "real_homes": dict((path, os.path.realpath(path)) for path in paths),
         "helper": installed_helpers(paths),
         "self_sha256": own_digest(),
         "warnings": warnings,
@@ -3109,6 +3183,8 @@ PEER_DEPTH = 8
 # consent, so a decision that is late is a refusal, answered {}.
 DECIDE_SECONDS = 1.5
 PEER_PS_TIMEOUT = 1
+# A process_start token: clock ticks on Linux, an lstart date on Darwin.
+AGENT_START_MAX = 64
 # Reading the request itself. A client that connects and says nothing must
 # not hold a thread forever.
 HOOK_READ_TIMEOUT = 10
@@ -3384,6 +3460,53 @@ def peer_chain(sock):
     whole table, so the walk costs one subprocess however deep it goes. Any
     failure is an empty list, which is never held. Tests replace this.
     """
+    return [process_label(row) for _, row in peer_walk(sock)]
+
+
+def peer_agent(sock):
+    """The Kimi Code or BearCode process that ran the hook on the other end
+    of `sock`, as {"pid", "name", "start"}, or None.
+
+    Their processes are told apart only by working directory, so a Mac that
+    answers a session by keystrokes must aim at the process the session's
+    own prompt came from, not at whichever one shares its directory: that
+    once typed a dead session's Approve into a live one's prompt. The
+    bridge is a child of the agent that ran the hook and is still waiting
+    on this socket, so the nearest agent above it is that process. Only
+    the nearest: a Kimi further up the chain did not run this hook. Its
+    start time goes with it, so a pid handed to a new process later is
+    never taken for it. Tests replace this.
+    """
+    for pid, row in peer_walk(sock):
+        name = agent_name(row)
+        if name is None:
+            continue
+        if name not in KIMI_AGENTS:
+            return None
+        start = process_start(pid)
+        return {"pid": pid, "name": name, "start": start} if start else None
+    return None
+
+
+def valid_agent(agent):
+    """A relayed hook's agent process as peer_agent shapes it, or None. A
+    follower's broker may be the home's own user, so its word is taken
+    only in this shape."""
+    if not isinstance(agent, dict):
+        return None
+    pid, name, start = agent.get("pid"), agent.get("name"), agent.get("start")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 \
+            or not isinstance(name, str) or name not in KIMI_AGENTS \
+            or not isinstance(start, str) or not start or len(start) > AGENT_START_MAX:
+        return None
+    return {"pid": pid, "name": name, "start": start}
+
+
+def peer_walk(sock):
+    """[(pid, row)] for the peer of a Unix socket and its ancestors, nearest
+    first and at most PEER_DEPTH of them, each row as `ps` printed it
+    (ppid, raw comm, comm basename, args). One ps lists the whole table.
+    Any failure is an empty list."""
     pid = peer_pid(sock)
     if not pid:
         return []
@@ -3405,14 +3528,14 @@ def peer_chain(sock):
             continue
         table[row_pid] = {"ppid": ppid, "raw": parts[2], "comm": parts[2].split("/")[-1],
                           "args": parts[3].strip() if len(parts) > 3 else ""}
-    names = []
+    walk = []
     seen = set()
     current = pid
-    while current in table and current not in seen and len(names) < PEER_DEPTH:
+    while current in table and current not in seen and len(walk) < PEER_DEPTH:
         seen.add(current)
-        names.append(process_label(table[current]))
+        walk.append((current, table[current]))
         current = table[current]["ppid"]
-    return names
+    return walk
 
 
 def process_label(row):
@@ -4312,6 +4435,7 @@ class HookHome(object):
             "path": path,
             "account": account if isinstance(account, str) else None,
             "peer": peer,
+            "agent": valid_agent(message.get("agent")),
             "body": body,
             "held": message.get("held") is True and rid in self.relayed,
         }
@@ -4404,14 +4528,19 @@ class HookHome(object):
         return True
 
     def permission_check(self, sock, body):
-        """(peer, holdable) for a PermissionRequest. The Grok session check
-        runs only for a chain that already proves claude."""
+        """(peer, holdable, agent) for a PermissionRequest. The Grok session
+        check runs only for a chain that already proves claude. The agent
+        process (peer_agent) is looked up only where the nearest agent is a
+        Kimi-family one: it is never held, and the Mac answers it by
+        keystrokes only into that process."""
         peer = peer_chain(sock)
         if not isinstance(peer, list):
             peer = []
+        if nearest_agent(peer) in KIMI_AGENTS:
+            return peer, False, peer_agent(sock)
         if not is_holdable("PermissionRequest", peer):
-            return peer, False
-        return peer, not grok_session(self.home, body.get("session_id"))
+            return peer, False, None
+        return peer, not grok_session(self.home, body.get("session_id")), None
 
     def handle_post(self, handler):
         match = HOOK_PATH.match(handler.path)
@@ -4426,11 +4555,11 @@ class HookHome(object):
         event = match.group(1)
         # Only a PermissionRequest needs the peer, and it is bounded: a late
         # decision is a refusal. Every other event is answered without one.
-        peer, holdable = [], event == "OpenCodePermission"
+        peer, holdable, agent = [], event == "OpenCodePermission", None
         if event == "PermissionRequest":
-            peer, holdable = bounded(
+            peer, holdable, agent = bounded(
                 lambda: self.permission_check(handler.connection, payload),
-                DECIDE_SECONDS, ([], False))
+                DECIDE_SECONDS, ([], False, None))
         account = handler.headers.get("X-Claude-Account", "").strip() or None
         message = {
             "event": "hook",
@@ -4440,6 +4569,7 @@ class HookHome(object):
             "path": "/hook/" + event,
             "account": account,
             "peer": peer,
+            "agent": agent,
             "body": payload,
             "held": holdable,
         }

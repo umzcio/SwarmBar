@@ -340,6 +340,64 @@ struct RemoteHookRelayTests {
             == .working(activity: "Thinking…"))
     }
 
+    /// A Kimi session id the mirrored home's index names, so its events
+    /// read as Kimi Code's.
+    private func kimiSession(in mirror: RemoteMirror) throws -> String {
+        let raw = "session_\(UUID().uuidString)"
+        let dir = try #require(mirror.local(home)).appendingPathComponent(".kimi-code")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data((#"{"sessionId":"\#(raw)","sessionDir":"/home/u/.kimi-code/sessions/x"}"# + "\n").utf8)
+            .write(to: dir.appendingPathComponent("session_index.jsonl"))
+        return raw
+    }
+
+    /// find_014cCa2Cdku9Bj5LWjxM2uNP: a relayed Kimi prompt binds its row
+    /// to the process the helper found above its bridge. One that names no
+    /// process unbinds it, so keys never go by an old binding, and the end
+    /// of the session forgets it.
+    @Test func aKimiPromptBindsItsRowToItsOwnProcess() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = try kimiSession(in: mirror)
+        let id = rowID(raw)
+        var asking = origin(mirror: mirror, peer: ["curl", "sh", "kimi-code"])
+        asking.agent = .init(pid: 4242, name: "kimi-code", start: "t0")
+        func send(_ event: String, _ origin: RemoteHookOrigin, rid: String) {
+            server.handleRemote(
+                event: event, body: permissionBody(raw), accountLabel: nil,
+                origin: origin, rid: rid, held: false) { _, _ in }
+        }
+
+        send("PermissionRequest", asking, rid: "k1")
+        #expect(store.sessions.first { $0.id == id }?.tool == .kimiCode)
+        #expect(RemoteProcessBinding.bound(id) == .init(hostID: hostID, agent: asking.agent!))
+
+        send("PermissionRequest", origin(mirror: mirror, peer: ["curl", "sh", "kimi-code"]), rid: "k2")
+        #expect(RemoteProcessBinding.bound(id) == nil)
+
+        send("PermissionRequest", asking, rid: "k3")
+        send("SessionEnd", origin(mirror: mirror), rid: "k4")
+        #expect(RemoteProcessBinding.bound(id) == nil)
+    }
+
+    @Test func theRelayCarriesTheAgentProcess() async throws {
+        let (_, server) = rig()
+        let mirror = try makeMirror()
+        let raw = try kimiSession(in: mirror)
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: FakeReplier(), hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+        sink.yield(try hookLine(
+            rid: "k1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["curl", "sh", "kimi"], held: false,
+            agent: ["pid": 4343, "name": "kimi", "start": "1234"]))
+        await settle { RemoteProcessBinding.bound(rowID(raw)) != nil }
+        #expect(RemoteProcessBinding.bound(rowID(raw))?.agent == .init(pid: 4343, name: "kimi", start: "1234"))
+    }
+
     /// A home the mirror refuses cannot say which tool a session belongs
     /// to, so nothing is held and no row is invented for it.
     @Test func unmappableHomeIsReleasedAndShowsNothing() throws {
@@ -446,12 +504,13 @@ struct RemoteHookRelayTests {
 
     private func hookLine(
         rid: String, path: String, body: [String: Any], peer: [String], held: Bool,
-        generation: Int = 0
+        generation: Int = 0, agent: [String: Any]? = nil
     ) throws -> HelperEvent {
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "event": "hook", "rid": rid, "home": home, "user": "u", "path": path,
             "account": NSNull(), "peer": peer, "body": body, "held": held,
         ]
+        if let agent { object["agent"] = agent }
         return HelperEvent(
             name: "hook", payload: try JSONSerialization.data(withJSONObject: object),
             generation: generation)

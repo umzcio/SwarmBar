@@ -268,6 +268,13 @@ enum SetupCommand {
         var number = 0
         for (index, change) in plan.changes.enumerated() where change.isSent {
             number += 1
+            // Before anything names the file: its description and every
+            // line below carry the path.
+            guard isSpeakable(change, plan) else {
+                omitted.append(index)
+                out.append("\(number). " + (change.home == nil ? ownerUnknown : chosenElsewhere(change)))
+                continue
+            }
             let path = shellQuoted(change.path)
             var step = ["\(number). \(change.description).", "File: \(path)"]
             if case .write(let text, _) = change.action,
@@ -280,9 +287,12 @@ enum SetupCommand {
             }
             if let waiting = change.dependsOn.first(where: omitted.contains) {
                 omitted.append(index)
-                step.append(tooLarge.contains(waiting)
-                    ? "Skip this one: it needs \(plan.changes[waiting].path), which is too large to paste."
-                    : "Skip this one: it needs \(plan.changes[waiting].path), which this prompt leaves out.")
+                let needed = plan.changes[waiting]
+                step.append(!isSpeakable(needed, plan)
+                    ? "Skip this one: it needs a file this prompt leaves out."
+                    : tooLarge.contains(waiting)
+                    ? "Skip this one: it needs \(needed.path), which is too large to paste."
+                    : "Skip this one: it needs \(needed.path), which this prompt leaves out.")
                 out.append(step.joined(separator: "\n"))
                 continue
             }
@@ -374,7 +384,8 @@ enum SetupCommand {
         let byHand = plan.changes.filter { $0.action == .byHand }
         if !byHand.isEmpty {
             out.append("These need a person, so leave them alone and mention them when you report:\n"
-                + byHand.map { "- \($0.description)" }.joined(separator: "\n"))
+                + byHand.map { "- \(isSpeakable($0, plan) ? $0.description : handEditElsewhere($0))" }
+                    .joined(separator: "\n"))
         }
         if madeFolder {
             out.append("Then remove the private folder and anything left in it:\n```sh\nrm -rf \(scriptFolder)\n```")
@@ -385,6 +396,52 @@ enum SetupCommand {
         }
         out.append("If any hash differs from the one given, stop and report it rather than finishing.")
         return Prompt(text: out.joined(separator: "\n\n") + "\n", omitted: omitted)
+    }
+
+    /// SwarmBar's own names for what it sets up, relative to a home: the
+    /// configs where each tool keeps them and the bridge files.
+    static let ownNames: Set<String> = [
+        ".claude/settings.json", ".kimi-code/config.toml", ".bearcode/config.toml",
+        ".config/opencode/opencode.json", ".config/opencode/opencode.jsonc",
+        ".swarmbar/swarmbar-remote-hook.sh", ".swarmbar/swarmbar-remote-kimi-hook.sh",
+        ".config/opencode/plugins/swarmbar-remote.js",
+    ]
+
+    /// Whether a change's path may appear in the prompt as text. The
+    /// prompt's file contents are only ever base64, because they came from
+    /// the host and could hold words an agent would take as instructions.
+    /// A path can too: a watched user names the folders in their own home,
+    /// and when every user is watched the agent has been told to run as
+    /// root. So in any home but the login user's and root's, whose names
+    /// are their own, a path goes in only as the home (from the account
+    /// database) plus a name SwarmBar defines. Anything else, a profile
+    /// called .claude-whatever included, is left out of the prompt for the
+    /// setup command or 'Let SwarmBar do it' to make.
+    static func isSpeakable(_ change: PlannedChange, _ plan: SetupPlan) -> Bool {
+        guard plan.watchAs == .everyUser else { return true }
+        guard let home = change.home else { return false }
+        if home.user == "root" || home.user == plan.loginUser { return true }
+        guard let relative = SetupPlanner.relative(change.path, under: [home.path]) else { return false }
+        return ownNames.contains(relative)
+    }
+
+    /// The line a left-out change gets in place of its own.
+    private static func chosenElsewhere(_ change: PlannedChange) -> String {
+        "Skip this one: it is a file in \(owner(change)) whose folder name that account chose, so this prompt "
+            + "leaves it out. Use 'Let SwarmBar do it' or the command for this host instead."
+    }
+
+    /// The hand edit list's line for one whose description names such a path.
+    private static func handEditElsewhere(_ change: PlannedChange) -> String {
+        "A file in \(owner(change)) needs editing by hand. SwarmBar's setup sheet shows which one and why."
+    }
+
+    /// "u's home", by the account database's name for its owner.
+    private static func owner(_ change: PlannedChange) -> String {
+        guard let user = change.home?.user, isSafeOwner(user), SetupPlanner.isShellSafe(user) else {
+            return "another user's home"
+        }
+        return "\(user)'s home"
     }
 
     /// A script as the prompt shows it, between fences of its own.
