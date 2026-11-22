@@ -276,6 +276,22 @@ extension RemoteMonitorSupervisor: RemoteActing {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
             return false
         }
+        // Codex's hotkey and Antigravity's gate say nothing about which call
+        // they answer: `y` reads nothing, and agy's selector reads the same
+        // on every gate. The row can be a poll behind, and one snapshot can
+        // pair the database from before a call settled with a pane showing
+        // the next call's gate. So the keys wait for rows built from a
+        // snapshot taken after the click (and after the capture above),
+        // which must still show this very request, as the local path
+        // re-reads the rollout or the conversation database at press time.
+        if Self.needsStateAfterClick(session.tool) {
+            guard await freshState(target.connection, session.tool),
+                  store.sessions.contains(where: { $0.id == session.id })
+            else {
+                remoteAnswerLog.notice("answer: no state read after the click on \(host, privacy: .public), nothing sent")
+                return false
+            }
+        }
         // The capture was a round trip. A snapshot that landed meanwhile
         // may show the request answered, or another in its place, and the
         // keys must not answer that one.
@@ -317,6 +333,30 @@ extension RemoteMonitorSupervisor: RemoteActing {
             remoteAnswerLog.notice("answer: keys on \(host, privacy: .public) not sent: \(reason, privacy: .public)")
             return false
         }
+    }
+
+    /// Tools whose keys are tied to no particular request, so a remote
+    /// answer needs the host's state read after the click.
+    nonisolated static func needsStateAfterClick(_ tool: AgentTool) -> Bool {
+        tool == .codex || tool == .antigravity
+    }
+
+    /// Asks the host's monitor for a poll now and waits until one that sent
+    /// its request after this call has synced the tool's rows. False when
+    /// none does in time (a failing, paused or disabled host), and then
+    /// nothing is pressed.
+    static func awaitFreshPoll(
+        _ connection: RemoteHostConnection, tool: AgentTool, timeout: Duration = .seconds(30)
+    ) async -> Bool {
+        let mark = connection.snapshotsRequested
+        connection.wantPoll()
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline, !Task.isCancelled {
+            if connection.syncedThrough(tool) > mark { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return false
     }
 
     private typealias PaneTarget = (

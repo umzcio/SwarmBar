@@ -829,6 +829,15 @@ final class SessionStore {
             }
             switch route {
             case .keys(let keys):
+                // Codex's hotkey reads nothing off the screen, so the
+                // rollout is read again first and must still have exactly
+                // the request this row showed waiting.
+                if tool == .codex {
+                    guard case .waitingApproval(let shown) = session.status,
+                          CodexAnswerCheck.mayAnswer(
+                            shown: shown, pending: CodexAnswerCheck.livePending(sessionID: id))
+                    else { return giveUp() }
+                }
                 return TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys)
                     ? true : giveUp()
             case .numberedSelector:

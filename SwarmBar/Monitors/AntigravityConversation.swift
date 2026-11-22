@@ -29,6 +29,12 @@ enum AntigravityConversation {
     /// The only status value ever observed on a settled step.
     nonisolated static let doneStatus: Int64 = 3
 
+    /// Past this a step's metadata is not read at all: the step counts as a
+    /// call SwarmBar cannot read, and the row offers the terminal. A file
+    /// write carries the file in its arguments, so this is generous, but a
+    /// remote host can ship far more than any real step holds.
+    nonisolated static let maxMetadataBytes = 8 << 20
+
     /// A step that has not settled. Two very different things arrive here.
     ///
     /// One is agy's `ask_question` tool, whose arguments carry the question
@@ -130,13 +136,31 @@ enum AntigravityConversation {
     /// The metadata column is a protobuf, but the tool call's arguments sit
     /// inside it as a plain JSON string, so the document can be lifted out
     /// whole rather than decoding a schema SwarmBar does not have.
+    ///
+    /// A blob past `maxMetadataBytes` is not read: it may be a call, and
+    /// one SwarmBar cannot read, so it counts as one and offers the
+    /// terminal.
     nonisolated static func pending(inMetadata blob: Data) -> Pending? {
+        guard blob.count <= maxMetadataBytes else { return unreadableCall(summary: nil) }
         // Invalid protobuf bytes become replacement characters; the ASCII
         // JSON in the middle survives intact.
-        pending(inText: String(decoding: blob, as: UTF8.self))
+        return pending(inText: String(decoding: blob, as: UTF8.self))
+    }
+
+    /// A step that may hold a tool call SwarmBar cannot read. It counts as
+    /// a call waiting, so it can never be the one beside a call that can be
+    /// read, and it is never offered for approval.
+    private nonisolated static func unreadableCall(summary: String?) -> Pending {
+        let summary = summary ?? "Tool call"
+        return Pending(
+            question: nil, options: [], summary: summary,
+            prompt: .unreadable(
+                "SwarmBar cannot read what Antigravity is asking to do. Review it in the terminal.",
+                context: summary))
     }
 
     nonisolated static func pending(inText text: String) -> Pending? {
+        guard text.utf8.count <= maxMetadataBytes else { return unreadableCall(summary: nil) }
         // An ask_question call: the question and its options are right
         // there, so no corroboration is needed. Only when the step's one
         // framed call NAMES that tool: going by a `questions` key alone let
@@ -144,7 +168,7 @@ enum AntigravityConversation {
         // then showed a harmless question while Approve answered the gate
         // for the command.
         let calls = framedCalls(in: text)
-        if calls.count == 1, calls[0].tool == "ask_question",
+        if let calls, calls.count == 1, calls[0].tool == "ask_question",
            let questions = calls[0].arguments["questions"] as? [[String: Any]],
            let first = questions.first,
            let prompt = first["question"] as? String, !prompt.isEmpty {
@@ -156,22 +180,36 @@ enum AntigravityConversation {
                 prompt: ApprovalPrompt(prompt)
             )
         }
-        // Any other tool call. Every argument object carries toolSummary
-        // and toolAction, so one of them describes what is being asked of
-        // the user, or what is simply running. The framed call's own
-        // object when there is one: the last brace before the key can be a
-        // nested object inside the arguments.
-        guard let json = (calls.count == 1 ? calls[0].arguments : nil)
-                ?? embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
-                ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\""),
-              let summary = ((json["toolSummary"] as? String)
-                ?? (json["toolAction"] as? String))?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !summary.isEmpty
-        else { return nil }
+        // Any other tool call. The summary and action are context only, so
+        // they come from the framed call's own object when there is one and
+        // are looked for leniently otherwise.
+        let framed = calls?.count == 1 ? calls?.first : nil
+        let summaryObject = framed?.arguments
+            ?? outermostObject(in: text).flatMap { json in
+                json["toolSummary"] != nil || json["toolAction"] != nil ? json : nil
+            }
+            ?? embeddedJSONObject(in: text, containingKey: "\"toolSummary\"")
+            ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\"")
+        let written = ((summaryObject?["toolSummary"] as? String)
+            ?? (summaryObject?["toolAction"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary = (written?.isEmpty == false ? written : nil)
+            ?? framed?.tool.map(AntigravityTranscript.humanize)
+        guard let calls else {
+            // A frame that would not parse: whatever it is, it cannot be
+            // ruled out as a call.
+            return unreadableCall(summary: summary)
+        }
+        if calls.count > 1 {
+            return unreadableCall(summary: summary)
+        }
+        // A framed call counts whether or not the model wrote summary keys
+        // into it. With no frame, only an argument object carrying them
+        // says a call is here at all.
+        guard let summary else { return nil }
         return Pending(
             question: nil, options: [], summary: summary,
-            prompt: gatedPrompt(in: text, summary: summary))
+            prompt: gatedPrompt(in: text, summary: summary, calls: calls))
     }
 
     /// The gated call's own arguments, for the approval row. The summary
@@ -185,20 +223,32 @@ enum AntigravityConversation {
     /// must be present: a second one, say inside other text the step
     /// carries, makes the call ambiguous, and an ambiguous call is not
     /// offered for approval.
+    ///
+    /// Found by structure, never by the model-written summary keys: those
+    /// can be left off the call and put on an object nested in its
+    /// arguments beside decoy values, and the nested object was once shown
+    /// as the request while Approve allowed the real one.
     nonisolated static func gatedPrompt(in text: String, summary: String) -> ApprovalPrompt {
+        gatedPrompt(in: text, summary: summary, calls: framedCalls(in: text))
+    }
+
+    private nonisolated static func gatedPrompt(
+        in text: String, summary: String, calls: [Frame]?
+    ) -> ApprovalPrompt {
         let unreadable = ApprovalPrompt.unreadable(
             "SwarmBar cannot read what Antigravity is asking to do. Review it in the terminal.",
             context: summary)
-        let calls = framedCalls(in: text)
-        let call: (tool: String?, arguments: [String: Any])
+        guard let calls else { return unreadable }
+        let call: Frame
         if calls.count == 1 {
             call = calls[0]
         } else if calls.isEmpty,
                   occurrences(of: "\"toolSummary\"", in: text) <= 1,
                   occurrences(of: "\"toolAction\"", in: text) <= 1,
-                  let json = embeddedJSONObject(in: text, containingKey: "\"toolSummary\"", strict: true)
-                    ?? embeddedJSONObject(in: text, containingKey: "\"toolAction\"", strict: true) {
-            // No frame, but only one argument object to choose from.
+                  let json = outermostObject(in: text),
+                  json["toolSummary"] != nil || json["toolAction"] != nil {
+            // No frame (a tool name the frame reader cannot see), but one
+            // outermost argument object, carrying the keys itself.
             call = (nil, json)
         } else {
             return unreadable
@@ -211,16 +261,31 @@ enum AntigravityConversation {
             tool: call.tool ?? "Tool call", arguments: arguments))
     }
 
-    /// Every `<length><name>{json}` frame whose object carries a tool
-    /// summary or action, which is how a tool call's arguments sit in the
-    /// step's metadata.
-    nonisolated static func framedCalls(in text: String) -> [(tool: String?, arguments: [String: Any])] {
+    typealias Frame = (tool: String?, arguments: [String: Any])
+
+    /// Every `<length><name>{json}` frame, which is how a tool call's
+    /// arguments sit in the step's metadata, read whether or not the model
+    /// wrote summary keys into it. Nil when the text cannot be read: a
+    /// candidate frame that does not parse (a repeated key, say), since
+    /// what lies inside it can then be anything, and an object nested in
+    /// it must never stand in for the call.
+    ///
+    /// One pass. A parsed frame is skipped whole, so nothing nested inside
+    /// it is ever taken for a frame of its own; the first frame that does
+    /// not parse ends the scan; and a second frame ends it too, since two
+    /// already make the call ambiguous. Each candidate used to restart a
+    /// full parse to the end of the text and the scan then moved on by one
+    /// scalar, so a few megabytes of unclosed frames never finished.
+    nonisolated static func framedCalls(in text: String) -> [Frame]? {
+        guard text.utf8.count <= maxMetadataBytes else { return nil }
         let scalars = text.unicodeScalars
-        var found: [(tool: String?, arguments: [String: Any])] = []
+        var found: [Frame] = []
         var index = scalars.startIndex
         while index < scalars.endIndex {
-            defer { index = scalars.index(after: index) }
-            guard scalars[index] == "{" else { continue }
+            guard scalars[index] == "{" else {
+                index = scalars.index(after: index)
+                continue
+            }
             var nameStart = index
             var length = 0
             while nameStart > scalars.startIndex, length < 127 {
@@ -233,11 +298,15 @@ enum AntigravityConversation {
                 length += 1
             }
             guard length > 0, nameStart > scalars.startIndex,
-                  scalars[scalars.index(before: nameStart)].value == UInt32(length),
-                  let parsed = StrictJSONObject.parse(in: text, from: index),
-                  parsed.object["toolSummary"] != nil || parsed.object["toolAction"] != nil
-            else { continue }
+                  scalars[scalars.index(before: nameStart)].value == UInt32(length)
+            else {
+                index = scalars.index(after: index)
+                continue
+            }
+            guard let parsed = StrictJSONObject.parse(in: text, from: index) else { return nil }
             found.append((String(scalars[nameStart..<index]), parsed.object))
+            if found.count > 1 { return found }
+            index = parsed.end
         }
         return found
     }
@@ -252,28 +321,33 @@ enum AntigravityConversation {
         return count
     }
 
+    /// The object opened by the first `{` in the text, parsed with the key
+    /// rules, or nil. Nothing precedes that brace that could enclose it, so
+    /// it is never an object nested inside another one; the last brace
+    /// before a key, which the unframed reading once used, can be.
+    private nonisolated static func outermostObject(in text: String) -> [String: Any]? {
+        guard let open = text.unicodeScalars.firstIndex(of: "{") else { return nil }
+        return StrictJSONObject.parse(in: text, from: open)?.object
+    }
+
     /// Finds the JSON object that opens immediately before `key` and
     /// returns it parsed. Brace counting has to respect strings, since the
     /// questions themselves contain braces and quotes, so it goes through
     /// `StrictJSONObject`'s scalar scan. Searched literally, so a quote or
     /// brace with a mark fused onto it is still found.
     ///
-    /// `strict` applies the key rules too, and is what the fallback that
-    /// reads an unframed argument object for Approve uses: it must refuse
-    /// what the frame reader refuses, or a frame refused for a repeated key
-    /// would be read here instead, with JSONSerialization picking the first
-    /// of the two. The summary lookups are context only and stay lenient,
-    /// so a malformed call still shows as a prompt, just not an approvable
-    /// one.
+    /// Lenient, and only ever used for the summary, which is context: the
+    /// object it finds can be nested inside the call's arguments, so it is
+    /// never what Approve is shown beside.
     nonisolated static func embeddedJSONObject(
-        in text: String, containingKey key: String, strict: Bool = false
+        in text: String, containingKey key: String
     ) -> [String: Any]? {
         guard let keyRange = text.range(of: key, options: .literal) else { return nil }
         // The object opens at the last `{` at or before the key.
         guard let open = text.range(
             of: "{", options: [.backwards, .literal], range: text.startIndex..<keyRange.upperBound
         )?.lowerBound else { return nil }
-        return StrictJSONObject.parse(in: text, from: open, checkingKeys: strict)?.object
+        return StrictJSONObject.parse(in: text, from: open, checkingKeys: false)?.object
     }
 }
 

