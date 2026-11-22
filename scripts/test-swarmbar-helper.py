@@ -4580,7 +4580,8 @@ class RootPathTests(unittest.TestCase):
         self.assertTrue(first.startswith("#!/"), first)
         interpreter = first[2:].split()
         self.assertNotIn("env", os.path.basename(interpreter[0]))
-        self.assertEqual(interpreter, ["/usr/bin/python3", "-I"])
+        # sh, root's own on every host, picks the python (RootInterpreterTests).
+        self.assertEqual(interpreter, ["/bin/sh"])
 
     def test_only_directories_only_root_can_change_are_kept(self):
         planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
@@ -4629,6 +4630,168 @@ class RootPathTests(unittest.TestCase):
         self.assertIn("/usr/bin", helper.trusted_root_path().split(":"))
 
 
+HELPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+PROLOGUE_CONDITION = '[ "$(/usr/bin/id -u)" = 0 ] && [ "$(/usr/bin/uname -s)" = Darwin ]'
+PROLOGUE_EXEC = 'exec "$f/Versions/Current/bin/python3" -I "$0" "$@"'
+PROLOGUE_ANCESTORS = ("/ /Library /Library/Developer /Library/Developer/CommandLineTools "
+                      "/Library/Developer/CommandLineTools/Library "
+                      "/Library/Developer/CommandLineTools/Library/Frameworks")
+
+
+class RootInterpreterTests(unittest.TestCase):
+    """The narrow sudo rule has the kernel run the helper as root, so the
+    python it starts must be one only root can change. On macOS
+    /usr/bin/python3 launches whichever developer directory is selected,
+    possibly an Xcode a user owns, so the file's sh prologue picks the
+    Command Line Tools' python and vets all of it first."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="sbi-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.me = os.geteuid()
+
+    def framework(self, name="Python3.framework"):
+        """A synthetic framework laid out like the Command Line Tools' one."""
+        top = os.path.join(self.base, name)
+        bin_dir = os.path.join(top, "Versions", "3.9", "bin")
+        os.makedirs(bin_dir)
+        os.makedirs(os.path.join(top, "Versions", "3.9", "lib", "python3.9"))
+        with open(os.path.join(top, "Versions", "3.9", "lib", "python3.9", "os.py"), "w") as handle:
+            handle.write("# synthetic\n")
+        python = os.path.join(bin_dir, "python3")
+        with open(python, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(python, 0o755)
+        os.symlink("3.9", os.path.join(top, "Versions", "Current"))
+        return top
+
+    def prologue(self, top=None, ancestors="", owner=None, condition="true"):
+        """The helper's sh prologue, adjusted to run here: as this user, on
+        a synthetic framework, printing what it would exec."""
+        with open(HELPER_PATH) as handle:
+            text = handle.read()
+        script = text[:text.index('\n":"""\n')] + "\n"
+        replacements = [(PROLOGUE_CONDITION, condition),
+                        (PROLOGUE_EXEC, PROLOGUE_EXEC.replace("exec", "echo", 1) + "; exit 0"),
+                        ('exec /usr/bin/python3 -I "$0" "$@"',
+                         'echo /usr/bin/python3 -I "$0" "$@"; exit 0')]
+        if top is not None:
+            replacements.append((helper.ROOT_PYTHON_FRAMEWORK, top))
+        if owner is not None:
+            replacements.append(("-user 0", "-user %d" % owner))
+        for old, new in replacements:
+            self.assertIn(old, script)
+            script = script.replace(old, new)
+        if top is not None:
+            script, count = re.subn(r'above="[^"]*"', 'above="%s"' % ancestors, script)
+            self.assertEqual(count, 1)
+        path = os.path.join(self.base, "prologue.sh")
+        with open(path, "w") as handle:
+            handle.write(script)
+        return subprocess.run(["/bin/sh", path, "serve"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    def test_the_prologue_names_the_framework_the_helper_checks(self):
+        with open(HELPER_PATH) as handle:
+            text = handle.read()
+        self.assertIn("f=%s\n" % helper.ROOT_PYTHON_FRAMEWORK, text)
+        ancestors = []
+        current = helper.ROOT_PYTHON_FRAMEWORK
+        while current != "/":
+            current = os.path.dirname(current)
+            ancestors.insert(0, current)
+        self.assertEqual(" ".join(ancestors), PROLOGUE_ANCESTORS)
+        self.assertIn(PROLOGUE_ANCESTORS, " ".join(text.split()))
+
+    def test_python_reads_the_prologue_as_a_string(self):
+        done = subprocess.run([sys.executable, "-I", "-W", "error", "-c",
+                               "import ast,sys; ast.parse(open(sys.argv[1]).read())", HELPER_PATH],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_anyone_else_and_other_systems_keep_usr_bin_python3(self):
+        done = self.prologue(condition="false")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.decode().split()[:2], ["/usr/bin/python3", "-I"])
+
+    def test_a_framework_only_its_owner_can_change_runs(self):
+        top = self.framework()
+        done = self.prologue(top, owner=self.me)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.decode().split()[:2],
+                         [os.path.join(top, "Versions", "Current", "bin", "python3"), "-I"])
+        self.assertTrue(helper.root_python_framework_ok(top, owner=self.me, stop=self.base))
+
+    def test_a_framework_root_does_not_own_never_runs(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        top = self.framework()
+        done = self.prologue(top)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, b"")
+        self.assertIn(b"Command Line Tools", done.stderr)
+        self.assertFalse(helper.root_python_framework_ok(top, stop=self.base))
+
+    def test_anything_writable_by_others_in_or_above_it_never_runs(self):
+        top = self.framework()
+        library = os.path.join(top, "Versions", "3.9", "lib", "python3.9")
+        for path, mode in ((os.path.join(library, "os.py"), 0o664),
+                           (library, 0o757), (top, 0o775)):
+            original = stat.S_IMODE(os.stat(path).st_mode)
+            os.chmod(path, mode)
+            try:
+                done = self.prologue(top, owner=self.me)
+                self.assertEqual(done.returncode, 1, path)
+                self.assertEqual(done.stdout, b"", path)
+                self.assertFalse(helper.root_python_framework_ok(top, owner=self.me, stop=self.base))
+            finally:
+                os.chmod(path, original)
+        os.chmod(self.base, 0o775)
+        self.addCleanup(os.chmod, self.base, 0o755)
+        done = self.prologue(top, ancestors=self.base, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(helper.root_python_framework_ok(
+            top, owner=self.me, stop=os.path.dirname(self.base)))
+
+    def test_a_missing_or_linked_framework_never_runs(self):
+        missing = os.path.join(self.base, "Missing.framework")
+        done = self.prologue(missing, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(helper.root_python_framework_ok(missing, owner=self.me, stop=self.base))
+        real = self.framework("Real.framework")
+        link = os.path.join(self.base, "Python3.framework")
+        os.symlink(real, link)
+        done = self.prologue(link, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, b"")
+        self.assertFalse(helper.root_python_framework_ok(link, owner=self.me, stop=self.base))
+
+    @unittest.skipUnless(os.path.isdir("/Library/Developer/CommandLineTools/Library/Frameworks"
+                                       "/Python3.framework"), "no Command Line Tools python")
+    def test_this_macs_command_line_tools_python_qualifies(self):
+        done = self.prologue()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        python = done.stdout.decode().split()[0]
+        self.assertTrue(python.startswith(helper.ROOT_PYTHON_FRAMEWORK + "/"), python)
+        self.assertTrue(helper.root_python_framework_ok())
+
+    def test_the_rule_is_installed_only_where_that_python_qualifies(self):
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper.platform, "system", return_value="Darwin"), \
+                mock.patch.object(helper, "root_python_framework_ok", return_value=False), \
+                mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo"), \
+                mock.patch.object(helper, "SUDOERS_PATH", os.path.join(self.base, "swarmbar")), \
+                mock.patch.object(helper, "run_command", runner):
+            result = helper.install_sudoers({"user": "nobody"})
+        self.assertFalse(result["ok"])
+        self.assertIn("Command Line Tools", result["error"])
+        runner.assert_not_called()
+        with mock.patch.object(helper.platform, "system", return_value="Linux"), \
+                mock.patch.object(helper, "root_python_framework_ok", return_value=False):
+            self.assertTrue(helper.root_interpreter_ok())
+
+
 class SudoersTests(unittest.TestCase):
     """The narrow sudo rule: one user, one command, checked by visudo."""
 
@@ -4637,7 +4800,8 @@ class SudoersTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "swarmbar")
         for patch in (mock.patch.object(helper, "SUDOERS_PATH", self.path),
-                      mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo")):
+                      mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo"),
+                      mock.patch.object(helper, "root_interpreter_ok", return_value=True)):
             patch.start()
             self.addCleanup(patch.stop)
 

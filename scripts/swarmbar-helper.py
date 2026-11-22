@@ -1,4 +1,32 @@
-#!/usr/bin/python3 -I
+#!/bin/sh
+""":"
+# sh reads these lines and python sees one string. The narrow sudo rule has
+# the kernel run this file as root, so the python that runs it is chosen
+# here, before any python can run. On macOS /usr/bin/python3 only launches
+# the python of the selected developer directory, which may be an Xcode a
+# user owns, so root runs the Command Line Tools' own python instead, and
+# only while every file of it, and every directory above it, is root's and
+# writable by nobody else. Each program is named by absolute path: sudo on
+# macOS passes the caller's PATH through. root_python_framework_ok applies
+# the same rule before the sudo rule is installed.
+if [ "$(/usr/bin/id -u)" = 0 ] && [ "$(/usr/bin/uname -s)" = Darwin ]; then
+  f=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework
+  above="/ /Library /Library/Developer /Library/Developer/CommandLineTools
+    /Library/Developer/CommandLineTools/Library
+    /Library/Developer/CommandLineTools/Library/Frameworks"
+  for d in $above; do
+    [ -z "$(/usr/bin/find "$d" -prune '(' '!' -user 0 -o -perm -0020 -o -perm -0002 ')' -print 2>&1)" ] || f=
+  done
+  if [ -n "$f" ] && [ -d "$f" ] && [ ! -L "$f" ] && [ -x "$f/Versions/Current/bin/python3" ] &&
+      [ -z "$(/usr/bin/find "$f" '(' '!' -user 0 -o '(' '!' -type l '(' -perm -0020 -o -perm -0002 ')' ')' ')' -print 2>&1)" ]; then
+    exec "$f/Versions/Current/bin/python3" -I "$0" "$@"
+  fi
+  echo "swarmbar: no python here that only root can change; install the Command Line Tools (xcode-select --install)" >&2
+  exit 1
+fi
+exec /usr/bin/python3 -I "$0" "$@"
+":"""
+
 """SwarmBar remote helper.
 
 Ships bytes, never verdicts. It lists agent state files for all seven tools
@@ -17,8 +45,10 @@ Constraints that are not negotiable:
 The interpreter is named by absolute path, never found through env: the
 narrow sudo rule runs this file as root with the caller's PATH wherever
 sudoers sets no secure_path, as on stock macOS, so `env python3` would let
-the caller pick the program root runs. -I keeps PYTHON* variables, the
-user site and the script's directory off the module path.
+the caller pick the program root runs. The sh prologue above picks it, so
+that on macOS it is never /usr/bin/python3's choice either. -I keeps
+PYTHON* variables, the user site and the script's directory off the
+module path.
 """
 
 import sys
@@ -4800,6 +4830,58 @@ def install_helper(request, source=None):
     return {"ok": True, "installed": dest, "sha256": digest}
 
 
+# The python the sh prologue at the top of this file runs a root helper with
+# on macOS. A test holds the two equal.
+ROOT_PYTHON_FRAMEWORK = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework"
+
+
+def root_python_framework_ok(top=ROOT_PYTHON_FRAMEWORK, owner=0, stop=None):
+    """Whether the prologue would run the python in `top`: a real directory
+    holding Versions/Current/bin/python3, where it and every directory
+    above it (up to `stop`, a test's stand-in for the root) belong to
+    `owner` and are writable by neither group nor others, and so is every
+    entry under it, links excepted from the mode alone. The prologue's
+    find applies exactly this; only_owner_can_write's user-private-group
+    allowance is deliberately not made, so the two never disagree."""
+    current = top
+    try:
+        if not stat_module.S_ISDIR(os.lstat(top).st_mode):
+            return False
+        while current != stop:
+            info = os.lstat(current)
+            if info.st_uid != owner or info.st_mode & 0o022:
+                return False
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        if not os.access(os.path.join(top, "Versions", "Current", "bin", "python3"), os.X_OK):
+            return False
+        for directory, dirs, files in os.walk(top, onerror=_raise):
+            for name in dirs + files:
+                info = os.lstat(os.path.join(directory, name))
+                if info.st_uid != owner:
+                    return False
+                if not stat_module.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _raise(error):
+    raise error
+
+
+def root_interpreter_ok():
+    """Whether the python the sudo rule would run is one only root can
+    change. Elsewhere than macOS the prologue runs /usr/bin/python3, as
+    the #! line always did."""
+    if platform.system() != "Darwin":
+        return True
+    return root_python_framework_ok()
+
+
 def install_sudoers(request):
     """{user}: /etc/sudoers.d/swarmbar, letting one user run the root helper
     and nothing else without a password. Root only. The rule is written
@@ -4821,6 +4903,13 @@ def install_sudoers(request):
         pwd.getpwnam(user)
     except (ImportError, KeyError):
         return {"ok": False, "error": "no such user: %s" % user}
+    # The rule would run the helper as root through its prologue, which
+    # refuses any python someone besides root could change. A rule it
+    # could never use would only grant what nobody should rely on.
+    if not root_interpreter_ok():
+        return {"ok": False, "error": "no python here that only root can change, so the "
+                "sudo rule could not start the helper; install the Command Line Tools "
+                "(xcode-select --install)"}
     visudo = visudo_path()
     if visudo is None:
         return {"ok": False, "error": "visudo not found"}
