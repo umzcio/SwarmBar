@@ -99,9 +99,15 @@ enum AntigravityTranscript {
     /// The user's own words, dug out of the USER_INPUT envelope. The step's
     /// content wraps the prompt in <USER_REQUEST> and follows it with
     /// metadata blocks the user never typed.
+    ///
+    /// The closing tag is looked for only after the opening one. Searched
+    /// independently, a closing tag written first made a backwards range,
+    /// which traps even in a release build, and the content is whatever
+    /// the user (or, on a watched host, any account there) wrote.
     nonisolated static func userRequest(in content: String) -> String {
         guard let open = content.range(of: "<USER_REQUEST>"),
-              let close = content.range(of: "</USER_REQUEST>")
+              let close = content.range(
+                of: "</USER_REQUEST>", range: open.upperBound..<content.endIndex)
         else { return content.trimmingCharacters(in: .whitespacesAndNewlines) }
         return content[open.upperBound..<close.lowerBound]
             .trimmingCharacters(in: .whitespacesAndNewlines)

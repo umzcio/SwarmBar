@@ -1275,6 +1275,24 @@ struct AntigravityTranscriptTests {
         }
     }
 
+    /// The tags come from text the user or a remote account wrote. Out of
+    /// order they once formed a backwards range, which ends the process
+    /// even in a release build. Any arrangement but an opening tag followed
+    /// by a closing one falls back to the whole content.
+    @Test func userRequestTagsOutOfOrderFallBackToTheContent() {
+        #expect(AntigravityTranscript.userRequest(in: "</USER_REQUEST> x <USER_REQUEST>")
+            == "</USER_REQUEST> x <USER_REQUEST>")
+        #expect(AntigravityTranscript.userRequest(in: "<USER_REQUEST> only open") == "<USER_REQUEST> only open")
+        #expect(AntigravityTranscript.userRequest(in: "only close </USER_REQUEST>") == "only close </USER_REQUEST>")
+        #expect(AntigravityTranscript.userRequest(in: "</USER_REQUEST><USER_REQUEST>fix it</USER_REQUEST>")
+            == "fix it")
+        // The two tags share no scalars, but a closing tag must still start
+        // after the opening one ends.
+        #expect(AntigravityTranscript.userRequest(in: "<USER_REQUEST></USER_REQUEST>") == "")
+        let reversed = #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"</USER_REQUEST>\nhi\n<USER_REQUEST>"}"#
+        #expect(AntigravityTranscript.status(for: AntigravityTranscript.steps(in: reversed)) != nil)
+    }
+
     @Test func anEmptyOrUnreadableTranscriptHasNoOpinion() {
         #expect(AntigravityTranscript.status(for: []) == nil)
         #expect(AntigravityTranscript.steps(in: "not json\n\n").isEmpty)
