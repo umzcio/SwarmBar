@@ -3333,6 +3333,18 @@ MAX_BROKER_LINE = 8 * 1024 * 1024
 # that stops reading costs dropped events, never a stalled request: a held
 # request whose event is dropped times out to {}.
 EMIT_QUEUE_SIZE = 256
+# One root helper serves every home's sockets, and any user can opt their
+# home in with a marker file, so each home gets a fixed share of what that
+# process has: connections served at once on its hook socket (a hold is
+# one, and MAX_HOLDS bounds those) and its broker (one per other helper
+# following it), the time a whole hook request may take to arrive, and
+# events waiting in the queue to this helper's Mac. Past a budget a
+# connection is closed at once without an answer, and an event is dropped,
+# so one home's owner never silences another home's hooks.
+MAX_HOOK_CONNECTIONS = 64
+MAX_FOLLOWERS = 8
+HOOK_REQUEST_SECONDS = 10
+EMIT_HOME_SHARE = 32
 # sun_path is 104 bytes on Darwin and 108 on Linux, NUL included.
 MAX_SOCKET_PATH = 103
 # None runs each home step in a child exactly when running as root. True runs
@@ -4249,8 +4261,43 @@ def read_hook_body(handler):
 
 
 class _QuietServer(socketserver.ThreadingUnixStreamServer):
+    """One home's socket. `limit` is how many connections it serves at
+    once; one past it is closed as it is accepted, before any thread or
+    answer, so a home's owner holding connections open spends only their
+    own home's share of this process."""
     daemon_threads = True
     hub = None
+    limit = None
+
+    def __init__(self, *args, **kwargs):
+        socketserver.ThreadingUnixStreamServer.__init__(self, *args, **kwargs)
+        self.active = 0
+        self.active_lock = threading.Lock()
+
+    def verify_request(self, request, client_address):
+        with self.active_lock:
+            if self.limit is not None and self.active >= self.limit:
+                return False
+            self.active += 1
+        return True
+
+    def process_request(self, request, client_address):
+        try:
+            socketserver.ThreadingUnixStreamServer.process_request(self, request, client_address)
+        except BaseException:
+            self.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            socketserver.ThreadingUnixStreamServer.process_request_thread(
+                self, request, client_address)
+        finally:
+            self.release()
+
+    def release(self):
+        with self.active_lock:
+            self.active -= 1
 
     def handle_error(self, request, client_address):
         # A held client dropped at exit fails its final flush. socketserver
@@ -4261,6 +4308,29 @@ class _QuietServer(socketserver.ThreadingUnixStreamServer):
 class HookHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = HOOK_READ_TIMEOUT
+    request_read = False
+
+    def setup(self):
+        # HOOK_READ_TIMEOUT bounds one read, and a client sending a byte
+        # every few seconds would never meet it. The whole request, line,
+        # headers and body, must be in by HOOK_REQUEST_SECONDS, or the
+        # connection is dropped unanswered. A held request is read long
+        # before its wait begins, so holding is untouched.
+        http.server.BaseHTTPRequestHandler.setup(self)
+        self.reaper = threading.Timer(HOOK_REQUEST_SECONDS, self.reap)
+        self.reaper.daemon = True
+        self.reaper.start()
+
+    def reap(self):
+        if not self.request_read:
+            drop_connection(self.connection)
+
+    def finish(self):
+        self.reaper.cancel()
+        try:
+            http.server.BaseHTTPRequestHandler.finish(self)
+        except OSError:
+            pass
 
     def log_message(self, format, *args):
         pass
@@ -4395,6 +4465,7 @@ class HookHome(object):
             server.socket.close()
             server.socket = socket.socket(fileno=fd)
             server.hub = self
+            server.limit = MAX_HOOK_CONNECTIONS if handler is HookHandler else MAX_FOLLOWERS
             servers.append(server)
         with self.lock:
             self.servers = servers
@@ -4643,6 +4714,7 @@ class HookHome(object):
             body = read_hook_body(handler)
         except OSError:
             body = None
+        handler.request_read = True
         payload = parse_line(body) if body is not None else None
         if match is None or payload is None or self.closing:
             handler.answer({})
@@ -4795,6 +4867,7 @@ class HookRelay(object):
         self.lock = threading.Lock()
         self.closed = False
         self.dropped = 0
+        self.waiting = collections.Counter()
         self.queue = queue.Queue(EMIT_QUEUE_SIZE)
         writer = threading.Thread(target=self.drain, name="swarmbar-emit")
         writer.daemon = True
@@ -4814,23 +4887,35 @@ class HookRelay(object):
         return self.clock() - last <= MAC_QUIET_SECONDS
 
     def emit(self, message):
-        """Queues an event for this helper's Mac. False when it was dropped."""
+        """Queues an event for this helper's Mac. False when it was dropped:
+        the queue is full, or the event's home already has EMIT_HOME_SHARE
+        events waiting, so one home flooding its own socket cannot crowd
+        out another home's held request."""
+        home = message.get("home") if isinstance(message, dict) else None
+        with self.lock:
+            if self.waiting[home] >= EMIT_HOME_SHARE:
+                self.dropped += 1
+                return False
+            self.waiting[home] += 1
         try:
-            self.queue.put_nowait(message)
+            self.queue.put_nowait((home, message))
             return True
         except queue.Full:
             with self.lock:
+                self.waiting[home] -= 1
                 self.dropped += 1
             return False
 
     def drain(self):
         while True:
             try:
-                message = self.queue.get(timeout=0.2)
+                home, message = self.queue.get(timeout=0.2)
             except queue.Empty:
                 if self.closed:
                     return
                 continue
+            with self.lock:
+                self.waiting[home] -= 1
             try:
                 self.emit_line(message)
             except Exception:

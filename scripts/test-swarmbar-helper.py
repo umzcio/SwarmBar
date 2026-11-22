@@ -3215,6 +3215,104 @@ class HookRelayTests(unittest.TestCase):
         self.assertIsNone(helper.parse_line(b"[" * 100000))
 
 
+class HookBudgetTests(unittest.TestCase):
+    """Every home's sockets are served by one root process, and any user
+    can opt their home in with a marker file. One home's owner must not be
+    able to use up that process's descriptors, threads or event queue and
+    silence another home's hooks."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbq-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.homes = []
+        for name in ("a", "b"):
+            home = os.path.join(self.base, name)
+            os.makedirs(os.path.join(home, ".swarmbar"))
+            open(os.path.join(home, ".swarmbar", "swarmbar-remote-hook.sh"), "w").close()
+            self.homes.append(home)
+        self.a, self.b = self.homes
+        for patch in (
+                mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": ":".join(self.homes)}),
+                mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.05),
+                mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
+                mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
+                mock.patch.object(helper, "peer_chain", return_value=["curl", "bash", "claude"]),
+                mock.patch.object(helper, "peer_uid", side_effect=lambda sock: os.getuid()),
+                mock.patch.object(helper, "agent_processes", return_value=[]),
+                mock.patch.object(helper, "MAX_HOOK_CONNECTIONS", 4),
+                mock.patch.object(helper, "MAX_FOLLOWERS", 2),
+                mock.patch.object(helper, "HOOK_REQUEST_SECONDS", 0.5)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.sink = EventSink()
+        self.relay = helper.HookRelay(emit=self.sink)
+        self.addCleanup(self.relay.close)
+        self.relay.refresh()
+        self.clients = []
+        self.addCleanup(lambda: [client.close() for client in self.clients])
+
+    def connect(self, home, name="hook.sock"):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.connect(os.path.join(home, ".swarmbar", name))
+        self.clients.append(client)
+        return client
+
+    def test_connections_over_a_homes_budget_are_closed_at_once(self):
+        for _ in range(helper.MAX_HOOK_CONNECTIONS):
+            self.connect(self.a)
+        time.sleep(0.2)
+        self.assertTrue(connection_dropped(self.connect(self.a), timeout=2))
+        # The other home is answered as if nothing were happening.
+        client = post_hook(self.b, "Stop", {"session_id": "s"})
+        self.clients.append(client)
+        self.assertTrue(answered_within(client, 2))
+        self.assertEqual(read_response(client)[2], {})
+        # And its held request still reaches the Mac.
+        held = post_hook(self.b, "PermissionRequest", {"session_id": "s1"})
+        self.clients.append(held)
+        self.assertIsNotNone(self.sink.wait_for(
+            lambda e: e.get("event") == "hook" and e.get("home") == self.b and e.get("held")))
+
+    def test_followers_over_a_homes_budget_are_closed_at_once(self):
+        for _ in range(helper.MAX_FOLLOWERS):
+            follower = self.connect(self.a, "broker.sock")
+            self.assertTrue(follower.recv(65536))
+        self.assertTrue(wait_until(
+            lambda: self.relay.hubs[self.a].follower_count() == helper.MAX_FOLLOWERS))
+        self.assertTrue(connection_dropped(self.connect(self.a, "broker.sock"), timeout=2))
+        self.assertEqual(self.relay.hubs[self.a].follower_count(), helper.MAX_FOLLOWERS)
+
+    def test_a_request_trickled_in_is_dropped_at_its_deadline(self):
+        client = self.connect(self.a)
+        began = time.monotonic()
+        dropped = False
+        for character in "POST /hook/Stop HTTP/1.1\r\nHost: swarmbar\r\nX-Pad: " + "x" * 200:
+            try:
+                client.sendall(character.encode("ascii"))
+            except OSError:
+                dropped = True
+                break
+            readable, _, _ = select.select([client], [], [], 0.05)
+            if readable:
+                dropped = client.recv(1) == b""
+                break
+        self.assertTrue(dropped)
+        self.assertLess(time.monotonic() - began, 3)
+
+    def test_one_home_cannot_fill_the_queue_to_the_mac(self):
+        self.sink.gate = threading.Event()
+        self.addCleanup(self.sink.gate.set)
+        taken = [self.relay.emit({"event": "hook", "home": self.a, "n": n})
+                 for n in range(helper.EMIT_QUEUE_SIZE)]
+        self.assertLessEqual(sum(taken), helper.EMIT_HOME_SHARE + 1)
+        self.assertTrue(self.relay.emit({"event": "hook", "home": self.b, "held": True}))
+        self.sink.gate.set()
+        self.assertIsNotNone(self.sink.wait_for(lambda e: e.get("home") == self.b))
+        # Once the Mac has taken them, the home has its share again.
+        self.assertTrue(wait_until(lambda: self.relay.emit({"event": "hook", "home": self.a})))
+
+
 class FollowerRelayTests(unittest.TestCase):
     """A follower relays what its broker sends. The broker is whoever holds
     the home's lock, possibly the home's own user, so it never decides
