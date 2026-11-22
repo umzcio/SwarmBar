@@ -593,8 +593,9 @@ final class HookServer: ApprovalResponding {
 
     /// A permission.ask payload from the OpenCode plugin: the full
     /// PermissionRequest (id per_..., sessionID ses_..., permission,
-    /// patterns, metadata) plus the plugin's project directory. For bash
-    /// asks the pattern is the command itself.
+    /// patterns, metadata), the plugin's project directory, and the tool
+    /// call the request gates, which is what the row shows and Approve
+    /// releases (see `openCodePrompt`).
     private func handleOpenCodePermission(_ body: [String: Any], context: HookContext) {
         guard let rawSessionID = body["sessionID"] as? String else {
             context.release()
@@ -678,32 +679,41 @@ final class HookServer: ApprovalResponding {
         return ApprovalPrompt(ApprovalPrompt.describe(tool: toolName, arguments: input))
     }
 
-    /// A permission.asked payload from the OpenCode plugin, in full: the
-    /// bash command itself, or the permission with every pattern and
-    /// metadata field it carries.
+    /// What Approve on an OpenCode request releases: the tool call the
+    /// permission gates, from the call's own input, which the plugin sends
+    /// as `call: {tool, input}`. For a shell call that is the whole
+    /// command and anything else that changes what runs; for any other
+    /// tool, its name and every argument.
+    ///
+    /// Never the permission's patterns or metadata. Patterns are what a
+    /// rule matches, not the call: for bash OpenCode keeps only command
+    /// names and plain words, dropping redirections, cd, assignments and
+    /// expansions, and a generic tool asks with "*". Metadata is the tool's
+    /// own summary, and bash sends none. A row built from either showed a
+    /// part as the whole, and Approve released the rest. A request without
+    /// the call (an older plugin, or one that could not find it) is
+    /// unreadable, so it is not held and the row offers the terminal.
     nonisolated static func openCodePrompt(_ body: [String: Any]) -> ApprovalPrompt {
-        let permission = (body["permission"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "tool"
-        var metadata = body["metadata"] as? [String: Any] ?? [:]
-        let patterns = (body["patterns"] as? [Any])?.compactMap { $0 as? String } ?? []
-        if permission == "bash" {
-            // The command itself where the plugin has it, otherwise every
-            // pattern, which for bash are the commands.
-            let command = (metadata.removeValue(forKey: "command") as? String)
-                ?? (patterns.isEmpty ? nil : patterns.joined(separator: "\n"))
-            if let command {
-                let rest = ApprovalPrompt.describeArguments(metadata)
-                return ApprovalPrompt(rest.isEmpty ? command : command + "\n" + rest)
-            }
+        guard let call = body["call"] as? [String: Any],
+              let tool = (call["tool"] as? String).flatMap({ $0.isEmpty ? nil : $0 }),
+              var input = call["input"] as? [String: Any]
+        else {
+            return .unreadable(
+                "SwarmBar cannot read the exact call OpenCode is asking about. Review it in the terminal.")
         }
-        var head = permission
-        if patterns.count == 1 {
-            head += " " + patterns[0]
-        } else if !patterns.isEmpty {
-            head += "\n" + patterns.joined(separator: "\n")
+        if openCodeShellTools.contains(tool), let command = input.removeValue(forKey: "command") as? String {
+            // The description and timeout change nothing about what runs.
+            // Anything else might (the working directory, the shell, a
+            // background flag), and is shown after the command.
+            for key in ["description", "timeout"] { input.removeValue(forKey: key) }
+            let rest = ApprovalPrompt.describeArguments(input)
+            return ApprovalPrompt(rest.isEmpty ? command : command + "\n" + rest)
         }
-        let rest = ApprovalPrompt.describeArguments(metadata)
-        return ApprovalPrompt(rest.isEmpty ? head : head + "\n" + rest)
+        return ApprovalPrompt(ApprovalPrompt.describe(tool: tool, arguments: input))
     }
+
+    /// OpenCode 1's shell tool is "bash"; OpenCode 2 renamed it "shell".
+    nonisolated static let openCodeShellTools: Set<String> = ["bash", "shell"]
 
     /// The first question of an AskUserQuestion call, with a count when
     /// there are more.

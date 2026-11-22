@@ -119,6 +119,7 @@ struct RemoteHookRelayTests {
         let body: [String: Any] = [
             "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
             "patterns": ["ls -la"], "directory": "/home/u/web",
+            "call": ["tool": "bash", "input": ["command": "ls -la"]],
         ]
         server.handleRemote(
             event: "OpenCodePermission", body: body, accountLabel: nil,
@@ -133,6 +134,35 @@ struct RemoteHookRelayTests {
 
         store.deny(row)
         #expect(decode(try #require(answers.first))["decision"] as? String == "deny")
+    }
+
+    /// An older plugin, or one that could not find the gated call, sends
+    /// only the permission's patterns. The row cannot show what Approve
+    /// would release, so the request is let go at once, failing open to
+    /// OpenCode's own prompt, and the row offers the terminal.
+    @Test func anOpenCodeRequestWithoutItsCallIsNotHeld() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        var answers: [Data] = []
+        let body: [String: Any] = [
+            "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
+            "patterns": ["echo hi"], "metadata": [String: String](), "directory": "/home/u/web",
+        ]
+        server.handleRemote(
+            event: "OpenCodePermission", body: body, accountLabel: nil,
+            origin: origin(mirror: mirror, peer: []), rid: "r3", held: true) { json, _ in answers.append(json) }
+
+        let id = RemoteIdentity.sessionID(
+            hostID: hostID, home: home, localID: StableID.uuid(for: "ses_abc"))
+        #expect(!server.isHolding(sessionID: id))
+        #expect(answers.count == 1)
+        #expect(answers.first.map(isEmptyAnswer) == true)
+        let row = try #require(store.sessions.first { $0.id == id })
+        guard case .waitingApproval(let prompt) = row.status else {
+            Issue.record("row is \(row.status)")
+            return
+        }
+        #expect(!prompt.offersApprove)
     }
 
     /// A second held request for a session that is already holding one,
@@ -177,6 +207,7 @@ struct RemoteHookRelayTests {
         let body: [String: Any] = [
             "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
             "patterns": ["ls -la"], "directory": "/home/u/web",
+            "call": ["tool": "bash", "input": ["command": "ls -la"]],
         ]
         server.handleRemote(
             event: "OpenCodePermission", body: body, accountLabel: nil,
@@ -187,7 +218,8 @@ struct RemoteHookRelayTests {
 
         var huge = body
         huge["id"] = "per_2"
-        huge["patterns"] = [String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]
+        huge["call"] = ["tool": "bash", "input": [
+            "command": String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]]
         server.handleRemote(
             event: "OpenCodePermission", body: huge, accountLabel: nil,
             origin: origin(mirror: mirror, peer: []), rid: "r2", held: true) { json, _ in second.append(json) }
