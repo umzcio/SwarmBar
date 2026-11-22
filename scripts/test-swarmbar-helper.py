@@ -4075,9 +4075,56 @@ class KimiEventsTests(unittest.TestCase):
                 self.assertEqual(self.events(home=home)["error"], "not a home")
         runner.assert_not_called()
 
+    def test_root_runs_for_another_home_only_a_build_its_owner_or_root_controls(self):
+        # The build is this test's user's, the home another user's: run as
+        # that user it would be one account's program in another's name.
+        me = os.geteuid()
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("bob", me + 1, me + 1)), \
+                mock.patch.object(helper, "run_command", runner):
+            result = self.events()
+        self.assertIsNone(result["events"])
+        self.assertIn("will not run", result["error"])
+        runner.assert_not_called()
+
+        # A link the home's owner could not have placed is refused even
+        # when the file it leads to is theirs.
+        link = os.path.join(self.root, "elsewhere", "kimi")
+        os.makedirs(os.path.dirname(link))
+        os.symlink(self.kimi, link)
+        trusted = lambda path, uid: uid == me and not path.startswith(os.path.dirname(link))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "path_trusted_for", side_effect=trusted), \
+                mock.patch.object(helper, "run_command", runner):
+            self.assertIsNone(self.events(link)["events"])
+        runner.assert_not_called()
+
+    def test_narrow_rule_runs_doctor_only_for_the_callers_own_home(self):
+        me = os.geteuid()
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "narrow_rule_run", return_value=True), \
+                mock.patch.dict(os.environ, {"SUDO_UID": str(me + 1)}), \
+                mock.patch.object(helper, "path_trusted_for", return_value=True), \
+                mock.patch.object(helper, "run_command", runner):
+            result = self.events()
+        self.assertIsNone(result["events"])
+        self.assertIn("sudo rule", result["error"])
+        runner.assert_not_called()
+        seen = {}
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "narrow_rule_run", return_value=True), \
+                mock.patch.dict(os.environ, {"SUDO_UID": str(me)}), \
+                mock.patch.object(helper, "path_trusted_for", return_value=True), \
+                mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events()["events"])
+
     def test_root_runs_doctor_as_the_home_owner(self):
         seen = {}
         with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "path_trusted_for",
+                                  lambda path, uid: uid == os.stat(self.home).st_uid), \
                 mock.patch.object(helper, "run_command", self.recording(seen)):
             self.assertIsNotNone(self.events()["events"])
         self.assertEqual(seen["options"]["user"], os.stat(self.home).st_uid)

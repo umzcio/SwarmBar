@@ -3782,19 +3782,25 @@ def doctor_identity(home, executable, found=None):
     have changed: anything else would hand root to whoever could. That
     holds for the name it was found by as much as for the file, since a
     link in a directory someone else can write is theirs to repoint, so
-    every link from `found` to the file is vetted too. {} means run as
+    every link from `found` to the file is vetted too. Another user's home
+    gets the same rule with that user beside root (path_trusted_for): the
+    request names the build, and one owned or reachable by a third account
+    would run that account's program as the home's owner. {} means run as
     this process."""
     user, uid, gid = home_owner(home)
     if uid is None:
         return None
     if os.geteuid() != 0:
         return {} if uid == os.geteuid() else None
+    links = link_locations(found) if found is not None else []
     if uid == 0:
-        links = link_locations(found) if found is not None else []
         if links is None or not root_only_path(executable) \
                 or not all(root_only_path(link) for link in links):
             return None
         return {}
+    if links is None or not path_trusted_for(executable, uid) \
+            or not all(path_trusted_for(link, uid) for link in links):
+        return None
     return {"user": uid, "group": gid, "extra_groups": supplementary_groups(user, gid)}
 
 
@@ -3814,6 +3820,11 @@ def kimi_events(request):
     if not isinstance(home, str) or "\x00" in home or os.path.realpath(home) not in homes:
         return {"events": None, "error": "not a home"}
     home = homes[os.path.realpath(home)]
+    # The sudo rule lets its login send any request, and the Mac never
+    # asks this through it, so a program the request names runs only as
+    # the login who invoked sudo.
+    if narrow_rule_run() and home_owner(home)[1] != sudo_caller_uid():
+        return {"events": None, "error": "refused under the SwarmBar sudo rule for %s" % home}
     ids = doctor_identity(home, executable, found)
     if ids is None:
         return {"events": None, "error": "will not run %s for %s" % (executable, home)}
@@ -4627,6 +4638,14 @@ def narrow_rule_run():
     if os.path.realpath(path) != os.path.realpath(HELPER_PATHS[0]):
         return False
     return os.environ.get("SUDO_UID", "0") not in ("", "0")
+
+
+def sudo_caller_uid():
+    """The uid that invoked sudo, or None when it is not known."""
+    try:
+        return int(os.environ.get("SUDO_UID", ""))
+    except ValueError:
+        return None
 
 
 NARROW_RULE_REFUSAL = {"ok": False, "error": "refused under the SwarmBar sudo rule; "
