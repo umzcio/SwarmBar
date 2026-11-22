@@ -1618,6 +1618,113 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
             self.assertEqual(rec.sent(), [])
 
+    # A Grok press is bound to the request the Mac read through its
+    # events.jsonl: every Grok gate draws the same options with the cursor
+    # in the same place, so the screen alone cannot say which call it is for.
+    GROK_SCREEN = "  2 (●) Yes, proceed\n  3 (○) No, reject"
+    GROK_PROMPT = ('{"ts":"t","type":"phase_changed","phase":"permission_prompt"}\n'
+                   '{"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}\n')
+
+    def grok_events(self, text=GROK_PROMPT, shipped=True):
+        home = os.path.join(self.root, "home")
+        session = os.path.join(home, ".grok", "sessions", "cwd", "sess")
+        os.makedirs(session)
+        path = os.path.join(session, "events.jsonl")
+        with open(path, "w") as handle:
+            handle.write(text)
+        homes = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": home})
+        homes.start()
+        self.addCleanup(homes.stop)
+        record = helper.Shipped(len(text), 0, 0, len(text) - 1)
+        table = mock.patch.dict(helper.SHIPPED, {path: record} if shipped else {}, clear=True)
+        table.start()
+        self.addCleanup(table.stop)
+        return path, len(text)
+
+    def grok_keys(self, path, size, rec):
+        return self.call({"cmd": "keys", "pane": self.pane, "keys": ["DOWN", "\n"],
+                          "expect": ["No, reject", {"once": "2 (●) Yes, proceed"},
+                                     {"grok_events": {"path": path, "size": size}}]}, rec)
+
+    def test_grok_events_unchanged_presses(self):
+        path, size = self.grok_events()
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": True})
+        self.assertEqual(len(rec.sent()), 2)
+
+    def test_grok_events_ignore_unrelated_records(self):
+        path, size = self.grok_events()
+        with open(path, "a") as handle:
+            handle.write('{"ts":"t","type":"tool_started","tool_name":"read_file"}\n')
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": True})
+
+    def test_grok_events_another_prompt_since_sends_nothing(self):
+        # The prompt the row showed was answered at the terminal and Grok
+        # gated another call. The selector reads exactly as it did.
+        path, size = self.grok_events()
+        with open(path, "a") as handle:
+            handle.write('{"ts":"t","type":"permission_resolved","decision":"allow"}\n'
+                         '{"ts":"t","type":"phase_changed","phase":"working"}\n'
+                         + self.GROK_PROMPT)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_grok_events_that_cannot_be_vouched_for_send_nothing(self):
+        cases = (
+            # Shrunk: not the file the Mac read.
+            ("", lambda path, size: (path, size + 1)),
+            # A record still being written, or one that does not parse.
+            ('{"ts":"t","type":"perm', None),
+            ('not json\n', None),
+            ('["a list"]\n', None),
+            ('{"ts":"t"}\n', None),
+        )
+        for appended, adjust in cases:
+            with self.subTest(appended=appended):
+                self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp"))
+                self.addCleanup(shutil.rmtree, self.root, True)
+                path, size = self.grok_events()
+                with open(path, "a") as handle:
+                    handle.write(appended)
+                if adjust is not None:
+                    path, size = adjust(path, size)
+                rec = TmuxRecorder(screen=self.GROK_SCREEN)
+                self.assertEqual(self.grok_keys(path, size, rec),
+                                 {"sent": False, "reason": "changed"})
+                self.assertEqual(rec.sent(), [])
+
+    def test_grok_events_only_for_a_shipped_grok_events_file(self):
+        path, size = self.grok_events(shipped=False)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+        # Shipped, but not a Grok session's events.jsonl.
+        other = os.path.join(self.root, "home", "notes.jsonl")
+        with open(other, "w") as handle:
+            handle.write(self.GROK_PROMPT)
+        helper.SHIPPED[other] = helper.Shipped(1, 0, 0, 0)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(other, len(self.GROK_PROMPT), rec),
+                         {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_malformed_grok_events_is_bad_keys(self):
+        for bad in ({"grok_events": {"path": 3, "size": 0}},
+                    {"grok_events": {"path": "", "size": 0}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": -1}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": True}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": 0, "more": 1}},
+                    {"grok_events": "/x/events.jsonl"},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": 0}, "once": "x"}):
+            rec = TmuxRecorder(screen="x")
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect": [bad]}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
+            self.assertEqual(rec.sent(), [])
+
     def test_expect_more_needs_the_count_to_rise(self):
         # "ok" was on screen twice before the paste. Twice is not enough.
         for screen, sent in (("ok\n> ok", False), ("ok\n> x", False), ("ok\nok\n> ok", True)):
