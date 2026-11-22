@@ -303,7 +303,7 @@ struct GrokBuildMonitor: SessionMonitor {
             status: status,
             startedAt: createdAt,
             lastActivityAt: updatedAt,
-            pid: isActive ? infoId.flatMap { pids[$0] }.map { pid_t($0) } : nil,
+            pid: isActive ? infoId.flatMap { pids[$0] }.flatMap { pid_t(processID: $0) } : nil,
             processAlive: isActive
         )
     }

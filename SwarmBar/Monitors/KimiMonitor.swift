@@ -96,7 +96,7 @@ struct KimiMonitor: SessionMonitor {
         return sessions.map { session in
             guard session.processAlive, let cwd = session.projectPath?.path else { return session }
             var session = session
-            session.pid = context.processes.pid(processNames: names, cwd: cwd).map { pid_t($0) }
+            session.pid = context.processes.pid(processNames: names, cwd: cwd).flatMap { pid_t(processID: $0) }
             return session
         }
     }

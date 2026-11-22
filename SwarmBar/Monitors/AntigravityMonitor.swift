@@ -191,7 +191,7 @@ struct AntigravityMonitor: SessionMonitor {
             status: status,
             startedAt: lastActivity,
             lastActivityAt: lastActivity,
-            pid: pid.map { pid_t($0) },
+            pid: pid.flatMap { pid_t(processID: $0) },
             title: title,
             processAlive: alive
         )

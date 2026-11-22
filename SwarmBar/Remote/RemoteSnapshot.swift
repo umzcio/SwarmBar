@@ -126,9 +126,24 @@ extension RemoteProcessRecord: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let pid = try container.decode(Int.self, forKey: .pid)
+        let ppid = try container.decode(Int.self, forKey: .ppid)
+        // Rejected like a negative size: every process id is a pid_t on the
+        // host, so a number outside one is no process at all, and a pid
+        // handed on past here is narrowed to pid_t by the monitors. A ppid
+        // of 0 is real (a process the kernel itself started); a pid of 0 or
+        // less never names one process.
+        guard pid > 0, pid <= Int(pid_t.max) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .pid, in: container, debugDescription: "pid \(pid) is not a process id")
+        }
+        guard ppid >= 0, ppid <= Int(pid_t.max) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .ppid, in: container, debugDescription: "ppid \(ppid) is not a process id")
+        }
         self.init(
-            pid: try container.decode(Int.self, forKey: .pid),
-            ppid: try container.decode(Int.self, forKey: .ppid),
+            pid: pid,
+            ppid: ppid,
             user: try container.decode(String.self, forKey: .user),
             comm: try container.decode(String.self, forKey: .comm),
             args: try container.decode(String.self, forKey: .args),

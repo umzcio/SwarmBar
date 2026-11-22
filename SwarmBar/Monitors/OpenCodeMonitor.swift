@@ -35,7 +35,7 @@ struct OpenCodeMonitor: SessionMonitor {
             guard session.processAlive, let cwd = session.projectPath?.path else { return session }
             var session = session
             session.pid = context.processes.pid(processNames: [processName], cwd: cwd)
-                .map { pid_t($0) }
+                .flatMap { pid_t(processID: $0) }
             return session
         }
     }
