@@ -2252,41 +2252,52 @@ def valid_pane(pane):
     """The pane with its socket resolved, or None when it is not drivable.
 
     The pane comes off the wire, so it is checked as hostile input: the id
-    must be a bare pane id, and the socket must sit in a tmux-* directory both
-    as written and after symlinks resolve, under /tmp or TMUX_TMPDIR, be a
-    real socket, and be owned by whoever owns its tmux-* directory. The
-    resolved path is what every later tmux call uses, so the path checked is
-    the path run, with no window for a symlink to be swapped in between.
-    The socket's owner rides along as "uid": every tmux call runs as that
-    owner, and a pid named beside the pane must belong to it.
+    must be a bare pane id, and the socket must be <root>/tmux-*/<name>
+    exactly, root being /tmp or TMUX_TMPDIR, as tmux_sockets reports it.
+    Only the root is resolved through links. The tmux-* entry and the
+    socket are read without following any, and must be a real directory
+    and a real socket owned by one uid, as tmux_sockets requires.
+
+    That owner rides along as "uid": every tmux call runs as it, and a pid
+    named beside the pane must belong to it. Reading it through a link
+    would let whoever owns a tmux-* entry in /tmp, which is anyone, swap
+    the entry for a link to root's directory while it is read and back
+    while tmux connects, and have a root client obey their server. Read
+    from the entry itself, the uid is the one person able to swap it, and
+    a client run as them gains nothing a swap could point it at.
     """
     if not isinstance(pane, dict):
         return None
     pane_id, sock = pane.get("id"), pane.get("socket")
     if not isinstance(pane_id, str) or not PANE_ID.match(pane_id):
         return None
-    if not isinstance(sock, str) or not os.path.isabs(sock):
+    if not isinstance(sock, str) or not os.path.isabs(sock) or os.path.normpath(sock) != sock:
         return None
-    if not os.path.basename(os.path.dirname(sock)).startswith("tmux-"):
-        return None
-    real = os.path.realpath(sock)
-    real_dir = os.path.dirname(real)
-    if not os.path.basename(real_dir).startswith("tmux-"):
+    directory, name = os.path.split(sock)
+    parent, entry = os.path.split(directory)
+    if not entry.startswith("tmux-") or not name:
         return None
     roots = ["/tmp"]
     if os.environ.get("TMUX_TMPDIR"):
         roots.append(os.environ["TMUX_TMPDIR"])
-    parent = os.path.dirname(real_dir)
-    if not any(parent == os.path.realpath(root) for root in roots):
+    real_root = None
+    for root in roots:
+        if parent in (os.path.normpath(root), os.path.realpath(root)):
+            real_root = os.path.realpath(root)
+            break
+    if real_root is None:
         return None
+    real_dir = os.path.join(real_root, entry)
+    real = os.path.join(real_dir, name)
     try:
-        info = os.stat(real)
-        dir_info = os.stat(real_dir)
+        dir_info = os.lstat(real_dir)
+        info = os.lstat(real)
     except OSError:
         return None
-    if not stat_module.S_ISSOCK(info.st_mode) or info.st_uid != dir_info.st_uid:
+    if not stat_module.S_ISDIR(dir_info.st_mode) or not stat_module.S_ISSOCK(info.st_mode) \
+            or info.st_uid != dir_info.st_uid:
         return None
-    return {"socket": real, "id": pane_id, "uid": info.st_uid}
+    return {"socket": real, "id": pane_id, "uid": dir_info.st_uid}
 
 
 def tmux_run(pane, args, input=None):

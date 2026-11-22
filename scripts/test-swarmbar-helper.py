@@ -1784,13 +1784,55 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(rec.calls, [])
 
     def test_real_socket_accepted_and_resolved_path_used(self):
-        link = os.path.join(self.root, "tmux-1", "alias")
-        os.symlink(self.sock, link)
+        # The root may be written through its link (/tmp is /private/tmp on
+        # macOS); the path run is the resolved one.
+        alias_root = os.path.join(tempfile.mkdtemp(dir="/tmp"), "r")
+        self.addCleanup(shutil.rmtree, os.path.dirname(alias_root), True)
+        os.symlink(self.root, alias_root)
         rec = TmuxRecorder()
-        out = self.call({"cmd": "keys", "pane": {"socket": link, "id": "%3"},
-                         "keys": ["UP"], "expect": []}, rec)
+        with mock.patch.dict(os.environ, {"TMUX_TMPDIR": alias_root}):
+            out = self.call({"cmd": "keys",
+                             "pane": {"socket": os.path.join(alias_root, "tmux-1", "default"),
+                                      "id": "%3"},
+                             "keys": ["UP"], "expect": []}, rec)
         self.assertEqual(out, {"sent": True})
         self.assertEqual(rec.calls[0][2], self.sock)
+
+    def test_a_linked_socket_is_refused(self):
+        # tmux_sockets never reports one, so a pane naming one did not come
+        # from a snapshot.
+        link = os.path.join(self.root, "tmux-1", "alias")
+        os.symlink(self.sock, link)
+        self.assertIsNone(helper.valid_pane({"socket": link, "id": "%3"}))
+
+    def test_a_tmux_entry_that_is_a_link_is_refused(self):
+        # Whoever owns a tmux-* entry in /tmp can swap it for a link to
+        # another user's directory, root's included, at any moment. Read
+        # through the link, that owner's uid would be the one a client runs
+        # as while tmux connects to whatever the entry names by then.
+        swapped = os.path.join(self.root, "tmux-2")
+        os.symlink(os.path.join(self.root, "tmux-1"), swapped)
+        rec = TmuxRecorder()
+        out = self.call({"cmd": "capture", "pane": {"socket": os.path.join(swapped, "default"),
+                                                    "id": "%3"}}, rec)
+        self.assertEqual(out, {"ok": False, "error": "bad pane"})
+        self.assertEqual(rec.calls, [])
+
+    def test_the_client_runs_as_the_owner_of_the_entry_as_found(self):
+        real_lstat = os.lstat
+        directory = os.path.join(self.root, "tmux-1")
+
+        def owned_by(uid):
+            def fake(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                                       uid, info.st_gid, info.st_size, 0, 0, 0))
+            return fake
+        with mock.patch.object(helper.os, "lstat", owned_by(4242)), \
+                mock.patch.object(helper.os, "stat", owned_by(0)):
+            pane = helper.valid_pane(self.pane)
+        self.assertEqual(pane["uid"], 4242)
+        self.assertEqual(os.path.dirname(pane["socket"]), directory)
 
     def test_non_socket_file_refused(self):
         plain = os.path.join(self.root, "tmux-1", "plain")
@@ -1798,17 +1840,17 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertIsNone(helper.valid_pane({"socket": plain, "id": "%1"}))
 
     def test_owner_mismatch_refused(self):
-        real_stat = os.stat
+        real_lstat = os.lstat
         directory = os.path.join(self.root, "tmux-1")
 
         def fake(path, *args, **kwargs):
-            info = real_stat(path, *args, **kwargs)
+            info = real_lstat(path, *args, **kwargs)
             if path == directory:
                 return os.stat_result((info.st_mode, info.st_ino, info.st_dev,
                                        info.st_nlink, info.st_uid + 1, info.st_gid,
                                        info.st_size, 0, 0, 0))
             return info
-        with mock.patch.object(helper.os, "stat", fake):
+        with mock.patch.object(helper.os, "lstat", fake):
             self.assertIsNone(helper.valid_pane(self.pane))
         self.assertIsNotNone(helper.valid_pane(self.pane))
 
