@@ -201,3 +201,26 @@ struct DiscoveryContextTests {
         #expect(HookServer.originTool(rawSessionID: "grok-raw-id", home: try makeHome()) == .claudeCode)
     }
 }
+
+@Suite("Process ids from untrusted numbers")
+struct ProcessIDRangeTests {
+    @Test("only a positive pid_t is a process id")
+    func narrowing() {
+        #expect(pid_t(processID: 4101) == 4101)
+        #expect(pid_t(processID: Int(pid_t.max)) == pid_t.max)
+        #expect(pid_t(processID: Int(pid_t.max) + 1) == nil)
+        #expect(pid_t(processID: Int(UInt32.max) + 4101) == nil)
+        #expect(pid_t(processID: 0) == nil)
+        #expect(pid_t(processID: -1) == nil)
+    }
+
+    /// kill(-1, 0) answers for every process this user can signal, and a
+    /// pid past 32 bits used to trap before kill was even reached.
+    @Test("the local table calls no such number alive")
+    func localLivenessRefusesThem() {
+        let facts = LocalProcessFacts()
+        #expect(!facts.isAlive(Int(UInt32.max) + 1))
+        #expect(!facts.isAlive(-1))
+        #expect(!facts.isAlive(0))
+    }
+}

@@ -188,7 +188,7 @@ struct CodexMonitor: SessionMonitor {
                 status: parsed.status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                pid: pid.map { pid_t($0) },
+                pid: pid.flatMap { pid_t(processID: $0) },
                 processAlive: pid != nil,
                 attentionEventID: parsed.attentionEventID
             ))

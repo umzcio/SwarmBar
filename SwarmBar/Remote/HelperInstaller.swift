@@ -105,7 +105,7 @@ enum HelperInstaller {
         alias: String, watchAs: WatchAs, channel: SSHChannel, runner: Runner? = nil
     ) async -> RemoteHostMonitor.InstallOutcome {
         guard let helper = bundledHelper else {
-            NSLog("SwarmBar: swarmbar-helper.py missing from the app bundle")
+            SwarmLog.log("SwarmBar: swarmbar-helper.py missing from the app bundle")
             return .failed("helper missing from the app bundle")
         }
         let run: Runner
@@ -179,7 +179,7 @@ enum HelperInstaller {
         } catch {
             let said = SSHChannel.readAvailable(stderr.fileHandleForReading)
             let hint = Self.hint(said)
-            NSLog("SwarmBar: helper install failed on \(alias): \(error)\(hint)")
+            SwarmLog.log("SwarmBar: helper install failed on \(alias): \(error)\(hint)")
             throw InstallFailure(message: "helper install failed\(hint)", stderr: String(decoding: said, as: UTF8.self))
         }
 
@@ -189,13 +189,13 @@ enum HelperInstaller {
         }
         if task.isRunning {
             task.terminate()
-            NSLog("SwarmBar: helper install timed out after \(Int(installTimeout))s on \(alias)")
+            SwarmLog.log("SwarmBar: helper install timed out after \(Int(installTimeout))s on \(alias)")
             throw InstallFailure(message: "helper install timed out on \(alias)", stderr: "")
         }
         if task.terminationStatus != 0 {
             let said = SSHChannel.readAvailable(stderr.fileHandleForReading)
             let hint = Self.hint(said)
-            NSLog("SwarmBar: helper install exited \(task.terminationStatus) on \(alias)\(hint)")
+            SwarmLog.log("SwarmBar: helper install exited \(task.terminationStatus) on \(alias)\(hint)")
             throw InstallFailure(
                 message: "helper install exited \(task.terminationStatus)\(hint)",
                 stderr: String(decoding: said, as: UTF8.self))

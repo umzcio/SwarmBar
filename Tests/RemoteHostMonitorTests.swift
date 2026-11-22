@@ -231,14 +231,26 @@ struct RemoteHostMonitorTests {
         await settle { rig.rows.count == 2 }
         #expect(rig.rows.count == 2)
 
-        // Something only a reset removes: it sits outside every home, so
-        // the per-home sweep never reaches it.
+        // Something only a reset changes: the mirror file of a transcript
+        // that does not change. A poll on the same stream lists it with no
+        // chunks and leaves the file alone; a reset deletes it and the
+        // fresh stream ships it into a new file.
+        let kept = try #require(rig.connection.mirror.local(
+            MonitorRig.transcript(MonitorRig.first, in: rig.home).path))
+        func inode(_ url: URL) -> UInt64? {
+            var info = stat()
+            return lstat(url.path, &info) == 0 ? UInt64(info.st_ino) : nil
+        }
+        let original = try #require(inode(kept))
+        // Anything outside every home, by contrast, goes on the very next
+        // poll: no snapshot accounts for it.
         let stray = rig.connection.mirror.root.appendingPathComponent("stray")
         try Data("stray".utf8).write(to: stray)
         let shipped = try #require(rig.connection.lastSnapshot)
         await settle { rig.connection.lastSnapshot?.now != shipped.now }
         #expect(rig.connection.lastSnapshot?.stream == shipped.stream)
-        #expect(FileManager.default.fileExists(atPath: stray.path), "a poll on the same stream kept it")
+        #expect(inode(kept) == original, "a poll on the same stream kept the file")
+        #expect(!FileManager.default.fileExists(atPath: stray.path), "a path outside every home outlived a poll")
 
         // During the gap a session goes away on the host.
         let gone = MonitorRig.transcript(MonitorRig.second, in: rig.home)
@@ -248,7 +260,7 @@ struct RemoteHostMonitorTests {
         await rig.stop()
 
         #expect(rig.connection.lastSnapshot?.stream != shipped.stream)
-        #expect(!FileManager.default.fileExists(atPath: stray.path))
+        #expect(inode(kept) != nil && inode(kept) != original, "the reset did not replace the file")
         let mirrored = try #require(rig.connection.mirror.local(gone.path))
         #expect(!FileManager.default.fileExists(atPath: mirrored.path))
         #expect(rig.rows.map(\.id) == [rig.rowID(MonitorRig.first)])

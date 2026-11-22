@@ -23,6 +23,9 @@ enum OpenCodeReader {
     nonisolated static let discoveryWindow: TimeInterval = 8 * 60 * 60
     nonisolated static let waitingAfter: TimeInterval = 30 * 60
     nonisolated static let recentPartLimit = 20
+    /// Every table the queries below read, for SQLiteSnapshot to hold to
+    /// being ordinary tables. The 2.x pair is absent from a 1.x database.
+    nonisolated static let tables = ["session", "message", "part", "session_v2", "session_message"]
 
     /// liveDirectories: cwds of running opencode processes; sessions in any
     /// other directory read idle. Pass nil to skip the liveness filter
@@ -39,7 +42,7 @@ enum OpenCodeReader {
         // working. That is a property of how the tool happens to run, not a
         // guarantee, and when it stops holding the whole tool goes silently
         // empty. See SQLiteSnapshot for why the failure is so quiet.
-        SQLiteSnapshot.read(dbPath: dbPath) { db in
+        SQLiteSnapshot.read(dbPath: dbPath, tables: tables) { db in
             sessions(db: db, liveDirectories: liveDirectories, now: now)
         } ?? []
     }
@@ -67,7 +70,8 @@ enum OpenCodeReader {
         defer { sqlite3_finalize(sessionStmt) }
 
         var results: [AgentSession] = []
-        while sqlite3_step(sessionStmt) == SQLITE_ROW {
+        var cursor = SQLiteSnapshot.Cursor()
+        while SQLiteSnapshot.nextRow(sessionStmt, &cursor) {
             guard let idText = sqlite3_column_text(sessionStmt, 0) else { continue }
             let id = String(cString: idText)
             let directory = sqlite3_column_text(sessionStmt, 1).map { String(cString: $0) }
@@ -137,7 +141,8 @@ enum OpenCodeReader {
             sqlite3_column_type(stmt, column) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, column)
         }
         var results: [AgentSession] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var cursor = SQLiteSnapshot.Cursor()
+        while SQLiteSnapshot.nextRow(stmt, &cursor) {
             guard let idText = sqlite3_column_text(stmt, 0) else { continue }
             let id = String(cString: idText)
             let directory = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
@@ -249,7 +254,8 @@ enum OpenCodeReader {
         sqlite3_bind_text(stmt, 1, sessionId, -1, sqliteTransient)
 
         var rows: [PartRow] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var cursor = SQLiteSnapshot.Cursor()
+        while SQLiteSnapshot.nextRow(stmt, &cursor) {
             guard let dataText = sqlite3_column_text(stmt, 0) else { continue }
             let json = String(cString: dataText)
             guard let data = json.data(using: .utf8),

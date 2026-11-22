@@ -773,7 +773,8 @@ enum TerminalFocuser {
             guard let output = run("/usr/sbin/lsof", ["-n", "-P", "-F", "p", file.path])
             else { continue }
             for line in output.split(separator: "\n") where line.hasPrefix("p") {
-                if let pid = Int(line.dropFirst()), kill(pid_t(pid), 0) == 0 { return pid }
+                if let pid = Int(line.dropFirst()), let alive = pid_t(processID: pid),
+                   kill(alive, 0) == 0 { return pid }
             }
         }
         return nil

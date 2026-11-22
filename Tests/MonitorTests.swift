@@ -433,7 +433,12 @@ struct GrokBuildMonitorTests {
         for value in readable {
             #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == expected, "\(value)")
         }
-        let unreadable: [Any] = ["2026-01-02T03:04:05", "2026-01-02 03:04:05", "yesterday", "", true, -5]
+        // A far-future instant would let any process's start time pass the
+        // bound ProcessIdentity holds a recorded pid to.
+        let unreadable: [Any] = [
+            "2026-01-02T03:04:05", "2026-01-02 03:04:05", "yesterday", "", true, -5,
+            1e300, "9999-01-02T03:04:05Z",
+        ]
         for value in unreadable {
             #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == nil, "\(value)")
         }
@@ -890,6 +895,36 @@ struct KimiStateShapeTests {
         #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 0 as Double]) == nil)
         #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "not a date"]) == nil)
     }
+
+    /// A far-future date would trap the row timer's Int conversion and,
+    /// with a negative age, pass the discovery window forever.
+    @Test func rejectsDatesOutsideAPlausibleRange() {
+        let now = Date(timeIntervalSince1970: 1_786_160_685)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 1e300], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 4_000_000_000_000 as Double], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "9999-12-31T23:59:59Z"], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 12 as Double], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 1_786_160_000 as Double], now: now) != nil)
+    }
+
+    /// The same file on a watched host, with the wire log's mtime pushed out
+    /// too: nothing dates the session, so there is no row to anchor a timer.
+    @Test func aSessionDatedOnlyInTheFarFutureIsNotDiscovered() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionDir = root.appendingPathComponent("session_far")
+        let wire = sessionDir.appendingPathComponent("agents/main/wire.jsonl")
+        try FileManager.default.createDirectory(
+            at: wire.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "{\"sessionId\":\"session_far\",\"sessionDir\":\"\(sessionDir.path)\",\"workDir\":\"/tmp/far\"}\n"
+            .write(to: root.appendingPathComponent("session_index.jsonl"), atomically: true, encoding: .utf8)
+        try "{\"workDir\":\"/tmp/far\",\"updatedAt\":1e300}"
+            .write(to: sessionDir.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
+        try "{\"type\":\"metadata\"}\n".write(to: wire, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 32_503_680_000)], ofItemAtPath: wire.path)
+        #expect(KimiMonitor.discover(root: root, now: .now).isEmpty)
+    }
 }
 
 /// Grok gives every subagent its own session directory beside its parent's,
@@ -1200,6 +1235,19 @@ struct AntigravityLiveSessionTests {
             {"display":"ok","timestamp":1786223614380,"workspace":"/a","conversationId":"c1"}
             """
         #expect(AntigravityReader.history(atPath: "", tail: text).count == 1)
+    }
+
+    /// The workspace is still worth having; the time is not, and a live
+    /// session with no transcript step would otherwise be dated by it.
+    @Test func anImplausibleHistoryTimestampIsNoTime() {
+        let text = """
+            {"display":"far","timestamp":1e300,"workspace":"/a","conversationId":"c1"}
+            {"display":"ok","timestamp":1786223614380,"workspace":"/b","conversationId":"c2"}
+            """
+        let entries = AntigravityReader.history(atPath: "", tail: text)
+        #expect(entries["c1"]?.workspace == "/a")
+        #expect(entries["c1"]?.sentAt == nil)
+        #expect(entries["c2"]?.sentAt == Date(timeIntervalSince1970: 1_786_223_614.380))
     }
 }
 
@@ -1642,8 +1690,8 @@ struct SQLiteWALFallbackTests {
             return true
         }
         let result = direct
-            ? SQLiteSnapshot.readDirect(dbPath: path, probe)
-            : SQLiteSnapshot.read(dbPath: path, probe)
+            ? SQLiteSnapshot.readDirect(dbPath: path, tables: [table], probe)
+            : SQLiteSnapshot.read(dbPath: path, tables: [table], probe)
         return result ?? false
     }
 
@@ -1713,6 +1761,122 @@ struct SQLiteWALFallbackTests {
     @Test func aMissingDatabaseIsEmptyRatherThanACrash() {
         #expect(AntigravityReader.rows(dbPath: "/nope/missing.db").isEmpty)
         #expect(OpenCodeReader.sessions(dbPath: "/nope/missing.db").isEmpty)
+    }
+}
+
+/// A remote host's databases are mirrored as the host shipped them, so the
+/// bytes can be any account's. Each case is a few kilobytes of schema that,
+/// read as if the tool wrote it, would spin or allocate without bound.
+@MainActor
+struct SQLiteUntrustedFileTests {
+    private func makeDatabase(_ sql: String) throws -> String {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("state.db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+        return path
+    }
+
+    /// Rows forever, from a view named like the table.
+    private let endless = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT"
+
+    @Test func aViewStandingInForAQueriedTableIsUnreadable() throws {
+        let summaries = try makeDatabase("""
+            CREATE VIEW conversation_summaries AS \(endless)
+              'c' || i, '', '', '[]', '', 0, 0, '', '2026-08-08 15:00:00' FROM n;
+            """)
+        let started = ContinuousClock.now
+        #expect(AntigravityReader.rows(dbPath: summaries).isEmpty)
+        let opencode = try makeDatabase("""
+            CREATE VIEW session AS \(endless)
+              's' || i AS id, '/tmp/p' AS directory, 1 AS time_created,
+              \(Int(Date.now.timeIntervalSince1970 * 1000)) AS time_updated, NULL AS parent_id FROM n;
+            """)
+        #expect(OpenCodeReader.sessions(dbPath: opencode).isEmpty)
+        #expect(ContinuousClock.now - started < .seconds(2), "refused by schema, not by the clock")
+    }
+
+    @Test func aComputedColumnInAQueriedTableIsUnreadable() throws {
+        let path = try makeDatabase("""
+            CREATE TABLE steps(idx INTEGER, status INTEGER,
+              metadata BLOB GENERATED ALWAYS AS (zeroblob(15000000)) VIRTUAL);
+            INSERT INTO steps(idx, status) VALUES (1, 9), (2, 9), (3, 9);
+            """)
+        #expect(AntigravityConversation.pending(dbPath: path) == nil)
+    }
+
+    @Test func aStatementPastTheTimeBudgetIsUnreadable() throws {
+        let path = try makeDatabase("CREATE TABLE t(x);")
+        let started = ContinuousClock.now
+        let result: Int? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) count(*) FROM n", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            _ = sqlite3_step(statement)
+            return 1
+        }
+        #expect(result == nil)
+        #expect(ContinuousClock.now - started < .seconds(Int(SQLiteSnapshot.timeBudget) + 3))
+    }
+
+    /// The row and byte caps leave a reader a shorter answer. A value past
+    /// maxValueBytes cannot be produced at all.
+    @Test func aStatementStopsAtItsRowAndByteCaps() throws {
+        let path = try makeDatabase("CREATE TABLE t(x);")
+        let counted: SQLiteSnapshot.Cursor? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) i FROM n LIMIT \(SQLiteSnapshot.maxRows * 2)", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            var cursor = SQLiteSnapshot.Cursor()
+            while SQLiteSnapshot.nextRow(statement, &cursor) {}
+            return cursor
+        }
+        #expect(counted?.rows == SQLiteSnapshot.maxRows)
+
+        let bytes: SQLiteSnapshot.Cursor? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) zeroblob(15000000) FROM n LIMIT 10", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            var cursor = SQLiteSnapshot.Cursor()
+            while SQLiteSnapshot.nextRow(statement, &cursor) {}
+            return cursor
+        }
+        #expect(bytes.map { $0.rows < 10 && $0.bytes <= SQLiteSnapshot.maxResultBytes + 15_000_000 } == true)
+
+        let tooBig: Bool? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "SELECT zeroblob(\(Int(SQLiteSnapshot.maxValueBytes) + 1))", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            return sqlite3_step(statement) == SQLITE_ROW
+        }
+        #expect(tooBig == false)
+    }
+
+    /// The honest shapes still read: ordinary tables, stored generated
+    /// columns included, and an absent optional table.
+    @Test func ordinaryTablesStillRead() throws {
+        let millis = Int(Date.now.timeIntervalSince1970 * 1000)
+        let path = try makeDatabase("""
+            CREATE TABLE session(id TEXT, directory TEXT, title TEXT, parent_id TEXT,
+              time_created INTEGER, time_updated INTEGER,
+              stamp INTEGER GENERATED ALWAYS AS (time_updated / 1000) STORED);
+            CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER);
+            CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+            INSERT INTO session(id, directory, title, parent_id, time_created, time_updated)
+              VALUES ('s1', '/tmp/proj', 'T', NULL, \(millis), \(millis));
+            """)
+        #expect(OpenCodeReader.sessions(dbPath: path).count == 1)
     }
 }
 

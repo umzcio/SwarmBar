@@ -4,11 +4,13 @@ import Synchronization
 enum RemoteMirrorError: Error, CustomStringConvertible {
     case cannotCreate(String)
     case outsideMirror(String)
+    case overBudget(String)
 
     var description: String {
         switch self {
         case .cannotCreate(let path): "cannot create mirror file \(path)"
         case .outsideMirror(let path): "refused a path outside the mirror: \(path)"
+        case .overBudget(let detail): "refused a snapshot: \(detail)"
         }
     }
 }
@@ -45,9 +47,17 @@ struct RemoteMirror: Sendable {
     /// written. Far past any honest transcript, which the mirror holds
     /// sparse anyway.
     static let maxFileBytes = 4 * 1024 * 1024 * 1024
+    /// The most one record's chunks may carry, summed: the helper's own
+    /// ceiling on a whole file (WHOLE_MAX_BYTES), which is also more than a
+    /// head and a 4 MB tail together. A record carrying more is from no
+    /// helper SwarmBar ships, and is an omission like an oversized one.
+    static let maxRecordBytes = 16 * 1024 * 1024
 
-    init(root: URL) {
+    let budget: Budget
+
+    init(root: URL, budget: Budget = .standard) {
         self.root = root.standardizedFileURL
+        self.budget = budget
     }
 
     /// Where a host's mirror lives. Only computed here, never created: the
@@ -208,10 +218,23 @@ struct RemoteMirror: Sendable {
             guard let url = local(path), url.path != root.path else { return nil }
             return url
         }
+        // Every record must lie in one of the homes this snapshot lists.
+        // The helper only ever ships from those, and the sweep below keeps
+        // only what this snapshot accounts for, so a path anywhere else
+        // would be written once and then outlive every later snapshot.
+        let homes = snapshot.homes.compactMap { mapped($0.path) }.map { Array($0.path.utf8) }
+        func inHome(_ url: URL) -> Bool {
+            let bytes = Array(url.path.utf8)
+            return homes.contains { bytes == $0 || Self.isBeneath(bytes, $0) }
+        }
         var warnings: [String] = []
         var oversized: [String] = []
         let files = snapshot.files.compactMap { record -> (RemoteFileRecord, URL)? in
             guard let url = mapped(record.path) else { return nil }
+            guard inHome(url) else {
+                warnings.append("skipped \(record.path): not in any home the snapshot lists")
+                return nil
+            }
             if let reason = Self.oversizeReason(record) {
                 // An omission: the mirror keeps whatever it held for this
                 // path, and no file of the named size is ever made.
@@ -221,30 +244,35 @@ struct RemoteMirror: Sendable {
             }
             return (record, url)
         }
-        let dirs = snapshot.dirs.compactMap { record in mapped(record.path).map { (record, $0) } }
-        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path)?.path } + oversized)
+        let dirs = snapshot.dirs.compactMap { record in
+            mapped(record.path).flatMap { inHome($0) ? (record, $0) : nil }
+        }
+        let omitted = Set(snapshot.omitted.compactMap { mapped($0.path) }.filter(inHome).map(\.path)
+            + oversized)
+        let filePaths = Set(files.map(\.1.path))
 
         var keep = Set<String>()
-        for path in files.map(\.1.path) + dirs.map(\.1.path) + omitted {
+        for path in files.map(\.1.path) + dirs.map(\.1.path) + omitted
+            + snapshot.homes.compactMap({ mapped($0.path)?.path }) {
             keep.insert(path)
             for ancestor in ancestors(of: path) { keep.insert(ancestor) }
         }
 
-        // Sweep first. It also removes any symlink beneath a home, so the
-        // writes below never pass through one.
-        for home in snapshot.homes {
-            // A home the helper could not list yielded no files, which is
-            // "could not look" and not "nothing there".
-            guard let local = mapped(home.path), !omitted.contains(local.path),
-                  try clearLinks(to: local.path, including: false)
-            else { continue }
-            var info = stat()
-            guard lstat(local.path, &info) == 0 else { continue }
-            if info.st_mode & S_IFMT == S_IFDIR {
-                try sweep(local.path, keep: keep, omitted: omitted)
-            } else {
-                try fm.removeItem(atPath: local.path)
-            }
+        // Sweep first, from the root, so whatever this snapshot does not
+        // account for goes wherever it sits, a home no longer listed
+        // included. It also removes every symlink, so the writes below
+        // never pass through one. A home the helper could not list is
+        // omitted, which keeps it whole: "could not look" is not "nothing
+        // there".
+        try sweep(root.path, keep: keep, omitted: omitted, files: filePaths)
+
+        // The budget is checked against what is left after the sweep, and
+        // before anything is written, so an accepted snapshot never takes
+        // the mirror past it.
+        let before = usage()
+        let cost = Self.estimatedCost(files: files.map(\.0), dirs: dirs.count)
+        if let reason = budget.refusal(bytes: before.bytes + cost.bytes, entries: before.entries + cost.entries) {
+            throw RemoteMirrorError.overBudget(reason)
         }
 
         for (_, url) in dirs {
@@ -256,15 +284,87 @@ struct RemoteMirror: Sendable {
         // Last, because creating and removing entries above moves a
         // directory's mtime.
         for (record, url) in dirs {
-            var attributes: [FileAttributeKey: Any] = [
-                .modificationDate: Date(timeIntervalSince1970: record.mtime)
-            ]
-            if let created = record.created {
-                attributes[.creationDate] = Date(timeIntervalSince1970: created)
+            let attributes = Self.times(
+                modified: PlausibleDate.epoch(record.mtime),
+                created: record.created.flatMap { PlausibleDate.epoch($0) })
+            if !attributes.isEmpty {
+                try fm.setAttributes(attributes, ofItemAtPath: url.path)
             }
-            try fm.setAttributes(attributes, ofItemAtPath: url.path)
+        }
+        // Checked again on what landed. The estimate assumes holes are
+        // punched, and on a volume that refuses F_PUNCHHOLE a gap stays
+        // allocated, so only the real figure can say the mirror is inside
+        // the budget.
+        let after = usage()
+        if let reason = budget.refusal(bytes: after.bytes, entries: after.entries) {
+            throw RemoteMirrorError.overBudget(reason)
         }
         return warnings
+    }
+
+    /// Ceilings on one host's whole mirror, across every snapshot on a
+    /// stream. Each snapshot is already bounded on its own, but the mirror
+    /// keeps what it was sent until a later snapshot stops listing it, and
+    /// an omitted path keeps its whole subtree, so without a total a host
+    /// could add a little every poll and fill this Mac's disk. A snapshot
+    /// that would pass either ceiling is refused, which resets the stream.
+    struct Budget: Sendable {
+        /// Allocated bytes, not logical size: a sparse mirror file of any
+        /// length costs only the blocks written.
+        let allocatedBytes: Int
+        /// Files and directories.
+        let entries: Int
+
+        /// An honest host's mirror is its live sessions' tails (each
+        /// trimmed past 8 MB) plus whole databases and indexes of at most
+        /// 16 MB, a few hundred megabytes at the very most.
+        static let standard = Budget(allocatedBytes: 2 * 1024 * 1024 * 1024, entries: 100_000)
+
+        func refusal(bytes: Int, entries: Int) -> String? {
+            if bytes > allocatedBytes {
+                return "\(bytes) bytes is over the mirror's \(allocatedBytes) byte budget"
+            }
+            if entries > self.entries {
+                return "\(entries) entries is over the mirror's \(self.entries) entry budget"
+            }
+            return nil
+        }
+    }
+
+    /// The most a snapshot's writes can add, assuming every gap is punched:
+    /// each chunk can straddle one more block than its length fills, and
+    /// each file and directory is an entry with a block of its own. An
+    /// over-estimate, since a chunk often lands on blocks the file already
+    /// has, which only matters near the budget.
+    static func estimatedCost(files: [RemoteFileRecord], dirs: Int) -> (bytes: Int, entries: Int) {
+        let block = 4096
+        var bytes = dirs * block
+        for record in files {
+            bytes += block
+            for chunk in record.chunks {
+                bytes += (chunk.data.count / block + 2) * block
+            }
+        }
+        return (bytes, files.count + dirs)
+    }
+
+    /// What the mirror holds now: allocated bytes and entries, read with
+    /// lstat so nothing outside it is ever counted.
+    func usage() -> (bytes: Int, entries: Int) {
+        var bytes = 0, entries = 0
+        func walk(_ directory: String) {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+            for name in names {
+                let path = directory + "/" + name
+                var info = stat()
+                guard lstat(path, &info) == 0 else { continue }
+                entries += 1
+                bytes += Int(info.st_blocks) * 512
+                if info.st_mode & S_IFMT == S_IFDIR { walk(path) }
+            }
+        }
+        walk(root.path)
+        return (bytes, entries)
     }
 
     /// Every directory between `path` and `root`, both excluded. Cut at
@@ -288,9 +388,13 @@ struct RemoteMirror: Sendable {
     /// files and directories, so a link is foreign and is removed as an
     /// entry, leaving its target alone. An omitted path keeps its whole
     /// subtree, because the helper could not look there this time and that
-    /// is not the same as there being nothing to see.
-    private func sweep(_ directory: String, keep: Set<String>, omitted: Set<String>) throws {
-        guard Self.isBeneath(Array(directory.utf8), Array(root.path.utf8)) else {
+    /// is not the same as there being nothing to see. A kept path that is
+    /// neither a directory nor a file this snapshot ships or omits is a file
+    /// standing where a directory belongs, and goes too.
+    private func sweep(
+        _ directory: String, keep: Set<String>, omitted: Set<String>, files: Set<String>
+    ) throws {
+        guard directory == root.path || Self.isBeneath(Array(directory.utf8), Array(root.path.utf8)) else {
             throw RemoteMirrorError.outsideMirror(directory)
         }
         let fm = FileManager.default
@@ -300,7 +404,7 @@ struct RemoteMirror: Sendable {
         } catch {
             // Logged, not thrown: what cannot be listed cannot be swept, and
             // the writes that follow are still right.
-            NSLog("SwarmBar: cannot list mirror directory \(directory): \(error)")
+            SwarmLog.log("SwarmBar: cannot list mirror directory \(directory): \(error)")
             return
         }
         for name in names {
@@ -310,8 +414,12 @@ struct RemoteMirror: Sendable {
             let type = info.st_mode & S_IFMT
             if type == S_IFLNK || !keep.contains(path) {
                 try fm.removeItem(atPath: path)
-            } else if type == S_IFDIR && !omitted.contains(path) {
-                try sweep(path, keep: keep, omitted: omitted)
+            } else if type == S_IFDIR {
+                if !omitted.contains(path) {
+                    try sweep(path, keep: keep, omitted: omitted, files: files)
+                }
+            } else if !files.contains(path) && !omitted.contains(path) {
+                try fm.removeItem(atPath: path)
             }
         }
     }
@@ -422,22 +530,40 @@ struct RemoteMirror: Sendable {
         }
 
         // After the writes, which bump mtime.
-        var attributes: [FileAttributeKey: Any] = [
-            .modificationDate: Date(timeIntervalSince1970: record.mtime)
-        ]
-        if let created = record.created.map({ Date(timeIntervalSince1970: $0) }) ?? Self.headTimestamp(record) {
-            attributes[.creationDate] = created
+        let attributes = Self.times(
+            modified: PlausibleDate.epoch(record.mtime),
+            created: record.created.flatMap { PlausibleDate.epoch($0) }
+                ?? PlausibleDate.check(Self.headTimestamp(record)))
+        if !attributes.isEmpty {
+            try fm.setAttributes(attributes, ofItemAtPath: url.path)
         }
-        try fm.setAttributes(attributes, ofItemAtPath: url.path)
         return warnings
+    }
+
+    /// The times to stamp on a mirror entry. The readers date sessions by
+    /// them, and the host names them, so each has already been held to
+    /// PlausibleDate's range: one outside it is left off, and the entry
+    /// keeps the time it was written here rather than a far-future date
+    /// that no discovery window would ever age out.
+    private static func times(modified: Date?, created: Date?) -> [FileAttributeKey: Any] {
+        var attributes: [FileAttributeKey: Any] = [:]
+        if let modified { attributes[.modificationDate] = modified }
+        if let created { attributes[.creationDate] = created }
+        return attributes
     }
 
     /// Why a record would make a mirror file past `maxFileBytes`, or nil
     /// when it would not. A chunk ending past the limit is skipped in
     /// `write` instead, like one whose end overflows.
     private static func oversizeReason(_ record: RemoteFileRecord) -> String? {
-        guard record.size > maxFileBytes else { return nil }
-        return "\(record.size) bytes is over the mirror's \(maxFileBytes) byte limit"
+        if record.size > maxFileBytes {
+            return "\(record.size) bytes is over the mirror's \(maxFileBytes) byte limit"
+        }
+        let carried = record.chunks.reduce(0) { $0 + $1.data.count }
+        if carried > maxRecordBytes {
+            return "its chunks carry \(carried) bytes, over the \(maxRecordBytes) byte limit for one record"
+        }
+        return nil
     }
 
     /// True when one chunk carries the whole file. That is the helper's
@@ -501,7 +627,7 @@ struct RemoteMirror: Sendable {
         if fcntl(handle.fileDescriptor, F_PUNCHHOLE, &hole) != 0 {
             let reason = String(cString: strerror(errno))
             if punchFailureLogged.claim() {
-                NSLog("SwarmBar: mirror at \(root.path) cannot punch holes (\(reason)); files stay dense")
+                SwarmLog.log("SwarmBar: mirror at \(root.path) cannot punch holes (\(reason)); files stay dense")
             }
         }
     }

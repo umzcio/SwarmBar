@@ -621,6 +621,70 @@ struct RemoteHookRelayTests {
         #expect(replier.replies.isEmpty)
     }
 
+    /// The mirror read happens in `attribute`, which is nonisolated: called
+    /// here from a detached task, it never needs the main actor.
+    @Test func attributionIsReadFromTheMirrorOffTheMainActor() async throws {
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let grok = try #require(mirror.local(home + "/.grok"))
+        try FileManager.default.createDirectory(at: grok, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [["session_id": raw]])
+            .write(to: grok.appendingPathComponent("active_sessions.json"))
+        let event = try hookLine(
+            rid: "a1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["claude"], held: true)
+        let attribution = await Task.detached {
+            await RemoteHookRelay.attribute(event, mirror: mirror)
+        }.value
+        #expect(attribution == RemoteHookOrigin.Attribution(rawSessionID: raw, tool: .grokBuild))
+        let resolved = HelperEvent(name: "hook_resolved", payload: Data(#"{"rid":"a1"}"#.utf8))
+        #expect(await RemoteHookRelay.attribute(resolved, mirror: mirror) == nil)
+    }
+
+    /// What was read ahead is what the row gets: the main actor does not
+    /// read the mirror a second time, so an empty mirror here changes
+    /// nothing.
+    @Test func aReadAheadAttributionIsUsedAsIs() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror,
+            events: AsyncStream { $0.finish() }, replier: FakeReplier(),
+            hookServer: server, approvalsOff: { [] })
+        relay.handle(
+            try hookLine(
+                rid: "a2", path: "/hook/PermissionRequest", body: permissionBody(raw),
+                peer: ["claude"], held: false),
+            attribution: .init(rawSessionID: raw, tool: .grokBuild))
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+    }
+
+    /// Through the run loop, end to end: a Grok session named in the
+    /// mirror is still never held.
+    @Test func theRunLoopAttributesBeforeHandling() async throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let grok = try #require(mirror.local(home + "/.grok"))
+        try FileManager.default.createDirectory(at: grok, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [["session_id": raw]])
+            .write(to: grok.appendingPathComponent("active_sessions.json"))
+        let replier = FakeReplier()
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: replier, hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+        sink.yield(try hookLine(
+            rid: "a3", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["curl", "bash", "claude"], held: true))
+        await settle { !replier.replies.isEmpty }
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+        #expect(!server.isHolding(sessionID: rowID(raw)))
+    }
+
     @Test func aReplyThatFailsSaysSoOnTheRow() async throws {
         let (store, server) = rig()
         let mirror = try makeMirror()

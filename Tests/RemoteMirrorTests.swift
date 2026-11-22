@@ -378,6 +378,24 @@ struct RemoteMirrorTests {
         #expect(abs(created.timeIntervalSince1970 - 1_700_000_000.5) < 0.001)
     }
 
+    /// The readers date sessions by these, and a far-future one would never
+    /// age out of any window. Left alone, the file keeps the time it was
+    /// written here.
+    @Test("an implausible mtime or creation time from the manifest is not applied")
+    func implausibleTimesAreNotApplied() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.kimi-code/sessions/wd/s/agents/main/wire.jsonl"
+        try mirror.apply(snapshot(files: [
+            file(path, size: 2, mtime: 1e300, created: 32_503_680_000, chunks: [(0, "{}")])
+        ]))
+        let attributes = try FileManager.default.attributesOfItem(atPath: try #require(mirror.local(path)).path)
+        let modified = try #require(attributes[.modificationDate] as? Date)
+        let created = try #require(attributes[.creationDate] as? Date)
+        #expect(abs(modified.timeIntervalSinceNow) < 60)
+        #expect(abs(created.timeIntervalSinceNow) < 60)
+    }
+
     @Test("with no creation time, the first record's timestamp stands in")
     func creationFallsBackToFirstRecordTimestamp() throws {
         let mirror = makeMirror()
@@ -633,5 +651,104 @@ struct RemoteMirrorTests {
             path: path, size: whole.count, mtime: 1_792_000_000, created: nil, reset: true,
             chunks: [RemoteChunk(offset: 0, data: whole)])]))
         #expect(try bytes(try #require(mirror.local(path))) == whole)
+    }
+
+    // MARK: What a host may make the mirror hold
+
+    @Test("a record outside every listed home is refused and never written")
+    func recordOutsideHomesIsRefused() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let outside = "/srv/fill/a.bin"
+        let warnings = try mirror.apply(snapshot(
+            files: [file(outside, size: 2, chunks: [(0, "{}")])],
+            dirs: [RemoteDirRecord(path: "/srv/fill/d", mtime: 1_792_000_000, created: nil)],
+            omitted: [RemoteOmission(path: "/srv/keepme", reason: "synthetic")]))
+        #expect(!exists(try #require(mirror.local("/srv"))))
+        #expect(warnings.contains { $0.contains(outside) })
+    }
+
+    /// A home dropped from the list, or a path an older build let in, is
+    /// swept like anything else the snapshot no longer accounts for.
+    @Test("a file outside every home the next snapshot lists is gone after it")
+    func fileOutsideListedHomesIsSwept() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let elsewhere = "/home/v/.claude/projects/-home-v-a/t.jsonl"
+        try mirror.apply(snapshot(
+            homes: ["/home/u", "/home/v"], files: [file(elsewhere, size: 2, chunks: [(0, "{}")])]))
+        #expect(exists(try #require(mirror.local(elsewhere))))
+        // A stray at the root, as a hostile host's earlier writes would be.
+        try Data("x".utf8).write(to: mirror.root.appendingPathComponent("stray"))
+        try mirror.apply(snapshot(homes: ["/home/u"], files: []))
+        #expect(!exists(try #require(mirror.local("/home/v"))))
+        #expect(!exists(mirror.root.appendingPathComponent("stray")))
+        #expect(exists(mirror.root))
+    }
+
+    /// An omission keeps its subtree, so a host could otherwise keep adding
+    /// files beneath one it omits every time.
+    @Test("an omission outside every home keeps nothing")
+    func omissionOutsideHomesKeepsNothing() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let old = "/home/v/x/old.bin"
+        try mirror.apply(snapshot(homes: ["/home/u", "/home/v"], files: [file(old, size: 2, chunks: [(0, "{}")])]))
+        try mirror.apply(snapshot(
+            homes: ["/home/u"], files: [], omitted: [RemoteOmission(path: "/home/v/x", reason: "synthetic")]))
+        #expect(!exists(try #require(mirror.local(old))))
+    }
+
+    @Test("a record carrying more than the helper ever ships in one is an omission")
+    func recordOverTheHelperCeilingIsOmitted() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.local/share/opencode/opencode.db"
+        let big = Data(count: RemoteMirror.maxRecordBytes + 1)
+        let warnings = try mirror.apply(snapshot(files: [RemoteFileRecord(
+            path: path, size: big.count, mtime: 1_792_000_000, created: nil, reset: true,
+            chunks: [RemoteChunk(offset: 0, data: big)])]))
+        #expect(!exists(try #require(mirror.local(path))))
+        #expect(warnings.contains { $0.contains(path) })
+    }
+
+    /// A host keeps one stream and adds a little more every poll, beneath
+    /// an omission it repeats so the sweep keeps the old files. Each
+    /// snapshot on its own is small; the total is what is bounded.
+    @Test("no run of snapshots on one stream takes the mirror past its budget")
+    func cumulativeBudgetHolds() throws {
+        let budget = RemoteMirror.Budget(allocatedBytes: 256 * 1024, entries: 1000)
+        let mirror = RemoteMirror(
+            root: FileManager.default.temporaryDirectory.appendingPathComponent("mirror-\(UUID().uuidString)"),
+            budget: budget)
+        defer { try? mirror.reset() }
+        let omission = RemoteOmission(path: "/home/u/fill", reason: "synthetic")
+        var refused = false
+        for poll in 0..<64 {
+            // Many tiny chunks, each costing at least a block on disk.
+            let chunks = (0..<4).map { ($0 * 8192, "x") }
+            let record = file("/home/u/fill/\(poll).bin", size: 4 * 8192, chunks: chunks)
+            do {
+                try mirror.apply(snapshot(files: [record], omitted: [omission]))
+            } catch RemoteMirrorError.overBudget {
+                refused = true
+                break
+            }
+            #expect(mirror.usage().bytes <= budget.allocatedBytes)
+        }
+        #expect(refused, "the mirror kept accepting past its budget")
+        #expect(mirror.usage().bytes <= budget.allocatedBytes)
+    }
+
+    @Test("a snapshot naming more entries than the budget allows is refused")
+    func entryBudgetHolds() throws {
+        let budget = RemoteMirror.Budget(allocatedBytes: 1024 * 1024 * 1024, entries: 20)
+        let mirror = RemoteMirror(
+            root: FileManager.default.temporaryDirectory.appendingPathComponent("mirror-\(UUID().uuidString)"),
+            budget: budget)
+        defer { try? mirror.reset() }
+        let dirs = (0..<40).map { RemoteDirRecord(path: "/home/u/d\($0)", mtime: 1_792_000_000, created: nil) }
+        #expect(throws: RemoteMirrorError.self) { try mirror.apply(snapshot(files: [], dirs: dirs)) }
+        #expect(mirror.usage().entries <= budget.entries)
     }
 }
