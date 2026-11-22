@@ -129,6 +129,35 @@ struct RemoteSnapshotTests {
         #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
     }
 
+    /// A process id is a pid_t on both ends. Anything else is not a
+    /// process, and handed on it would trap the first narrowing to pid_t.
+    @Test("a process whose pid or ppid cannot be a pid_t fails the decode",
+          arguments: [
+              (4_294_967_297, 1), (2_147_483_648, 1), (0, 1), (-5, 1),
+              (4101, 4_294_967_297), (4101, -1),
+          ])
+    func outOfRangePidThrows(pid: Int, ppid: Int) {
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+         "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],"processes_failed":false,
+         "processes":[{"pid":\(pid),"ppid":\(ppid),"user":"u","comm":"kimi-code","args":"kimi-code",
+                       "cwd":"/home/u/p","tty":"pts/1","open":[]}]}
+        """
+        #expect(throws: (any Error).self) { try RemoteSnapshot.decode(Data(json.utf8)) }
+    }
+
+    @Test("the largest pid and a zero ppid decode")
+    func boundaryPidsDecode() throws {
+        let json = """
+        {"ok":true,"protocol":3,"stream":"s","hostname":"h","system":"Linux","now":0,
+         "homes":[],"files":[],"dirs":[],"omitted":[],"warnings":[],"processes_failed":false,
+         "processes":[{"pid":2147483647,"ppid":0,"user":"u","comm":"kimi-code","args":"kimi-code",
+                       "cwd":"/home/u/p","tty":"pts/1","open":[]}]}
+        """
+        let snapshot = try RemoteSnapshot.decode(Data(json.utf8))
+        #expect(snapshot.processes.first?.pid == 2_147_483_647)
+    }
+
     @Test("a chunk with a negative offset fails the decode")
     func negativeOffsetThrows() {
         let json = """

@@ -24,4 +24,18 @@ struct ElapsedFormatTests {
     @Test func negativeClampsToZero() {
         #expect(ElapsedTimeText.format(-5) == "0s")
     }
+
+    /// Int(_:) traps on a Double past Int's range, and a session date read
+    /// from a file can be anything, so neither format may convert first and
+    /// clamp afterwards.
+    @Test func outOfRangeIntervalsNeverTrap() {
+        for elapsed in [1e300, -1e300, .infinity, -.infinity, .nan, 9.3e18] {
+            _ = ElapsedTimeText.format(elapsed)
+            _ = ElapsedTimeText.agoFormat(elapsed)
+        }
+        #expect(ElapsedTimeText.format(-1e300) == "0s")
+        #expect(ElapsedTimeText.format(.nan) == "0s")
+        #expect(ElapsedTimeText.agoFormat(-.infinity) == "just now")
+        #expect(ElapsedTimeText.format(1e300) == ElapsedTimeText.format(ElapsedTimeText.longestShown))
+    }
 }

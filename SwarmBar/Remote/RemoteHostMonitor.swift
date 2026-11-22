@@ -102,12 +102,28 @@ struct RemoteHostMonitor: SessionMonitor {
                 delay = await poll(into: store, state: &state)
             }
             if Task.isCancelled { break }
-            try? await Task.sleep(for: delay)
+            await rest(for: delay)
         }
         // A snapshot the helper built for a poll that was then cancelled is
         // marked shipped on the far side and never reached the mirror. Ending
         // the process ends that stream with it.
         await connection.channel.shutdown()
+    }
+
+    /// The wait between polls, cut short when an answer wants state read
+    /// after its click (RemoteHostConnection.wantPoll). Only the ordinary
+    /// wait is: a backoff after a failure is kept whole, since the answer
+    /// cannot be sent to a host that is failing anyway.
+    private func rest(for delay: Duration) async {
+        guard delay == pollInterval else {
+            try? await Task.sleep(for: delay)
+            return
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now + delay
+        while !Task.isCancelled, clock.now < deadline, !connection.takePollWanted() {
+            try? await Task.sleep(for: min(.milliseconds(250), deadline - clock.now))
+        }
     }
 
     /// One poll. Returns how long to wait before the next one.
@@ -146,7 +162,7 @@ struct RemoteHostMonitor: SessionMonitor {
                 case .needsSetup(let message):
                     state.setupNeeded = message
                 case .failed(let message):
-                    NSLog("SwarmBar: \(name) keeps its old helper: \(message)")
+                    SwarmLog.log("SwarmBar: \(name) keeps its old helper: \(message)")
                 }
             }
             // Either way the helper answers, and an old helper that still
@@ -181,6 +197,10 @@ struct RemoteHostMonitor: SessionMonitor {
         if connection.noteHelperCurrent(!state.runningStale) { store.noteRemotePanesChanged() }
 
         let snapshot: RemoteSnapshot
+        // Numbered before the request goes, so an answer waiting on state
+        // read after its click knows this poll's files were read after any
+        // count it took earlier.
+        let pollNumber = connection.noteSnapshotRequested()
         do {
             snapshot = try await channel.snapshot()
         } catch {
@@ -207,7 +227,7 @@ struct RemoteHostMonitor: SessionMonitor {
             // fresh helper and an empty mirror recover from that, and this
             // is counted as a failure so a disk that keeps refusing backs off
             // rather than taking a full reship every poll.
-            NSLog("SwarmBar: \(name) mirror write failed: \(error)")
+            SwarmLog.log("SwarmBar: \(name) mirror write failed: \(error)")
             state.stream = nil
             await channel.noteFailure("mirror: \(error)")
             if Task.isCancelled { return pollInterval }
@@ -226,12 +246,19 @@ struct RemoteHostMonitor: SessionMonitor {
         if Task.isCancelled { return pollInterval }
 
         if connection.noteApplied(snapshot) { store.noteRemotePanesChanged() }
+        // A full process table says which bound Kimi-family processes are
+        // gone, before the sync that lets a gone one's pinned prompt go.
+        if !snapshot.processesFailed {
+            RemoteProcessBinding.noteProcesses(hostID: hostID, snapshot.processes)
+        }
         // A tool this pass cannot vouch for keeps its previous rows. Its
         // sessions may only be missing because the evidence could not be
         // read, and syncing would turn "could not look" into "nothing there".
-        for tool in AgentTool.allCases where !result.unverifiedTools.contains(tool) {
+        let synced = AgentTool.allCases.filter { !result.unverifiedTools.contains($0) }
+        for tool in synced {
             store.sync(tool: tool, host: name, sessions: result.sessions[tool] ?? [])
         }
+        connection.noteSynced(pollNumber, tools: synced)
         store.noteRemoteReachability(host: name, state.setupNeeded.map { .needsSetup($0) } ?? .reachable)
 
         // The helper's own warnings (a backup-looking root skipped, a record
@@ -241,7 +268,7 @@ struct RemoteHostMonitor: SessionMonitor {
         // condition persists.
         let warnings = snapshot.warnings + mirrorWarnings + result.warnings
         if !warnings.isEmpty && warnings != state.lastWarnings {
-            NSLog("SwarmBar: \(name) reported warnings: \(warnings)")
+            SwarmLog.log("SwarmBar: \(name) reported warnings: \(warnings)")
         }
         state.lastWarnings = warnings
         return pollInterval

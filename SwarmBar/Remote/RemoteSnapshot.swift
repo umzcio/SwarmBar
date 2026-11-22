@@ -116,19 +116,38 @@ struct RemoteProcessRecord: Sendable, Equatable {
     /// an empty `open` means unknown rather than none.
     let openFailed: Bool
     let screen: String?
+    /// When the process started, as the helper's process_start token. Sent
+    /// only for the Kimi family, whose sessions are bound to a process by
+    /// pid and start time (RemoteProcessBinding). Nil from an older helper.
+    var started: String? = nil
 }
 
 extension RemoteProcessRecord: Decodable {
     enum CodingKeys: String, CodingKey {
-        case pid, ppid, user, comm, args, cwd, tty, pane, open, screen
+        case pid, ppid, user, comm, args, cwd, tty, pane, open, screen, started
         case openFailed = "open_failed"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let pid = try container.decode(Int.self, forKey: .pid)
+        let ppid = try container.decode(Int.self, forKey: .ppid)
+        // Rejected like a negative size: every process id is a pid_t on the
+        // host, so a number outside one is no process at all, and a pid
+        // handed on past here is narrowed to pid_t by the monitors. A ppid
+        // of 0 is real (a process the kernel itself started); a pid of 0 or
+        // less never names one process.
+        guard pid > 0, pid <= Int(pid_t.max) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .pid, in: container, debugDescription: "pid \(pid) is not a process id")
+        }
+        guard ppid >= 0, ppid <= Int(pid_t.max) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .ppid, in: container, debugDescription: "ppid \(ppid) is not a process id")
+        }
         self.init(
-            pid: try container.decode(Int.self, forKey: .pid),
-            ppid: try container.decode(Int.self, forKey: .ppid),
+            pid: pid,
+            ppid: ppid,
             user: try container.decode(String.self, forKey: .user),
             comm: try container.decode(String.self, forKey: .comm),
             args: try container.decode(String.self, forKey: .args),
@@ -138,7 +157,10 @@ extension RemoteProcessRecord: Decodable {
             open: try container.decode([String].self, forKey: .open),
             // The helper only sends the key when the read failed.
             openFailed: try container.decodeIfPresent(Bool.self, forKey: .openFailed) ?? false,
-            screen: try container.decodeIfPresent(String.self, forKey: .screen))
+            screen: try container.decodeIfPresent(String.self, forKey: .screen),
+            // Anything but a string is no start time, never a failed
+            // snapshot: it only decides whether keys may be aimed.
+            started: (try? container.decodeIfPresent(String.self, forKey: .started)) ?? nil)
     }
 }
 

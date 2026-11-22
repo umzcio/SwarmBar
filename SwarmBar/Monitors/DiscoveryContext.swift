@@ -38,6 +38,19 @@ extension ProcessFacts {
     nonisolated func isNamedAgent(_ pid: Int, names: Set<String>) -> Bool { false }
 }
 
+extension pid_t {
+    /// `value` as a process id, or nil when it cannot be one. Discovery's
+    /// pids come from tool state files and from a remote host's process
+    /// table, so any Int may arrive, and the plain `pid_t(_:)` traps on one
+    /// past 32 bits, which would take the whole app down on every poll. Zero
+    /// and negatives are refused too: kill() reads them as a process group
+    /// or every process, never as one pid.
+    nonisolated init?(processID value: Int) {
+        guard value > 0, let pid = pid_t(exactly: value) else { return nil }
+        self = pid
+    }
+}
+
 /// This Mac's process table. Each method calls the code discovery called
 /// before the protocol existed, unchanged, so a user with no remote hosts
 /// runs exactly the same pgrep and lsof invocations, with the same flags,
@@ -48,7 +61,8 @@ struct LocalProcessFacts: ProcessFacts {
     /// Signal 0 delivers nothing and only checks that the pid exists, which
     /// is how every liveness check here has always been made.
     nonisolated func isAlive(_ pid: Int) -> Bool {
-        kill(pid_t(pid), 0) == 0
+        guard let pid = pid_t(processID: pid) else { return false }
+        return kill(pid, 0) == 0
     }
 
     /// Name, owner and start time, not mere existence: see ProcessIdentity.

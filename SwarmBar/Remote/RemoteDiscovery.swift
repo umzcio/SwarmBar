@@ -100,7 +100,12 @@ enum RemoteDiscovery {
                 },
                 screen: { facts.screen(pid: $0) },
                 resolvesPids: true)
-            for (tool, sessions) in discoverAll(now: now, context: context) {
+            for (tool, all) in discoverAll(now: now, context: context) {
+                let sessions = capped(all)
+                if sessions.count < all.count {
+                    warnings.append("kept the newest \(sessions.count) of \(all.count) "
+                        + "\(tool.rawValue) sessions in \(home.path)")
+                }
                 // Rekeyed per home, because the same local id can sit in
                 // two homes and must still give two rows.
                 found[tool, default: []] += sessions.map {
@@ -117,6 +122,20 @@ enum RemoteDiscovery {
         return Result(
             sessions: found, warnings: warnings,
             processesFailed: snapshot.processesFailed, unverifiedTools: unverified)
+    }
+
+    /// The most rows one tool may contribute from one home. A home's state
+    /// directories are its user's to fill, and every row found goes into
+    /// the store and the popover, so without a ceiling a hostile account
+    /// decides how large both grow. Far past any honest discovery window.
+    nonisolated static let maxSessionsPerToolAndHome = 500
+
+    /// The newest `limit` sessions, by last activity.
+    nonisolated static func capped(
+        _ sessions: [AgentSession], limit: Int = maxSessionsPerToolAndHome
+    ) -> [AgentSession] {
+        guard sessions.count > limit else { return sessions }
+        return Array(sessions.sorted { $0.lastActivityAt > $1.lastActivityAt }.prefix(limit))
     }
 
     private nonisolated static func discoverAll(

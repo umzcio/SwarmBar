@@ -270,11 +270,45 @@ extension RemoteMonitorSupervisor: RemoteActing {
             }
         }
         let choose = allow ? TuiPromptLayout.approveOnceOption(in:) : TuiPromptLayout.rejectOption(in:)
-        guard let command = RemoteAnswerPlan.command(
+        guard var command = RemoteAnswerPlan.command(
             route: route, screen: screen, choose: choose, tool: session.tool)
         else {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
             return false
+        }
+        // Codex's hotkey and Antigravity's gate say nothing about which call
+        // they answer: `y` reads nothing, and agy's selector reads the same
+        // on every gate. The row can be a poll behind, and one snapshot can
+        // pair the database from before a call settled with a pane showing
+        // the next call's gate. So the keys wait for rows built from a
+        // snapshot taken after the click (and after the capture above),
+        // which must still show this very request, as the local path
+        // re-reads the rollout or the conversation database at press time.
+        if Self.needsStateAfterClick(session.tool) {
+            guard await freshState(target.connection, session.tool),
+                  store.sessions.contains(where: { $0.id == session.id })
+            else {
+                remoteAnswerLog.notice("answer: no state read after the click on \(host, privacy: .public), nothing sent")
+                return false
+            }
+        }
+        if session.tool == .grokBuild {
+            // Every Grok gate draws the same options with the cursor in the
+            // same place, so the screen cannot say which call it is for.
+            // The press is bound to the request the row showed, through
+            // Grok's own record of it (GrokAnswerCheck.remoteBinding).
+            let mirror = target.connection.mirror, hostID = target.connection.host.id
+            let homes = target.connection.lastSnapshot?.homes.map(\.path) ?? [], id = session.id
+            let binding = await Task.detached {
+                GrokAnswerCheck.remoteBinding(sessionID: id, hostID: hostID, homes: homes, mirror: mirror)
+            }.value
+            guard case .waitingApproval(let shown) = session.status, let binding,
+                  GrokAnswerCheck.mayAnswer(shown: shown, pending: binding.prompt)
+            else {
+                remoteAnswerLog.notice("answer: Grok on \(host, privacy: .public) is not asking what the row showed, nothing sent")
+                return false
+            }
+            command.events = binding.events
         }
         // The capture was a round trip. A snapshot that landed meanwhile
         // may show the request answered, or another in its place, and the
@@ -319,6 +353,30 @@ extension RemoteMonitorSupervisor: RemoteActing {
         }
     }
 
+    /// Tools whose keys are tied to no particular request, so a remote
+    /// answer needs the host's state read after the click.
+    nonisolated static func needsStateAfterClick(_ tool: AgentTool) -> Bool {
+        tool == .codex || tool == .antigravity
+    }
+
+    /// Asks the host's monitor for a poll now and waits until one that sent
+    /// its request after this call has synced the tool's rows. False when
+    /// none does in time (a failing, paused or disabled host), and then
+    /// nothing is pressed.
+    static func awaitFreshPoll(
+        _ connection: RemoteHostConnection, tool: AgentTool, timeout: Duration = .seconds(30)
+    ) async -> Bool {
+        let mark = connection.snapshotsRequested
+        connection.wantPoll()
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline, !Task.isCancelled {
+            if connection.syncedThrough(tool) > mark { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return false
+    }
+
     private typealias PaneTarget = (
         process: RemoteProcessRecord, pane: RemotePane, connection: RemoteHostConnection)
 
@@ -335,14 +393,34 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// check), and a snapshot has landed since the last gap. All are
     /// checked before any request, so a click on a dark host's row never
     /// starts ssh, and a pane map from before a gap never aims a key.
-    private func paneTarget(for session: AgentSession) -> PaneTarget? {
-        guard let hostName = session.host, let pid = session.pid, !sharesPid(session),
+    ///
+    /// A Kimi or BearCode row's pid is only the newest process in its
+    /// directory, which can be another session's, so an approval for one
+    /// (`forAnswer`) goes only to the process its own prompt came from
+    /// (RemoteProcessBinding), still running with the start time it had
+    /// then. Unbound, it gets no keys at all. A reply, which answers no
+    /// prompt, uses that process when there is one and otherwise the
+    /// directory's, as on this Mac (TerminalFocuser.tty(forSession:)).
+    private func paneTarget(for session: AgentSession, forAnswer: Bool = false) -> PaneTarget? {
+        guard let hostName = session.host,
               store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
               connection.helperIsCurrent,
-              let process = connection.lastSnapshot?.processes.first(where: { $0.pid == Int(pid) }),
-              let pane = process.pane
+              let processes = connection.lastSnapshot?.processes
         else { return nil }
+        let process: RemoteProcessRecord?
+        if RemoteProcessBinding.applies(to: session.tool),
+           RemoteProcessBinding.bound(session.id) != nil || forAnswer {
+            // Bound but gone or replaced is never a reason to fall back to
+            // the directory's process: that is how a dead row reached a
+            // live session's prompt.
+            process = RemoteProcessBinding.record(
+                for: session.id, hostID: connection.host.id, tool: session.tool, in: processes)
+        } else {
+            guard let pid = session.pid, !sharesPid(session) else { return nil }
+            process = processes.first { $0.pid == Int(pid) }
+        }
+        guard let process, let pane = process.pane else { return nil }
         return (process, pane, connection)
     }
 
@@ -362,7 +440,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// `paneTarget`, for an approval: also nil when approvals are off for
     /// this tool on this host, or its keystroke switch is off.
     private func keystrokeTarget(for session: AgentSession) -> PaneTarget? {
-        guard let target = paneTarget(for: session) else { return nil }
+        guard let target = paneTarget(for: session, forAnswer: true) else { return nil }
         let connection = target.connection
         // Read from the registry, not the connection's copy, so switching
         // approvals off in Settings applies at once without a restart.

@@ -41,6 +41,11 @@ private func scriptedHelper() throws -> HelperLaunch {
             continue
         if command == "emit":
             print(json.dumps({"event": "hook", "detail": "synthetic"}), flush=True)
+        if command == "eventflood":
+            for _ in range(request["count"]):
+                print(json.dumps({"event": "hook", "detail": "synthetic"}), flush=True)
+        if command == "bigevent":
+            print(json.dumps({"event": "hook", "pad": "x" * request["size"]}), flush=True)
         if command == "flood":
             print(json.dumps({"ok": True, "id": request["id"]}), flush=True)
             while True:
@@ -200,7 +205,11 @@ struct HelperChannelTests {
         let source = try String(contentsOf: script, encoding: .utf8)
         // By absolute path, never through env: under the narrow sudo rule
         // the caller's PATH can reach root, and would choose the python.
-        #expect(source.hasPrefix("#!/usr/bin/python3 -I\n"))
+        // The sh prologue picks it, so that on macOS root never runs the
+        // python /usr/bin/python3 would launch for the selected Xcode.
+        #expect(source.hasPrefix("#!/bin/sh\n\"\"\":\"\n"))
+        #expect(source.contains("\nexec /usr/bin/python3 -I \"$0\" \"$@\"\n\":\"\"\"\n"))
+        #expect(source.contains(#"exec "$f/Versions/Current/bin/python3" -I "$0" "$@""#))
         #expect(HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser).arguments.last
             == #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#)
     }
@@ -408,6 +417,67 @@ struct HelperChannelTests {
             return
         }
         await channel.shutdown()
+    }
+
+    /// Nothing reads `events` here, as when the relay is busy: past the
+    /// queue's ceiling the helper goes, rather than the Mac holding every
+    /// event it cares to push.
+    @Test("a helper pushing more events than the queue holds is torn down",
+          .enabled(if: pythonAvailable))
+    func eventFloodIsCutOff() async throws {
+        let limits = EventLimits(lineBytes: 64 * 1024, queuedEvents: 8, queuedBytes: 1024 * 1024)
+        let channel = SSHChannel(launch: try scriptedHelper(), eventLimits: limits)
+        await #expect {
+            _ = try await channel.request("eventflood", ["count": .int(500)], timeout: .seconds(10))
+        } throws: { error in
+            guard case SSHChannelError.closed = error else { return false }
+            return true
+        }
+        guard case .unreachable = await channel.reachability else {
+            Issue.record("a helper past the event ceiling must leave the host unreachable")
+            return
+        }
+        #expect(channel.eventBudget.held.events <= limits.queuedEvents)
+        #expect(await channel.currentBackoff == 2)
+        await channel.shutdown()
+    }
+
+    @Test("an event line over its ceiling tears the helper down before anything parses it",
+          .enabled(if: pythonAvailable))
+    func oversizedEventIsCutOff() async throws {
+        let limits = EventLimits(lineBytes: 64 * 1024, queuedEvents: 8, queuedBytes: 1024 * 1024)
+        let channel = SSHChannel(launch: try scriptedHelper(), eventLimits: limits)
+        await #expect {
+            _ = try await channel.request("bigevent", ["size": .int(128 * 1024)], timeout: .seconds(10))
+        } throws: { error in
+            guard case SSHChannelError.closed = error else { return false }
+            return true
+        }
+        #expect(channel.eventBudget.held == (0, 0))
+        await channel.shutdown()
+    }
+
+    /// The count follows each event's own life, so an event the reader has
+    /// handled and dropped frees its place without anyone releasing it.
+    @Test("the event budget counts each queued event until its last copy is gone")
+    func eventBudgetFollowsTheEvent() {
+        let budget = EventBudget(limits: EventLimits(lineBytes: 10, queuedEvents: 2, queuedBytes: 15))
+        #expect(!budget.admit(11))
+        #expect(budget.admit(10))
+        var first: HelperEvent? = HelperEvent(
+            name: "hook", payload: Data(count: 10), ticket: EventTicket(budget: budget, bytes: 10))
+        #expect(budget.held == (1, 10))
+        #expect(!budget.admit(6))
+        #expect(budget.admit(5))
+        let second = HelperEvent(
+            name: "hook", payload: Data(count: 5), ticket: EventTicket(budget: budget, bytes: 5))
+        withExtendedLifetime(second) {
+            #expect(!budget.admit(1))
+            first = nil
+            #expect(first == nil)
+            #expect(budget.held == (1, 5))
+            #expect(budget.admit(10))
+        }
     }
 
     @Test("the stdout budget admits up to its limit, frees what lines release, and latches once over")

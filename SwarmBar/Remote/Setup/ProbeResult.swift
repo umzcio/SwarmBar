@@ -84,6 +84,10 @@ struct ProbeResult: Decodable, Sendable, Equatable {
     var bridges: [String: [BridgeFile]]? = nil
     /// Keyed by home path.
     var claudeDirs: [String: [ClaudeDir]]? = nil
+    /// Keyed by home path: the home's realpath, which every reported file
+    /// path is spelled under. Darwin's /var/root is /private/var/root. Nil
+    /// from a helper that predates it.
+    var realHomes: [String: String]? = nil
     var helper: [HelperFile] = []
     /// The probing helper's own sha256 when it ran from an installed file,
     /// as it does under the narrow sudo rule; nil when it came from stdin.
@@ -99,6 +103,7 @@ struct ProbeResult: Decodable, Sendable, Equatable {
         case installedUnknown = "installed_unknown"
         case selfSHA256 = "self_sha256"
         case claudeDirs = "claude_dirs"
+        case realHomes = "real_homes"
     }
 
     /// The helper's tool names, as in its SPECS table and the probe's

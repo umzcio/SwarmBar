@@ -138,6 +138,44 @@ struct GrokBuildMonitor: SessionMonitor {
         return nil
     }
 
+    /// The request the session's pending permission prompt is about, read
+    /// now, or nil when the session is not at one.
+    nonisolated static func pendingPrompt(dir: URL) -> ApprovalPrompt? {
+        guard let pending = pendingPermission(dir: dir) else { return nil }
+        guard let updates = promptUpdates(at: dir.appendingPathComponent("updates.jsonl")) else {
+            return .unreadable(
+                "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal.")
+        }
+        return GrokUpdatesParser.pendingToolPrompt(
+            tail: updates.text, tool: pending.tool, callID: pending.callID,
+            fromStart: updates.fromStart)
+    }
+
+    /// updates.jsonl for finding a gated call: the whole file up to the
+    /// tail ceiling, else its last ceiling's worth, and whether the text
+    /// runs from the file's real start. The status tail's 64 KB is not
+    /// enough here: one large call record pushes everything before it out
+    /// of the window, and the call that is waiting can be among them.
+    ///
+    /// A remote mirror holds a file at its true size with zeros wherever
+    /// the helper shipped nothing, so reading from offset 0 there is not
+    /// reading from the start. JSON never holds a raw NUL, which is how a
+    /// hole is told from the file.
+    nonisolated static func promptUpdates(at file: URL) -> (text: String, fromStart: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        if size <= UInt64(ClaudeCodeMonitor.maxTailBytes) {
+            guard (try? handle.seek(toOffset: 0)) != nil,
+                  let data = try? handle.read(upToCount: Int(size)) ?? Data()
+            else { return nil }
+            return (String(decoding: data, as: UTF8.self), !data.contains(0))
+        }
+        guard let text = ClaudeCodeMonitor.tail(of: file, startingAt: ClaudeCodeMonitor.maxTailBytes)
+        else { return nil }
+        return (text, false)
+    }
+
     private nonisolated static func isDirectory(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
@@ -173,8 +211,14 @@ struct GrokBuildMonitor: SessionMonitor {
     /// read: ISO 8601 with a zone (a space for the T as well), or seconds
     /// or milliseconds since 1970. A time with no zone is not an instant,
     /// and reading it in the wrong zone would move the bound ProcessIdentity
-    /// holds a pid to by hours, so it stays unread.
+    /// holds a pid to by hours, so it stays unread. So does an instant
+    /// outside PlausibleDate's range: a far-future one would let any
+    /// process's start time pass that bound.
     nonisolated static func openedAt(_ entry: [String: Any]) -> Date? {
+        PlausibleDate.check(spelledOpenedAt(entry))
+    }
+
+    private nonisolated static func spelledOpenedAt(_ entry: [String: Any]) -> Date? {
         let value = entry["opened_at"]
         if let number = value as? NSNumber {
             guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
@@ -275,15 +319,11 @@ struct GrokBuildMonitor: SessionMonitor {
             // events.jsonl records permission prompts explicitly
             // (phase_changed to permission_prompt + permission_requested);
             // otherwise the update stream carries the working state.
-            let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
-            if let pending = pendingPermission(dir: dir) {
-                status = .waitingApproval(command: tail.map {
-                    GrokUpdatesParser.pendingToolPrompt(
-                        tail: $0, tool: pending.tool, callID: pending.callID)
-                } ?? .unreadable(
-                    "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal."))
+            if let prompt = pendingPrompt(dir: dir) {
+                status = .waitingApproval(command: prompt)
             } else {
-                status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
+                status = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
+                    .flatMap { GrokUpdatesParser.parse(tail: $0) }
                     ?? .working(activity: "Working…")
             }
         } else {
@@ -292,7 +332,7 @@ struct GrokBuildMonitor: SessionMonitor {
             status = .idle
         }
 
-        let id = infoId.flatMap { UUID(uuidString: $0) } ?? StableID.uuid(for: dir.lastPathComponent)
+        let id = rowID(infoID: infoId, dir: dir)
         let projectPath = cwd.map { URL(fileURLWithPath: $0) }
 
         return AgentSession(
@@ -303,9 +343,100 @@ struct GrokBuildMonitor: SessionMonitor {
             status: status,
             startedAt: createdAt,
             lastActivityAt: updatedAt,
-            pid: isActive ? infoId.flatMap { pids[$0] }.map { pid_t($0) } : nil,
+            pid: isActive ? infoId.flatMap { pids[$0] }.flatMap { pid_t(processID: $0) } : nil,
             processAlive: isActive
         )
     }
 
+    /// The row id of a session directory: the id its summary names, else
+    /// one derived from the directory's name.
+    nonisolated static func rowID(infoID: String?, dir: URL) -> UUID {
+        infoID.flatMap { UUID(uuidString: $0) } ?? StableID.uuid(for: dir.lastPathComponent)
+    }
+
+    /// The one session directory under `root` (a ~/.grok) whose row id,
+    /// passed through `rowID` (a remote row is rekeyed per host and home),
+    /// is `id`. Nil when none is, or more than one is, since two
+    /// directories claiming one row cannot say which prompt it showed.
+    nonisolated static func sessionDir(
+        id: UUID, root: URL, rowID mapped: (UUID) -> UUID = { $0 }
+    ) -> URL? {
+        let fm = FileManager.default
+        let cwdDirs = (try? fm.contentsOfDirectory(
+            at: root.appendingPathComponent("sessions"), includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        var found: [URL] = []
+        for cwdDir in cwdDirs where isDirectory(cwdDir) {
+            let sessionDirs = (try? fm.contentsOfDirectory(
+                at: cwdDir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+            for dir in sessionDirs where isDirectory(dir) {
+                guard let data = BoundedRead.data(of: dir.appendingPathComponent("summary.json")),
+                      let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                else { continue }
+                let infoID = (json["info"] as? [String: Any])?["id"] as? String
+                if mapped(rowID(infoID: infoID, dir: dir)) == id { found.append(dir) }
+            }
+        }
+        return found.count == 1 ? found[0] : nil
+    }
+}
+
+/// Whether a Grok Approve or Deny may be pressed, judged on Grok's own
+/// state read at click time.
+///
+/// The row is a poll behind the terminal: 5 s here, about 10 s through a
+/// host's mirror, and a hook pin can be older still. In between, the call
+/// it showed can be answered at the terminal and Grok can gate another,
+/// and the press-time checks confirm only an option label and the marked
+/// line, which read the same on every Grok gate. So the press goes ahead
+/// only when the prompt Grok records as pending, read again now, is the
+/// very request the row showed.
+enum GrokAnswerCheck {
+    nonisolated static func mayAnswer(shown: ApprovalPrompt, pending: ApprovalPrompt?) -> Bool {
+        guard shown.offersApprove, let pending else { return false }
+        return pending == shown
+    }
+
+    /// The pending prompt of the session behind a row on this Mac, read
+    /// from its state now. Nil when it is not at a prompt or its
+    /// directory cannot be found.
+    nonisolated static func livePending(
+        sessionID: UUID, root: URL = GrokBuildMonitor.defaultRoot()
+    ) -> ApprovalPrompt? {
+        guard let dir = GrokBuildMonitor.sessionDir(id: sessionID, root: root) else { return nil }
+        return GrokBuildMonitor.pendingPrompt(dir: dir)
+    }
+
+    /// What a remote Grok answer is bound to: the pending prompt read from
+    /// the host's mirror now, the host path of the session's events.jsonl,
+    /// and that file's size as the mirror holds it. The helper presses only
+    /// if nothing written to the file since that size records a prompt
+    /// opening, closing or changing phase, so the check runs on the host in
+    /// the same step as the press, not only here a round trip earlier.
+    ///
+    /// The size is read before the prompt. A snapshot landing in between
+    /// can only make the prompt newer than the size, and the helper then
+    /// checks more of the file, never less.
+    nonisolated static func remoteBinding(
+        sessionID: UUID, hostID: UUID, homes: [String], mirror: RemoteMirror
+    ) -> (prompt: ApprovalPrompt?, events: RemoteEventsAnchor)? {
+        var found: [(home: String, dir: URL)] = []
+        for home in homes {
+            guard let local = mirror.local(home),
+                  let dir = GrokBuildMonitor.sessionDir(
+                    id: sessionID, root: GrokBuildMonitor.defaultRoot(home: local),
+                    rowID: { RemoteIdentity.sessionID(hostID: hostID, home: home, localID: $0) })
+            else { continue }
+            found.append((home, dir))
+        }
+        guard found.count == 1, let (home, dir) = found.first else { return nil }
+        let events = dir.appendingPathComponent("events.jsonl")
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: events.path))?[.size] as? Int
+        else { return nil }
+        // Built from the names, not from the mirror path, which the file
+        // system may have spelled differently (/var against /private/var).
+        let cwdName = dir.deletingLastPathComponent().lastPathComponent
+        let path = (home.hasSuffix("/") ? String(home.dropLast()) : home)
+            + "/.grok/sessions/\(cwdName)/\(dir.lastPathComponent)/events.jsonl"
+        return (GrokBuildMonitor.pendingPrompt(dir: dir), RemoteEventsAnchor(path: path, size: size))
+    }
 }

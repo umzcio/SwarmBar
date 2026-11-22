@@ -241,4 +241,25 @@ enum TuiPromptLayout {
             options(in: screen).first { $0.number == number }
         }
     }
+
+    /// The bottom-most line drawn as `option`, as drawn (trimmed of spaces
+    /// only, like `Selector.cursorLine`), so a walk can re-confirm its
+    /// target by the line that carries the target's number as well as its
+    /// label. Nil when no line reads as that option.
+    nonisolated static func drawnLine(of option: Option, in screen: String) -> String? {
+        for raw in screen.split(separator: "\n", omittingEmptySubsequences: false).reversed() {
+            let stripped = raw.trimmingCharacters(in: .whitespaces)
+            let line = stripped
+                .trimmingCharacters(in: CharacterSet(charactersIn: "▶►>❯›➜ \u{2502}\u{2503}\u{258F}"))
+                .trimmingCharacters(in: .whitespaces)
+            if let radio = radioOption(line) {
+                if radio.number == option.number, radio.label == option.label { return stripped }
+            } else if let dot = line.firstIndex(of: "."),
+                      Int(line[line.startIndex..<dot]) == option.number,
+                      line[line.index(after: dot)...].trimmingCharacters(in: .whitespaces) == option.label {
+                return stripped
+            }
+        }
+        return nil
+    }
 }

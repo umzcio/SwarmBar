@@ -117,9 +117,9 @@ private final class MonitorRig {
         home.appendingPathComponent(".claude/projects/-home-u-demo/\(id.uuidString.lowercased()).jsonl")
     }
 
-    func start() {
+    func start(pollInterval: Duration = .milliseconds(100)) {
         let monitor = RemoteHostMonitor(
-            connection: connection, pollInterval: .milliseconds(100), installRunner: installRunner)
+            connection: connection, pollInterval: pollInterval, installRunner: installRunner)
         let store = store
         task = Task { await monitor.start(into: store) }
     }
@@ -193,6 +193,25 @@ struct RemoteHostMonitorTests {
         #expect(FileManager.default.fileExists(atPath: mirrored.path))
     }
 
+    /// A remote Codex or Antigravity answer waits for rows read after its
+    /// click, so it asks for a poll now instead of waiting out the usual
+    /// interval, and only a poll requested after it counts.
+    @Test("an answer's poll request cuts the wait short", .enabled(if: pythonAvailable))
+    func aWantedPollComesPromptly() async throws {
+        let rig = try MonitorRig()
+        defer { rig.remove() }
+        rig.start(pollInterval: .seconds(120))
+        await settle { rig.rows.count == 2 }
+        let first = rig.connection.syncedThrough(.claudeCode)
+        #expect(first > 0)
+        let clock = ContinuousClock()
+        let started = clock.now
+        #expect(await RemoteMonitorSupervisor.awaitFreshPoll(rig.connection, tool: .claudeCode, timeout: .seconds(30)))
+        #expect(clock.now - started < .seconds(30))
+        #expect(rig.connection.syncedThrough(.claudeCode) > first)
+        await rig.stop()
+    }
+
     @Test("a failed poll keeps the rows and says the host is unreachable", .enabled(if: pythonAvailable))
     func failedPollKeepsRows() async throws {
         let rig = try MonitorRig()
@@ -231,14 +250,26 @@ struct RemoteHostMonitorTests {
         await settle { rig.rows.count == 2 }
         #expect(rig.rows.count == 2)
 
-        // Something only a reset removes: it sits outside every home, so
-        // the per-home sweep never reaches it.
+        // Something only a reset changes: the mirror file of a transcript
+        // that does not change. A poll on the same stream lists it with no
+        // chunks and leaves the file alone; a reset deletes it and the
+        // fresh stream ships it into a new file.
+        let kept = try #require(rig.connection.mirror.local(
+            MonitorRig.transcript(MonitorRig.first, in: rig.home).path))
+        func inode(_ url: URL) -> UInt64? {
+            var info = stat()
+            return lstat(url.path, &info) == 0 ? UInt64(info.st_ino) : nil
+        }
+        let original = try #require(inode(kept))
+        // Anything outside every home, by contrast, goes on the very next
+        // poll: no snapshot accounts for it.
         let stray = rig.connection.mirror.root.appendingPathComponent("stray")
         try Data("stray".utf8).write(to: stray)
         let shipped = try #require(rig.connection.lastSnapshot)
         await settle { rig.connection.lastSnapshot?.now != shipped.now }
         #expect(rig.connection.lastSnapshot?.stream == shipped.stream)
-        #expect(FileManager.default.fileExists(atPath: stray.path), "a poll on the same stream kept it")
+        #expect(inode(kept) == original, "a poll on the same stream kept the file")
+        #expect(!FileManager.default.fileExists(atPath: stray.path), "a path outside every home outlived a poll")
 
         // During the gap a session goes away on the host.
         let gone = MonitorRig.transcript(MonitorRig.second, in: rig.home)
@@ -248,7 +279,7 @@ struct RemoteHostMonitorTests {
         await rig.stop()
 
         #expect(rig.connection.lastSnapshot?.stream != shipped.stream)
-        #expect(!FileManager.default.fileExists(atPath: stray.path))
+        #expect(inode(kept) != nil && inode(kept) != original, "the reset did not replace the file")
         let mirrored = try #require(rig.connection.mirror.local(gone.path))
         #expect(!FileManager.default.fileExists(atPath: mirrored.path))
         #expect(rig.rows.map(\.id) == [rig.rowID(MonitorRig.first)])

@@ -629,6 +629,92 @@ def reader_tail(data, start):
         window = min(window * 2, helper.MAX_TAIL_BYTES)
 
 
+class SnapshotBudgetTests(unittest.TestCase):
+    """One home's owner chooses how much state it holds, so a snapshot
+    takes a bounded amount from each home and in total. What is left over
+    is omitted, never shipped empty, and ships on a later snapshot once
+    what did ship costs nothing to repeat."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-budget-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.a = os.path.join(self.base, "a")
+        self.b = os.path.join(self.base, "b")
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.a + ":" + self.b})
+        env.start()
+        self.addCleanup(env.stop)
+        ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        ps.start()
+        self.addCleanup(ps.stop)
+        helper.SHIPPED.clear()
+        self.addCleanup(helper.SHIPPED.clear)
+
+    def put(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def summaries(self, home, count, size):
+        return [self.put(os.path.join(home, ".grok", "sessions", "w", "s%03d" % i, "summary.json"),
+                         b"{" + b" " * (size - 2) + b"}") for i in range(count)]
+
+    def shipped_bytes(self, snap, home):
+        return sum(len(data) for item in snap["files"] if item["path"].startswith(home + "/")
+                   for _, data in decode_chunks(item))
+
+    def test_one_home_cannot_crowd_out_another(self):
+        planted = self.summaries(self.a, 10, 1000)
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        with mock.patch.object(helper, "HOME_BYTES_BUDGET", 3000), \
+                mock.patch.object(helper, "SNAPSHOT_BYTES_BUDGET", 5000):
+            snap = helper.snapshot()
+            self.assertLessEqual(self.shipped_bytes(snap, self.a), 3000)
+            self.assertIn(other, [item["path"] for item in snap["files"]])
+            over = [entry["path"] for entry in snap["omitted"] if "budget" in entry["reason"]]
+            self.assertEqual(len(over), 7)
+            self.assertTrue(set(over) <= set(planted))
+            # Once shipped, a file costs nothing to list again, so the rest
+            # follow on later snapshots.
+            listed = set()
+            for _ in range(4):
+                listed |= set(item["path"] for item in snap["files"] if item["chunks"] or
+                              item["path"] in listed)
+                snap = helper.snapshot()
+            listed |= set(item["path"] for item in snap["files"])
+        self.assertTrue(set(planted) <= listed)
+
+    def test_the_snapshot_total_is_bounded_across_homes(self):
+        self.summaries(self.a, 3, 1000)
+        self.summaries(self.b, 3, 1000)
+        with mock.patch.object(helper, "HOME_BYTES_BUDGET", 3000), \
+                mock.patch.object(helper, "SNAPSHOT_BYTES_BUDGET", 4000):
+            snap = helper.snapshot()
+        self.assertLessEqual(self.shipped_bytes(snap, self.a) + self.shipped_bytes(snap, self.b),
+                             4000)
+        self.assertEqual(len([e for e in snap["omitted"] if "budget" in e["reason"]]), 2)
+
+    def test_file_count_per_home_is_bounded(self):
+        self.summaries(self.a, 5, 10)
+        with mock.patch.object(helper, "MAX_FILES_PER_HOME", 3):
+            snap = helper.snapshot()
+        self.assertEqual(len(snap["files"]), 3)
+        self.assertEqual(len([e for e in snap["omitted"] if "budget" in e["reason"]]), 2)
+
+    def test_sparse_files_just_under_the_whole_limit_stay_within_the_budget(self):
+        for i in range(12):
+            path = os.path.join(self.a, ".claude", "sessions", "s%02d.json" % i)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.truncate(helper.WHOLE_MAX_BYTES - 1)
+        os.makedirs(os.path.join(self.a, ".claude", "projects"))
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        line = helper.json_line(helper.snapshot())
+        self.assertLess(len(line), helper.SNAPSHOT_BYTES_BUDGET * 4 // 3 + 1024 * 1024)
+        snap = json.loads(line)
+        self.assertIn(other, [item["path"] for item in snap["files"]])
+
+
 class CrossUserReadTests(unittest.TestCase):
     """Root reading another user's home: that user chooses every name in
     it, so a link must not steer root's reads, or hide another user's
@@ -755,6 +841,41 @@ class CrossUserReadTests(unittest.TestCase):
         self.assertIn(transcript, paths)
         self.assertFalse([p for p in paths if p.startswith(self.a + "/")], paths)
 
+    def test_probe_never_reports_another_homes_claude_dir(self):
+        # a links a .claude* name to b's profile, which has no settings.json
+        # yet. Reported under a, setup would create b's settings running
+        # a's script as b.
+        os.makedirs(os.path.join(self.b, ".claude-work", "projects"))
+        os.symlink(os.path.join(self.b, ".claude-work"), os.path.join(self.a, ".claude-work"))
+        warnings = []
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, warnings), [])
+            self.assertNotIn("claude", helper.home_tools(self.a))
+            self.assertEqual(helper.home_claude_dirs(self.b, []),
+                             [{"path": os.path.join(self.b, ".claude-work"), "settings": "missing"}])
+        self.assertTrue(warnings)
+
+    def test_probe_never_reports_a_tool_whose_state_leads_out(self):
+        os.makedirs(os.path.join(self.b, ".kimi-code"))
+        os.symlink(os.path.join(self.b, ".kimi-code"), os.path.join(self.a, ".kimi-code"))
+        with self.foreign():
+            self.assertNotIn("kimi", helper.home_tools(self.a))
+            self.assertIn("kimi", helper.home_tools(self.b))
+
+    def test_probe_claude_dir_its_user_does_not_own_is_not_reported(self):
+        os.makedirs(os.path.join(self.a, ".claude", "projects"))
+        with self.foreign(self.owner + 1):
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [])
+            self.assertEqual(helper.home_tools(self.a), [])
+
+    def test_probe_claude_dir_linked_within_its_home_counts(self):
+        real = os.path.join(self.a, "dotfiles", "claude")
+        os.makedirs(os.path.join(real, "projects"))
+        os.symlink(real, os.path.join(self.a, ".claude"))
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [{"path": real, "settings": "missing"}])
+            self.assertIn("claude", helper.home_tools(self.a))
+
     def test_claude_root_in_its_own_home_by_link_counts(self):
         real = os.path.join(self.a, "dotfiles", "claude", "projects")
         os.makedirs(real)
@@ -762,6 +883,77 @@ class CrossUserReadTests(unittest.TestCase):
         with self.foreign():
             self.assertEqual(helper.claude_roots([]),
                              [os.path.join(self.a, ".claude", "projects")])
+
+    def snapshot_behind(self, link, populate):
+        """The snapshot with `link` pointing at a directory outside the
+        home, after `populate` has filled that directory (or not)."""
+        target = os.path.join(self.outside, "t")
+        shutil.rmtree(target, ignore_errors=True)
+        if populate is not None:
+            os.makedirs(target)
+            populate(target)
+        if not os.path.lexists(link):
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            os.symlink(target, link)
+        helper.SHIPPED.clear()
+        with self.foreign():
+            snap = helper.snapshot()
+        return dict((key, snap[key]) for key in ("files", "dirs", "omitted"))
+
+    def assert_same_whatever_is_behind(self, link, populate):
+        empty = self.snapshot_behind(link, lambda target: None)
+        missing = self.snapshot_behind(link, None)
+        full = self.snapshot_behind(link, populate)
+        self.assertEqual(full, empty)
+        self.assertEqual(full, missing)
+        self.assertNotIn("rootonly", json.dumps(full))
+        return full
+
+    def test_a_linked_directory_on_a_pattern_lists_nothing_behind_it(self):
+        def populate(target):
+            self.put(os.path.join(target, "rootonly-secret", "x", "summary.json"), b"{}")
+            os.makedirs(os.path.join(target, "rootonly-name", "y"))
+        link = os.path.join(self.a, ".grok", "sessions")
+        snap = self.assert_same_whatever_is_behind(link, populate)
+        self.assertIn({"path": link, "reason": "leads outside its home"}, snap["omitted"])
+
+    def test_a_linked_walk_base_walks_nothing_behind_it(self):
+        def populate(target):
+            self.put(os.path.join(target, "rootonly", "2026", "rollout-x.jsonl"), b'{"x":1}\n')
+        self.assert_same_whatever_is_behind(os.path.join(self.a, ".codex", "sessions"), populate)
+
+    def test_a_linked_literal_path_is_not_tested_for_existence(self):
+        def populate(target):
+            self.put(os.path.join(target, "active_sessions.json"), b"{}")
+        self.assert_same_whatever_is_behind(os.path.join(self.a, ".grok"), populate)
+
+    def test_a_linked_presence_directory_never_gates_a_database_in(self):
+        agy = os.path.join(self.a, ".gemini", "antigravity-cli")
+        database = self.put(os.path.join(agy, "conversations", "c1.db"), b"sqlite")
+
+        def populate(target):
+            self.put(os.path.join(target, "c1.lock"), b"")
+        full = self.assert_same_whatever_is_behind(os.path.join(agy, "presence"), populate)
+        self.assertNotIn(database, [item["path"] for item in full["files"]])
+
+    def test_a_real_presence_lock_still_gates_its_database_in(self):
+        agy = os.path.join(self.a, ".gemini", "antigravity-cli")
+        database = self.put(os.path.join(agy, "conversations", "c1.db"), b"sqlite")
+        self.put(os.path.join(agy, "presence", "c1.lock"), b"")
+        with self.foreign():
+            self.assertIn(database, self.paths(helper.snapshot()))
+
+    def test_one_homes_walk_is_bounded_and_reported(self):
+        for day in range(40):
+            os.makedirs(os.path.join(self.a, ".codex", "sessions", "2026", "%02d" % day))
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        with self.foreign(), mock.patch.object(helper, "MAX_WALK_ENTRIES", 20):
+            snap = helper.snapshot()
+        self.assertTrue([entry for entry in snap["omitted"] if entry["path"].startswith(self.a)
+                         and "walk budget" in entry["reason"]], snap["omitted"])
+        self.assertFalse([entry for entry in snap["omitted"] if entry["path"].startswith(self.b)
+                          and "walk budget" in entry["reason"]])
+        self.assertIn(other, self.paths(snap))
 
 
 class CrossUserProbeTests(unittest.TestCase):
@@ -1169,7 +1361,7 @@ class FakeRunner(object):
         self.lsof, self.ps_code = lsof, ps_code
         self.calls = []
 
-    def __call__(self, argv, timeout=5):
+    def __call__(self, argv, timeout=5, **options):
         self.calls.append(list(argv))
         if argv[0] == "ps":
             return completed(argv, self.ps_code, self.ps if self.ps is not None else PS_SAMPLE)
@@ -1252,6 +1444,15 @@ class ProcessTableTests(unittest.TestCase):
     def test_parse_ps_skips_malformed_lines(self):
         self.assertEqual(helper.parse_ps("garbage\n  x 1 0 u t c a\n  5 1 x u t c a\n"), [])
 
+    def test_kimi_family_carries_its_start_time(self):
+        # A Kimi-family session is bound to the process its hook came from,
+        # held to this start time, so a reused pid is never taken for it.
+        with mock.patch.object(helper, "process_start", side_effect=lambda pid: "start-%d" % pid):
+            table, _ = self.run_table(FakeRunner())
+        by_pid = dict((p["pid"], p) for p in table)
+        self.assertEqual(by_pid[800]["started"], "start-800")
+        self.assertNotIn("started", by_pid[700])
+
     def test_bearcode_found_by_args(self):
         table, _ = self.run_table(FakeRunner())
         pids = sorted(p["pid"] for p in table)
@@ -1275,7 +1476,7 @@ class ProcessTableTests(unittest.TestCase):
     def test_missing_tmux_means_null_panes_not_failure(self):
         fake = FakeRunner()
 
-        def runner(argv, timeout=5):
+        def runner(argv, timeout=5, **options):
             if argv[0] == "tmux":
                 raise OSError("no tmux")
             return fake(argv, timeout)
@@ -1365,7 +1566,7 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_lsof_failure_is_flagged(self):
         ps = "  10  1 1000 z ttys1 codex codex\n"
-        def runner(argv, timeout=5):
+        def runner(argv, timeout=5, **options):
             if argv[0] == "lsof":
                 raise OSError("gone")
             return FakeRunner(ps=ps)(argv, timeout)
@@ -1422,7 +1623,7 @@ class TmuxRecorder(object):
         self.fail_on_send = fail_on_send
         self.sends = 0
 
-    def __call__(self, argv, timeout=5, input=None):
+    def __call__(self, argv, timeout=5, input=None, **options):
         self.calls.append(list(argv))
         self.inputs.append(input)
         if argv[0] == "ps":
@@ -1618,6 +1819,113 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
             self.assertEqual(rec.sent(), [])
 
+    # A Grok press is bound to the request the Mac read through its
+    # events.jsonl: every Grok gate draws the same options with the cursor
+    # in the same place, so the screen alone cannot say which call it is for.
+    GROK_SCREEN = "  2 (●) Yes, proceed\n  3 (○) No, reject"
+    GROK_PROMPT = ('{"ts":"t","type":"phase_changed","phase":"permission_prompt"}\n'
+                   '{"ts":"t","type":"permission_requested","tool_name":"run_terminal_command"}\n')
+
+    def grok_events(self, text=GROK_PROMPT, shipped=True):
+        home = os.path.join(self.root, "home")
+        session = os.path.join(home, ".grok", "sessions", "cwd", "sess")
+        os.makedirs(session)
+        path = os.path.join(session, "events.jsonl")
+        with open(path, "w") as handle:
+            handle.write(text)
+        homes = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": home})
+        homes.start()
+        self.addCleanup(homes.stop)
+        record = helper.Shipped(len(text), 0, 0, len(text) - 1)
+        table = mock.patch.dict(helper.SHIPPED, {path: record} if shipped else {}, clear=True)
+        table.start()
+        self.addCleanup(table.stop)
+        return path, len(text)
+
+    def grok_keys(self, path, size, rec):
+        return self.call({"cmd": "keys", "pane": self.pane, "keys": ["DOWN", "\n"],
+                          "expect": ["No, reject", {"once": "2 (●) Yes, proceed"},
+                                     {"grok_events": {"path": path, "size": size}}]}, rec)
+
+    def test_grok_events_unchanged_presses(self):
+        path, size = self.grok_events()
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": True})
+        self.assertEqual(len(rec.sent()), 2)
+
+    def test_grok_events_ignore_unrelated_records(self):
+        path, size = self.grok_events()
+        with open(path, "a") as handle:
+            handle.write('{"ts":"t","type":"tool_started","tool_name":"read_file"}\n')
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": True})
+
+    def test_grok_events_another_prompt_since_sends_nothing(self):
+        # The prompt the row showed was answered at the terminal and Grok
+        # gated another call. The selector reads exactly as it did.
+        path, size = self.grok_events()
+        with open(path, "a") as handle:
+            handle.write('{"ts":"t","type":"permission_resolved","decision":"allow"}\n'
+                         '{"ts":"t","type":"phase_changed","phase":"working"}\n'
+                         + self.GROK_PROMPT)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_grok_events_that_cannot_be_vouched_for_send_nothing(self):
+        cases = (
+            # Shrunk: not the file the Mac read.
+            ("", lambda path, size: (path, size + 1)),
+            # A record still being written, or one that does not parse.
+            ('{"ts":"t","type":"perm', None),
+            ('not json\n', None),
+            ('["a list"]\n', None),
+            ('{"ts":"t"}\n', None),
+        )
+        for appended, adjust in cases:
+            with self.subTest(appended=appended):
+                self.root = os.path.realpath(tempfile.mkdtemp(dir="/tmp"))
+                self.addCleanup(shutil.rmtree, self.root, True)
+                path, size = self.grok_events()
+                with open(path, "a") as handle:
+                    handle.write(appended)
+                if adjust is not None:
+                    path, size = adjust(path, size)
+                rec = TmuxRecorder(screen=self.GROK_SCREEN)
+                self.assertEqual(self.grok_keys(path, size, rec),
+                                 {"sent": False, "reason": "changed"})
+                self.assertEqual(rec.sent(), [])
+
+    def test_grok_events_only_for_a_shipped_grok_events_file(self):
+        path, size = self.grok_events(shipped=False)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(path, size, rec), {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+        # Shipped, but not a Grok session's events.jsonl.
+        other = os.path.join(self.root, "home", "notes.jsonl")
+        with open(other, "w") as handle:
+            handle.write(self.GROK_PROMPT)
+        helper.SHIPPED[other] = helper.Shipped(1, 0, 0, 0)
+        rec = TmuxRecorder(screen=self.GROK_SCREEN)
+        self.assertEqual(self.grok_keys(other, len(self.GROK_PROMPT), rec),
+                         {"sent": False, "reason": "changed"})
+        self.assertEqual(rec.sent(), [])
+
+    def test_malformed_grok_events_is_bad_keys(self):
+        for bad in ({"grok_events": {"path": 3, "size": 0}},
+                    {"grok_events": {"path": "", "size": 0}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": -1}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": True}},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": 0, "more": 1}},
+                    {"grok_events": "/x/events.jsonl"},
+                    {"grok_events": {"path": "/x/events.jsonl", "size": 0}, "once": "x"}):
+            rec = TmuxRecorder(screen="x")
+            out = self.call({"cmd": "keys", "pane": self.pane, "keys": ["\n"],
+                             "expect": [bad]}, rec)
+            self.assertEqual(out, {"ok": False, "error": "bad keys"}, bad)
+            self.assertEqual(rec.sent(), [])
+
     def test_expect_more_needs_the_count_to_rise(self):
         # "ok" was on screen twice before the paste. Twice is not enough.
         for screen, sent in (("ok\n> ok", False), ("ok\n> x", False), ("ok\nok\n> ok", True)):
@@ -1784,13 +2092,55 @@ class TmuxCommandTests(unittest.TestCase):
             self.assertEqual(rec.calls, [])
 
     def test_real_socket_accepted_and_resolved_path_used(self):
-        link = os.path.join(self.root, "tmux-1", "alias")
-        os.symlink(self.sock, link)
+        # The root may be written through its link (/tmp is /private/tmp on
+        # macOS); the path run is the resolved one.
+        alias_root = os.path.join(tempfile.mkdtemp(dir="/tmp"), "r")
+        self.addCleanup(shutil.rmtree, os.path.dirname(alias_root), True)
+        os.symlink(self.root, alias_root)
         rec = TmuxRecorder()
-        out = self.call({"cmd": "keys", "pane": {"socket": link, "id": "%3"},
-                         "keys": ["UP"], "expect": []}, rec)
+        with mock.patch.dict(os.environ, {"TMUX_TMPDIR": alias_root}):
+            out = self.call({"cmd": "keys",
+                             "pane": {"socket": os.path.join(alias_root, "tmux-1", "default"),
+                                      "id": "%3"},
+                             "keys": ["UP"], "expect": []}, rec)
         self.assertEqual(out, {"sent": True})
         self.assertEqual(rec.calls[0][2], self.sock)
+
+    def test_a_linked_socket_is_refused(self):
+        # tmux_sockets never reports one, so a pane naming one did not come
+        # from a snapshot.
+        link = os.path.join(self.root, "tmux-1", "alias")
+        os.symlink(self.sock, link)
+        self.assertIsNone(helper.valid_pane({"socket": link, "id": "%3"}))
+
+    def test_a_tmux_entry_that_is_a_link_is_refused(self):
+        # Whoever owns a tmux-* entry in /tmp can swap it for a link to
+        # another user's directory, root's included, at any moment. Read
+        # through the link, that owner's uid would be the one a client runs
+        # as while tmux connects to whatever the entry names by then.
+        swapped = os.path.join(self.root, "tmux-2")
+        os.symlink(os.path.join(self.root, "tmux-1"), swapped)
+        rec = TmuxRecorder()
+        out = self.call({"cmd": "capture", "pane": {"socket": os.path.join(swapped, "default"),
+                                                    "id": "%3"}}, rec)
+        self.assertEqual(out, {"ok": False, "error": "bad pane"})
+        self.assertEqual(rec.calls, [])
+
+    def test_the_client_runs_as_the_owner_of_the_entry_as_found(self):
+        real_lstat = os.lstat
+        directory = os.path.join(self.root, "tmux-1")
+
+        def owned_by(uid):
+            def fake(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                                       uid, info.st_gid, info.st_size, 0, 0, 0))
+            return fake
+        with mock.patch.object(helper.os, "lstat", owned_by(4242)), \
+                mock.patch.object(helper.os, "stat", owned_by(0)):
+            pane = helper.valid_pane(self.pane)
+        self.assertEqual(pane["uid"], 4242)
+        self.assertEqual(os.path.dirname(pane["socket"]), directory)
 
     def test_non_socket_file_refused(self):
         plain = os.path.join(self.root, "tmux-1", "plain")
@@ -1798,17 +2148,17 @@ class TmuxCommandTests(unittest.TestCase):
         self.assertIsNone(helper.valid_pane({"socket": plain, "id": "%1"}))
 
     def test_owner_mismatch_refused(self):
-        real_stat = os.stat
+        real_lstat = os.lstat
         directory = os.path.join(self.root, "tmux-1")
 
         def fake(path, *args, **kwargs):
-            info = real_stat(path, *args, **kwargs)
+            info = real_lstat(path, *args, **kwargs)
             if path == directory:
                 return os.stat_result((info.st_mode, info.st_ino, info.st_dev,
                                        info.st_nlink, info.st_uid + 1, info.st_gid,
                                        info.st_size, 0, 0, 0))
             return info
-        with mock.patch.object(helper.os, "stat", fake):
+        with mock.patch.object(helper.os, "lstat", fake):
             self.assertIsNone(helper.valid_pane(self.pane))
         self.assertIsNotNone(helper.valid_pane(self.pane))
 
@@ -2015,6 +2365,10 @@ class TmuxOwnerTests(unittest.TestCase):
             panes = helper.tmux_panes()
         self.assertEqual(panes, {(42, 1500): {"socket": "/tmp/tmux-1500/default", "id": "%1"}})
         by_socket = dict((argv[2], options) for argv, options in calls)
+        self.assertIn("env", by_socket["/tmp/tmux-1500/default"])
+        del by_socket["/tmp/tmux-1500/default"]["env"]
+        for options in by_socket.values():
+            self.assertEqual(options.pop("output_limit"), helper.TMUX_OUTPUT_MAX)
         self.assertEqual(by_socket["/tmp/tmux-1500/default"],
                          {"user": 1500, "group": 1500, "extra_groups": [1500], "cwd": "/"})
         # Root's own server is root's: run as root, as before.
@@ -2064,6 +2418,130 @@ class TmuxOwnerTests(unittest.TestCase):
                             {"cmd": "paste", "pane": pane, "text": "x"}):
                 self.assertEqual(helper.handle_tmux(request), {"ok": False, "error": "bad pane"})
         self.assertEqual(calls, [])
+
+
+class TmuxBudgetTests(unittest.TestCase):
+    """Any user can make sockets under /tmp/tmux-* that accept and never
+    answer, or stream without end, so the tmux servers a snapshot or a
+    press-time check contacts are bounded in number, time and output."""
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.real_monotonic = time.monotonic
+        clock = mock.patch.object(helper.time, "monotonic", lambda: self.now[0])
+        clock.start()
+        self.addCleanup(clock.stop)
+        identity = mock.patch.object(helper, "tmux_identity", return_value={})
+        identity.start()
+        self.addCleanup(identity.stop)
+        self.calls = []
+
+    def runner(self, silent):
+        """A run_command whose servers owned by `silent` take their whole
+        timeout to say nothing, and whose others answer at once."""
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            self.assertIn("output_limit", options)
+            if argv[2].startswith("/tmp/tmux-%d/" % silent):
+                self.now[0] += timeout
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return completed(argv, 0, "%%7 %s\n" % argv[2].rsplit("-", 1)[-1].split("/")[0])
+        return run
+
+    def sockets(self):
+        planted = [("/tmp/tmux-1000/s%04d" % i, 1000) for i in range(3000)]
+        return planted + [("/tmp/tmux-1001/default", 1001), ("/tmp/tmux-1002/default", 1002)]
+
+    def test_silent_sockets_of_one_user_cannot_hide_anothers_panes(self):
+        skipped = []
+        with mock.patch.object(helper, "tmux_sockets", self.sockets), \
+                mock.patch.object(helper, "run_command", self.runner(silent=1000)):
+            panes = helper.tmux_panes(uids={1000, 1001}, skipped=skipped)
+        self.assertIn((1001, 1001), panes)
+        # Only servers of users with an agent are contacted at all.
+        self.assertNotIn("/tmp/tmux-1002/default", [socket for socket, _ in self.calls])
+        tried = len([c for c in self.calls if "tmux-1000" in c[0]])
+        self.assertLessEqual(tried, helper.TMUX_SOCKETS_PER_USER)
+        self.assertLessEqual(self.now[0] - 1000.0, helper.TMUX_PANES_BUDGET_SECONDS)
+        self.assertTrue(all(timeout <= helper.TMUX_LIST_SECONDS for _, timeout in self.calls))
+        # The rest are reported as not looked at.
+        self.assertEqual(len(skipped), 3000 - tried)
+
+    def test_each_user_is_capped_even_when_time_remains(self):
+        sockets = [("/tmp/tmux-1000/s%04d" % i, 1000) for i in range(50)]
+        skipped = []
+
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            return completed(argv, 0, "")
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            helper.tmux_panes(skipped=skipped)
+        self.assertEqual(len(self.calls), helper.TMUX_SOCKETS_PER_USER)
+        self.assertEqual(len(skipped), 50 - helper.TMUX_SOCKETS_PER_USER)
+
+    def test_the_time_budget_holds_across_users(self):
+        sockets = [("/tmp/tmux-%d/default" % uid, uid) for uid in range(2000, 2100)]
+        skipped = []
+
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            self.now[0] += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertEqual(helper.tmux_panes(skipped=skipped), {})
+        self.assertLessEqual(self.now[0] - 1000.0, helper.TMUX_PANES_BUDGET_SECONDS)
+        self.assertEqual(len(skipped) + len(self.calls), 100)
+        self.assertTrue(skipped)
+
+    def test_snapshot_warns_about_servers_not_contacted(self):
+        ps = PS_SAMPLE
+        runner = FakeRunner(ps=ps)
+        with mock.patch.object(helper, "tmux_panes",
+                               side_effect=lambda uids=None, only=None, skipped=None:
+                               skipped.extend(["/tmp/tmux-1000/x"]) or {}), \
+                mock.patch.object(helper, "process_cwd", return_value="/work"), \
+                mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")), \
+                mock.patch.object(helper, "run_command", runner):
+            warnings = []
+            helper.agent_processes(warnings)
+        self.assertTrue(any("not contacted" in warning for warning in warnings), warnings)
+
+    def test_press_time_check_contacts_only_the_panes_own_server(self):
+        sockets = [("/tmp/tmux-1000/default", 1000), ("/tmp/tmux-1000/other", 1000),
+                   ("/tmp/tmux-1001/default", 1001)]
+        ps = PS_SAMPLE
+        contacted = []
+
+        def run(argv, timeout=5, input=None, **options):
+            if argv[0] == "ps":
+                return completed(argv, 0, ps)
+            contacted.append(argv[2])
+            return completed(argv, 0, "%3 610\n")
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertTrue(helper.target_still_there(
+                700, "claude", {"socket": "/tmp/tmux-1000/default", "id": "%3", "uid": 1000}))
+        self.assertEqual(contacted, ["/tmp/tmux-1000/default"])
+
+    def test_output_is_bounded(self):
+        with mock.patch.object(helper.time, "monotonic", self.real_monotonic):
+            with self.assertRaises(subprocess.SubprocessError):
+                helper.run_command(["/bin/sh", "-c", "while :; do echo xxxxxxxxxxxxxxxx; done"],
+                                   timeout=30, output_limit=64 * 1024)
+            done = helper.run_command(["/bin/sh", "-c", "echo hello; echo there >&2"],
+                                      timeout=5, output_limit=64 * 1024)
+        self.assertEqual((done.returncode, done.stdout, done.stderr),
+                         (0, b"hello\n", b"there\n"))
+
+    def test_bounded_output_still_times_out(self):
+        with mock.patch.object(helper.time, "monotonic", self.real_monotonic):
+            began = self.real_monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                helper.run_command(["/bin/sh", "-c", "sleep 10"], timeout=0.5,
+                                   output_limit=1024)
+            self.assertLess(self.real_monotonic() - began, 5)
 
 
 class EventSink(object):
@@ -2221,12 +2699,14 @@ class HookRelayTests(unittest.TestCase):
         open(os.path.join(self.bridge_dir, "swarmbar-remote-hook.sh"), "w").close()
         self.sock_path = os.path.join(self.bridge_dir, "hook.sock")
         self.peer = ["curl", "bash", "claude"]
+        self.agent = None
         self.patches = [
             mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.home}),
             mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.05),
             mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
             mock.patch.object(helper, "peer_chain", side_effect=self.fake_peer),
+            mock.patch.object(helper, "peer_agent", side_effect=lambda sock: self.agent),
             mock.patch.object(helper, "peer_uid", side_effect=lambda sock: os.getuid(),
                               create=True),
             mock.patch.object(helper, "agent_processes", return_value=[]),
@@ -2709,6 +3189,30 @@ class HookRelayTests(unittest.TestCase):
             self.peer = peer
             self.assert_answered_at_once(relay, sink, {"session_id": "s1"})
 
+    def test_kimi_permission_names_the_process_that_asked(self):
+        # A remote Kimi row is answered only into the process its own hook
+        # came from, never one found by directory.
+        relay, sink = self.relay()
+        self.peer = ["curl", "sh", "kimi-code", "bash", "tmux: server"]
+        self.agent = {"pid": 4242, "name": "kimi-code", "start": "12345"}
+        client = self.post("PermissionRequest", {"session_id": "session_k1"})
+        self.assertEqual(read_response(client, timeout=1)[2], {})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        self.assertEqual(event["agent"], self.agent)
+        self.assertIs(event["held"], False)
+
+    def test_only_a_kimi_permission_looks_up_its_agent(self):
+        relay, sink = self.relay()
+        self.agent = {"pid": 4242, "name": "kimi-code", "start": "12345"}
+        client = self.post("PermissionRequest", {"session_id": "s1"})
+        event = sink.wait_for(is_hook("/hook/PermissionRequest"))
+        relay.handle_reply({"rid": event["rid"], "body": {}})
+        read_response(client)
+        self.assertIsNone(event.get("agent"))
+        self.peer = ["curl", "sh", "kimi"]
+        read_response(self.post("Stop", {"session_id": "session_k1"}))
+        self.assertIsNone(sink.wait_for(is_hook("/hook/Stop")).get("agent"))
+
     def test_slow_peer_lookup_is_answered_empty(self):
         release = threading.Event()
         self.addCleanup(release.set)
@@ -2888,6 +3392,104 @@ class HookRelayTests(unittest.TestCase):
         self.assertIsNone(helper.parse_line(b"[" * 100000))
 
 
+class HookBudgetTests(unittest.TestCase):
+    """Every home's sockets are served by one root process, and any user
+    can opt their home in with a marker file. One home's owner must not be
+    able to use up that process's descriptors, threads or event queue and
+    silence another home's hooks."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="sbq-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.homes = []
+        for name in ("a", "b"):
+            home = os.path.join(self.base, name)
+            os.makedirs(os.path.join(home, ".swarmbar"))
+            open(os.path.join(home, ".swarmbar", "swarmbar-remote-hook.sh"), "w").close()
+            self.homes.append(home)
+        self.a, self.b = self.homes
+        for patch in (
+                mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": ":".join(self.homes)}),
+                mock.patch.object(helper, "LOCK_RETRY_SECONDS", 0.05),
+                mock.patch.object(helper, "SERVE_POLL_SECONDS", 0.05),
+                mock.patch.object(helper, "HOLD_POLL_SECONDS", 0.05),
+                mock.patch.object(helper, "peer_chain", return_value=["curl", "bash", "claude"]),
+                mock.patch.object(helper, "peer_uid", side_effect=lambda sock: os.getuid()),
+                mock.patch.object(helper, "agent_processes", return_value=[]),
+                mock.patch.object(helper, "MAX_HOOK_CONNECTIONS", 4),
+                mock.patch.object(helper, "MAX_FOLLOWERS", 2),
+                mock.patch.object(helper, "HOOK_REQUEST_SECONDS", 0.5)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.sink = EventSink()
+        self.relay = helper.HookRelay(emit=self.sink)
+        self.addCleanup(self.relay.close)
+        self.relay.refresh()
+        self.clients = []
+        self.addCleanup(lambda: [client.close() for client in self.clients])
+
+    def connect(self, home, name="hook.sock"):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.connect(os.path.join(home, ".swarmbar", name))
+        self.clients.append(client)
+        return client
+
+    def test_connections_over_a_homes_budget_are_closed_at_once(self):
+        for _ in range(helper.MAX_HOOK_CONNECTIONS):
+            self.connect(self.a)
+        time.sleep(0.2)
+        self.assertTrue(connection_dropped(self.connect(self.a), timeout=2))
+        # The other home is answered as if nothing were happening.
+        client = post_hook(self.b, "Stop", {"session_id": "s"})
+        self.clients.append(client)
+        self.assertTrue(answered_within(client, 2))
+        self.assertEqual(read_response(client)[2], {})
+        # And its held request still reaches the Mac.
+        held = post_hook(self.b, "PermissionRequest", {"session_id": "s1"})
+        self.clients.append(held)
+        self.assertIsNotNone(self.sink.wait_for(
+            lambda e: e.get("event") == "hook" and e.get("home") == self.b and e.get("held")))
+
+    def test_followers_over_a_homes_budget_are_closed_at_once(self):
+        for _ in range(helper.MAX_FOLLOWERS):
+            follower = self.connect(self.a, "broker.sock")
+            self.assertTrue(follower.recv(65536))
+        self.assertTrue(wait_until(
+            lambda: self.relay.hubs[self.a].follower_count() == helper.MAX_FOLLOWERS))
+        self.assertTrue(connection_dropped(self.connect(self.a, "broker.sock"), timeout=2))
+        self.assertEqual(self.relay.hubs[self.a].follower_count(), helper.MAX_FOLLOWERS)
+
+    def test_a_request_trickled_in_is_dropped_at_its_deadline(self):
+        client = self.connect(self.a)
+        began = time.monotonic()
+        dropped = False
+        for character in "POST /hook/Stop HTTP/1.1\r\nHost: swarmbar\r\nX-Pad: " + "x" * 200:
+            try:
+                client.sendall(character.encode("ascii"))
+            except OSError:
+                dropped = True
+                break
+            readable, _, _ = select.select([client], [], [], 0.05)
+            if readable:
+                dropped = client.recv(1) == b""
+                break
+        self.assertTrue(dropped)
+        self.assertLess(time.monotonic() - began, 3)
+
+    def test_one_home_cannot_fill_the_queue_to_the_mac(self):
+        self.sink.gate = threading.Event()
+        self.addCleanup(self.sink.gate.set)
+        taken = [self.relay.emit({"event": "hook", "home": self.a, "n": n})
+                 for n in range(helper.EMIT_QUEUE_SIZE)]
+        self.assertLessEqual(sum(taken), helper.EMIT_HOME_SHARE + 1)
+        self.assertTrue(self.relay.emit({"event": "hook", "home": self.b, "held": True}))
+        self.sink.gate.set()
+        self.assertIsNotNone(self.sink.wait_for(lambda e: e.get("home") == self.b))
+        # Once the Mac has taken them, the home has its share again.
+        self.assertTrue(wait_until(lambda: self.relay.emit({"event": "hook", "home": self.a})))
+
+
 class FollowerRelayTests(unittest.TestCase):
     """A follower relays what its broker sends. The broker is whoever holds
     the home's lock, possibly the home's own user, so it never decides
@@ -2937,6 +3539,19 @@ class FollowerRelayTests(unittest.TestCase):
         self.assertEqual(event["peer"], (["a"] + ["b"] * 20)[:helper.PEER_DEPTH])
         self.assertIsNone(event["account"])
 
+    def test_agent_is_checked_for_shape(self):
+        good = {"pid": 4242, "name": "bearcode", "start": "12345"}
+        self.hub.relay_message(self.hook(agent=good))
+        self.assertEqual(self.sent[-1]["agent"], good)
+        for bad in (None, 7, {"pid": True, "name": "kimi", "start": "1"},
+                    {"pid": 1, "name": "kimi", "start": "1"},
+                    {"pid": 42, "name": "claude", "start": "1"},
+                    {"pid": 42, "name": "kimi", "start": ""},
+                    {"pid": 42, "name": "kimi", "start": "x" * 200},
+                    {"pid": 42, "name": "kimi"}):
+            self.hub.relay_message(self.hook(agent=bad))
+            self.assertIsNone(self.sent[-1]["agent"], bad)
+
     def test_only_announced_holds_can_be_resolved(self):
         self.hub.relay_message({"event": "hook_resolved", "rid": "someone-elses"})
         self.assertEqual(self.sent, [])
@@ -2963,6 +3578,45 @@ class PeerChainTests(unittest.TestCase):
             chain = helper.peer_chain(None)
         self.assertEqual(chain, ["curl", "swarmbar-remote", "claude", "bash", "tmux:", "Terminal"])
         self.assertEqual(runner.calls[0][:2], ["ps", "-axo"])
+
+    KIMI_TABLE = (
+        "  900   800 curl            curl -s --unix-socket x\n"
+        "  800   700 sh              /bin/sh /home/u/.swarmbar/swarmbar-remote-kimi-hook.sh PermissionRequest\n"
+        "  700   600 kimi-code       kimi-code\n"
+        "  600   500 bash            -bash\n"
+        "  500     1 claude          claude --resume\n"
+    )
+
+    def test_peer_agent_is_the_kimi_process_above_the_hook(self):
+        runner = FakeRunner(ps=self.KIMI_TABLE)
+        with mock.patch.object(helper, "run_command", side_effect=runner), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value="12345"):
+            self.assertEqual(helper.peer_agent(None),
+                             {"pid": 700, "name": "kimi-code", "start": "12345"})
+
+    def test_peer_agent_is_only_ever_the_nearest_agent(self):
+        # The nearest agent ran the hook. A Kimi further up is not it.
+        table = self.KIMI_TABLE.replace("kimi-code       kimi-code", "codex           codex")
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps=table)), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value="12345"):
+            self.assertIsNone(helper.peer_agent(None))
+
+    def test_peer_agent_without_a_start_time_is_none(self):
+        with mock.patch.object(helper, "run_command", side_effect=FakeRunner(ps=self.KIMI_TABLE)), \
+                mock.patch.object(helper, "peer_pid", return_value=900), \
+                mock.patch.object(helper, "process_start", return_value=None):
+            self.assertIsNone(helper.peer_agent(None))
+        with mock.patch.object(helper, "peer_pid", return_value=None):
+            self.assertIsNone(helper.peer_agent(None))
+
+    def test_process_start_of_this_process_is_stable(self):
+        first = helper.process_start(os.getpid())
+        self.assertIsInstance(first, str)
+        self.assertTrue(first)
+        self.assertEqual(helper.process_start(os.getpid()), first)
+        self.assertIsNone(helper.process_start(0))
 
     def test_peer_uid_of_a_socketpair_is_ours(self):
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3216,6 +3870,11 @@ class ProbeTests(unittest.TestCase):
             {"path": os.path.join(real, ".claude"), "settings": "present"},
             {"path": os.path.join(real, ".claude-work"), "settings": "missing"},
         ])
+
+    def test_probe_reports_each_homes_realpath(self):
+        # Every file path it reports is a realpath, so the Mac needs the
+        # home's own to tell which home a path is in.
+        self.assertEqual(self.probe()["real_homes"], {self.home: os.path.realpath(self.home)})
 
     def test_probe_reports_unreadable_claude_settings(self):
         self.put(".claude/projects/p/s.jsonl", "{}\n")
@@ -4073,9 +4732,56 @@ class KimiEventsTests(unittest.TestCase):
                 self.assertEqual(self.events(home=home)["error"], "not a home")
         runner.assert_not_called()
 
+    def test_root_runs_for_another_home_only_a_build_its_owner_or_root_controls(self):
+        # The build is this test's user's, the home another user's: run as
+        # that user it would be one account's program in another's name.
+        me = os.geteuid()
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "home_owner", return_value=("bob", me + 1, me + 1)), \
+                mock.patch.object(helper, "run_command", runner):
+            result = self.events()
+        self.assertIsNone(result["events"])
+        self.assertIn("will not run", result["error"])
+        runner.assert_not_called()
+
+        # A link the home's owner could not have placed is refused even
+        # when the file it leads to is theirs.
+        link = os.path.join(self.root, "elsewhere", "kimi")
+        os.makedirs(os.path.dirname(link))
+        os.symlink(self.kimi, link)
+        trusted = lambda path, uid: uid == me and not path.startswith(os.path.dirname(link))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "path_trusted_for", side_effect=trusted), \
+                mock.patch.object(helper, "run_command", runner):
+            self.assertIsNone(self.events(link)["events"])
+        runner.assert_not_called()
+
+    def test_narrow_rule_runs_doctor_only_for_the_callers_own_home(self):
+        me = os.geteuid()
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "narrow_rule_run", return_value=True), \
+                mock.patch.dict(os.environ, {"SUDO_UID": str(me + 1)}), \
+                mock.patch.object(helper, "path_trusted_for", return_value=True), \
+                mock.patch.object(helper, "run_command", runner):
+            result = self.events()
+        self.assertIsNone(result["events"])
+        self.assertIn("sudo rule", result["error"])
+        runner.assert_not_called()
+        seen = {}
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "narrow_rule_run", return_value=True), \
+                mock.patch.dict(os.environ, {"SUDO_UID": str(me)}), \
+                mock.patch.object(helper, "path_trusted_for", return_value=True), \
+                mock.patch.object(helper, "run_command", self.recording(seen)):
+            self.assertIsNotNone(self.events()["events"])
+
     def test_root_runs_doctor_as_the_home_owner(self):
         seen = {}
         with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper, "path_trusted_for",
+                                  lambda path, uid: uid == os.stat(self.home).st_uid), \
                 mock.patch.object(helper, "run_command", self.recording(seen)):
             self.assertIsNotNone(self.events()["events"])
         self.assertEqual(seen["options"]["user"], os.stat(self.home).st_uid)
@@ -4248,6 +4954,66 @@ class KimiEventsTests(unittest.TestCase):
                 mock.patch.object(helper, "run_command", runner):
             self.assertIsNone(self.events(first)["events"])
         runner.assert_not_called()
+
+
+class ChildStdinTests(unittest.TestCase):
+    """The helper's stdin is the Mac's request stream, write_file contents
+    and replies included. A tmux client hands its descriptors to its
+    server, which may belong to any user, so no child may hold it."""
+
+    def request_pipe(self):
+        """Puts a pipe holding one request line on descriptor 0, as ssh
+        does for a serving helper, and restores the real stdin after."""
+        read_end, write_end = os.pipe()
+        os.write(write_end, b'{"cmd":"write_file","content_b64":"c2VjcmV0"}\n')
+        os.close(write_end)
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        os.close(read_end)
+
+        def restore():
+            os.dup2(saved, 0)
+            os.close(saved)
+        self.addCleanup(restore)
+
+    def test_children_read_end_of_file_not_the_requests(self):
+        for options in ({}, {"start_new_session": True},
+                        {"start_new_session": True, "env": {"PATH": "/usr/bin:/bin"}}):
+            self.request_pipe()
+            done = helper.run_command(["/bin/sh", "-c", "cat"], timeout=5, **options)
+            self.assertEqual(done.stdout, b"", options)
+            # The request is still there for the helper to read.
+            self.assertIn(b"write_file", os.read(0, 4096), options)
+
+    def test_explicit_input_still_reaches_the_child(self):
+        self.request_pipe()
+        for options in ({}, {"start_new_session": True}):
+            done = helper.run_command(["/bin/sh", "-c", "cat"], timeout=5, input=b"paste", **options)
+            self.assertEqual(done.stdout, b"paste", options)
+
+    def test_tmux_client_as_another_user_gets_only_what_it_needs(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        seen = []
+
+        def run(argv, timeout=5, input=None, **options):
+            seen.append(options)
+            return completed(argv, 0, "")
+        environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                       "SUDO_USER": "root-caller", "SBK_SECRET": "must not reach tmux"}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
+                mock.patch.object(helper, "run_command", run):
+            helper.tmux_command("/tmp/tmux-1500/default", 1500, ["list-panes"])
+            helper.tmux_command("/tmp/tmux-0/default", 0, ["list-panes"])
+        # The locale stays, so capture-pane keeps the selector's symbols.
+        self.assertEqual(seen[0]["env"], {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                                          "LC_ALL": "C.UTF-8"})
+        # Root's own server is root's own: its environment as it is.
+        self.assertNotIn("env", seen[1])
+
 
 class ApplyTests(unittest.TestCase):
     """`swarmbar-helper.py apply <blob>`: the pasted-command path."""
@@ -4429,7 +5195,8 @@ class RootPathTests(unittest.TestCase):
         self.assertTrue(first.startswith("#!/"), first)
         interpreter = first[2:].split()
         self.assertNotIn("env", os.path.basename(interpreter[0]))
-        self.assertEqual(interpreter, ["/usr/bin/python3", "-I"])
+        # sh, root's own on every host, picks the python (RootInterpreterTests).
+        self.assertEqual(interpreter, ["/bin/sh"])
 
     def test_only_directories_only_root_can_change_are_kept(self):
         planted = tempfile.mkdtemp(prefix="swarmbar-planted-")
@@ -4478,6 +5245,168 @@ class RootPathTests(unittest.TestCase):
         self.assertIn("/usr/bin", helper.trusted_root_path().split(":"))
 
 
+HELPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "swarmbar-helper.py")
+PROLOGUE_CONDITION = '[ "$(/usr/bin/id -u)" = 0 ] && [ "$(/usr/bin/uname -s)" = Darwin ]'
+PROLOGUE_EXEC = 'exec "$f/Versions/Current/bin/python3" -I "$0" "$@"'
+PROLOGUE_ANCESTORS = ("/ /Library /Library/Developer /Library/Developer/CommandLineTools "
+                      "/Library/Developer/CommandLineTools/Library "
+                      "/Library/Developer/CommandLineTools/Library/Frameworks")
+
+
+class RootInterpreterTests(unittest.TestCase):
+    """The narrow sudo rule has the kernel run the helper as root, so the
+    python it starts must be one only root can change. On macOS
+    /usr/bin/python3 launches whichever developer directory is selected,
+    possibly an Xcode a user owns, so the file's sh prologue picks the
+    Command Line Tools' python and vets all of it first."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="sbi-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.me = os.geteuid()
+
+    def framework(self, name="Python3.framework"):
+        """A synthetic framework laid out like the Command Line Tools' one."""
+        top = os.path.join(self.base, name)
+        bin_dir = os.path.join(top, "Versions", "3.9", "bin")
+        os.makedirs(bin_dir)
+        os.makedirs(os.path.join(top, "Versions", "3.9", "lib", "python3.9"))
+        with open(os.path.join(top, "Versions", "3.9", "lib", "python3.9", "os.py"), "w") as handle:
+            handle.write("# synthetic\n")
+        python = os.path.join(bin_dir, "python3")
+        with open(python, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(python, 0o755)
+        os.symlink("3.9", os.path.join(top, "Versions", "Current"))
+        return top
+
+    def prologue(self, top=None, ancestors="", owner=None, condition="true"):
+        """The helper's sh prologue, adjusted to run here: as this user, on
+        a synthetic framework, printing what it would exec."""
+        with open(HELPER_PATH) as handle:
+            text = handle.read()
+        script = text[:text.index('\n":"""\n')] + "\n"
+        replacements = [(PROLOGUE_CONDITION, condition),
+                        (PROLOGUE_EXEC, PROLOGUE_EXEC.replace("exec", "echo", 1) + "; exit 0"),
+                        ('exec /usr/bin/python3 -I "$0" "$@"',
+                         'echo /usr/bin/python3 -I "$0" "$@"; exit 0')]
+        if top is not None:
+            replacements.append((helper.ROOT_PYTHON_FRAMEWORK, top))
+        if owner is not None:
+            replacements.append(("-user 0", "-user %d" % owner))
+        for old, new in replacements:
+            self.assertIn(old, script)
+            script = script.replace(old, new)
+        if top is not None:
+            script, count = re.subn(r'above="[^"]*"', 'above="%s"' % ancestors, script)
+            self.assertEqual(count, 1)
+        path = os.path.join(self.base, "prologue.sh")
+        with open(path, "w") as handle:
+            handle.write(script)
+        return subprocess.run(["/bin/sh", path, "serve"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    def test_the_prologue_names_the_framework_the_helper_checks(self):
+        with open(HELPER_PATH) as handle:
+            text = handle.read()
+        self.assertIn("f=%s\n" % helper.ROOT_PYTHON_FRAMEWORK, text)
+        ancestors = []
+        current = helper.ROOT_PYTHON_FRAMEWORK
+        while current != "/":
+            current = os.path.dirname(current)
+            ancestors.insert(0, current)
+        self.assertEqual(" ".join(ancestors), PROLOGUE_ANCESTORS)
+        self.assertIn(PROLOGUE_ANCESTORS, " ".join(text.split()))
+
+    def test_python_reads_the_prologue_as_a_string(self):
+        done = subprocess.run([sys.executable, "-I", "-W", "error", "-c",
+                               "import ast,sys; ast.parse(open(sys.argv[1]).read())", HELPER_PATH],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_anyone_else_and_other_systems_keep_usr_bin_python3(self):
+        done = self.prologue(condition="false")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.decode().split()[:2], ["/usr/bin/python3", "-I"])
+
+    def test_a_framework_only_its_owner_can_change_runs(self):
+        top = self.framework()
+        done = self.prologue(top, owner=self.me)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.decode().split()[:2],
+                         [os.path.join(top, "Versions", "Current", "bin", "python3"), "-I"])
+        self.assertTrue(helper.root_python_framework_ok(top, owner=self.me, stop=self.base))
+
+    def test_a_framework_root_does_not_own_never_runs(self):
+        if self.me == 0:
+            self.skipTest("runs as root")
+        top = self.framework()
+        done = self.prologue(top)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, b"")
+        self.assertIn(b"Command Line Tools", done.stderr)
+        self.assertFalse(helper.root_python_framework_ok(top, stop=self.base))
+
+    def test_anything_writable_by_others_in_or_above_it_never_runs(self):
+        top = self.framework()
+        library = os.path.join(top, "Versions", "3.9", "lib", "python3.9")
+        for path, mode in ((os.path.join(library, "os.py"), 0o664),
+                           (library, 0o757), (top, 0o775)):
+            original = stat.S_IMODE(os.stat(path).st_mode)
+            os.chmod(path, mode)
+            try:
+                done = self.prologue(top, owner=self.me)
+                self.assertEqual(done.returncode, 1, path)
+                self.assertEqual(done.stdout, b"", path)
+                self.assertFalse(helper.root_python_framework_ok(top, owner=self.me, stop=self.base))
+            finally:
+                os.chmod(path, original)
+        os.chmod(self.base, 0o775)
+        self.addCleanup(os.chmod, self.base, 0o755)
+        done = self.prologue(top, ancestors=self.base, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(helper.root_python_framework_ok(
+            top, owner=self.me, stop=os.path.dirname(self.base)))
+
+    def test_a_missing_or_linked_framework_never_runs(self):
+        missing = os.path.join(self.base, "Missing.framework")
+        done = self.prologue(missing, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(helper.root_python_framework_ok(missing, owner=self.me, stop=self.base))
+        real = self.framework("Real.framework")
+        link = os.path.join(self.base, "Python3.framework")
+        os.symlink(real, link)
+        done = self.prologue(link, owner=self.me)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, b"")
+        self.assertFalse(helper.root_python_framework_ok(link, owner=self.me, stop=self.base))
+
+    @unittest.skipUnless(os.path.isdir("/Library/Developer/CommandLineTools/Library/Frameworks"
+                                       "/Python3.framework"), "no Command Line Tools python")
+    def test_this_macs_command_line_tools_python_qualifies(self):
+        done = self.prologue()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        python = done.stdout.decode().split()[0]
+        self.assertTrue(python.startswith(helper.ROOT_PYTHON_FRAMEWORK + "/"), python)
+        self.assertTrue(helper.root_python_framework_ok())
+
+    def test_the_rule_is_installed_only_where_that_python_qualifies(self):
+        runner = mock.Mock(side_effect=AssertionError("ran"))
+        with mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch.object(helper.platform, "system", return_value="Darwin"), \
+                mock.patch.object(helper, "root_python_framework_ok", return_value=False), \
+                mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo"), \
+                mock.patch.object(helper, "SUDOERS_PATH", os.path.join(self.base, "swarmbar")), \
+                mock.patch.object(helper, "run_command", runner):
+            result = helper.install_sudoers({"user": "nobody"})
+        self.assertFalse(result["ok"])
+        self.assertIn("Command Line Tools", result["error"])
+        runner.assert_not_called()
+        with mock.patch.object(helper.platform, "system", return_value="Linux"), \
+                mock.patch.object(helper, "root_python_framework_ok", return_value=False):
+            self.assertTrue(helper.root_interpreter_ok())
+
+
 class SudoersTests(unittest.TestCase):
     """The narrow sudo rule: one user, one command, checked by visudo."""
 
@@ -4486,7 +5415,8 @@ class SudoersTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "swarmbar")
         for patch in (mock.patch.object(helper, "SUDOERS_PATH", self.path),
-                      mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo")):
+                      mock.patch.object(helper, "visudo_path", return_value="/usr/sbin/visudo"),
+                      mock.patch.object(helper, "root_interpreter_ok", return_value=True)):
             patch.start()
             self.addCleanup(patch.stop)
 

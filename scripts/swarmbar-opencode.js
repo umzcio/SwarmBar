@@ -19,7 +19,9 @@
 // the user answers in the TUI first (or SwarmBar is not running), the
 // held request resolves empty and nothing happens. permission.replied is
 // forwarded so SwarmBar clears its approval row no matter where the
-// prompt was answered.
+// prompt was answered. Each prompt goes with the tool call it gates, read
+// from OpenCode's own tool hooks, since the prompt alone does not say
+// what the call runs (see gatedCall).
 //
 // It talks only to SwarmBar's own Unix socket, in a folder only this user
 // can enter, never to a network port: whatever held a port while SwarmBar
@@ -96,6 +98,48 @@ export function asV1Request(request, directory) {
   }
 }
 
+// The tool calls OpenCode is running, by call id. A permission request
+// names the call it gates but carries only the permission's patterns,
+// which are what a rule matches, not what runs: for a shell call they
+// drop redirections, cd, assignments and expansions, and other tools ask
+// with "*". So each request is relayed with the gated call's own input,
+// and SwarmBar shows that beside Approve. A call this plugin did not see
+// start is sent without one, and SwarmBar offers the terminal instead.
+const calls = new Map()
+const MAX_CALLS = 256
+
+function remember(id, read) {
+  if (typeof id !== "string" || id === "") return
+  calls.delete(id)
+  calls.set(id, read)
+  while (calls.size > MAX_CALLS) calls.delete(calls.keys().next().value)
+}
+
+function forget(id) {
+  if (typeof id === "string") calls.delete(id)
+}
+
+// The call as { tool, input }, or undefined when it is not known.
+function gatedCall(id) {
+  const read = typeof id === "string" ? calls.get(id) : undefined
+  if (!read) return undefined
+  try {
+    const { tool, input } = read()
+    if (typeof tool !== "string" || tool === "") return undefined
+    if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+    return { tool, input }
+  } catch {
+    return undefined
+  }
+}
+
+// The request with the gated call attached as `call`, and never a `call`
+// of any other origin.
+function withCall(request, call) {
+  const { call: _unused, ...rest } = request
+  return call ? { ...rest, call } : rest
+}
+
 // Holds for SwarmBar's decision and hands an allow or a deny to `answer`.
 // Anything else, including no answer at all, leaves the TUI prompt alone.
 async function relay(request, answer) {
@@ -112,10 +156,19 @@ async function relay(request, answer) {
 // OpenCode 1.17 and later.
 async function server({ client, directory }) {
   return {
+    // OpenCode 1 hands the tool the same args object it passes here, so
+    // the object itself is kept, not a copy, and read when a request for
+    // the call is relayed.
+    "tool.execute.before": async (input, output) => {
+      const tool = input?.tool
+      const args = output?.args
+      remember(input?.callID, () => ({ tool, input: args }))
+    },
+    "tool.execute.after": async (input) => forget(input?.callID),
     event: async ({ event }) => {
       const input = event.properties ?? {}
       if (event.type === "permission.asked") {
-        relay({ ...input, directory }, (response) =>
+        relay(withCall({ ...input, directory }, gatedCall(input.tool?.callID)), (response) =>
           client.postSessionIdPermissionsPermissionId({
             path: { id: input.sessionID, permissionID: input.id },
             body: { response },
@@ -130,6 +183,17 @@ async function server({ client, directory }) {
 
 // OpenCode 2. Events arrive as { type, location: { directory }, data }.
 async function setup(opencode) {
+  // OpenCode 2 runs the input as it stands on this payload once every
+  // execute.before hook has run (a hook repairs it by assigning to it), so
+  // the payload is kept and its tool and input are read at relay time.
+  try {
+    Promise.resolve(opencode.tool.hook("execute.before", (call) => {
+      remember(call?.id, () => ({ tool: call.tool, input: call.input }))
+    })).catch(() => {})
+    Promise.resolve(opencode.tool.hook("execute.after", (call) => forget(call?.id))).catch(() => {})
+  } catch {
+    // No tool hooks: every request goes without its call, to the terminal.
+  }
   const stop = new AbortController()
   const events = opencode.event.subscribe({
     types: ["permission.asked", "permission.replied"],
@@ -140,7 +204,8 @@ async function setup(opencode) {
       const data = event.data ?? event.properties ?? {}
       const directory = event.location?.directory ?? opencode.location?.directory
       if (event.type === "permission.asked") {
-        relay(asV1Request(data, directory), (decision) =>
+        const source = data.source?.type === "tool" ? data.source.id : undefined
+        relay(withCall(asV1Request(data, directory), gatedCall(source)), (decision) =>
           opencode.permission.reply({
             sessionID: data.sessionID, requestID: data.id, decision,
           }))

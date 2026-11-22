@@ -272,13 +272,15 @@ final class SessionStore {
                 }
             }
         }
-        if host == nil, tool == .kimiCode || tool == .bearCode {
+        if tool == .kimiCode || tool == .bearCode {
             // The Kimi family's liveness is a count per directory, so a
             // session that died at its prompt can still read as alive
             // beside another. Its pin goes once the process its own hook
-            // came from is gone (SessionProcessRegistry).
-            let rows = Set(sessions.filter { $0.tool == tool && $0.host == nil }.map(\.id))
-            for (id, pin) in hookOverrides where pin.sticky && rows.contains(id) && boundProcessGone(id) {
+            // came from is gone: SessionProcessRegistry on this Mac,
+            // RemoteProcessBinding on a host.
+            let gone = host == nil ? boundProcessGone : remoteBoundProcessGone
+            let rows = Set(sessions.filter { $0.tool == tool && $0.host == host }.map(\.id))
+            for (id, pin) in hookOverrides where pin.sticky && rows.contains(id) && gone(id) {
                 hookOverrides.removeValue(forKey: id)
             }
         }
@@ -328,6 +330,58 @@ final class SessionStore {
     /// had drawn next. A prompt with no event id is matched by its text.
     @ObservationIgnored private var answeredPrompts:
         [UUID: (eventID: String?, prompt: ApprovalPrompt, allow: Bool, tool: AgentTool)] = [:]
+
+    /// How long a request must have been on its row, unchanged, before
+    /// Approve is honoured for it. A held request answered by Approve can
+    /// be replaced by the agent's next one at once (two tool calls in one
+    /// message, the second gated as soon as the first is allowed), drawn in
+    /// the same place with its Approve under the pointer, and the second
+    /// click of a double click, or a click just as the row swapped, then
+    /// allowed a command nobody had read. A second is longer than a double
+    /// click and shorter than reading any command. Deny allows nothing, so
+    /// it is never held back.
+    nonisolated static let approveSettle: TimeInterval = 1
+
+    /// The store's clock. A seam for tests.
+    @ObservationIgnored var clock: () -> Date = { .now }
+
+    /// `approveSettle`, per store, so a test about something else can
+    /// approve a row it has just made. Never changed by the app.
+    @ObservationIgnored var approveSettleInterval: TimeInterval = SessionStore.approveSettle
+
+    /// When each approvable request was first on its row, with what makes
+    /// it that request: its text and its event id. Recorded once the store
+    /// has settled after a change (as alerts are), so a poll's passing
+    /// flicker does not restart the clock, and a different request, or the
+    /// same text asked again, does.
+    @ObservationIgnored private var approvalShownAt:
+        [UUID: (prompt: ApprovalPrompt, eventID: String?, at: Date)] = [:]
+
+    private func noteApprovalsShown() {
+        let now = clock()
+        var shown: [UUID: (prompt: ApprovalPrompt, eventID: String?, at: Date)] = [:]
+        for session in sessions {
+            guard case .waitingApproval(let prompt) = session.status, prompt.offersApprove else { continue }
+            if let last = approvalShownAt[session.id],
+               last.prompt == prompt, last.eventID == session.attentionEventID {
+                shown[session.id] = last
+            } else {
+                shown[session.id] = (prompt, session.attentionEventID, now)
+            }
+        }
+        approvalShownAt = shown
+    }
+
+    /// Whether the request this row shows has been on screen long enough
+    /// for an Approve to be the answer to it. The row must be the store's
+    /// current request (see `isStillAsking`), with the same event id.
+    func approvalHasSettled(_ session: AgentSession) -> Bool {
+        guard case .waitingApproval(let prompt) = session.status,
+              let shown = approvalShownAt[session.id],
+              shown.prompt == prompt, shown.eventID == session.attentionEventID
+        else { return false }
+        return clock().timeIntervalSince(shown.at) >= approveSettleInterval
+    }
 
     /// Local sessions whose keystroke answer is on its way. A second click
     /// meanwhile would read the same screen and could press into whatever
@@ -456,6 +510,9 @@ final class SessionStore {
     /// Whether a Kimi-family session's own process, proved by its hook,
     /// is gone. A seam for tests.
     @ObservationIgnored var boundProcessGone: (UUID) -> Bool = { SessionProcessRegistry.isGone($0) }
+    /// The same for a remote Kimi-family row, as its host's last full
+    /// process table showed it. A seam for tests.
+    @ObservationIgnored var remoteBoundProcessGone: (UUID) -> Bool = { RemoteProcessBinding.isGone($0) }
     @ObservationIgnored weak var approvalResponder: ApprovalResponding?
 
     /// Test seam. When set, a local answer is reported here instead of
@@ -638,6 +695,7 @@ final class SessionStore {
 
     private func noteAttentionTransitions() {
         guard !isSyncing else { return }
+        noteApprovalsShown()
         for session in sessions where session.status.needsAttention {
             if let last = alertedStatus[session.id] {
                 if let eventID = session.attentionEventID,
@@ -700,11 +758,20 @@ final class SessionStore {
     /// The held hook connection broke before the decision reached the agent.
     /// The row said "Running"; say plainly that it did not land, so the user
     /// goes to the terminal instead of trusting a false confirmation.
+    ///
+    /// The agent is still asking, in its own permission dialog, so the row
+    /// asks too, as an approval it cannot answer. It used to say so as a
+    /// waiting question, and a waiting question offers Reply: the reply was
+    /// pasted into that dialog and Enter confirmed whichever option the
+    /// cursor was on.
     func noteApprovalDeliveryFailed(sessionID: UUID) {
         update(id: sessionID) { session in
-            session.status = .waitingInput(prompt: "Answer at the terminal, SwarmBar could not deliver")
+            session.status = .waitingApproval(command: .unreadable(Self.undeliveredReason))
         }
     }
+
+    nonisolated static let undeliveredReason =
+        "SwarmBar could not deliver that answer. Answer it in the terminal."
 
     // Called by row buttons. Mock sessions (no projectPath) transition state
     // directly. Real sessions are answered through their tool's own control
@@ -722,6 +789,10 @@ final class SessionStore {
             if session.host == nil, session.projectPath != nil { openInTerminal(session) }
             return
         }
+        // Only a request that has been on the row long enough to read, on
+        // every route: a click this soon after the row changed was aimed
+        // at what was there before.
+        guard approvalHasSettled(session) else { return }
         if approvalResponder?.resolveApproval(sessionID: session.id, allow: true) == true {
             noteAnswered(session.id, command: command, allow: true)
             return
@@ -829,6 +900,15 @@ final class SessionStore {
             }
             switch route {
             case .keys(let keys):
+                // Codex's hotkey reads nothing off the screen, so the
+                // rollout is read again first and must still have exactly
+                // the request this row showed waiting.
+                if tool == .codex {
+                    guard case .waitingApproval(let shown) = session.status,
+                          CodexAnswerCheck.mayAnswer(
+                            shown: shown, pending: CodexAnswerCheck.livePending(sessionID: id))
+                    else { return giveUp() }
+                }
                 return TerminalFocuser.sendKeys(sessionID: id, tool: tool, projectPath: path, keys: keys)
                     ? true : giveUp()
             case .numberedSelector:
@@ -929,15 +1009,24 @@ final class SessionStore {
                     pending: AntigravityAnswerCheck.livePending(sessionID: id))
             else { return false }
         }
+        if tool == .grokBuild {
+            // Grok's gates all read alike, so its own record of the pending
+            // call, read now, must be the request the row showed.
+            guard case .waitingApproval(let shown) = session.status,
+                  GrokAnswerCheck.mayAnswer(shown: shown, pending: GrokAnswerCheck.livePending(sessionID: id))
+            else { return false }
+        }
         let selector = TuiPromptLayout.selector(in: screen)
         guard let cursor = selector.cursor,
               let cursorLine = selector.cursorLine,
+              let targetLine = TuiPromptLayout.drawnLine(of: option, in: screen),
               let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
         else { return false }
         return TerminalFocuser.answerByNavigation(
             sessionID: id, tool: tool, projectPath: path,
             key: move.key, presses: move.presses,
-            expectedCursorLine: cursorLine, expectedLabel: option.label) == .sent
+            expectedCursorLine: cursorLine, expectedLabel: option.label,
+            expectedTargetLine: targetLine) == .sent
     }
 
     // MARK: - Inline reply
@@ -1017,6 +1106,10 @@ final class SessionStore {
                     TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
                     completion(.failed(
                         "The text did not appear in the composer, so nothing was submitted. Check the terminal."))
+                case .selectorShown:
+                    TerminalFocuser.focus(sessionID: id, tool: tool, projectPath: path)
+                    completion(.failed(
+                        "This session is showing a list of choices, so nothing was submitted. Answer it in the terminal."))
                 case .noTerminal:
                     completion(.failed(
                         "Could not reach this session's terminal. Inline reply needs iTerm2."))

@@ -58,6 +58,7 @@ struct RemoteHookRelayTests {
     /// dir, so the local path's Grok and Kimi lookups read nothing real.
     private func rig(remoteHold: Duration = .seconds(350)) -> (SessionStore, HookServer) {
         let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        store.approveSettleInterval = 0
         let localHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-hook-local-\(UUID().uuidString)", isDirectory: true)
         let server = HookServer(store: store, remoteDecisionHold: remoteHold, localHome: localHome)
@@ -119,6 +120,7 @@ struct RemoteHookRelayTests {
         let body: [String: Any] = [
             "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
             "patterns": ["ls -la"], "directory": "/home/u/web",
+            "call": ["tool": "bash", "input": ["command": "ls -la"]],
         ]
         server.handleRemote(
             event: "OpenCodePermission", body: body, accountLabel: nil,
@@ -133,6 +135,35 @@ struct RemoteHookRelayTests {
 
         store.deny(row)
         #expect(decode(try #require(answers.first))["decision"] as? String == "deny")
+    }
+
+    /// An older plugin, or one that could not find the gated call, sends
+    /// only the permission's patterns. The row cannot show what Approve
+    /// would release, so the request is let go at once, failing open to
+    /// OpenCode's own prompt, and the row offers the terminal.
+    @Test func anOpenCodeRequestWithoutItsCallIsNotHeld() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        var answers: [Data] = []
+        let body: [String: Any] = [
+            "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
+            "patterns": ["echo hi"], "metadata": [String: String](), "directory": "/home/u/web",
+        ]
+        server.handleRemote(
+            event: "OpenCodePermission", body: body, accountLabel: nil,
+            origin: origin(mirror: mirror, peer: []), rid: "r3", held: true) { json, _ in answers.append(json) }
+
+        let id = RemoteIdentity.sessionID(
+            hostID: hostID, home: home, localID: StableID.uuid(for: "ses_abc"))
+        #expect(!server.isHolding(sessionID: id))
+        #expect(answers.count == 1)
+        #expect(answers.first.map(isEmptyAnswer) == true)
+        let row = try #require(store.sessions.first { $0.id == id })
+        guard case .waitingApproval(let prompt) = row.status else {
+            Issue.record("row is \(row.status)")
+            return
+        }
+        #expect(!prompt.offersApprove)
     }
 
     /// A second held request for a session that is already holding one,
@@ -177,6 +208,7 @@ struct RemoteHookRelayTests {
         let body: [String: Any] = [
             "id": "per_1", "sessionID": "ses_abc", "permission": "bash",
             "patterns": ["ls -la"], "directory": "/home/u/web",
+            "call": ["tool": "bash", "input": ["command": "ls -la"]],
         ]
         server.handleRemote(
             event: "OpenCodePermission", body: body, accountLabel: nil,
@@ -187,7 +219,8 @@ struct RemoteHookRelayTests {
 
         var huge = body
         huge["id"] = "per_2"
-        huge["patterns"] = [String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]
+        huge["call"] = ["tool": "bash", "input": [
+            "command": String(repeating: "x", count: ApprovalPrompt.maxScalars + 1)]]
         server.handleRemote(
             event: "OpenCodePermission", body: huge, accountLabel: nil,
             origin: origin(mirror: mirror, peer: []), rid: "r2", held: true) { json, _ in second.append(json) }
@@ -241,6 +274,11 @@ struct RemoteHookRelayTests {
         #expect(isEmptyAnswer(answers[0]))
         #expect(!server.isHolding(sessionID: rowID(raw)))
         #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+        // Grok sends no hook when a prompt is answered at its terminal, so
+        // a pin that never expired kept offering Approve for a prompt long
+        // gone. It lasts until the next poll can read Grok's own record.
+        let pin = try #require(store.hookOverrides[rowID(raw)])
+        #expect(!pin.sticky)
     }
 
     @Test func approvalsOffAnswersEmptyButShowsStatus() throws {
@@ -300,6 +338,64 @@ struct RemoteHookRelayTests {
         #expect(answers.isEmpty)
         #expect(store.sessions.first { $0.id == rowID(raw) }?.status
             == .working(activity: "Thinking…"))
+    }
+
+    /// A Kimi session id the mirrored home's index names, so its events
+    /// read as Kimi Code's.
+    private func kimiSession(in mirror: RemoteMirror) throws -> String {
+        let raw = "session_\(UUID().uuidString)"
+        let dir = try #require(mirror.local(home)).appendingPathComponent(".kimi-code")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data((#"{"sessionId":"\#(raw)","sessionDir":"/home/u/.kimi-code/sessions/x"}"# + "\n").utf8)
+            .write(to: dir.appendingPathComponent("session_index.jsonl"))
+        return raw
+    }
+
+    /// find_014cCa2Cdku9Bj5LWjxM2uNP: a relayed Kimi prompt binds its row
+    /// to the process the helper found above its bridge. One that names no
+    /// process unbinds it, so keys never go by an old binding, and the end
+    /// of the session forgets it.
+    @Test func aKimiPromptBindsItsRowToItsOwnProcess() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = try kimiSession(in: mirror)
+        let id = rowID(raw)
+        var asking = origin(mirror: mirror, peer: ["curl", "sh", "kimi-code"])
+        asking.agent = .init(pid: 4242, name: "kimi-code", start: "t0")
+        func send(_ event: String, _ origin: RemoteHookOrigin, rid: String) {
+            server.handleRemote(
+                event: event, body: permissionBody(raw), accountLabel: nil,
+                origin: origin, rid: rid, held: false) { _, _ in }
+        }
+
+        send("PermissionRequest", asking, rid: "k1")
+        #expect(store.sessions.first { $0.id == id }?.tool == .kimiCode)
+        #expect(RemoteProcessBinding.bound(id) == .init(hostID: hostID, agent: asking.agent!))
+
+        send("PermissionRequest", origin(mirror: mirror, peer: ["curl", "sh", "kimi-code"]), rid: "k2")
+        #expect(RemoteProcessBinding.bound(id) == nil)
+
+        send("PermissionRequest", asking, rid: "k3")
+        send("SessionEnd", origin(mirror: mirror), rid: "k4")
+        #expect(RemoteProcessBinding.bound(id) == nil)
+    }
+
+    @Test func theRelayCarriesTheAgentProcess() async throws {
+        let (_, server) = rig()
+        let mirror = try makeMirror()
+        let raw = try kimiSession(in: mirror)
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: FakeReplier(), hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+        sink.yield(try hookLine(
+            rid: "k1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["curl", "sh", "kimi"], held: false,
+            agent: ["pid": 4343, "name": "kimi", "start": "1234"]))
+        await settle { RemoteProcessBinding.bound(rowID(raw)) != nil }
+        #expect(RemoteProcessBinding.bound(rowID(raw))?.agent == .init(pid: 4343, name: "kimi", start: "1234"))
     }
 
     /// A home the mirror refuses cannot say which tool a session belongs
@@ -408,12 +504,13 @@ struct RemoteHookRelayTests {
 
     private func hookLine(
         rid: String, path: String, body: [String: Any], peer: [String], held: Bool,
-        generation: Int = 0
+        generation: Int = 0, agent: [String: Any]? = nil
     ) throws -> HelperEvent {
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "event": "hook", "rid": rid, "home": home, "user": "u", "path": path,
             "account": NSNull(), "peer": peer, "body": body, "held": held,
         ]
+        if let agent { object["agent"] = agent }
         return HelperEvent(
             name: "hook", payload: try JSONSerialization.data(withJSONObject: object),
             generation: generation)
@@ -621,6 +718,70 @@ struct RemoteHookRelayTests {
         #expect(replier.replies.isEmpty)
     }
 
+    /// The mirror read happens in `attribute`, which is nonisolated: called
+    /// here from a detached task, it never needs the main actor.
+    @Test func attributionIsReadFromTheMirrorOffTheMainActor() async throws {
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let grok = try #require(mirror.local(home + "/.grok"))
+        try FileManager.default.createDirectory(at: grok, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [["session_id": raw]])
+            .write(to: grok.appendingPathComponent("active_sessions.json"))
+        let event = try hookLine(
+            rid: "a1", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["claude"], held: true)
+        let attribution = await Task.detached {
+            await RemoteHookRelay.attribute(event, mirror: mirror)
+        }.value
+        #expect(attribution == RemoteHookOrigin.Attribution(rawSessionID: raw, tool: .grokBuild))
+        let resolved = HelperEvent(name: "hook_resolved", payload: Data(#"{"rid":"a1"}"#.utf8))
+        #expect(await RemoteHookRelay.attribute(resolved, mirror: mirror) == nil)
+    }
+
+    /// What was read ahead is what the row gets: the main actor does not
+    /// read the mirror a second time, so an empty mirror here changes
+    /// nothing.
+    @Test func aReadAheadAttributionIsUsedAsIs() throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror,
+            events: AsyncStream { $0.finish() }, replier: FakeReplier(),
+            hookServer: server, approvalsOff: { [] })
+        relay.handle(
+            try hookLine(
+                rid: "a2", path: "/hook/PermissionRequest", body: permissionBody(raw),
+                peer: ["claude"], held: false),
+            attribution: .init(rawSessionID: raw, tool: .grokBuild))
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+    }
+
+    /// Through the run loop, end to end: a Grok session named in the
+    /// mirror is still never held.
+    @Test func theRunLoopAttributesBeforeHandling() async throws {
+        let (store, server) = rig()
+        let mirror = try makeMirror()
+        let raw = UUID().uuidString
+        let grok = try #require(mirror.local(home + "/.grok"))
+        try FileManager.default.createDirectory(at: grok, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [["session_id": raw]])
+            .write(to: grok.appendingPathComponent("active_sessions.json"))
+        let replier = FakeReplier()
+        let (events, sink) = AsyncStream.makeStream(of: HelperEvent.self)
+        let relay = RemoteHookRelay(
+            hostID: hostID, hostName: "devbox", mirror: mirror, events: events,
+            replier: replier, hookServer: server, approvalsOff: { [] })
+        let running = Task { await relay.run() }
+        defer { running.cancel() }
+        sink.yield(try hookLine(
+            rid: "a3", path: "/hook/PermissionRequest", body: permissionBody(raw),
+            peer: ["curl", "bash", "claude"], held: true))
+        await settle { !replier.replies.isEmpty }
+        #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+        #expect(!server.isHolding(sessionID: rowID(raw)))
+    }
+
     @Test func aReplyThatFailsSaysSoOnTheRow() async throws {
         let (store, server) = rig()
         let mirror = try makeMirror()
@@ -640,8 +801,8 @@ struct RemoteHookRelayTests {
         await settle { server.isHolding(sessionID: rowID(raw)) }
         let row = try #require(store.sessions.first { $0.id == rowID(raw) })
         store.approve(row)
-        let undelivered = SessionStatus.waitingInput(
-            prompt: "Answer at the terminal, SwarmBar could not deliver")
+        let undelivered = SessionStatus.waitingApproval(
+            command: .unreadable(SessionStore.undeliveredReason))
         await settle { store.sessions.first { $0.id == rowID(raw) }?.status == undelivered }
         #expect(replier.replies.count == 1)
         #expect(store.sessions.first { $0.id == rowID(raw) }?.status == undelivered)

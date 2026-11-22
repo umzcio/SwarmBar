@@ -188,7 +188,7 @@ struct CodexMonitor: SessionMonitor {
                 status: parsed.status,
                 startedAt: values.creationDate ?? mtime,
                 lastActivityAt: mtime,
-                pid: pid.map { pid_t($0) },
+                pid: pid.flatMap { pid_t(processID: $0) },
                 processAlive: pid != nil,
                 attentionEventID: parsed.attentionEventID
             ))
@@ -251,5 +251,45 @@ struct CodexMonitor: SessionMonitor {
             return id
         }
         return UUID()
+    }
+}
+
+/// Whether a Codex Approve or Deny may be pressed now.
+///
+/// Codex is answered with a hotkey that reads nothing off the screen, and
+/// the row is a poll behind the rollout. In the seconds between, the call
+/// it showed can be answered at the terminal and another escalation take
+/// its place, and `y` would approve that one unseen. So the keys go only
+/// when the rollout, read again at press time, still has exactly the
+/// request the row showed waiting. The parser refuses to name one when
+/// more than one escalation waits, so a match means the prompt on screen
+/// can only be the one shown.
+enum CodexAnswerCheck {
+    nonisolated static func mayAnswer(shown: ApprovalPrompt, pending: ApprovalPrompt?) -> Bool {
+        pending == shown
+    }
+
+    /// The request the session's rollout has waiting now, read fresh rather
+    /// than from the discovery cache, or nil when it has none or the
+    /// rollout cannot be found.
+    nonisolated static func livePending(
+        sessionID: UUID, home: URL = FileManager.default.homeDirectoryForCurrentUser, now: Date = .now
+    ) -> ApprovalPrompt? {
+        let fm = FileManager.default
+        let root = home.appendingPathComponent(".codex/sessions")
+        let suffix = "\(sessionID.uuidString.lowercased()).jsonl"
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return nil }
+        var found: URL?
+        for case let file as URL in enumerator
+        where file.lastPathComponent.hasPrefix("rollout-") && file.lastPathComponent.lowercased().hasSuffix(suffix) {
+            // Two rollouts claiming one session cannot say which is asking.
+            guard found == nil else { return nil }
+            found = file
+        }
+        guard let file = found,
+              let tail = ClaudeCodeMonitor.tail(of: file),
+              case .waitingApproval(let prompt) = CodexMonitor.parsedStatus(of: file, tail: tail, now: now)?.status
+        else { return nil }
+        return prompt
     }
 }

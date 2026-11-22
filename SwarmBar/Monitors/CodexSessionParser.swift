@@ -102,6 +102,15 @@ enum CodexSessionParser {
     /// reviewer, which settles it in seconds and never asks the person
     /// (a rejection goes back to the model), so it is no prompt. Any other
     /// or unknown reviewer is treated as the person, as before.
+    ///
+    /// Every escalation still unanswered in the current turn is a request,
+    /// not just the newest call. One response can carry several calls, all
+    /// written before the first is answered, and Codex prompts for them in
+    /// order, so a row naming the newest put Approve beside a command other
+    /// than the one the `y` answered. With more than one escalation
+    /// waiting, the row says it cannot tell which is on screen. A call left
+    /// unanswered by an earlier turn (interrupted) is over, so each
+    /// turn_context or task_started starts the count again.
     private static func pendingRequest(tail: String, reviewer: String? = nil) -> (prompt: ApprovalPrompt, id: String)? {
         var answered = Set<String>()
         var lines: [[String: Any]] = []
@@ -109,25 +118,48 @@ enum CodexSessionParser {
         for raw in tail.split(separator: "\n") {
             if raw.contains("\"turn_context\""), let named = Self.reviewer(inTurnContext: raw) {
                 reviewer = named
+                lines.removeAll()
                 continue
             }
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  line["type"] as? String == "response_item",
                   let payload = line["payload"] as? [String: Any],
                   let type = payload["type"] as? String
             else { continue }
-            if type.hasSuffix("_call_output"), let callId = payload["call_id"] as? String {
-                answered.insert(callId)
-            } else if type == "custom_tool_call" || type == "function_call" {
-                lines.append(payload)
+            switch line["type"] as? String {
+            case "turn_context":
+                lines.removeAll()
+            case "event_msg" where type == "task_started":
+                lines.removeAll()
+            case "response_item":
+                if type.hasSuffix("_call_output"), let callId = payload["call_id"] as? String {
+                    answered.insert(callId)
+                } else if type == "custom_tool_call" || type == "function_call" {
+                    lines.append(payload)
+                }
+            default:
+                break
             }
         }
-        guard let latest = lines.last,
-              let callId = latest["call_id"] as? String,
-              !answered.contains(callId),
-              reviewer != "auto_review"
-        else { return nil }
+        guard reviewer != "auto_review" else { return nil }
+        let waiting: [(prompt: ApprovalPrompt, id: String)] = lines.compactMap { call in
+            guard let callId = call["call_id"] as? String, !answered.contains(callId),
+                  let prompt = request(in: call)
+            else { return nil }
+            return (prompt, callId)
+        }
+        guard let newest = waiting.last else { return nil }
+        guard waiting.count == 1 else {
+            return (.unreadable(
+                "Codex has more than one command waiting, and SwarmBar cannot tell which one it is asking about. Review it in the terminal."),
+                newest.id)
+        }
+        return newest
+    }
+
+    /// What one unanswered call asks for, or nil when it asks for nothing:
+    /// a sandboxed call runs without a prompt.
+    private static func request(in latest: [String: Any]) -> ApprovalPrompt? {
         let input = (latest["input"] as? String) ?? (latest["arguments"] as? String) ?? ""
 
         // The call's arguments, read as data. A function_call's arguments
@@ -148,20 +180,18 @@ enum CodexSessionParser {
             // Unreadable, but it may still be a prompt. Say so rather than
             // either inventing a command or hiding a prompt that is there.
             guard mentionsEscalation(input) else { return nil }
-            return (.unreadable(
-                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal."),
-                callId)
+            return .unreadable(
+                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal.")
         }
         guard isEscalated(arguments) else { return nil }
         // Code mode is only ever read as its one exec_command call.
         let tool = isFunctionCall ? latest["name"] as? String : "exec_command"
         guard let tool, let command = command(in: arguments, tool: tool) else {
-            return (.unreadable(
-                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal."),
-                callId)
+            return .unreadable(
+                "SwarmBar cannot read the exact command Codex is asking to run. Review it in the terminal.")
         }
         let workdir = (arguments["workdir"] as? String).map { "\nworkdir: \($0)" } ?? ""
-        return (ApprovalPrompt(command + workdir), callId)
+        return ApprovalPrompt(command + workdir)
     }
 
     private static func mentionsEscalation(_ input: String) -> Bool {
@@ -229,19 +259,88 @@ enum CodexSessionParser {
         let identifier = "[A-Za-z_$][A-Za-z0-9_$]*"
         let shapes = [
             (head: "^\\s*(?:(?:const|let|var)\\s+\(identifier)\\s*=\\s*)?await\\s+tools\\.exec_command\\(\\s*",
-             tail: "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"),
+             textWrapped: false),
             (head: "^\\s*text\\(\\s*await\\s+tools\\.exec_command\\(\\s*",
-             tail: "^\\s*\\)\\s*\\)\\s*;?\\s*$"),
+             textWrapped: true),
         ]
         for shape in shapes {
             guard let headRange = program.range(of: shape.head, options: .regularExpression),
                   let parsed = StrictJSONObject.parseJavaScriptLiteral(in: program, from: headRange.upperBound)
             else { continue }
-            let rest = String(program.unicodeScalars[parsed.end...])
-            guard rest.range(of: shape.tail, options: .regularExpression) != nil else { continue }
+            guard isAcceptedTail(Array(program.unicodeScalars[parsed.end...]), textWrapped: shape.textWrapped)
+            else { continue }
             return parsed.object
         }
         return nil
+    }
+
+    /// Whether what follows the call's object literal is exactly
+    ///
+    ///     ) [;] { text(<name>[.<name>]...) [;] }      (the assigned form)
+    ///     ) ) [;]                                      (the text-wrapped form)
+    ///
+    /// with whitespace anywhere a `\s*` stood in the patterns these
+    /// replace, and nothing else.
+    ///
+    /// Scanned by hand, each scalar looked at once. The text is model
+    /// written, and the pattern for the first form ended its repeated group
+    /// in two whitespace runs that could split the same spaces any number
+    /// of ways, so a long run of `text(…)` statements followed by anything
+    /// it refused backtracked exponentially, and the Codex monitor (or a
+    /// remote host's whole discovery) never finished another pass.
+    private static func isAcceptedTail(_ scalars: [Unicode.Scalar], textWrapped: Bool) -> Bool {
+        var index = 0
+        func skipSpace() {
+            while index < scalars.count, scalars[index].properties.isWhitespace { index += 1 }
+        }
+        func eat(_ word: String) -> Bool {
+            let expected = Array(word.unicodeScalars)
+            guard index + expected.count <= scalars.count,
+                  scalars[index..<index + expected.count].elementsEqual(expected)
+            else { return false }
+            index += expected.count
+            return true
+        }
+        func identifier() -> Bool {
+            func isStart(_ s: Unicode.Scalar) -> Bool {
+                s.isASCII && (s.properties.isAlphabetic || s == "_" || s == "$")
+            }
+            guard index < scalars.count, isStart(scalars[index]) else { return false }
+            index += 1
+            while index < scalars.count, isStart(scalars[index]) || ("0"..."9").contains(scalars[index]) {
+                index += 1
+            }
+            return true
+        }
+        // `;?` then whitespace, as the patterns had it.
+        func optionalSemicolon() {
+            _ = eat(";")
+            skipSpace()
+        }
+
+        skipSpace()
+        guard eat(")") else { return false }
+        skipSpace()
+        if textWrapped {
+            guard eat(")") else { return false }
+            skipSpace()
+            optionalSemicolon()
+            return index == scalars.count
+        }
+        optionalSemicolon()
+        while index < scalars.count {
+            guard eat("text(") else { return false }
+            skipSpace()
+            guard identifier() else { return false }
+            while eat(".") {
+                guard identifier() else { return false }
+            }
+            skipSpace()
+            guard eat(")") else { return false }
+            skipSpace()
+            optionalSemicolon()
+        }
+        return true
     }
 
     /// The first line of a rollout file is session_meta with cwd and id.

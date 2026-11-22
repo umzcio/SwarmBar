@@ -35,20 +35,22 @@ private struct Rig {
         try? FileManager.default.removeItem(at: base)
     }
 
-    static func make() async throws -> Rig {
+    /// `pidOffset` shifts every pid the rig writes or lists, so a test can
+    /// push them all past what a pid_t holds.
+    static func make(pidOffset: Int = 0) async throws -> Rig {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-discovery-\(UUID().uuidString)")
         do {
-            return try await make(base: base)
+            return try await make(base: base, pidOffset: pidOffset)
         } catch {
             try? FileManager.default.removeItem(at: base)
             throw error
         }
     }
 
-    private static func make(base: URL) async throws -> Rig {
+    private static func make(base: URL, pidOffset: Int) async throws -> Rig {
         let home = base.appendingPathComponent("home/u")
-        try writeHome(home)
+        try writeHome(home, pidOffset: pidOffset)
 
         let script = try #require(Bundle.main.url(forResource: "swarmbar-helper", withExtension: "py"))
         let channel = SSHChannel(launch: .local(
@@ -66,23 +68,24 @@ private struct Rig {
         try mirror.apply(shipped)
         return Rig(
             base: base, home: home.path, mirror: mirror,
-            snapshot: shipped.replacingProcesses(processes(home: home.path), failed: false))
+            snapshot: shipped.replacingProcesses(
+                processes(home: home.path, pidOffset: pidOffset), failed: false))
     }
 
     /// The synthetic process table: one live process per tool, each placed
     /// where that tool's liveness looks for it.
-    static func processes(home: String) -> [RemoteProcessRecord] {
+    static func processes(home: String, pidOffset: Int = 0) -> [RemoteProcessRecord] {
         let agy = home + "/.gemini/antigravity-cli"
         let rollout = home + "/.codex/sessions/2026/08/01/rollout-2026-08-01T10-00-00-\(codexID).jsonl"
         return [
-            record(claudePid, "claude", cwd: "/home/u/claude-proj"),
-            record(codexPid, "codex", cwd: "/home/u/demo", open: [rollout]),
-            record(kimiPid, "kimi-code", cwd: "/home/u/kimi-proj"),
-            record(bearPid, "bearcode", cwd: "/home/u/bear-proj"),
-            record(openCodePid, "opencode", cwd: "/home/u/open-proj"),
-            record(grokPid, "grok", cwd: "/home/u/grok-proj"),
+            record(claudePid + pidOffset, "claude", cwd: "/home/u/claude-proj"),
+            record(codexPid + pidOffset, "codex", cwd: "/home/u/demo", open: [rollout]),
+            record(kimiPid + pidOffset, "kimi-code", cwd: "/home/u/kimi-proj"),
+            record(bearPid + pidOffset, "bearcode", cwd: "/home/u/bear-proj"),
+            record(openCodePid + pidOffset, "opencode", cwd: "/home/u/open-proj"),
+            record(grokPid + pidOffset, "grok", cwd: "/home/u/grok-proj"),
             record(
-                agyPid, "agy", cwd: "/home/u/agy-proj",
+                agyPid + pidOffset, "agy", cwd: "/home/u/agy-proj",
                 open: [agy + "/presence/\(conversation).lock"], screen: "synthetic screen"),
         ]
     }
@@ -102,8 +105,9 @@ private struct Rig {
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private static func writeHome(_ home: URL) throws {
+    private static func writeHome(_ home: URL, pidOffset: Int) throws {
         let iso = ISO8601DateFormatter().string(from: .now)
+        let claudePid = claudePid + pidOffset, grokPid = grokPid + pidOffset
 
         try write(
             try fixture("claude-working"),
@@ -212,6 +216,24 @@ struct RemoteDiscoveryTests {
         #expect(result[.antigravity]?.first?.projectName == "agy-proj")
     }
 
+    /// The snapshot decoder refuses such a table, so this hands the facts
+    /// over undecoded to prove the monitors cannot trap on one either: a
+    /// pid read back from lsof-style output, from a cwd match, from a held
+    /// file or from a tool's own state file all narrow to pid_t.
+    @Test("pids past what a pid_t holds give rows without a pid, never a trap",
+          .enabled(if: pythonAvailable))
+    func outOfRangePidsNeverTrap() async throws {
+        let rig = try await Rig.make(pidOffset: Int(UInt32.max))
+        defer { rig.remove() }
+        let result = RemoteDiscovery.sessions(
+            snapshot: rig.snapshot, mirror: rig.mirror, hostID: hostID, hostName: "devbox", now: .now)
+        for tool in AgentTool.allCases {
+            let rows = result[tool] ?? []
+            #expect(rows.count == 1, "\(tool) produced \(rows.count) rows")
+            #expect(rows.allSatisfy { $0.pid == nil }, "\(tool) kept a pid it cannot hold")
+        }
+    }
+
     @Test("session ids are scoped to the host", .enabled(if: pythonAvailable))
     func idsAreHostScoped() async throws {
         let rig = try await Rig.make()
@@ -237,6 +259,21 @@ struct RemoteDiscoveryTests {
         let expected = try #require(ClaudeSessionParser.parse(tail: try fixture("claude-working"), now: now))
         #expect(result[.claudeCode]?.first?.status == expected.status)
         #expect(result[.claudeCode]?.first?.projectName == "demo")
+    }
+
+    @Test("one tool in one home contributes at most a fixed number of rows, the newest")
+    func sessionsPerToolAndHomeAreCapped() {
+        let now = Date.now
+        let sessions = (0..<12).map { index in
+            AgentSession(
+                id: StableID.uuid(for: "s\(index)"), tool: .kimiCode, projectName: "p\(index)",
+                projectPath: nil, status: .idle,
+                startedAt: now, lastActivityAt: now.addingTimeInterval(TimeInterval(-index)))
+        }
+        let kept = RemoteDiscovery.capped(sessions.shuffled(), limit: 5)
+        #expect(kept.map(\.projectName) == ["p0", "p1", "p2", "p3", "p4"])
+        #expect(RemoteDiscovery.capped(sessions, limit: 20).count == 12)
+        #expect(RemoteDiscovery.maxSessionsPerToolAndHome > 0)
     }
 
     @Test("an empty snapshot still answers for all seven tools")

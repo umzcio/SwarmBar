@@ -56,6 +56,12 @@ final class RemoteMonitorSupervisor {
     @ObservationIgnored var keystrokeToggles: @MainActor () -> (grok: Bool, antigravity: Bool) = {
         (SessionStore.grokKeystrokesEnabled, SessionStore.antigravityKeystrokesEnabled)
     }
+    /// Waits until a snapshot the helper took after this call has reached
+    /// the store's rows for the tool, and says whether one did. See
+    /// `performAnswer`. A stub in tests, which run no poll.
+    @ObservationIgnored var freshState: @MainActor (RemoteHostConnection, AgentTool) async -> Bool = {
+        await RemoteMonitorSupervisor.awaitFreshPoll($0, tool: $1)
+    }
     /// Sessions with an answer in flight. See `performAnswer`.
     @ObservationIgnored var answering: Set<UUID> = []
     @ObservationIgnored private var running: [UUID: Running] = [:]
