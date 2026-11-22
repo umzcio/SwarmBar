@@ -54,13 +54,147 @@ struct AnswerScriptTests {
         #expect(script.hasPrefix("on run argv"))
         #expect(script.contains("set wantedDevice to item 1 of argv"))
         #expect(script.contains("set wantedLabel to item 2 of argv"))
-        #expect(script.contains("if screenText contains wantedLabel then"))
         #expect(script.contains("write text \"3\" newline NO"))
         // No literal is compared against the screen: the only quoted
-        // strings are the digit, the app name and the fixed replies.
+        // strings are the digit, the app name, the fixed replies and the
+        // characters a line is trimmed of.
         let literals = script.components(separatedBy: "\"").enumerated()
             .filter { $0.offset % 2 == 1 }.map(\.element)
-        #expect(Set(literals) == ["iTerm2", "3", "SENT", "CHANGED", "MISS"])
+        #expect(Set(literals) == ["iTerm2", "3.", "3", "SENT", "CHANGED", "MISS", "▶►>❯›➜│┃▏ ", " ", ""])
+    }
+
+    /// The label must be at the digit about to be pressed, not merely on
+    /// screen, and with case: AppleScript ignores case unless told not to.
+    @Test func theDigitScriptConfirmsTheLabelAtTheDigit() {
+        let script = TerminalFocuser.numberedAnswerScript(number: 3)
+        #expect(!script.contains("screenText contains wantedLabel"))
+        #expect(script.contains("set shownLabel to my optionLabelAt(screenText, \"3.\")"))
+        let flat = script.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(flat.contains(
+            "considering case set stillThere to (shownLabel is wantedLabel) end considering if stillThere then"))
+        #expect(script.contains("on optionLabelAt(screenText, wantedPrefix)"))
+    }
+
+    private let kimiPrompt = """
+          ▶ Run this command?
+
+          cwd: /tmp/example
+          $ echo 3. Reject
+
+          ▶ 1. Approve once
+            2. Approve for this session
+            3. Reject
+            4. Reject with feedback
+
+          ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+        """
+
+    /// Runs the shipped label handler on a screen with plain osascript.
+    /// No application is addressed, so nothing is driven: this is string
+    /// work only, and it is the same source the press script carries.
+    private func label(at number: Int, in screen: String, wanted: String) throws -> (shown: String, matches: Bool) {
+        let script = """
+            on run argv
+              set shownLabel to optionLabelAt(item 1 of argv, item 2 of argv)
+              considering case
+                set stillThere to (shownLabel is (item 3 of argv))
+              end considering
+              if shownLabel is missing value then set shownLabel to "<none>"
+              return (stillThere as text) & "|" & shownLabel
+            end run
+
+            \(TerminalFocuser.optionLineHandlers)
+            """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script, screen, "\(number).", wanted]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)
+        let parts = output.split(separator: "|", maxSplits: 1).map(String.init)
+        try #require(parts.count == 2, "osascript said \(output)")
+        return (parts[1], parts[0] == "true")
+    }
+
+    @Test func theLabelIsReadAtItsNumber() throws {
+        let result = try label(at: 3, in: kimiPrompt, wanted: "Reject")
+        #expect(result.shown == "Reject")
+        #expect(result.matches)
+    }
+
+    /// The prompt was answered and redrawn with Reject one place up: the
+    /// label is still on screen, but not at 3, so 3 is not pressed.
+    @Test func aLabelThatMovedToAnotherNumberDoesNotMatch() throws {
+        let redrawn = """
+              ▶ 1. Approve once
+                2. Reject
+                3. Approve for this session
+            """
+        let result = try label(at: 3, in: redrawn, wanted: "Reject")
+        #expect(result.shown == "Approve for this session")
+        #expect(!result.matches)
+    }
+
+    /// "3. Reject" in prose or the command echo above the selector is not
+    /// the selector's option 3: the bottom-most line drawn as 3 is.
+    @Test func theLabelOnlyInTextAboveTheSelectorDoesNotMatch() throws {
+        let screen = """
+              3. Reject
+              $ echo 3. Reject
+
+              ▶ 1. Approve once
+                2. Reject
+                3. Approve for this session
+            """
+        #expect(try !label(at: 3, in: screen, wanted: "Reject").matches)
+    }
+
+    @Test func caseCountsAndALongerLabelIsAnotherLabel() throws {
+        #expect(try !label(at: 3, in: kimiPrompt, wanted: "reject").matches)
+        #expect(try !label(at: 4, in: kimiPrompt, wanted: "Reject").matches)
+        #expect(try label(at: 4, in: kimiPrompt, wanted: "Reject with feedback").matches)
+    }
+
+    @Test func boxedOptionsAndMissingOnesAreReadAsSelectorReadsThem() throws {
+        #expect(try label(at: 2, in: "┃ 1. Yes ┃\n┃ 2. No   ┃", wanted: "No").matches)
+        let none = try label(at: 3, in: "no options here", wanted: "Reject")
+        #expect(none.shown == "<none>")
+        #expect(!none.matches)
+    }
+
+    /// The walk confirms its target by the whole line drawn for it, which
+    /// carries the number, so the presses still lead there.
+    @Test func theWalkTargetIsTheLineDrawnForThatOption() {
+        let grok = """
+              ┃  1 (○) Yes, and don't ask again
+              ┃  2 (●) Yes, proceed
+              ┃  3 (○) No, reject (type to add feedback)
+              ┃  4 (○) Never allow: touch /tmp/example
+            """
+        #expect(TuiPromptLayout.drawnLine(
+            of: .init(number: 3, label: "No, reject (type to add feedback)"), in: grok)
+            == "┃  3 (○) No, reject (type to add feedback)")
+        let agy = """
+              > 1. Approve
+                2. Deny
+
+                ↑/↓ Navigate · enter Select · esc Skip
+            """
+        #expect(TuiPromptLayout.drawnLine(of: .init(number: 2, label: "Deny"), in: agy) == "2. Deny")
+        #expect(TuiPromptLayout.drawnLine(of: .init(number: 3, label: "Deny"), in: agy) == nil)
+        #expect(TuiPromptLayout.drawnLine(of: .init(number: 2, label: "deny"), in: agy) == nil)
+    }
+
+    @Test func theWalkScriptConfirmsTheTargetLineWithCase() throws {
+        let script = try #require(TerminalFocuser.navigationAnswerScript(key: "DOWN", presses: 1))
+        #expect(script.contains("set wantedTargetLine to item 4 of argv"))
+        #expect(script.contains("considering case"))
+        #expect(script.contains(
+            "set stillThere to (screenText contains wantedLabel and screenText contains wantedTargetLine and cursorLineCount is 1)"))
     }
 
     @Test func theWalkScriptTakesTheTtyLabelAndMarkedLineAsArguments() throws {
@@ -79,7 +213,7 @@ struct AnswerScriptTests {
     @Test func theWalkScriptRequiresTheMarkedLineExactlyOnce() throws {
         let script = try #require(TerminalFocuser.navigationAnswerScript(key: "UP", presses: 0))
         #expect(script.contains("set AppleScript's text item delimiters to wantedCursorLine"))
-        #expect(script.contains("if screenText contains wantedLabel and cursorLineCount is 1 then"))
+        #expect(script.contains("cursorLineCount is 1)"))
         #expect(!script.contains("[A"))
     }
 

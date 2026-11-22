@@ -409,7 +409,7 @@ enum TerminalFocuser {
         return String(trimmed.suffix(24))
     }
 
-    /// Presses `number` only if line `number` on screen still contains
+    /// Presses `number` only if the option drawn at `number` still carries
     /// `expectedLabel`. Read and write happen in one script so the prompt
     /// cannot advance in between: two round trips left a window in which a
     /// digit could land in a different selector.
@@ -437,6 +437,12 @@ enum TerminalFocuser {
     /// it is a number SwarmBar chose.
     ///
     /// Arguments: 1 is the tty device ("/dev/ttys004"), 2 the label.
+    ///
+    /// The label is confirmed AT the digit, on the bottom-most line drawn
+    /// as that option, and with case. Finding it anywhere on screen proved
+    /// nothing: the prompt can be answered at the terminal and redrawn with
+    /// the same label at another number, and the label also shows in the
+    /// command echo and in the agent's prose, so a stale digit passed.
     nonisolated static func numberedAnswerScript(number: Int) -> String {
         """
         on run argv
@@ -448,7 +454,11 @@ enum TerminalFocuser {
                 repeat with s in sessions of t
                   if tty of s is wantedDevice then
                     set screenText to (text of s)
-                    if screenText contains wantedLabel then
+                    set shownLabel to my optionLabelAt(screenText, "\(number).")
+                    considering case
+                      set stillThere to (shownLabel is wantedLabel)
+                    end considering
+                    if stillThere then
                       tell s to write text "\(number)" newline NO
                       return "SENT"
                     else
@@ -461,8 +471,48 @@ enum TerminalFocuser {
             return "MISS"
           end tell
         end run
+
+        \(optionLineHandlers)
         """
     }
+
+    /// AppleScript handlers that read an option's label off the screen the
+    /// way `TuiPromptLayout.selector` reads it: each line trimmed of cursor
+    /// markers, box edges and spaces, and the label being what follows
+    /// "N." on the LAST such line, which is the selector's, since it is
+    /// drawn at the bottom. `missing value` when no line opens with "N.".
+    /// Shared by the scripts and by the tests that run these handlers on
+    /// fixture screens, so what is tested is the source that ships.
+    nonisolated static let optionLineHandlers = """
+        on optionLabelAt(screenText, wantedPrefix)
+          set found to missing value
+          considering case
+            repeat with para in paragraphs of screenText
+              set lineText to my trimEdges(contents of para, "▶►>❯›➜│┃▏ " & tab)
+              if lineText starts with wantedPrefix then
+                if (count of lineText) > (count of wantedPrefix) then
+                  set found to my trimEdges(text ((count of wantedPrefix) + 1) thru -1 of lineText, " " & tab)
+                else
+                  set found to ""
+                end if
+              end if
+            end repeat
+          end considering
+          return found
+        end optionLabelAt
+
+        on trimEdges(t, edges)
+          repeat while (count of t) > 0 and edges contains (character 1 of t)
+            if (count of t) is 1 then return ""
+            set t to text 2 thru -1 of t
+          end repeat
+          repeat while (count of t) > 0 and edges contains (character -1 of t)
+            if (count of t) is 1 then return ""
+            set t to text 1 thru -2 of t
+          end repeat
+          return t
+        end trimEdges
+        """
 
     /// Moves the selector's cursor to a labeled option and submits.
     ///
@@ -476,7 +526,10 @@ enum TerminalFocuser {
     /// and this re-confirms that same screen before sending. Confirming
     /// the label alone would not be enough, since the cursor may have
     /// moved while the label stayed put, so the marked line is checked
-    /// too.
+    /// too, and so is the target's own line as drawn. Both lines carry
+    /// their option numbers, so together they pin the distance walked: a
+    /// selector redrawn with the cursor where it was but the options
+    /// reordered would otherwise take the same presses to another option.
     nonisolated static func answerByNavigation(
         sessionID: UUID,
         tool: AgentTool,
@@ -484,13 +537,16 @@ enum TerminalFocuser {
         key: String,
         presses: Int,
         expectedCursorLine: String,
-        expectedLabel: String
+        expectedLabel: String,
+        expectedTargetLine: String
     ) -> AnswerOutcome {
         guard let script = navigationAnswerScript(key: key, presses: presses),
               let tty = tty(forSession: sessionID, tool: tool, projectPath: projectPath, forAnswer: true),
               isRunning("iTerm2")
         else { return .noTerminal }
-        switch runScript(script, arguments: ["/dev/\(tty)", expectedLabel, expectedCursorLine]) {
+        switch runScript(script, arguments: [
+            "/dev/\(tty)", expectedLabel, expectedCursorLine, expectedTargetLine,
+        ]) {
         case "SENT":    return .sent
         case "CHANGED": return .promptChanged
         default:        return .noTerminal
@@ -501,11 +557,12 @@ enum TerminalFocuser {
     /// make. Pure, so what reaches osascript can be asserted.
     ///
     /// As with `numberedAnswerScript`, nothing read off the terminal is in
-    /// the source: the tty, the label and the marked line are arguments 1,
-    /// 2 and 3. The marked line must appear exactly once. It is the line
-    /// that moves, so a second copy on screen (agent text drawn to look
-    /// like the selector) means the one being confirmed may not be the one
-    /// the keys will move, and nothing is pressed.
+    /// the source: the tty, the label, the marked line and the target's
+    /// line are arguments 1 to 4. The marked line must appear exactly once.
+    /// It is the line that moves, so a second copy on screen (agent text
+    /// drawn to look like the selector) means the one being confirmed may
+    /// not be the one the keys will move, and nothing is pressed. Every
+    /// comparison considers case, which AppleScript otherwise ignores.
     nonisolated static func navigationAnswerScript(key: String, presses: Int) -> String? {
         guard presses >= 0, key == "UP" || key == "DOWN" else { return nil }
         let arrow = key == "UP" ? "[A" : "[B"
@@ -517,16 +574,20 @@ enum TerminalFocuser {
           set wantedDevice to item 1 of argv
           set wantedLabel to item 2 of argv
           set wantedCursorLine to item 3 of argv
+          set wantedTargetLine to item 4 of argv
           tell application "iTerm2"
             repeat with w in windows
               repeat with t in tabs of w
                 repeat with s in sessions of t
                   if tty of s is wantedDevice then
                     set screenText to (text of s)
-                    set AppleScript's text item delimiters to wantedCursorLine
-                    set cursorLineCount to (count of text items of screenText) - 1
-                    set AppleScript's text item delimiters to ""
-                    if screenText contains wantedLabel and cursorLineCount is 1 then
+                    considering case
+                      set AppleScript's text item delimiters to wantedCursorLine
+                      set cursorLineCount to (count of text items of screenText) - 1
+                      set AppleScript's text item delimiters to ""
+                      set stillThere to (screenText contains wantedLabel and screenText contains wantedTargetLine and cursorLineCount is 1)
+                    end considering
+                    if stillThere then
                       \(moves.isEmpty ? "" : moves + "\n                      delay 0.08")
                       tell s to write text ""
                       return "SENT"

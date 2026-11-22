@@ -932,12 +932,14 @@ final class SessionStore {
         let selector = TuiPromptLayout.selector(in: screen)
         guard let cursor = selector.cursor,
               let cursorLine = selector.cursorLine,
+              let targetLine = TuiPromptLayout.drawnLine(of: option, in: screen),
               let move = TuiPromptLayout.navigation(from: cursor, to: option.number)
         else { return false }
         return TerminalFocuser.answerByNavigation(
             sessionID: id, tool: tool, projectPath: path,
             key: move.key, presses: move.presses,
-            expectedCursorLine: cursorLine, expectedLabel: option.label) == .sent
+            expectedCursorLine: cursorLine, expectedLabel: option.label,
+            expectedTargetLine: targetLine) == .sent
     }
 
     // MARK: - Inline reply
