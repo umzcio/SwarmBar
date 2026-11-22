@@ -976,6 +976,33 @@ def stat_entry(path, info):
     return {"path": path, "mtime": info.st_mtime, "created": created_time(info)}
 
 
+# What one snapshot takes from any one home, and in all. Each home's owner
+# decides how much state it holds, and a file over a budget is read whole
+# into memory and then base64 inside one reply line, so without these a few
+# sparse files could grow the root helper by gigabytes and push the reply
+# past the Mac's line cap, failing every user's view of the host. A file
+# left over is omitted, so the Mac keeps what it has, and ships on a later
+# snapshot: anything already shipped costs nothing to list again. One home
+# fits a whole file at WHOLE_MAX_BYTES, and the total fits two such homes.
+HOME_BYTES_BUDGET = 20 * 1024 * 1024
+SNAPSHOT_BYTES_BUDGET = 48 * 1024 * 1024
+MAX_FILES_PER_HOME = 4096
+
+
+def read_cost(spec, info, prev):
+    """The most a file's chunks can hold this snapshot: nothing when it is
+    unchanged since it last shipped, its size when shipped whole, and at
+    most a head and the widest tail otherwise."""
+    if spec.mode == "listing":
+        return 0
+    if ship_decision(prev.size if prev else None, prev.mtime if prev else None,
+                     info.st_size, info.st_mtime) == "none":
+        return 0
+    if spec.mode == "whole":
+        return info.st_size
+    return min(info.st_size, MAX_TAIL_BYTES + MAX_HEAD_BYTES)
+
+
 def manifest(now, warnings, shipped_before):
     """files, dirs, omitted, and the SHIPPED map to commit if the snapshot
     that asked for them completes. It never touches SHIPPED itself."""
@@ -987,6 +1014,7 @@ def manifest(now, warnings, shipped_before):
     unreadable = {}
     seen = set()
     shipped = {}
+    spent, listed, spent_total = collections.Counter(), collections.Counter(), 0
     openers, foreign = {}, {}
     for home in homes:
         openers[home] = shipped_opener(home)
@@ -1019,6 +1047,15 @@ def manifest(now, warnings, shipped_before):
             if is_dir:
                 dirs[path] = stat_entry(path, info)
             else:
+                cost = read_cost(spec, info, shipped_before.get(path))
+                if listed[home] >= MAX_FILES_PER_HOME:
+                    omitted.append({"path": path, "reason": "over its home's file budget"})
+                    continue
+                if cost and (spent[home] + cost > HOME_BYTES_BUDGET
+                             or spent_total + cost > SNAPSHOT_BYTES_BUDGET):
+                    omitted.append({"path": path,
+                                    "reason": "over this snapshot's byte budget, ships later"})
+                    continue
                 # One file's failure is that file's omission, never the
                 # snapshot's: a user who can plant a file must not be able
                 # to blind the host for everyone.
@@ -1035,6 +1072,10 @@ def manifest(now, warnings, shipped_before):
                     omitted.append({"path": path, "reason": result})
                     continue
                 reset, chunks, record = result
+                taken = sum(len(data) for _, data in chunks)
+                spent[home] += taken
+                spent_total += taken
+                listed[home] += 1
                 item = stat_entry(path, info)
                 item.update({
                     "size": info.st_size,

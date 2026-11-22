@@ -629,6 +629,92 @@ def reader_tail(data, start):
         window = min(window * 2, helper.MAX_TAIL_BYTES)
 
 
+class SnapshotBudgetTests(unittest.TestCase):
+    """One home's owner chooses how much state it holds, so a snapshot
+    takes a bounded amount from each home and in total. What is left over
+    is omitted, never shipped empty, and ships on a later snapshot once
+    what did ship costs nothing to repeat."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="swarmbar-budget-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.a = os.path.join(self.base, "a")
+        self.b = os.path.join(self.base, "b")
+        env = mock.patch.dict(os.environ, {"SWARMBAR_HELPER_HOMES": self.a + ":" + self.b})
+        env.start()
+        self.addCleanup(env.stop)
+        ps = mock.patch.object(helper, "agent_processes", return_value=[])
+        ps.start()
+        self.addCleanup(ps.stop)
+        helper.SHIPPED.clear()
+        self.addCleanup(helper.SHIPPED.clear)
+
+    def put(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def summaries(self, home, count, size):
+        return [self.put(os.path.join(home, ".grok", "sessions", "w", "s%03d" % i, "summary.json"),
+                         b"{" + b" " * (size - 2) + b"}") for i in range(count)]
+
+    def shipped_bytes(self, snap, home):
+        return sum(len(data) for item in snap["files"] if item["path"].startswith(home + "/")
+                   for _, data in decode_chunks(item))
+
+    def test_one_home_cannot_crowd_out_another(self):
+        planted = self.summaries(self.a, 10, 1000)
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        with mock.patch.object(helper, "HOME_BYTES_BUDGET", 3000), \
+                mock.patch.object(helper, "SNAPSHOT_BYTES_BUDGET", 5000):
+            snap = helper.snapshot()
+            self.assertLessEqual(self.shipped_bytes(snap, self.a), 3000)
+            self.assertIn(other, [item["path"] for item in snap["files"]])
+            over = [entry["path"] for entry in snap["omitted"] if "budget" in entry["reason"]]
+            self.assertEqual(len(over), 7)
+            self.assertTrue(set(over) <= set(planted))
+            # Once shipped, a file costs nothing to list again, so the rest
+            # follow on later snapshots.
+            listed = set()
+            for _ in range(4):
+                listed |= set(item["path"] for item in snap["files"] if item["chunks"] or
+                              item["path"] in listed)
+                snap = helper.snapshot()
+            listed |= set(item["path"] for item in snap["files"])
+        self.assertTrue(set(planted) <= listed)
+
+    def test_the_snapshot_total_is_bounded_across_homes(self):
+        self.summaries(self.a, 3, 1000)
+        self.summaries(self.b, 3, 1000)
+        with mock.patch.object(helper, "HOME_BYTES_BUDGET", 3000), \
+                mock.patch.object(helper, "SNAPSHOT_BYTES_BUDGET", 4000):
+            snap = helper.snapshot()
+        self.assertLessEqual(self.shipped_bytes(snap, self.a) + self.shipped_bytes(snap, self.b),
+                             4000)
+        self.assertEqual(len([e for e in snap["omitted"] if "budget" in e["reason"]]), 2)
+
+    def test_file_count_per_home_is_bounded(self):
+        self.summaries(self.a, 5, 10)
+        with mock.patch.object(helper, "MAX_FILES_PER_HOME", 3):
+            snap = helper.snapshot()
+        self.assertEqual(len(snap["files"]), 3)
+        self.assertEqual(len([e for e in snap["omitted"] if "budget" in e["reason"]]), 2)
+
+    def test_sparse_files_just_under_the_whole_limit_stay_within_the_budget(self):
+        for i in range(12):
+            path = os.path.join(self.a, ".claude", "sessions", "s%02d.json" % i)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.truncate(helper.WHOLE_MAX_BYTES - 1)
+        os.makedirs(os.path.join(self.a, ".claude", "projects"))
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        line = helper.json_line(helper.snapshot())
+        self.assertLess(len(line), helper.SNAPSHOT_BYTES_BUDGET * 4 // 3 + 1024 * 1024)
+        snap = json.loads(line)
+        self.assertIn(other, [item["path"] for item in snap["files"]])
+
+
 class CrossUserReadTests(unittest.TestCase):
     """Root reading another user's home: that user chooses every name in
     it, so a link must not steer root's reads, or hide another user's
