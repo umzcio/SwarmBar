@@ -103,7 +103,12 @@ enum GrokUpdatesParser {
             return .unreadable(
                 "Grok has not recorded what this \(tool) call would do. Review it in the terminal.")
         }
-        if let command = input.removeValue(forKey: "command") as? String {
+        // Taken out of the arguments only once it is known to be a string.
+        // removeValue runs before the cast, so removing first dropped an
+        // argv array or an object from a prompt still offered as exact;
+        // anything else stays an argument and is described as JSON.
+        if let command = input["command"] as? String {
+            input.removeValue(forKey: "command")
             // The whole command, every line of it, with anything else the
             // call carries (its working directory, say) after it.
             let rest = ApprovalPrompt.describeArguments(input)
