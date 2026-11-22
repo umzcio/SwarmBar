@@ -241,6 +241,11 @@ struct RemoteHookRelayTests {
         #expect(isEmptyAnswer(answers[0]))
         #expect(!server.isHolding(sessionID: rowID(raw)))
         #expect(store.sessions.first { $0.id == rowID(raw) }?.tool == .grokBuild)
+        // Grok sends no hook when a prompt is answered at its terminal, so
+        // a pin that never expired kept offering Approve for a prompt long
+        // gone. It lasts until the next poll can read Grok's own record.
+        let pin = try #require(store.hookOverrides[rowID(raw)])
+        #expect(!pin.sticky)
     }
 
     @Test func approvalsOffAnswersEmptyButShowsStatus() throws {

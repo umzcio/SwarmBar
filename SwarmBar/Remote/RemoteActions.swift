@@ -270,7 +270,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
             }
         }
         let choose = allow ? TuiPromptLayout.approveOnceOption(in:) : TuiPromptLayout.rejectOption(in:)
-        guard let command = RemoteAnswerPlan.command(
+        guard var command = RemoteAnswerPlan.command(
             route: route, screen: screen, choose: choose, tool: session.tool)
         else {
             remoteAnswerLog.notice("answer: no readable prompt for \(session.tool.rawValue, privacy: .public) on \(host, privacy: .public), nothing sent")
@@ -291,6 +291,24 @@ extension RemoteMonitorSupervisor: RemoteActing {
                 remoteAnswerLog.notice("answer: no state read after the click on \(host, privacy: .public), nothing sent")
                 return false
             }
+        }
+        if session.tool == .grokBuild {
+            // Every Grok gate draws the same options with the cursor in the
+            // same place, so the screen cannot say which call it is for.
+            // The press is bound to the request the row showed, through
+            // Grok's own record of it (GrokAnswerCheck.remoteBinding).
+            let mirror = target.connection.mirror, hostID = target.connection.host.id
+            let homes = target.connection.lastSnapshot?.homes.map(\.path) ?? [], id = session.id
+            let binding = await Task.detached {
+                GrokAnswerCheck.remoteBinding(sessionID: id, hostID: hostID, homes: homes, mirror: mirror)
+            }.value
+            guard case .waitingApproval(let shown) = session.status, let binding,
+                  GrokAnswerCheck.mayAnswer(shown: shown, pending: binding.prompt)
+            else {
+                remoteAnswerLog.notice("answer: Grok on \(host, privacy: .public) is not asking what the row showed, nothing sent")
+                return false
+            }
+            command.events = binding.events
         }
         // The capture was a round trip. A snapshot that landed meanwhile
         // may show the request answered, or another in its place, and the

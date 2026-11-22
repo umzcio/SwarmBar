@@ -938,6 +938,13 @@ final class SessionStore {
                     pending: AntigravityAnswerCheck.livePending(sessionID: id))
             else { return false }
         }
+        if tool == .grokBuild {
+            // Grok's gates all read alike, so its own record of the pending
+            // call, read now, must be the request the row showed.
+            guard case .waitingApproval(let shown) = session.status,
+                  GrokAnswerCheck.mayAnswer(shown: shown, pending: GrokAnswerCheck.livePending(sessionID: id))
+            else { return false }
+        }
         let selector = TuiPromptLayout.selector(in: screen)
         guard let cursor = selector.cursor,
               let cursorLine = selector.cursorLine,

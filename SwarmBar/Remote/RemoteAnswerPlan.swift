@@ -9,15 +9,34 @@ struct RemoteKeyCommand: Equatable, Sendable {
     var keys: [String]
     var expect: [String]
     var expectOnce: [String] = []
+    /// For Grok: the events.jsonl the row's request was read from, and how
+    /// much of it was read (GrokAnswerCheck.remoteBinding).
+    var events: RemoteEventsAnchor?
 
     /// The request's `expect` list: each `expect` string as itself, each
-    /// `expectOnce` one as {"once": text}. A helper from before that form
-    /// requires every item to be a string and answers "bad keys", so a
-    /// mixed install presses nothing rather than checking less.
+    /// `expectOnce` one as {"once": text}, and `events` as {"grok_events":
+    /// {"path", "size"}}. A helper from before a form requires every item
+    /// to be one it knows and answers "bad keys", so a mixed install
+    /// presses nothing rather than checking less.
     var expectJSON: JSONValue {
         .array(expect.map(JSONValue.string)
-            + expectOnce.map { .object(["once": .string($0)]) })
+            + expectOnce.map { .object(["once": .string($0)]) }
+            + (events.map { [.object(["grok_events": .object([
+                "path": .string($0.path), "size": .int($0.size),
+            ])])] } ?? []))
     }
+}
+
+/// A Grok session's events.jsonl on its host and the size it had when the
+/// Mac read the pending request from it. The helper presses only while
+/// nothing written past `size` records a permission prompt opening or
+/// closing, or a phase change: Grok writes those as a prompt is answered
+/// and as the next one opens, so a prompt answered at the terminal since
+/// the row was drawn, or another gated in its place, leaves its mark there
+/// even when the selector reads the same.
+struct RemoteEventsAnchor: Equatable, Sendable {
+    var path: String
+    var size: Int
 }
 
 /// Turns the route `ApprovalRouter` chose into a key command, from a screen
