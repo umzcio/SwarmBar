@@ -256,13 +256,12 @@ struct RemoteMirror: Sendable {
         // Last, because creating and removing entries above moves a
         // directory's mtime.
         for (record, url) in dirs {
-            var attributes: [FileAttributeKey: Any] = [
-                .modificationDate: Date(timeIntervalSince1970: record.mtime)
-            ]
-            if let created = record.created {
-                attributes[.creationDate] = Date(timeIntervalSince1970: created)
+            let attributes = Self.times(
+                modified: PlausibleDate.epoch(record.mtime),
+                created: record.created.flatMap { PlausibleDate.epoch($0) })
+            if !attributes.isEmpty {
+                try fm.setAttributes(attributes, ofItemAtPath: url.path)
             }
-            try fm.setAttributes(attributes, ofItemAtPath: url.path)
         }
         return warnings
     }
@@ -422,14 +421,26 @@ struct RemoteMirror: Sendable {
         }
 
         // After the writes, which bump mtime.
-        var attributes: [FileAttributeKey: Any] = [
-            .modificationDate: Date(timeIntervalSince1970: record.mtime)
-        ]
-        if let created = record.created.map({ Date(timeIntervalSince1970: $0) }) ?? Self.headTimestamp(record) {
-            attributes[.creationDate] = created
+        let attributes = Self.times(
+            modified: PlausibleDate.epoch(record.mtime),
+            created: record.created.flatMap { PlausibleDate.epoch($0) }
+                ?? PlausibleDate.check(Self.headTimestamp(record)))
+        if !attributes.isEmpty {
+            try fm.setAttributes(attributes, ofItemAtPath: url.path)
         }
-        try fm.setAttributes(attributes, ofItemAtPath: url.path)
         return warnings
+    }
+
+    /// The times to stamp on a mirror entry. The readers date sessions by
+    /// them, and the host names them, so each has already been held to
+    /// PlausibleDate's range: one outside it is left off, and the entry
+    /// keeps the time it was written here rather than a far-future date
+    /// that no discovery window would ever age out.
+    private static func times(modified: Date?, created: Date?) -> [FileAttributeKey: Any] {
+        var attributes: [FileAttributeKey: Any] = [:]
+        if let modified { attributes[.modificationDate] = modified }
+        if let created { attributes[.creationDate] = created }
+        return attributes
     }
 
     /// Why a record would make a mirror file past `maxFileBytes`, or nil

@@ -121,14 +121,16 @@ struct KimiMonitor: SessionMonitor {
     ///
     /// Returning nil here is not harmless. `discover` skips a session whose
     /// activity cannot be dated at all, so before this parsed, a session
-    /// new enough to have no wire log yet would not appear.
-    nonisolated static func stateUpdatedAt(_ json: [String: Any]?) -> Date? {
+    /// new enough to have no wire log yet would not appear. A date outside
+    /// PlausibleDate's range is still nil: the file is the host's to write,
+    /// and a far-future one would never leave the discovery window.
+    nonisolated static func stateUpdatedAt(_ json: [String: Any]?, now: Date = .now) -> Date? {
         if let text = json?["updatedAt"] as? String {
-            return ClaudeSessionParser.date(text)
+            return PlausibleDate.check(ClaudeSessionParser.date(text), now: now)
         }
         guard let number = json?["updatedAt"] as? Double, number > 0 else { return nil }
         let seconds = number > 1_000_000_000_000 ? number / 1000 : number
-        return Date(timeIntervalSince1970: seconds)
+        return PlausibleDate.epoch(seconds, now: now)
     }
 
     nonisolated static func discover(
@@ -174,7 +176,7 @@ struct KimiMonitor: SessionMonitor {
             let stateData = BoundedRead.data(of: sessionDir.appendingPathComponent("state.json"))
             let stateJSON = stateData.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
             let stateWorkDir = Self.stateWorkDir(stateJSON)
-            let stateUpdatedAt = Self.stateUpdatedAt(stateJSON)
+            let stateUpdatedAt = Self.stateUpdatedAt(stateJSON, now: now)
 
             let wirePath = sessionDir.appendingPathComponent("agents/main/wire.jsonl")
             let wireValues = try? wirePath.resourceValues(
@@ -182,7 +184,10 @@ struct KimiMonitor: SessionMonitor {
 
             // lastActivity is the newer of state.json's updatedAt and the
             // wire log's mtime; whichever file was touched most recently.
-            let candidates = [stateUpdatedAt, wireValues?.contentModificationDate].compactMap { $0 }
+            // A mirrored file carries the mtime its host named, so it is
+            // held to the same range as the state file's stamp.
+            let wireModified = PlausibleDate.check(wireValues?.contentModificationDate, now: now)
+            let candidates = [stateUpdatedAt, wireModified].compactMap { $0 }
             guard let lastActivity = candidates.max() else { continue }
             let age = now.timeIntervalSince(lastActivity)
             guard age < discoveryWindow else { continue }

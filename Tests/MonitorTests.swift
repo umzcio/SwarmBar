@@ -433,7 +433,12 @@ struct GrokBuildMonitorTests {
         for value in readable {
             #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == expected, "\(value)")
         }
-        let unreadable: [Any] = ["2026-01-02T03:04:05", "2026-01-02 03:04:05", "yesterday", "", true, -5]
+        // A far-future instant would let any process's start time pass the
+        // bound ProcessIdentity holds a recorded pid to.
+        let unreadable: [Any] = [
+            "2026-01-02T03:04:05", "2026-01-02 03:04:05", "yesterday", "", true, -5,
+            1e300, "9999-01-02T03:04:05Z",
+        ]
         for value in unreadable {
             #expect(GrokBuildMonitor.openedAt(["opened_at": value]) == nil, "\(value)")
         }
@@ -890,6 +895,36 @@ struct KimiStateShapeTests {
         #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 0 as Double]) == nil)
         #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "not a date"]) == nil)
     }
+
+    /// A far-future date would trap the row timer's Int conversion and,
+    /// with a negative age, pass the discovery window forever.
+    @Test func rejectsDatesOutsideAPlausibleRange() {
+        let now = Date(timeIntervalSince1970: 1_786_160_685)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 1e300], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 4_000_000_000_000 as Double], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": "9999-12-31T23:59:59Z"], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 12 as Double], now: now) == nil)
+        #expect(KimiMonitor.stateUpdatedAt(["updatedAt": 1_786_160_000 as Double], now: now) != nil)
+    }
+
+    /// The same file on a watched host, with the wire log's mtime pushed out
+    /// too: nothing dates the session, so there is no row to anchor a timer.
+    @Test func aSessionDatedOnlyInTheFarFutureIsNotDiscovered() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionDir = root.appendingPathComponent("session_far")
+        let wire = sessionDir.appendingPathComponent("agents/main/wire.jsonl")
+        try FileManager.default.createDirectory(
+            at: wire.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "{\"sessionId\":\"session_far\",\"sessionDir\":\"\(sessionDir.path)\",\"workDir\":\"/tmp/far\"}\n"
+            .write(to: root.appendingPathComponent("session_index.jsonl"), atomically: true, encoding: .utf8)
+        try "{\"workDir\":\"/tmp/far\",\"updatedAt\":1e300}"
+            .write(to: sessionDir.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
+        try "{\"type\":\"metadata\"}\n".write(to: wire, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 32_503_680_000)], ofItemAtPath: wire.path)
+        #expect(KimiMonitor.discover(root: root, now: .now).isEmpty)
+    }
 }
 
 /// Grok gives every subagent its own session directory beside its parent's,
@@ -1200,6 +1235,19 @@ struct AntigravityLiveSessionTests {
             {"display":"ok","timestamp":1786223614380,"workspace":"/a","conversationId":"c1"}
             """
         #expect(AntigravityReader.history(atPath: "", tail: text).count == 1)
+    }
+
+    /// The workspace is still worth having; the time is not, and a live
+    /// session with no transcript step would otherwise be dated by it.
+    @Test func anImplausibleHistoryTimestampIsNoTime() {
+        let text = """
+            {"display":"far","timestamp":1e300,"workspace":"/a","conversationId":"c1"}
+            {"display":"ok","timestamp":1786223614380,"workspace":"/b","conversationId":"c2"}
+            """
+        let entries = AntigravityReader.history(atPath: "", tail: text)
+        #expect(entries["c1"]?.workspace == "/a")
+        #expect(entries["c1"]?.sentAt == nil)
+        #expect(entries["c2"]?.sentAt == Date(timeIntervalSince1970: 1_786_223_614.380))
     }
 }
 

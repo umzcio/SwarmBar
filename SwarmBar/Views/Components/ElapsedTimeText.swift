@@ -17,8 +17,21 @@ struct ElapsedTimeText: View {
         }
     }
 
+    /// Past this the timer stops counting. A session's dates come from
+    /// tool state files, local or a remote host's, so the interval can be
+    /// anything at all, and Int(_:) traps on a Double outside Int's range.
+    /// A century is far beyond any real session and well inside an Int.
+    static let longestShown: TimeInterval = 100 * 365 * 24 * 60 * 60
+
+    /// Whole seconds, clamped before the Int conversion rather than after:
+    /// non-finite and negative intervals read as zero.
+    static func wholeSeconds(_ elapsed: TimeInterval) -> Int {
+        guard elapsed.isFinite, elapsed > 0 else { return 0 }
+        return Int(min(elapsed, longestShown))
+    }
+
     static func format(_ elapsed: TimeInterval) -> String {
-        let totalSeconds = max(0, Int(elapsed))
+        let totalSeconds = wholeSeconds(elapsed)
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         if minutes >= 60 { return "\(minutes / 60)h \(minutes % 60)m" }
@@ -27,7 +40,7 @@ struct ElapsedTimeText: View {
     }
 
     static func agoFormat(_ elapsed: TimeInterval) -> String {
-        let totalSeconds = max(0, Int(elapsed))
+        let totalSeconds = wholeSeconds(elapsed)
         let minutes = totalSeconds / 60
         if minutes >= 60 { return "\(minutes / 60)h \(minutes % 60)m ago" }
         if minutes > 0 { return "\(minutes)m ago" }

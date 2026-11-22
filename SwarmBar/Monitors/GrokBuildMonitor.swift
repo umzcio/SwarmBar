@@ -173,8 +173,14 @@ struct GrokBuildMonitor: SessionMonitor {
     /// read: ISO 8601 with a zone (a space for the T as well), or seconds
     /// or milliseconds since 1970. A time with no zone is not an instant,
     /// and reading it in the wrong zone would move the bound ProcessIdentity
-    /// holds a pid to by hours, so it stays unread.
+    /// holds a pid to by hours, so it stays unread. So does an instant
+    /// outside PlausibleDate's range: a far-future one would let any
+    /// process's start time pass that bound.
     nonisolated static func openedAt(_ entry: [String: Any]) -> Date? {
+        PlausibleDate.check(spelledOpenedAt(entry))
+    }
+
+    private nonisolated static func spelledOpenedAt(_ entry: [String: Any]) -> Date? {
         let value = entry["opened_at"]
         if let number = value as? NSNumber {
             guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }

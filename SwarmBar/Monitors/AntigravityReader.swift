@@ -37,7 +37,8 @@ enum AntigravityReader {
     struct HistoryEntry: Sendable, Equatable {
         let workspace: String
         let prompt: String
-        let sentAt: Date
+        /// Nil when the line carries no time within PlausibleDate's range.
+        let sentAt: Date?
     }
 
     /// Antigravity's state directory under a user's home, this Mac's by
@@ -112,12 +113,14 @@ enum AntigravityReader {
                   let workspace = json["workspace"] as? String, !workspace.isEmpty
             else { continue }
             // Milliseconds since the epoch, unlike every timestamp in the
-            // summaries table, which are datetime strings.
+            // summaries table, which are datetime strings. Any number can
+            // stand here, and a live session with no transcript step yet is
+            // dated by it, so one outside a plausible range is no time.
             let millis = (json["timestamp"] as? Double) ?? 0
             entries[id] = HistoryEntry(
                 workspace: workspace,
                 prompt: json["display"] as? String ?? "",
-                sentAt: Date(timeIntervalSince1970: millis / 1000)
+                sentAt: PlausibleDate.epoch(millis / 1000)
             )
         }
         return entries

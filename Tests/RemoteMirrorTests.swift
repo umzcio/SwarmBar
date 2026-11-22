@@ -378,6 +378,24 @@ struct RemoteMirrorTests {
         #expect(abs(created.timeIntervalSince1970 - 1_700_000_000.5) < 0.001)
     }
 
+    /// The readers date sessions by these, and a far-future one would never
+    /// age out of any window. Left alone, the file keeps the time it was
+    /// written here.
+    @Test("an implausible mtime or creation time from the manifest is not applied")
+    func implausibleTimesAreNotApplied() throws {
+        let mirror = makeMirror()
+        defer { try? mirror.reset() }
+        let path = "/home/u/.kimi-code/sessions/wd/s/agents/main/wire.jsonl"
+        try mirror.apply(snapshot(files: [
+            file(path, size: 2, mtime: 1e300, created: 32_503_680_000, chunks: [(0, "{}")])
+        ]))
+        let attributes = try FileManager.default.attributesOfItem(atPath: try #require(mirror.local(path)).path)
+        let modified = try #require(attributes[.modificationDate] as? Date)
+        let created = try #require(attributes[.creationDate] as? Date)
+        #expect(abs(modified.timeIntervalSinceNow) < 60)
+        #expect(abs(created.timeIntervalSinceNow) < 60)
+    }
+
     @Test("with no creation time, the first record's timestamp stands in")
     func creationFallsBackToFirstRecordTimestamp() throws {
         let mirror = makeMirror()
