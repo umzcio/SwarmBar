@@ -464,8 +464,9 @@ final class HookServer: ApprovalResponding {
         let context = HookContext(
             rowID: { RemoteIdentity.sessionID(hostID: origin.hostID, home: origin.home, localID: $0) },
             // A home the mirror refuses cannot say whose session this is,
-            // so it is treated as unknown rather than guessed at.
-            tool: { raw in origin.mirrorHome.flatMap { Self.originTool(rawSessionID: raw, home: $0) } },
+            // so it is treated as unknown rather than guessed at. The relay
+            // reads the answer ahead, off the main actor.
+            tool: { raw in origin.tool(forRawSessionID: raw) },
             cwd: body["cwd"] as? String,
             accountLabel: accountLabel,
             host: origin.hostName,

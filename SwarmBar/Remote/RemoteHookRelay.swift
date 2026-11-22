@@ -18,6 +18,24 @@ struct RemoteHookOrigin: Sendable {
     /// helper read them off the socket's peer.
     let peer: [String]
     let approvalsOff: Set<AgentTool>
+    /// Whose session the event's id names, read from the mirror before the
+    /// event reached the main actor. Nil when nothing was read ahead.
+    var attribution: Attribution? = nil
+
+    struct Attribution: Sendable, Equatable {
+        let rawSessionID: String
+        let tool: AgentTool?
+    }
+
+    /// The tool `raw` belongs to: the answer read ahead when there is one
+    /// for this id, else read from the mirror now. The read is two tails of
+    /// up to 4 MB and a JSON file of up to 16 MB, all sized by the host, so
+    /// the relay reads ahead off the main actor and this fallback only runs
+    /// for an event handed in some other way.
+    nonisolated func tool(forRawSessionID raw: String) -> AgentTool? {
+        if let attribution, attribution.rawSessionID == raw { return attribution.tool }
+        return mirrorHome.flatMap { HookServer.originTool(rawSessionID: raw, home: $0) }
+    }
 }
 
 /// Sends a decision back for a request the helper is holding. The channel
@@ -97,15 +115,42 @@ final class RemoteHookRelay {
 
     /// Runs until the task is cancelled or the channel ends. Either way no
     /// helper is left to take a reply, so the host's holds go with it.
+    ///
+    /// Each event's tool is read from the mirror first, off the main actor,
+    /// and only then is the event handled here. The read's cost is set by
+    /// file sizes the host chooses, and a host streaming hooks would
+    /// otherwise spend it on the main actor once per event, starving the
+    /// popover and every other host. Events are still taken one at a time,
+    /// in order, so a hook_resolved never overtakes its hook; one that
+    /// arrives faster than this keeps up queues against the channel's
+    /// EventBudget, which ends the helper once it is full.
     func run() async {
         for await event in events {
             if Task.isCancelled { break }
-            handle(event)
+            let attribution = await Self.attribute(event, mirror: mirror)
+            if Task.isCancelled { break }
+            handle(event, attribution: attribution)
         }
         hookServer.dropRemote(hostID: hostID)
     }
 
-    func handle(_ event: HelperEvent) {
+    /// The tool a hook event's session id belongs to, read from the mirror.
+    /// Nonisolated and async, so it runs on the global executor and never
+    /// on the main actor. Nil for anything that is not a hook with an id.
+    nonisolated static func attribute(
+        _ event: HelperEvent, mirror: RemoteMirror
+    ) async -> RemoteHookOrigin.Attribution? {
+        guard event.name == "hook",
+              let object = (try? JSONSerialization.jsonObject(with: event.payload)) as? [String: Any],
+              let home = object["home"] as? String,
+              let body = object["body"] as? [String: Any],
+              let raw = body["session_id"] as? String
+        else { return nil }
+        let tool = mirror.local(home).flatMap { HookServer.originTool(rawSessionID: raw, home: $0) }
+        return RemoteHookOrigin.Attribution(rawSessionID: raw, tool: tool)
+    }
+
+    func handle(_ event: HelperEvent, attribution: RemoteHookOrigin.Attribution? = nil) {
         if event.name == HelperEvent.helperExited {
             exitedGeneration = max(exitedGeneration, event.generation)
             hookServer.dropRemote(hostID: hostID)
@@ -119,7 +164,7 @@ final class RemoteHookRelay {
         else { return }
         switch event.name {
         case "hook":
-            relay(object, rid: rid)
+            relay(object, rid: rid, attribution: attribution)
         case "hook_resolved":
             hookServer.cancelRemote(rid: rid)
         default:
@@ -127,7 +172,9 @@ final class RemoteHookRelay {
         }
     }
 
-    private func relay(_ object: [String: Any], rid: String) {
+    private func relay(
+        _ object: [String: Any], rid: String, attribution: RemoteHookOrigin.Attribution?
+    ) {
         // Only a request the helper is holding can take a reply. Anything
         // else it has already answered {}, and must be left alone.
         let held = object["held"] as? Bool == true
@@ -154,7 +201,8 @@ final class RemoteHookRelay {
             hostID: hostID, hostName: hostName, home: home,
             mirrorHome: mirror.local(home),
             peer: object["peer"] as? [String] ?? [],
-            approvalsOff: approvalsOff())
+            approvalsOff: approvalsOff(),
+            attribution: attribution)
         hookServer.handleRemote(
             event: HookServer.eventName(fromPath: path),
             body: object["body"] as? [String: Any] ?? [:],

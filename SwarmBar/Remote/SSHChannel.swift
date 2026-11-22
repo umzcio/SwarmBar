@@ -31,11 +31,93 @@ struct HelperEvent: Sendable {
     let name: String
     let payload: Data
     var generation: Int = 0
+    /// Holds this event's place in its channel's EventBudget for as long as
+    /// the event exists, queued or being handled. Nil for an event the
+    /// channel made itself, or one a test built.
+    var ticket: EventTicket? = nil
 
     /// Pushed by the channel itself, never by a helper, when a helper
     /// process is torn down for any reason. The name cannot collide with a
     /// helper event, which never starts with an underscore.
     static let helperExited = "_helper_exited"
+}
+
+/// Ceilings on the events one channel may be holding for its reader. An
+/// event line leaves the StdoutBudget the moment it is split off, so
+/// without these the helper would decide how much memory the Mac spends
+/// queueing what it pushes faster than the relay takes it.
+struct EventLimits: Sendable {
+    /// One event line. The helper answers a hook body over 256 KB with {}
+    /// and never forwards it, and JSON escaping at most sextuples a byte,
+    /// so an honest event stays well under this.
+    let lineBytes: Int
+    /// Events queued or being handled at once.
+    let queuedEvents: Int
+    /// Their lines' bytes, summed.
+    let queuedBytes: Int
+
+    static let standard = EventLimits(
+        lineBytes: 4 * 1024 * 1024,
+        queuedEvents: 1024,
+        queuedBytes: 32 * 1024 * 1024)
+}
+
+/// What a channel's events are holding, counted when the reader queues one
+/// and released when the event is gone (see EventTicket).
+final class EventBudget: Sendable {
+    private struct State {
+        var events = 0
+        var bytes = 0
+    }
+
+    let limits: EventLimits
+    private let state = Mutex(State())
+
+    init(limits: EventLimits) {
+        self.limits = limits
+    }
+
+    /// True, and counted, when one more event of `bytes` fits.
+    func admit(_ bytes: Int) -> Bool {
+        state.withLock { state in
+            guard bytes <= limits.lineBytes,
+                  state.events < limits.queuedEvents,
+                  state.bytes + bytes <= limits.queuedBytes
+            else { return false }
+            state.events += 1
+            state.bytes += bytes
+            return true
+        }
+    }
+
+    func release(_ bytes: Int) {
+        state.withLock { state in
+            state.events = max(0, state.events - 1)
+            state.bytes = max(0, state.bytes - bytes)
+        }
+    }
+
+    var held: (events: Int, bytes: Int) {
+        state.withLock { ($0.events, $0.bytes) }
+    }
+}
+
+/// One admitted event's share of its budget, given back when the last copy
+/// of the event is released: when the stream drops it, or when its reader
+/// has handled it and let it go. Tying the count to the event's own life
+/// means nothing has to remember to release it.
+final class EventTicket: Sendable {
+    private let budget: EventBudget
+    private let bytes: Int
+
+    init(budget: EventBudget, bytes: Int) {
+        self.budget = budget
+        self.bytes = bytes
+    }
+
+    deinit {
+        budget.release(bytes)
+    }
 }
 
 /// The tail end of a helper's stderr, drained as it arrives. Draining keeps
@@ -189,10 +271,17 @@ actor SSHChannel {
     /// is the snapshot's own line ceiling.
     static let defaultStdoutLimit = RemoteSnapshot.Limits.standard.lineBytes
     private nonisolated let stdoutLimit: Int
+    /// Shared by every process this channel runs, since `events` outlives
+    /// each one and what an exited helper queued is still held.
+    nonisolated let eventBudget: EventBudget
 
-    init(launch: HelperLaunch, stdoutLimit: Int = SSHChannel.defaultStdoutLimit) {
+    init(
+        launch: HelperLaunch, stdoutLimit: Int = SSHChannel.defaultStdoutLimit,
+        eventLimits: EventLimits = .standard
+    ) {
         self.launch = launch
         self.stdoutLimit = stdoutLimit
+        self.eventBudget = EventBudget(limits: eventLimits)
         (events, eventSink) = AsyncStream.makeStream(of: HelperEvent.self)
     }
 
@@ -438,6 +527,7 @@ actor SSHChannel {
 
         let generation = self.generation
         let events = eventSink
+        let eventBudget = eventBudget
         // Detached and holding the channel weakly, so the line parsing,
         // which for a snapshot is a megabyte of JSON, happens off the actor
         // and an abandoned channel is not kept alive by its own reader.
@@ -456,7 +546,19 @@ actor SSHChannel {
                         guard let self else { return }
                         await self.deliver(Reply(line: line, ok: ok, generation: generation), id: id)
                     case .event(let name):
-                        events.yield(HelperEvent(name: name, payload: line, generation: generation))
+                        // An event line past its own ceiling, or one more
+                        // than the queue may hold, is a helper pushing
+                        // faster or bigger than anything honest does. Like
+                        // an endless line, it ends this process rather than
+                        // being dropped quietly: a dropped hook would leave
+                        // its agent waiting out the whole hold.
+                        guard eventBudget.admit(line.count) else {
+                            await self?.eventsOverflowed(generation: generation)
+                            return
+                        }
+                        let ticket = EventTicket(budget: eventBudget, bytes: line.count)
+                        events.yield(HelperEvent(
+                            name: name, payload: line, generation: generation, ticket: ticket))
                     case .unrouted:
                         // The helper answers a request it could not parse
                         // with no id, so nothing is waiting on it.
@@ -478,6 +580,14 @@ actor SSHChannel {
     private func overflowed(generation: Int) {
         guard generation == self.generation, process != nil else { return }
         noteFailure("\(label) sent more output than SwarmBar accepts")
+    }
+
+    /// The helper pushed an event line past `EventLimits.lineBytes`, or
+    /// more events than the queue holds. The same failure as an endless
+    /// line: the process goes and the next one waits out the backoff.
+    private func eventsOverflowed(generation: Int) {
+        guard generation == self.generation, process != nil else { return }
+        noteFailure("\(label) sent events faster than SwarmBar handles them")
     }
 
     private enum Frame {
