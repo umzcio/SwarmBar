@@ -1168,7 +1168,14 @@ def run_command(argv, timeout=5, input=None, **options):
     or timed out. Such a grandchild may also hold the output pipes open,
     so reading what is left after a timeout is bounded too: the call
     returns either way, never waiting on a process it did not start.
+
+    `output_limit` (bytes, with no `input`) is for a child whose output is
+    someone else's to choose, as a tmux client's is its server's: it is
+    killed, and OutputTooLarge raised, once either stream passes it.
     """
+    limit = options.pop("output_limit", None)
+    if limit is not None and input is None and not options.get("start_new_session"):
+        return run_bounded(argv, timeout, limit, options)
     if not options.get("start_new_session"):
         if input is None:
             options = dict(options, stdin=subprocess.DEVNULL)
@@ -1206,6 +1213,43 @@ def run_command(argv, timeout=5, input=None, **options):
     finally:
         if marker is not None:
             kill_marked(marker)
+
+
+class OutputTooLarge(subprocess.SubprocessError):
+    pass
+
+
+def run_bounded(argv, timeout, limit, options):
+    """run_command for a child whose output is not trusted: read as it
+    comes, never more than `limit` bytes a stream, and never past
+    `timeout`. Either one kills the child; nothing is ever buffered
+    beyond the limit, however fast it writes."""
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, **options) as proc:
+        buffers = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+        streams = list(buffers)
+        deadline = time.monotonic() + timeout
+        try:
+            while streams:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                ready, _, _ = select.select(streams, [], [], remaining)
+                for stream in ready:
+                    data = os.read(stream.fileno(), 64 * 1024)
+                    if not data:
+                        streams.remove(stream)
+                        continue
+                    buffers[stream].extend(data)
+                    if len(buffers[stream]) > limit:
+                        raise OutputTooLarge("more than %d bytes of output" % limit)
+            proc.wait(timeout=max(deadline - time.monotonic(), 0.01))
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, bytes(buffers[proc.stdout]),
+                                           bytes(buffers[proc.stderr]))
 
 
 # The environment variable run_command marks a call's descendants with.
@@ -1503,13 +1547,30 @@ def tmux_command(socket_path, uid, args, input=None, timeout=5):
                               if name in os.environ)
     if input is not None:
         options["input"] = input
+    else:
+        # What comes back is the server's to choose, and any user can run
+        # one that streams without end.
+        options["output_limit"] = TMUX_OUTPUT_MAX
     try:
-        return run_command(argv, **options)
+        return run_command(argv, timeout=timeout, **options)
     except (OSError, subprocess.SubprocessError):
         return None
 
 
-def tmux_panes():
+# What tmux_panes may spend. A healthy server lists its panes in
+# milliseconds, but any user can make sockets under /tmp/tmux-* that accept
+# and never answer, as many as they like, and the request loop waits on
+# every call. So each call gets TMUX_LIST_SECONDS, each user at most
+# TMUX_SOCKETS_PER_USER servers, and all of them together
+# TMUX_PANES_BUDGET_SECONDS. A tmux client's output is capped at
+# TMUX_OUTPUT_MAX, far above any real capture or pane list.
+TMUX_LIST_SECONDS = 2
+TMUX_SOCKETS_PER_USER = 8
+TMUX_PANES_BUDGET_SECONDS = 8
+TMUX_OUTPUT_MAX = 1024 * 1024
+
+
+def tmux_panes(uids=None, only=None, skipped=None):
     """(pane pid, server owner uid) -> {"socket", "id"} across every server
     this process may contact.
 
@@ -1522,23 +1583,53 @@ def tmux_panes():
     tmux missing, a dead socket and a server this process may not contact
     all just contribute nothing. Panes being null is a normal state, never
     processes_failed.
+
+    `uids`, when given, limits it to servers of those users, the only ones
+    pane_for could match, and `only` to the one server at that socket.
+    Servers are taken a round at a time, each user's first (its "default"
+    first) before anyone's second, within the budgets above, so one user's
+    silent sockets cannot use up the time before another user's server is
+    reached. A server not contacted is appended to `skipped`, so it reads
+    as not looked at rather than as having no panes.
     """
-    panes = {}
+    wanted = os.path.realpath(only) if only is not None else None
+    by_uid = collections.OrderedDict()
     for socket_path, uid in tmux_sockets():
-        done = tmux_command(socket_path, uid,
-                            ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
-        if done is None or done.returncode != 0:
+        if uids is not None and uid not in uids:
             continue
-        for line in done.stdout.decode("utf-8", "replace").splitlines():
-            fields = line.split()
-            if len(fields) != 2:
+        if wanted is not None and os.path.realpath(socket_path) != wanted:
+            continue
+        by_uid.setdefault(uid, []).append(socket_path)
+    for paths in by_uid.values():
+        paths.sort(key=lambda path: (os.path.basename(path) != "default", path))
+    panes = {}
+    deadline = time.monotonic() + TMUX_PANES_BUDGET_SECONDS
+    rounds = max([len(paths) for paths in by_uid.values()] or [0])
+    for index in range(rounds):
+        for uid, paths in by_uid.items():
+            if index >= len(paths):
                 continue
-            try:
-                key = (int(fields[1]), uid)
-            except ValueError:
+            socket_path = paths[index]
+            remaining = deadline - time.monotonic()
+            if index >= TMUX_SOCKETS_PER_USER or remaining <= 0:
+                if skipped is not None:
+                    skipped.append(socket_path)
                 continue
-            # The first server to claim a pid keeps it.
-            panes.setdefault(key, {"socket": socket_path, "id": fields[0]})
+            done = tmux_command(socket_path, uid,
+                                ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
+                                timeout=min(TMUX_LIST_SECONDS, remaining))
+            if done is None or done.returncode != 0:
+                continue
+            for line in done.stdout.decode("utf-8", "replace").splitlines():
+                fields = line.split()
+                if len(fields) != 2:
+                    continue
+                try:
+                    key = (int(fields[1]), uid)
+                except ValueError:
+                    continue
+                # The first server to claim a pid keeps it.
+                panes.setdefault(key, {"socket": socket_path, "id": fields[0]})
     return panes
 
 
@@ -1647,7 +1738,12 @@ def agent_processes(warnings, screens=True):
         if name:
             row["comm"] = name
             agents.append(row)
-    panes = tmux_panes() if agents else {}
+    skipped = []
+    panes = tmux_panes(uids=set(row["uid"] for row in agents), skipped=skipped) \
+        if agents else {}
+    if skipped:
+        warnings.append("%d tmux servers not contacted (over the per-user or time budget): %s"
+                        % (len(skipped), ", ".join(skipped[:5])))
     parents = dict((row["pid"], row["ppid"]) for row in rows)
     processes = []
     for row in agents:
@@ -2418,7 +2514,9 @@ def target_still_there(pid, comm, pane):
     if row["uid"] != pane.get("uid"):
         return False
     parents = dict((r["pid"], r["ppid"]) for r in rows)
-    found = pane_for(pid, parents, tmux_panes(), row["uid"])
+    # Only the pane's own server can confirm it, so only it is contacted.
+    found = pane_for(pid, parents,
+                     tmux_panes(uids={row["uid"]}, only=pane.get("socket", "")), row["uid"])
     if found is None or found.get("id") != pane.get("id"):
         return False
     return os.path.realpath(found.get("socket", "")) == os.path.realpath(pane.get("socket", ""))

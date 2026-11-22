@@ -1255,7 +1255,7 @@ class FakeRunner(object):
         self.lsof, self.ps_code = lsof, ps_code
         self.calls = []
 
-    def __call__(self, argv, timeout=5):
+    def __call__(self, argv, timeout=5, **options):
         self.calls.append(list(argv))
         if argv[0] == "ps":
             return completed(argv, self.ps_code, self.ps if self.ps is not None else PS_SAMPLE)
@@ -1361,7 +1361,7 @@ class ProcessTableTests(unittest.TestCase):
     def test_missing_tmux_means_null_panes_not_failure(self):
         fake = FakeRunner()
 
-        def runner(argv, timeout=5):
+        def runner(argv, timeout=5, **options):
             if argv[0] == "tmux":
                 raise OSError("no tmux")
             return fake(argv, timeout)
@@ -1451,7 +1451,7 @@ class ProcessTableTests(unittest.TestCase):
 
     def test_lsof_failure_is_flagged(self):
         ps = "  10  1 1000 z ttys1 codex codex\n"
-        def runner(argv, timeout=5):
+        def runner(argv, timeout=5, **options):
             if argv[0] == "lsof":
                 raise OSError("gone")
             return FakeRunner(ps=ps)(argv, timeout)
@@ -1508,7 +1508,7 @@ class TmuxRecorder(object):
         self.fail_on_send = fail_on_send
         self.sends = 0
 
-    def __call__(self, argv, timeout=5, input=None):
+    def __call__(self, argv, timeout=5, input=None, **options):
         self.calls.append(list(argv))
         self.inputs.append(input)
         if argv[0] == "ps":
@@ -2145,6 +2145,8 @@ class TmuxOwnerTests(unittest.TestCase):
         by_socket = dict((argv[2], options) for argv, options in calls)
         self.assertIn("env", by_socket["/tmp/tmux-1500/default"])
         del by_socket["/tmp/tmux-1500/default"]["env"]
+        for options in by_socket.values():
+            self.assertEqual(options.pop("output_limit"), helper.TMUX_OUTPUT_MAX)
         self.assertEqual(by_socket["/tmp/tmux-1500/default"],
                          {"user": 1500, "group": 1500, "extra_groups": [1500], "cwd": "/"})
         # Root's own server is root's: run as root, as before.
@@ -2194,6 +2196,130 @@ class TmuxOwnerTests(unittest.TestCase):
                             {"cmd": "paste", "pane": pane, "text": "x"}):
                 self.assertEqual(helper.handle_tmux(request), {"ok": False, "error": "bad pane"})
         self.assertEqual(calls, [])
+
+
+class TmuxBudgetTests(unittest.TestCase):
+    """Any user can make sockets under /tmp/tmux-* that accept and never
+    answer, or stream without end, so the tmux servers a snapshot or a
+    press-time check contacts are bounded in number, time and output."""
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.real_monotonic = time.monotonic
+        clock = mock.patch.object(helper.time, "monotonic", lambda: self.now[0])
+        clock.start()
+        self.addCleanup(clock.stop)
+        identity = mock.patch.object(helper, "tmux_identity", return_value={})
+        identity.start()
+        self.addCleanup(identity.stop)
+        self.calls = []
+
+    def runner(self, silent):
+        """A run_command whose servers owned by `silent` take their whole
+        timeout to say nothing, and whose others answer at once."""
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            self.assertIn("output_limit", options)
+            if argv[2].startswith("/tmp/tmux-%d/" % silent):
+                self.now[0] += timeout
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return completed(argv, 0, "%%7 %s\n" % argv[2].rsplit("-", 1)[-1].split("/")[0])
+        return run
+
+    def sockets(self):
+        planted = [("/tmp/tmux-1000/s%04d" % i, 1000) for i in range(3000)]
+        return planted + [("/tmp/tmux-1001/default", 1001), ("/tmp/tmux-1002/default", 1002)]
+
+    def test_silent_sockets_of_one_user_cannot_hide_anothers_panes(self):
+        skipped = []
+        with mock.patch.object(helper, "tmux_sockets", self.sockets), \
+                mock.patch.object(helper, "run_command", self.runner(silent=1000)):
+            panes = helper.tmux_panes(uids={1000, 1001}, skipped=skipped)
+        self.assertIn((1001, 1001), panes)
+        # Only servers of users with an agent are contacted at all.
+        self.assertNotIn("/tmp/tmux-1002/default", [socket for socket, _ in self.calls])
+        tried = len([c for c in self.calls if "tmux-1000" in c[0]])
+        self.assertLessEqual(tried, helper.TMUX_SOCKETS_PER_USER)
+        self.assertLessEqual(self.now[0] - 1000.0, helper.TMUX_PANES_BUDGET_SECONDS)
+        self.assertTrue(all(timeout <= helper.TMUX_LIST_SECONDS for _, timeout in self.calls))
+        # The rest are reported as not looked at.
+        self.assertEqual(len(skipped), 3000 - tried)
+
+    def test_each_user_is_capped_even_when_time_remains(self):
+        sockets = [("/tmp/tmux-1000/s%04d" % i, 1000) for i in range(50)]
+        skipped = []
+
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            return completed(argv, 0, "")
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            helper.tmux_panes(skipped=skipped)
+        self.assertEqual(len(self.calls), helper.TMUX_SOCKETS_PER_USER)
+        self.assertEqual(len(skipped), 50 - helper.TMUX_SOCKETS_PER_USER)
+
+    def test_the_time_budget_holds_across_users(self):
+        sockets = [("/tmp/tmux-%d/default" % uid, uid) for uid in range(2000, 2100)]
+        skipped = []
+
+        def run(argv, timeout=5, input=None, **options):
+            self.calls.append((argv[2], timeout))
+            self.now[0] += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertEqual(helper.tmux_panes(skipped=skipped), {})
+        self.assertLessEqual(self.now[0] - 1000.0, helper.TMUX_PANES_BUDGET_SECONDS)
+        self.assertEqual(len(skipped) + len(self.calls), 100)
+        self.assertTrue(skipped)
+
+    def test_snapshot_warns_about_servers_not_contacted(self):
+        ps = PS_SAMPLE
+        runner = FakeRunner(ps=ps)
+        with mock.patch.object(helper, "tmux_panes",
+                               side_effect=lambda uids=None, only=None, skipped=None:
+                               skipped.extend(["/tmp/tmux-1000/x"]) or {}), \
+                mock.patch.object(helper, "process_cwd", return_value="/work"), \
+                mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")), \
+                mock.patch.object(helper, "run_command", runner):
+            warnings = []
+            helper.agent_processes(warnings)
+        self.assertTrue(any("not contacted" in warning for warning in warnings), warnings)
+
+    def test_press_time_check_contacts_only_the_panes_own_server(self):
+        sockets = [("/tmp/tmux-1000/default", 1000), ("/tmp/tmux-1000/other", 1000),
+                   ("/tmp/tmux-1001/default", 1001)]
+        ps = PS_SAMPLE
+        contacted = []
+
+        def run(argv, timeout=5, input=None, **options):
+            if argv[0] == "ps":
+                return completed(argv, 0, ps)
+            contacted.append(argv[2])
+            return completed(argv, 0, "%3 610\n")
+        with mock.patch.object(helper, "tmux_sockets", return_value=sockets), \
+                mock.patch.object(helper, "run_command", run):
+            self.assertTrue(helper.target_still_there(
+                700, "claude", {"socket": "/tmp/tmux-1000/default", "id": "%3", "uid": 1000}))
+        self.assertEqual(contacted, ["/tmp/tmux-1000/default"])
+
+    def test_output_is_bounded(self):
+        with mock.patch.object(helper.time, "monotonic", self.real_monotonic):
+            with self.assertRaises(subprocess.SubprocessError):
+                helper.run_command(["/bin/sh", "-c", "while :; do echo xxxxxxxxxxxxxxxx; done"],
+                                   timeout=30, output_limit=64 * 1024)
+            done = helper.run_command(["/bin/sh", "-c", "echo hello; echo there >&2"],
+                                      timeout=5, output_limit=64 * 1024)
+        self.assertEqual((done.returncode, done.stdout, done.stderr),
+                         (0, b"hello\n", b"there\n"))
+
+    def test_bounded_output_still_times_out(self):
+        with mock.patch.object(helper.time, "monotonic", self.real_monotonic):
+            began = self.real_monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                helper.run_command(["/bin/sh", "-c", "sleep 10"], timeout=0.5,
+                                   output_limit=1024)
+            self.assertLess(self.real_monotonic() - began, 5)
 
 
 class EventSink(object):
