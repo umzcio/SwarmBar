@@ -58,6 +58,7 @@ struct RemoteHookRelayTests {
     /// dir, so the local path's Grok and Kimi lookups read nothing real.
     private func rig(remoteHold: Duration = .seconds(350)) -> (SessionStore, HookServer) {
         let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        store.approveSettleInterval = 0
         let localHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-hook-local-\(UUID().uuidString)", isDirectory: true)
         let server = HookServer(store: store, remoteDecisionHold: remoteHold, localHome: localHome)

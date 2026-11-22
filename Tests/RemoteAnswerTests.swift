@@ -199,6 +199,7 @@ struct RemoteAnswerTests {
             delay: Duration? = nil, remoteHold: Duration = .seconds(350)
         ) {
             let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+            store.approveSettleInterval = 0
             let localHome = FileManager.default.temporaryDirectory
                 .appendingPathComponent("remote-answer-local-\(UUID().uuidString)", isDirectory: true)
             let server = HookServer(store: store, remoteDecisionHold: remoteHold, localHome: localHome)
@@ -1100,6 +1101,7 @@ struct RemoteAnswerTests {
 
     @Test func remoteApproveNeverUsesLocalTerminal() {
         let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        store.approveSettleInterval = 0
         var routed: [AgentSession] = []
         store.localAnswerObserver = { session, _ in routed.append(session) }
         let actions = RecordingActions()

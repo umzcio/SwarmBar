@@ -548,6 +548,7 @@ struct ApprovalDispatchTests {
 
     @Test func approveUsesTheResponderWhenOneIsPending() {
         let store = SessionStore()
+        store.approveSettleInterval = 0
         let responder = RecordingResponder()
         store.approvalResponder = responder
         let s = session(.claudeCode)
@@ -588,6 +589,7 @@ struct ApprovalDispatchTests {
     @Test func responderIsAskedBeforeAnyKeystrokePathForEveryTool() {
         for tool in AgentTool.allCases {
             let store = SessionStore()
+            store.approveSettleInterval = 0
             let responder = RecordingResponder()
             store.approvalResponder = responder
             let s = session(tool)
@@ -612,6 +614,7 @@ struct LocalKeystrokeAnswerTests {
 
     private func store(presses: Presses, delay: Duration = .zero) -> SessionStore {
         let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        store.approveSettleInterval = 0
         store.keystrokeAnswerer = { _, _, _ in
             presses.add()
             if delay > .zero { try? await Task.sleep(for: delay) }
@@ -740,5 +743,127 @@ struct AntigravityAnswerCheckTests {
         let x = try #require(pending("\u{0b}run_command{\"CommandLine\":\"ls\",\"toolSummary\":\"List\"}"))
         #expect(!AntigravityAnswerCheck.mayAnswer(
             shown: x.prompt, screen: "Steps:\n> 1. Yes\n  2. No\n\n> Type a message", pending: x))
+    }
+}
+
+/// Approve is honoured only for a request that has been on the row,
+/// unchanged, long enough to be read. A held request answered by Approve
+/// can be replaced by the agent's next one within a double click, in the
+/// same place, and the second click would allow a command nobody read.
+@MainActor
+struct ApproveSettleTests {
+    private final class RecordingResponder: ApprovalResponding {
+        var calls: [(UUID, Bool)] = []
+        func resolveApproval(sessionID: UUID, allow: Bool) -> Bool {
+            calls.append((sessionID, allow))
+            return true
+        }
+    }
+
+    private final class Clock {
+        var now = Date(timeIntervalSinceReferenceDate: 1_000_000)
+    }
+
+    private func rig() -> (SessionStore, RecordingResponder, Clock) {
+        let store = SessionStore(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
+        let responder = RecordingResponder()
+        let clock = Clock()
+        store.approvalResponder = responder
+        store.clock = { clock.now }
+        return (store, responder, clock)
+    }
+
+    private func row(_ store: SessionStore, _ id: UUID) throws -> AgentSession {
+        try #require(store.sessions.first { $0.id == id })
+    }
+
+    private func ask(_ store: SessionStore, _ id: UUID, _ command: ApprovalPrompt) {
+        store.applyHookEvent(
+            sessionID: id, tool: .claudeCode, status: .waitingApproval(command: command),
+            sticky: true, cwd: "/tmp/example-proj", accountLabel: nil)
+    }
+
+    @Test func aRequestJustShownIsNotApprovedUntilItSettles() throws {
+        let (store, responder, clock) = rig()
+        let id = UUID()
+        ask(store, id, "git status")
+        store.approve(try row(store, id))
+        #expect(responder.calls.isEmpty)
+
+        clock.now += SessionStore.approveSettle
+        store.approve(try row(store, id))
+        #expect(responder.calls.count == 1)
+        #expect(responder.calls.first?.1 == true)
+    }
+
+    /// The double click: the first approves A, the agent asks B at once,
+    /// and the second lands on B's Approve.
+    @Test func aRepeatClickOnTheRequestThatReplacedTheAnsweredOneDoesNothing() throws {
+        let (store, responder, clock) = rig()
+        let id = UUID()
+        ask(store, id, "git status")
+        clock.now += SessionStore.approveSettle
+        store.approve(try row(store, id))
+        #expect(responder.calls.count == 1)
+
+        clock.now += 0.1
+        ask(store, id, "rm -rf ./build")
+        clock.now += 0.1
+        store.approve(try row(store, id))
+        #expect(responder.calls.count == 1)
+    }
+
+    /// The same command asked twice is two requests: the second one has
+    /// not been read either.
+    @Test func theSameTextAskedAgainStartsOver() throws {
+        let (store, responder, clock) = rig()
+        let id = UUID()
+        ask(store, id, "git push")
+        clock.now += SessionStore.approveSettle
+        store.approve(try row(store, id))
+        ask(store, id, "git push")
+        store.approve(try row(store, id))
+        #expect(responder.calls.count == 1)
+    }
+
+    /// A poll that changes the request in place, with no hook event, is a
+    /// new request too.
+    @Test func aPromptChangedInPlaceIsNotApprovedAtOnce() throws {
+        let (store, responder, clock) = rig()
+        var session = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/example-proj"),
+            status: .waitingApproval(command: "ls"))
+        store.upsert(session)
+        clock.now += SessionStore.approveSettle
+        session.status = .waitingApproval(command: "rm -rf ./build")
+        store.upsert(session)
+        store.approve(try row(store, session.id))
+        #expect(responder.calls.isEmpty)
+    }
+
+    /// A request that stays put keeps its time through polls, which
+    /// re-derive the same status every few seconds.
+    @Test func pollsDoNotRestartTheClock() throws {
+        let (store, responder, clock) = rig()
+        let session = AgentSession(
+            tool: .claudeCode, projectName: "proj",
+            projectPath: URL(fileURLWithPath: "/tmp/example-proj"),
+            status: .waitingApproval(command: "ls"))
+        store.sync(tool: .claudeCode, sessions: [session])
+        clock.now += SessionStore.approveSettle
+        store.sync(tool: .claudeCode, sessions: [session])
+        store.approve(try row(store, session.id))
+        #expect(responder.calls.count == 1)
+    }
+
+    /// Deny never allows anything, so it stays immediate.
+    @Test func denyIsImmediate() throws {
+        let (store, responder, _) = rig()
+        let id = UUID()
+        ask(store, id, "rm -rf ./build")
+        store.deny(try row(store, id))
+        #expect(responder.calls.count == 1)
+        #expect(responder.calls.first?.1 == false)
     }
 }

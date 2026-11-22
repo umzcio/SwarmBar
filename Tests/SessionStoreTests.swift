@@ -149,6 +149,7 @@ struct SessionStoreTests {
 
     @Test func mockApprovalTransitions() {
         let store = SessionStore()
+        store.approveSettleInterval = 0
         let approval = session(.waitingApproval(command: "git push origin main"))
         store.upsert(approval)
 
@@ -389,6 +390,7 @@ struct ApprovalDeliveryHonestyTests {
 
     @Test func approveDoesNotClaimSuccessWhenNothingIsPending() {
         let store = SessionStore()
+        store.approveSettleInterval = 0
         let responder = NoPendingApproval()
         store.approvalResponder = responder
 
