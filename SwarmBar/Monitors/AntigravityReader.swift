@@ -139,7 +139,7 @@ enum AntigravityReader {
     }
 
     nonisolated static func rows(dbPath: String = defaultDatabasePath()) -> [Row] {
-        SQLiteSnapshot.read(dbPath: dbPath, query) ?? []
+        SQLiteSnapshot.read(dbPath: dbPath, tables: ["conversation_summaries"], query) ?? []
     }
 
     /// Returns nil when the database cannot be read, which is different from
@@ -155,7 +155,8 @@ enum AntigravityReader {
         defer { sqlite3_finalize(statement) }
 
         var rows: [Row] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var cursor = SQLiteSnapshot.Cursor()
+        while SQLiteSnapshot.nextRow(statement, &cursor) {
             func text(_ column: Int32) -> String {
                 guard let c = sqlite3_column_text(statement, column) else { return "" }
                 return String(cString: c)

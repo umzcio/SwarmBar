@@ -1690,8 +1690,8 @@ struct SQLiteWALFallbackTests {
             return true
         }
         let result = direct
-            ? SQLiteSnapshot.readDirect(dbPath: path, probe)
-            : SQLiteSnapshot.read(dbPath: path, probe)
+            ? SQLiteSnapshot.readDirect(dbPath: path, tables: [table], probe)
+            : SQLiteSnapshot.read(dbPath: path, tables: [table], probe)
         return result ?? false
     }
 
@@ -1761,6 +1761,122 @@ struct SQLiteWALFallbackTests {
     @Test func aMissingDatabaseIsEmptyRatherThanACrash() {
         #expect(AntigravityReader.rows(dbPath: "/nope/missing.db").isEmpty)
         #expect(OpenCodeReader.sessions(dbPath: "/nope/missing.db").isEmpty)
+    }
+}
+
+/// A remote host's databases are mirrored as the host shipped them, so the
+/// bytes can be any account's. Each case is a few kilobytes of schema that,
+/// read as if the tool wrote it, would spin or allocate without bound.
+@MainActor
+struct SQLiteUntrustedFileTests {
+    private func makeDatabase(_ sql: String) throws -> String {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("state.db").path
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+        return path
+    }
+
+    /// Rows forever, from a view named like the table.
+    private let endless = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT"
+
+    @Test func aViewStandingInForAQueriedTableIsUnreadable() throws {
+        let summaries = try makeDatabase("""
+            CREATE VIEW conversation_summaries AS \(endless)
+              'c' || i, '', '', '[]', '', 0, 0, '', '2026-08-08 15:00:00' FROM n;
+            """)
+        let started = ContinuousClock.now
+        #expect(AntigravityReader.rows(dbPath: summaries).isEmpty)
+        let opencode = try makeDatabase("""
+            CREATE VIEW session AS \(endless)
+              's' || i AS id, '/tmp/p' AS directory, 1 AS time_created,
+              \(Int(Date.now.timeIntervalSince1970 * 1000)) AS time_updated, NULL AS parent_id FROM n;
+            """)
+        #expect(OpenCodeReader.sessions(dbPath: opencode).isEmpty)
+        #expect(ContinuousClock.now - started < .seconds(2), "refused by schema, not by the clock")
+    }
+
+    @Test func aComputedColumnInAQueriedTableIsUnreadable() throws {
+        let path = try makeDatabase("""
+            CREATE TABLE steps(idx INTEGER, status INTEGER,
+              metadata BLOB GENERATED ALWAYS AS (zeroblob(15000000)) VIRTUAL);
+            INSERT INTO steps(idx, status) VALUES (1, 9), (2, 9), (3, 9);
+            """)
+        #expect(AntigravityConversation.pending(dbPath: path) == nil)
+    }
+
+    @Test func aStatementPastTheTimeBudgetIsUnreadable() throws {
+        let path = try makeDatabase("CREATE TABLE t(x);")
+        let started = ContinuousClock.now
+        let result: Int? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) count(*) FROM n", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            _ = sqlite3_step(statement)
+            return 1
+        }
+        #expect(result == nil)
+        #expect(ContinuousClock.now - started < .seconds(Int(SQLiteSnapshot.timeBudget) + 3))
+    }
+
+    /// The row and byte caps leave a reader a shorter answer. A value past
+    /// maxValueBytes cannot be produced at all.
+    @Test func aStatementStopsAtItsRowAndByteCaps() throws {
+        let path = try makeDatabase("CREATE TABLE t(x);")
+        let counted: SQLiteSnapshot.Cursor? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) i FROM n LIMIT \(SQLiteSnapshot.maxRows * 2)", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            var cursor = SQLiteSnapshot.Cursor()
+            while SQLiteSnapshot.nextRow(statement, &cursor) {}
+            return cursor
+        }
+        #expect(counted?.rows == SQLiteSnapshot.maxRows)
+
+        let bytes: SQLiteSnapshot.Cursor? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "\(endless) zeroblob(15000000) FROM n LIMIT 10", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            var cursor = SQLiteSnapshot.Cursor()
+            while SQLiteSnapshot.nextRow(statement, &cursor) {}
+            return cursor
+        }
+        #expect(bytes.map { $0.rows < 10 && $0.bytes <= SQLiteSnapshot.maxResultBytes + 15_000_000 } == true)
+
+        let tooBig: Bool? = SQLiteSnapshot.read(dbPath: path, tables: ["t"]) { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "SELECT zeroblob(\(Int(SQLiteSnapshot.maxValueBytes) + 1))", -1, &statement, nil) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(statement) }
+            return sqlite3_step(statement) == SQLITE_ROW
+        }
+        #expect(tooBig == false)
+    }
+
+    /// The honest shapes still read: ordinary tables, stored generated
+    /// columns included, and an absent optional table.
+    @Test func ordinaryTablesStillRead() throws {
+        let millis = Int(Date.now.timeIntervalSince1970 * 1000)
+        let path = try makeDatabase("""
+            CREATE TABLE session(id TEXT, directory TEXT, title TEXT, parent_id TEXT,
+              time_created INTEGER, time_updated INTEGER,
+              stamp INTEGER GENERATED ALWAYS AS (time_updated / 1000) STORED);
+            CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER);
+            CREATE TABLE part(id TEXT, message_id TEXT, data TEXT);
+            INSERT INTO session(id, directory, title, parent_id, time_created, time_updated)
+              VALUES ('s1', '/tmp/proj', 'T', NULL, \(millis), \(millis));
+            """)
+        #expect(OpenCodeReader.sessions(dbPath: path).count == 1)
     }
 }
 

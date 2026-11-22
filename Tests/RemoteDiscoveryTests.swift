@@ -261,6 +261,21 @@ struct RemoteDiscoveryTests {
         #expect(result[.claudeCode]?.first?.projectName == "demo")
     }
 
+    @Test("one tool in one home contributes at most a fixed number of rows, the newest")
+    func sessionsPerToolAndHomeAreCapped() {
+        let now = Date.now
+        let sessions = (0..<12).map { index in
+            AgentSession(
+                id: StableID.uuid(for: "s\(index)"), tool: .kimiCode, projectName: "p\(index)",
+                projectPath: nil, status: .idle,
+                startedAt: now, lastActivityAt: now.addingTimeInterval(TimeInterval(-index)))
+        }
+        let kept = RemoteDiscovery.capped(sessions.shuffled(), limit: 5)
+        #expect(kept.map(\.projectName) == ["p0", "p1", "p2", "p3", "p4"])
+        #expect(RemoteDiscovery.capped(sessions, limit: 20).count == 12)
+        #expect(RemoteDiscovery.maxSessionsPerToolAndHome > 0)
+    }
+
     @Test("an empty snapshot still answers for all seven tools")
     func allSevenKeysPresent() {
         let mirror = RemoteMirror(root: FileManager.default.temporaryDirectory

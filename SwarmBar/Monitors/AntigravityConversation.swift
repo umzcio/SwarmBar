@@ -79,7 +79,7 @@ enum AntigravityConversation {
     /// evidence of a prompt must never become a prompt.
     nonisolated static func pending(dbPath: String) -> Pending? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
-        return SQLiteSnapshot.read(dbPath: dbPath) { db -> Pending?? in
+        return SQLiteSnapshot.read(dbPath: dbPath, tables: ["steps"]) { db -> Pending?? in
             let sql = """
                 SELECT metadata FROM steps
                 WHERE status <> \(doneStatus)
@@ -93,7 +93,8 @@ enum AntigravityConversation {
             }
             defer { sqlite3_finalize(statement) }
             var blobs: [Data] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            var cursor = SQLiteSnapshot.Cursor()
+            while SQLiteSnapshot.nextRow(statement, &cursor) {
                 guard let bytes = sqlite3_column_blob(statement, 0) else {
                     blobs.append(Data())
                     continue
