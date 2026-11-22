@@ -229,19 +229,88 @@ enum CodexSessionParser {
         let identifier = "[A-Za-z_$][A-Za-z0-9_$]*"
         let shapes = [
             (head: "^\\s*(?:(?:const|let|var)\\s+\(identifier)\\s*=\\s*)?await\\s+tools\\.exec_command\\(\\s*",
-             tail: "^\\s*\\)\\s*;?\\s*(?:text\\(\\s*\(identifier)(?:\\.\(identifier))*\\s*\\)\\s*;?\\s*)*$"),
+             textWrapped: false),
             (head: "^\\s*text\\(\\s*await\\s+tools\\.exec_command\\(\\s*",
-             tail: "^\\s*\\)\\s*\\)\\s*;?\\s*$"),
+             textWrapped: true),
         ]
         for shape in shapes {
             guard let headRange = program.range(of: shape.head, options: .regularExpression),
                   let parsed = StrictJSONObject.parseJavaScriptLiteral(in: program, from: headRange.upperBound)
             else { continue }
-            let rest = String(program.unicodeScalars[parsed.end...])
-            guard rest.range(of: shape.tail, options: .regularExpression) != nil else { continue }
+            guard isAcceptedTail(Array(program.unicodeScalars[parsed.end...]), textWrapped: shape.textWrapped)
+            else { continue }
             return parsed.object
         }
         return nil
+    }
+
+    /// Whether what follows the call's object literal is exactly
+    ///
+    ///     ) [;] { text(<name>[.<name>]...) [;] }      (the assigned form)
+    ///     ) ) [;]                                      (the text-wrapped form)
+    ///
+    /// with whitespace anywhere a `\s*` stood in the patterns these
+    /// replace, and nothing else.
+    ///
+    /// Scanned by hand, each scalar looked at once. The text is model
+    /// written, and the pattern for the first form ended its repeated group
+    /// in two whitespace runs that could split the same spaces any number
+    /// of ways, so a long run of `text(…)` statements followed by anything
+    /// it refused backtracked exponentially, and the Codex monitor (or a
+    /// remote host's whole discovery) never finished another pass.
+    private static func isAcceptedTail(_ scalars: [Unicode.Scalar], textWrapped: Bool) -> Bool {
+        var index = 0
+        func skipSpace() {
+            while index < scalars.count, scalars[index].properties.isWhitespace { index += 1 }
+        }
+        func eat(_ word: String) -> Bool {
+            let expected = Array(word.unicodeScalars)
+            guard index + expected.count <= scalars.count,
+                  scalars[index..<index + expected.count].elementsEqual(expected)
+            else { return false }
+            index += expected.count
+            return true
+        }
+        func identifier() -> Bool {
+            func isStart(_ s: Unicode.Scalar) -> Bool {
+                s.isASCII && (s.properties.isAlphabetic || s == "_" || s == "$")
+            }
+            guard index < scalars.count, isStart(scalars[index]) else { return false }
+            index += 1
+            while index < scalars.count, isStart(scalars[index]) || ("0"..."9").contains(scalars[index]) {
+                index += 1
+            }
+            return true
+        }
+        // `;?` then whitespace, as the patterns had it.
+        func optionalSemicolon() {
+            _ = eat(";")
+            skipSpace()
+        }
+
+        skipSpace()
+        guard eat(")") else { return false }
+        skipSpace()
+        if textWrapped {
+            guard eat(")") else { return false }
+            skipSpace()
+            optionalSemicolon()
+            return index == scalars.count
+        }
+        optionalSemicolon()
+        while index < scalars.count {
+            guard eat("text(") else { return false }
+            skipSpace()
+            guard identifier() else { return false }
+            while eat(".") {
+                guard identifier() else { return false }
+            }
+            skipSpace()
+            guard eat(")") else { return false }
+            skipSpace()
+            optionalSemicolon()
+        }
+        return true
     }
 
     /// The first line of a rollout file is session_meta with cwd and id.

@@ -162,6 +162,59 @@ struct CodexSessionParserTests {
         }
     }
 
+    /// The statements after the call are model-written text. They were
+    /// matched with a pattern whose repeated group ended in two adjacent
+    /// whitespace runs, so a long run of `text(…)` statements followed by
+    /// anything the pattern refused backtracked exponentially, and the
+    /// Codex monitor never finished another pass.
+    @Test func aLongRefusedTailIsRejectedPromptly() {
+        let head = "const r = await tools.exec_command({cmd:\"make\",sandbox_permissions:\"require_escalated\"});\n"
+        for count in [14, 2000] {
+            let program = head + String(repeating: "text(r.output)  \n", count: count) + "x"
+            let clock = ContinuousClock()
+            let elapsed = clock.measure {
+                #expect(CodexSessionParser.codeModeArguments(program) == nil)
+            }
+            #expect(elapsed < .milliseconds(500), "\(count) statements took \(elapsed)")
+        }
+        // The same statements with nothing refused after them still read.
+        let accepted = head + String(repeating: "text(r.output)  \n", count: 2000)
+        #expect(CodexSessionParser.codeModeArguments(accepted)?["cmd"] as? String == "make")
+    }
+
+    /// Exactly the statements the old patterns accepted, and no others.
+    @Test func theAcceptedTailsAreUnchanged() {
+        let call = "await tools.exec_command({cmd:\"make\",sandbox_permissions:\"require_escalated\"})"
+        let accepted = [
+            "const r = \(call);\ntext(r.output);",
+            "let r=\(call)\ntext( r.output )\ntext(r.a.b);  ",
+            "var r = \(call) ;  text(r) ; text($x._y)",
+            "\(call)",
+            "  \(call)  ;  ",
+            "text(\(call))",
+            "text( \(call) ) ; \n",
+        ]
+        for program in accepted {
+            #expect(CodexSessionParser.codeModeArguments(program) != nil, "\(program)")
+        }
+        let refused = [
+            "const r = \(call);\ntext(r.output);x",
+            "const r = \(call);\ntext (r.output);",
+            "const r = \(call);\ntext(r.);",
+            "const r = \(call);\ntext(r..output);",
+            "const r = \(call);\ntext(1r);",
+            "const r = \(call);;",
+            "const r = \(call);\ntext(r.output);;",
+            "const r = \(call);\ntext(r.output, r);",
+            "text(\(call)));",
+            "text(\(call)) text(r)",
+            "text(\(call)",
+        ]
+        for program in refused {
+            #expect(CodexSessionParser.codeModeArguments(program) == nil, "\(program)")
+        }
+    }
+
     private func turnContext(reviewer: String) -> String {
         #"{"timestamp":"2026-08-01T10:03:00.000Z","type":"turn_context","payload":{"cwd":"/Users/example","approval_policy":"on-request","approvals_reviewer":"\#(reviewer)"}}"#
     }
