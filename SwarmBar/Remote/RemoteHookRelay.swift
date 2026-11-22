@@ -18,6 +18,10 @@ struct RemoteHookOrigin: Sendable {
     /// helper read them off the socket's peer.
     let peer: [String]
     let approvalsOff: Set<AgentTool>
+    /// The Kimi-family process the helper found above the bridge of a
+    /// PermissionRequest, which is the only process that session's keys
+    /// may go to. Nil for every other event, and from an older helper.
+    var agent: RemoteProcessBinding.Agent? = nil
 }
 
 /// Sends a decision back for a request the helper is holding. The channel
@@ -154,7 +158,8 @@ final class RemoteHookRelay {
             hostID: hostID, hostName: hostName, home: home,
             mirrorHome: mirror.local(home),
             peer: object["peer"] as? [String] ?? [],
-            approvalsOff: approvalsOff())
+            approvalsOff: approvalsOff(),
+            agent: RemoteProcessBinding.agent(from: object["agent"]))
         hookServer.handleRemote(
             event: HookServer.eventName(fromPath: path),
             body: object["body"] as? [String: Any] ?? [:],

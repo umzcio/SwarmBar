@@ -304,6 +304,9 @@ final class HookServer: ApprovalResponding {
         /// The processes above the bridge that sent a local request,
         /// nearest first. Empty for remote.
         var peerAncestry: [Int] = []
+        /// Records which host process raised a relayed Kimi-family prompt
+        /// (RemoteProcessBinding). Nil for local.
+        var bindRemoteProcess: ((UUID, AgentTool) -> Void)? = nil
     }
 
     /// A tool switched off in Settings shows no row, so a held request
@@ -373,6 +376,11 @@ final class HookServer: ApprovalResponding {
                     SessionProcessRegistry.bind(sessionID: sessionID, tool: tool, ancestry: ancestry, cwd: cwd)
                 }
             }
+            if RemoteProcessBinding.applies(to: tool), let bind = context.bindRemoteProcess {
+                // The same for a host: the process the helper found above
+                // this prompt's bridge, or no binding at all.
+                bind(sessionID, tool)
+            }
             let holding = mayHold(.claudeHook, tool, context)
             // The command a row shows beside Approve is the command Approve
             // answers. A request nobody holds cannot be answered from the
@@ -428,6 +436,7 @@ final class HookServer: ApprovalResponding {
 
         case "SessionEnd":
             SessionProcessRegistry.forget(sessionID)
+            RemoteProcessBinding.forget(sessionID)
             cancelPending(sessionID: sessionID)
             store.markSessionEnded(sessionID)
             context.release()
@@ -491,6 +500,9 @@ final class HookServer: ApprovalResponding {
                     respond: respond,
                     isGone: { false },
                     remote: (rid, origin.hostID))
+            },
+            bindRemoteProcess: { sessionID, tool in
+                RemoteProcessBinding.bind(sessionID, hostID: origin.hostID, agent: origin.agent, tool: tool)
             })
         dispatch(event: event, body: body, context: context)
     }

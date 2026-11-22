@@ -335,14 +335,34 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// check), and a snapshot has landed since the last gap. All are
     /// checked before any request, so a click on a dark host's row never
     /// starts ssh, and a pane map from before a gap never aims a key.
-    private func paneTarget(for session: AgentSession) -> PaneTarget? {
-        guard let hostName = session.host, let pid = session.pid, !sharesPid(session),
+    ///
+    /// A Kimi or BearCode row's pid is only the newest process in its
+    /// directory, which can be another session's, so an approval for one
+    /// (`forAnswer`) goes only to the process its own prompt came from
+    /// (RemoteProcessBinding), still running with the start time it had
+    /// then. Unbound, it gets no keys at all. A reply, which answers no
+    /// prompt, uses that process when there is one and otherwise the
+    /// directory's, as on this Mac (TerminalFocuser.tty(forSession:)).
+    private func paneTarget(for session: AgentSession, forAnswer: Bool = false) -> PaneTarget? {
+        guard let hostName = session.host,
               store.remoteReachability[hostName] == .reachable,
               let connection = connection(forHostName: hostName),
               connection.helperIsCurrent,
-              let process = connection.lastSnapshot?.processes.first(where: { $0.pid == Int(pid) }),
-              let pane = process.pane
+              let processes = connection.lastSnapshot?.processes
         else { return nil }
+        let process: RemoteProcessRecord?
+        if RemoteProcessBinding.applies(to: session.tool),
+           RemoteProcessBinding.bound(session.id) != nil || forAnswer {
+            // Bound but gone or replaced is never a reason to fall back to
+            // the directory's process: that is how a dead row reached a
+            // live session's prompt.
+            process = RemoteProcessBinding.record(
+                for: session.id, hostID: connection.host.id, tool: session.tool, in: processes)
+        } else {
+            guard let pid = session.pid, !sharesPid(session) else { return nil }
+            process = processes.first { $0.pid == Int(pid) }
+        }
+        guard let process, let pane = process.pane else { return nil }
         return (process, pane, connection)
     }
 
@@ -362,7 +382,7 @@ extension RemoteMonitorSupervisor: RemoteActing {
     /// `paneTarget`, for an approval: also nil when approvals are off for
     /// this tool on this host, or its keystroke switch is off.
     private func keystrokeTarget(for session: AgentSession) -> PaneTarget? {
-        guard let target = paneTarget(for: session) else { return nil }
+        guard let target = paneTarget(for: session, forAnswer: true) else { return nil }
         let connection = target.connection
         // Read from the registry, not the connection's copy, so switching
         // approvals off in Settings applies at once without a restart.

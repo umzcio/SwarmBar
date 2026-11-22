@@ -317,6 +317,38 @@ struct AttentionAlertTests {
         }
     }
 
+    /// find_014cCa2Cdku9Bj5LWjxM2uNP (2): the same on a host. A remote
+    /// Kimi-family pin goes once the host's process table shows the process
+    /// its hook came from is gone, and only for that host's rows.
+    @Test func aRemoteKimiPinDiesWithItsOwnBoundProcess() {
+        for tool in [AgentTool.kimiCode, .bearCode] {
+            let store = SessionStore()
+            var gone: Set<UUID> = []
+            store.remoteBoundProcessGone = { gone.contains($0) }
+            store.boundProcessGone = { _ in Issue.record("asked this Mac's registry about a remote row"); return false }
+            let session = AgentSession(
+                tool: tool, projectName: "proj",
+                projectPath: URL(fileURLWithPath: "/home/u/proj"),
+                status: .working(activity: "Working…"), processAlive: true, host: "devbox")
+            store.sync(tool: tool, host: "devbox", sessions: [session])
+            store.applyHookEvent(
+                sessionID: session.id, tool: tool,
+                status: .waitingApproval(command: "touch /tmp/x"),
+                sticky: true, cwd: "/home/u/proj", accountLabel: nil, host: "devbox")
+            store.sync(tool: tool, host: "devbox", sessions: [session])
+            #expect(store.sessions.first?.status == .waitingApproval(command: "touch /tmp/x"), "\(tool)")
+
+            // Another host's sync leaves it alone.
+            gone = [session.id]
+            store.sync(tool: tool, host: "other", sessions: [])
+            #expect(store.hookOverrides[session.id] != nil, "\(tool)")
+
+            store.sync(tool: tool, host: "devbox", sessions: [session])
+            #expect(store.hookOverrides[session.id] == nil, "\(tool)")
+            #expect(store.sessions.first?.status.needsAttention == false, "\(tool)")
+        }
+    }
+
     /// A held Claude decision keeps its pin whatever a poll says.
     @Test func aClaudePinIsNotDroppedByLiveness() {
         let store = SessionStore()
