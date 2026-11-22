@@ -62,6 +62,39 @@ final class RemoteHostConnection {
         return true
     }
 
+    // MARK: - State read after a click
+
+    /// Snapshots asked of the helper so far. Each poll takes the next
+    /// number just before it sends its request, so a poll numbered above
+    /// a count read at some moment read the host's files after that moment.
+    private(set) var snapshotsRequested = 0
+    /// Per tool, the number of the newest poll whose rows for that tool
+    /// reached the store. A tool a poll could not vouch for keeps its old
+    /// rows, so it is not counted as synced by that poll.
+    private var syncedThrough: [AgentTool: Int] = [:]
+    /// Set by an answer that wants a poll now rather than at the end of the
+    /// usual wait; the monitor takes it when it next rests.
+    private var pollWanted = false
+
+    func noteSnapshotRequested() -> Int {
+        snapshotsRequested += 1
+        return snapshotsRequested
+    }
+
+    func noteSynced(_ poll: Int, tools: some Sequence<AgentTool>) {
+        for tool in tools { syncedThrough[tool] = max(syncedThrough[tool] ?? 0, poll) }
+    }
+
+    func syncedThrough(_ tool: AgentTool) -> Int { syncedThrough[tool] ?? 0 }
+
+    func wantPoll() { pollWanted = true }
+
+    /// Whether a poll was wanted, clearing the request.
+    func takePollWanted() -> Bool {
+        defer { pollWanted = false }
+        return pollWanted
+    }
+
     private static func panes(of snapshot: RemoteSnapshot?) -> [Int: RemotePane] {
         var panes: [Int: RemotePane] = [:]
         for process in snapshot?.processes ?? [] {

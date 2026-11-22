@@ -117,9 +117,9 @@ private final class MonitorRig {
         home.appendingPathComponent(".claude/projects/-home-u-demo/\(id.uuidString.lowercased()).jsonl")
     }
 
-    func start() {
+    func start(pollInterval: Duration = .milliseconds(100)) {
         let monitor = RemoteHostMonitor(
-            connection: connection, pollInterval: .milliseconds(100), installRunner: installRunner)
+            connection: connection, pollInterval: pollInterval, installRunner: installRunner)
         let store = store
         task = Task { await monitor.start(into: store) }
     }
@@ -191,6 +191,25 @@ struct RemoteHostMonitorTests {
         let mirrored = try #require(rig.connection.mirror.local(
             MonitorRig.transcript(MonitorRig.first, in: rig.home).path))
         #expect(FileManager.default.fileExists(atPath: mirrored.path))
+    }
+
+    /// A remote Codex or Antigravity answer waits for rows read after its
+    /// click, so it asks for a poll now instead of waiting out the usual
+    /// interval, and only a poll requested after it counts.
+    @Test("an answer's poll request cuts the wait short", .enabled(if: pythonAvailable))
+    func aWantedPollComesPromptly() async throws {
+        let rig = try MonitorRig()
+        defer { rig.remove() }
+        rig.start(pollInterval: .seconds(120))
+        await settle { rig.rows.count == 2 }
+        let first = rig.connection.syncedThrough(.claudeCode)
+        #expect(first > 0)
+        let clock = ContinuousClock()
+        let started = clock.now
+        #expect(await RemoteMonitorSupervisor.awaitFreshPoll(rig.connection, tool: .claudeCode, timeout: .seconds(30)))
+        #expect(clock.now - started < .seconds(30))
+        #expect(rig.connection.syncedThrough(.claudeCode) > first)
+        await rig.stop()
     }
 
     @Test("a failed poll keeps the rows and says the host is unreachable", .enabled(if: pythonAvailable))
