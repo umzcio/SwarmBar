@@ -1526,7 +1526,10 @@ import Testing
                           action: .write(newText: "{\"new\": true}\n", mode: 0o600), description: "Edit", home: owner),
             PlannedChange(tool: nil, path: fresh, expectSHA256: "absent",
                           action: .write(newText: "#!/bin/sh\n", mode: 0o700), description: "Create", home: owner),
-        ], installHelper: false, sudoersUser: nil, watchAs: .everyUser, system: "Darwin")
+        ], installHelper: false, sudoersUser: nil, watchAs: .everyUser, system: "Darwin",
+        // The login user's own home: in anyone else's, folder names that
+        // account chose are left out of the prompt altogether.
+        loginUser: "o'brien")
         let prompt = SetupCommand.prompt(plan: plan, hostName: "devbox")
         #expect(prompt.omitted.isEmpty)
         let prefix = #"sudo -u 'o'\''brien' -- "#
