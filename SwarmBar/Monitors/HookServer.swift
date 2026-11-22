@@ -393,7 +393,12 @@ final class HookServer: ApprovalResponding {
             if holding, !prompt.offersApprove {
                 cancelPending(sessionID: sessionID)
             }
-            apply(.waitingApproval(command: prompt), sticky: true)
+            // Grok records its own prompts in events.jsonl, and sends no
+            // hook when one is answered at its terminal, so a pin that
+            // never expired kept offering Approve for a prompt long gone.
+            // Its pin bridges the gap to the next poll and then yields to
+            // what Grok itself records.
+            apply(.waitingApproval(command: prompt), sticky: tool != .grokBuild)
             // A request the row cannot show whole is not offered for
             // approval there, so holding it would only keep the agent's
             // own prompt off screen for the whole hold.
