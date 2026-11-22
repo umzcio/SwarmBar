@@ -205,7 +205,11 @@ struct HelperChannelTests {
         let source = try String(contentsOf: script, encoding: .utf8)
         // By absolute path, never through env: under the narrow sudo rule
         // the caller's PATH can reach root, and would choose the python.
-        #expect(source.hasPrefix("#!/usr/bin/python3 -I\n"))
+        // The sh prologue picks it, so that on macOS root never runs the
+        // python /usr/bin/python3 would launch for the selected Xcode.
+        #expect(source.hasPrefix("#!/bin/sh\n\"\"\":\"\n"))
+        #expect(source.contains("\nexec /usr/bin/python3 -I \"$0\" \"$@\"\n\":\"\"\"\n"))
+        #expect(source.contains(#"exec "$f/Versions/Current/bin/python3" -I "$0" "$@""#))
         #expect(HelperLaunch.ssh(alias: "devbox", watchAs: .loginUser).arguments.last
             == #"exec python3 -I "$HOME/.swarmbar/swarmbar-helper""#)
     }
