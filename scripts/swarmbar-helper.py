@@ -660,16 +660,18 @@ Spec = collections.namedtuple(
 CLAUDE_PREFIX = ".claude*/"
 
 
-def has_presence_lock(path):
+def has_presence_lock(path, walk):
     """conversations/<id>.db* only while presence/<id>.lock exists.
 
     Antigravity keeps the lock open for the life of the session, so this
     ships the databases of running conversations and none of the ended
-    ones, which can be many and large.
+    ones, which can be many and large. The lock is looked for as `walk`
+    (the home's HomeWalk) allows, so in another user's home a linked
+    presence directory never tells whether some other file exists.
     """
     conversation = os.path.basename(path).rsplit(".db", 1)[0]
     agy = os.path.dirname(os.path.dirname(path))
-    return os.path.exists(os.path.join(agy, "presence", conversation + ".lock"))
+    return walk.holds(os.path.join(agy, "presence", conversation + ".lock"))
 
 
 def _kimi_family(tool, root):
@@ -856,25 +858,111 @@ def has_magic(part):
     return any(character in part for character in "*?[")
 
 
-def list_dir(directory, unreadable):
-    """Names in a directory. A directory that is not there is empty; one
-    that is there but cannot be read is recorded, never read as empty."""
-    try:
-        return sorted(os.listdir(directory))
-    except OSError as error:
-        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
-            unreadable[directory] = "cannot list: %s" % error.strerror
-        return []
+# How many directory entries one snapshot examines in any one home. A real
+# agent tree holds a few thousand; past this the rest of that home's
+# directories are reported as not looked at, and no other home waits.
+MAX_WALK_ENTRIES = 100000
 
 
-def matching(directory, part, unreadable):
+class HomeWalk(object):
+    """How one snapshot looks into one home's directories, and where what
+    it could not look at is recorded (`unreadable`, path -> reason).
+
+    In another user's home (cross_user) that user chooses every name, so a
+    directory is listed, and a file tested for, only at the path it
+    resolves to inside that home, reached one component at a time with no
+    link followed, through directories that user owns (owned_dir_fd), the
+    rule every file read there already follows. A link leading anywhere
+    else is reported as leading outside, the same whatever lies behind it,
+    and nothing behind it is listed or tested. A link elsewhere in the same
+    home is followed, as reads follow it.
+    """
+
+    def __init__(self, home, unreadable):
+        self.unreadable = unreadable
+        self.foreign = cross_user(home)
+        self.real_home = os.path.realpath(home)
+        self.left = MAX_WALK_ENTRIES
+
+    def resolved_parts(self, path):
+        """The components of where `path` resolves below the home, or None
+        when it resolves outside."""
+        resolved = os.path.realpath(path)
+        if resolved == self.real_home:
+            return []
+        if not inside(resolved, self.real_home):
+            return None
+        return resolved[len(self.real_home.rstrip("/")) + 1:].split("/")
+
+    def list(self, directory):
+        """Names in a directory. A directory that is not there is empty;
+        one that is there but cannot be read is recorded, never read as
+        empty."""
+        if self.left <= 0:
+            self.unreadable[directory] = "over its home's walk budget, not looked at"
+            return []
+        try:
+            if self.foreign is None:
+                names = os.listdir(directory)
+            else:
+                parts = self.resolved_parts(directory)
+                if parts is None:
+                    self.unreadable[directory] = "leads outside its home"
+                    return []
+                fd = owned_dir_fd(self.real_home, self.foreign, parts)
+                try:
+                    names = os.listdir(fd)
+                finally:
+                    os.close(fd)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+                self.unreadable[directory] = "cannot list: %s" % error.strerror
+            return []
+        self.left -= len(names) + 1
+        return sorted(names)
+
+    def holds(self, path):
+        """Whether `path` exists, tested in another user's home only as
+        list() would reach it."""
+        if self.foreign is None:
+            return os.path.exists(path)
+        parts = self.resolved_parts(path)
+        if not parts:
+            return False
+        try:
+            fd = owned_dir_fd(self.real_home, self.foreign, parts[:-1])
+        except OSError:
+            return False
+        try:
+            os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+
+def list_dir(directory, walk):
+    """Names in a directory, as `walk` (a HomeWalk) may list them."""
+    return walk.list(directory)
+
+
+def matching(directory, part, walk):
     """Entries of `directory` matching one pattern component. Like glob, a
     wildcard never matches a hidden name unless the component asks for one."""
     hidden = part.startswith(".")
     return [os.path.join(directory, name)
-            for name in list_dir(directory, unreadable)
+            for name in list_dir(directory, walk)
             if (hidden or not name.startswith("."))
             and fnmatch.fnmatchcase(name, part)]
+
+
+def is_real_directory(path):
+    """A directory and not a link to one, read without following it."""
+    try:
+        return stat_module.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 # How far below its start a "**" walk goes. Codex nests sessions/YYYY/MM/DD,
@@ -884,50 +972,54 @@ def matching(directory, part, unreadable):
 MAX_WALK_DEPTH = 32
 
 
-def subdirectories(directory, unreadable):
+def subdirectories(directory, walk):
     """`directory` and every directory beneath it, for "**", in the same
     depth-first order a recursive walk gives. Symlinked directories are not
-    followed, so a link loop cannot run forever. Iterative and bounded at
-    MAX_WALK_DEPTH: a directory past it is recorded in `unreadable` and not
-    entered, so it reads as not looked at rather than as empty."""
+    followed, so a link loop cannot run forever, and are told apart without
+    following them. Iterative and bounded at MAX_WALK_DEPTH: a directory
+    past it is recorded in the walk's `unreadable` and not entered, so it
+    reads as not looked at rather than as empty. The base itself is listed
+    as `walk` allows, so in another user's home a linked base leading out
+    of it walks nothing."""
     found = []
     pending = [(directory, 0)]
     while pending:
         current, depth = pending.pop()
         found.append(current)
-        children = [path for path in matching(current, "*", unreadable)
-                    if os.path.isdir(path) and not os.path.islink(path)]
+        children = [path for path in matching(current, "*", walk) if is_real_directory(path)]
         if children and depth >= MAX_WALK_DEPTH:
-            unreadable[current] = "deeper than %d levels, not walked" % MAX_WALK_DEPTH
+            walk.unreadable[current] = "deeper than %d levels, not walked" % MAX_WALK_DEPTH
             continue
         pending.extend((path, depth + 1) for path in reversed(children))
     return found
 
 
-def expand_pattern(base, pattern, unreadable):
+def expand_pattern(base, pattern, walk):
     """Candidate paths for a glob pattern under `base`.
 
     glob.glob would do, except that it reads a directory it may not open
     as an empty one, and "found nothing" must never look like "could not
-    look". This records such directories in `unreadable` instead. Literal
-    components are joined without a check; the caller's stat decides.
+    look". This records such directories in the walk's `unreadable`
+    instead. Literal components are joined without a check; the caller
+    decides, after its own check of where the path leads.
     """
     paths = [base]
     for part in pattern.split("/"):
         following = []
         for current in paths:
             if part == "**":
-                following.extend(subdirectories(current, unreadable))
+                following.extend(subdirectories(current, walk))
             elif has_magic(part):
-                following.extend(matching(current, part, unreadable))
+                following.extend(matching(current, part, walk))
             else:
                 following.append(os.path.join(current, part))
         paths = following
     return paths
 
 
-def expand(spec, homes, claude_dirs, unreadable):
+def expand(spec, homes, claude_dirs, walks):
     """(home, path) for every candidate of one spec, in a stable order.
+    `walks` holds each home's HomeWalk.
 
     The expansion runs here, inside the privileged process, never in a
     calling shell that cannot read the homes it names.
@@ -941,10 +1033,11 @@ def expand(spec, homes, claude_dirs, unreadable):
     for home, base in bases:
         # Anything a hostile tree can make the walk raise costs this base
         # this one pattern, reported as not looked at, never the snapshot.
+        walk = walks[home]
         try:
-            paths = expand_pattern(base, rest, unreadable)
+            paths = expand_pattern(base, rest, walk)
         except Exception as error:
-            unreadable[base] = "cannot expand %s: %s" % (rest, type(error).__name__)
+            walk.unreadable[base] = "cannot expand %s: %s" % (rest, type(error).__name__)
             continue
         for path in paths:
             yield home, path
@@ -1015,21 +1108,25 @@ def manifest(now, warnings, shipped_before):
     seen = set()
     shipped = {}
     spent, listed, spent_total = collections.Counter(), collections.Counter(), 0
-    openers, foreign = {}, {}
+    openers, foreign, walks = {}, {}, {}
     for home in homes:
         openers[home] = shipped_opener(home)
+        walks[home] = HomeWalk(home, unreadable)
         if cross_user(home) is not None:
             foreign[home] = os.path.realpath(home)
+    for home, _ in claude_dirs:
+        walks.setdefault(home, HomeWalk(home, unreadable))
     for spec in SPECS:
-        for home, path in expand(spec, homes, claude_dirs, unreadable):
+        for home, path in expand(spec, homes, claude_dirs, walks):
             if path in seen:
                 continue
             # Another user's link out of their home is never followed, not
-            # even to stat: what it leads to is not theirs to show.
+            # even to stat or to learn whether its target exists: what it
+            # leads to is not theirs to show, so it reads the same whatever
+            # is there.
             if home in foreign and not inside(os.path.realpath(path), foreign[home]):
-                if os.path.lexists(path):
-                    seen.add(path)
-                    omitted.append({"path": path, "reason": "leads outside its home"})
+                seen.add(path)
+                omitted.append({"path": path, "reason": "leads outside its home"})
                 continue
             info = stat_or_note(path, unreadable)
             if info is None:
@@ -1041,7 +1138,7 @@ def manifest(now, warnings, shipped_before):
                 continue
             if spec.windowed and now - info.st_mtime >= DISCOVERY_WINDOW_SECONDS:
                 continue
-            if spec.gate is not None and not spec.gate(path):
+            if spec.gate is not None and not spec.gate(path, walks[home]):
                 continue
             seen.add(path)
             if is_dir:

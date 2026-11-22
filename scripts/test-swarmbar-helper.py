@@ -849,6 +849,77 @@ class CrossUserReadTests(unittest.TestCase):
             self.assertEqual(helper.claude_roots([]),
                              [os.path.join(self.a, ".claude", "projects")])
 
+    def snapshot_behind(self, link, populate):
+        """The snapshot with `link` pointing at a directory outside the
+        home, after `populate` has filled that directory (or not)."""
+        target = os.path.join(self.outside, "t")
+        shutil.rmtree(target, ignore_errors=True)
+        if populate is not None:
+            os.makedirs(target)
+            populate(target)
+        if not os.path.lexists(link):
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            os.symlink(target, link)
+        helper.SHIPPED.clear()
+        with self.foreign():
+            snap = helper.snapshot()
+        return dict((key, snap[key]) for key in ("files", "dirs", "omitted"))
+
+    def assert_same_whatever_is_behind(self, link, populate):
+        empty = self.snapshot_behind(link, lambda target: None)
+        missing = self.snapshot_behind(link, None)
+        full = self.snapshot_behind(link, populate)
+        self.assertEqual(full, empty)
+        self.assertEqual(full, missing)
+        self.assertNotIn("rootonly", json.dumps(full))
+        return full
+
+    def test_a_linked_directory_on_a_pattern_lists_nothing_behind_it(self):
+        def populate(target):
+            self.put(os.path.join(target, "rootonly-secret", "x", "summary.json"), b"{}")
+            os.makedirs(os.path.join(target, "rootonly-name", "y"))
+        link = os.path.join(self.a, ".grok", "sessions")
+        snap = self.assert_same_whatever_is_behind(link, populate)
+        self.assertIn({"path": link, "reason": "leads outside its home"}, snap["omitted"])
+
+    def test_a_linked_walk_base_walks_nothing_behind_it(self):
+        def populate(target):
+            self.put(os.path.join(target, "rootonly", "2026", "rollout-x.jsonl"), b'{"x":1}\n')
+        self.assert_same_whatever_is_behind(os.path.join(self.a, ".codex", "sessions"), populate)
+
+    def test_a_linked_literal_path_is_not_tested_for_existence(self):
+        def populate(target):
+            self.put(os.path.join(target, "active_sessions.json"), b"{}")
+        self.assert_same_whatever_is_behind(os.path.join(self.a, ".grok"), populate)
+
+    def test_a_linked_presence_directory_never_gates_a_database_in(self):
+        agy = os.path.join(self.a, ".gemini", "antigravity-cli")
+        database = self.put(os.path.join(agy, "conversations", "c1.db"), b"sqlite")
+
+        def populate(target):
+            self.put(os.path.join(target, "c1.lock"), b"")
+        full = self.assert_same_whatever_is_behind(os.path.join(agy, "presence"), populate)
+        self.assertNotIn(database, [item["path"] for item in full["files"]])
+
+    def test_a_real_presence_lock_still_gates_its_database_in(self):
+        agy = os.path.join(self.a, ".gemini", "antigravity-cli")
+        database = self.put(os.path.join(agy, "conversations", "c1.db"), b"sqlite")
+        self.put(os.path.join(agy, "presence", "c1.lock"), b"")
+        with self.foreign():
+            self.assertIn(database, self.paths(helper.snapshot()))
+
+    def test_one_homes_walk_is_bounded_and_reported(self):
+        for day in range(40):
+            os.makedirs(os.path.join(self.a, ".codex", "sessions", "2026", "%02d" % day))
+        other = self.put(os.path.join(self.b, ".grok", "active_sessions.json"), b"{}")
+        with self.foreign(), mock.patch.object(helper, "MAX_WALK_ENTRIES", 20):
+            snap = helper.snapshot()
+        self.assertTrue([entry for entry in snap["omitted"] if entry["path"].startswith(self.a)
+                         and "walk budget" in entry["reason"]], snap["omitted"])
+        self.assertFalse([entry for entry in snap["omitted"] if entry["path"].startswith(self.b)
+                          and "walk budget" in entry["reason"]])
+        self.assertIn(other, self.paths(snap))
+
 
 class CrossUserProbeTests(unittest.TestCase):
     """The root hook relay checks Grok state and bridge markers in other
