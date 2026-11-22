@@ -149,6 +149,7 @@ enum SetupPlanner {
             }
             let tools = Set(toolList(probe.tools[home.path]))
             let reported = probe.bridges?[home.path] ?? []
+            let spellings = homeSpellings(home, probe)
             // A file several homes share is planned once, from the home
             // whose owner owns it: that is where it was readable, and its
             // bridge path is the one that home's agents run.
@@ -162,15 +163,30 @@ enum SetupPlanner {
                 // Every settings file there is, and one to create for each
                 // used profile that has none. Never a guessed ~/.claude: a
                 // profile the probe did not report is not known to exist.
-                var targets: [(file: ProbeResult.ConfigFile?, path: String)] =
-                    files.filter { $0.tool == "claude" }.map { ($0, $0.path) }
+                //
+                // Only a path inside this home. A .claude* name can be a
+                // link to another account's profile, and planned from here
+                // that account's settings would run this home's script as
+                // them. Such a path is not this home's to plan at all, so it
+                // is dropped rather than claimed, and the home that owns it
+                // still plans it with its own script.
+                var targets: [(file: ProbeResult.ConfigFile?, path: String, relative: String)] = []
+                for file in files where file.tool == "claude" {
+                    if let relative = relative(file.path, under: spellings) {
+                        targets.append((file, file.path, relative))
+                    }
+                }
                 for dir in probe.claudeDirs?[home.path] ?? [] where dir.settings == "missing" {
-                    targets.append((nil, "\(dir.path)/settings.json"))
+                    let path = "\(dir.path)/settings.json"
+                    if let relative = relative(path, under: spellings) {
+                        targets.append((nil, path, relative))
+                    }
                 }
                 for target in targets {
                     let events = ClaudeHookTransform.events.map(\.name)
                     let change = configChange(
-                        tool: .claudeCode, file: target.file, path: target.path, seed: "{}\n", seen: &seen,
+                        tool: .claudeCode, file: target.file, path: target.path, relative: target.relative,
+                        seed: "{}\n", seen: &seen,
                         description: "Add \(events.count) hook entries to \(target.path)",
                         instruction: "Add hooks for \(list(events)) that run bash '\(script)' <event>.",
                         refusal: "isn't valid JSON"
@@ -187,7 +203,11 @@ enum SetupPlanner {
             let kimiScriptPath = kimiScript(home: home.path)
             for family in tomlTools where tools.contains(family.tool) {
                 let file = files.first { $0.tool == family.name }
-                let path = file?.path ?? "\(home.path)/\(family.dir)/config.toml"
+                let usual = "\(home.path)/\(family.dir)/config.toml"
+                if let file, outside(file, spellings, usual: usual, tool: family.tool, seen: &seen, into: &configs) {
+                    continue
+                }
+                let path = file?.path ?? usual
                 let (events, leftOut) = acceptedEvents(for: family.tool, kimiEvents)
                 if events.isEmpty {
                     // Never an empty list: install with no events removes
@@ -207,7 +227,8 @@ enum SetupPlanner {
                         + (leftOut.count == 1 ? "it" : "them") + ": " + leftOut.joined(separator: ", ")
                 }
                 let change = configChange(
-                    tool: family.tool, file: file, path: path, seed: "", seen: &seen, description: description,
+                    tool: family.tool, file: file, path: path, relative: relative(path, under: spellings),
+                    seed: "", seen: &seen, description: description,
                     instruction: "Add [[hooks]] entries for \(list(events.map(\.name))) that run '\(kimiScriptPath)' <event>.",
                     refusal: "can't be edited"
                 ) { TomlHooksTransform.install($0, scriptPath: kimiScriptPath, family: .remote, events: events) }
@@ -225,17 +246,25 @@ enum SetupPlanner {
                 // The .jsonc wins when both exist, as it does for the local toggle.
                 let opencode = files.filter { $0.tool == "opencode" }
                 let file = opencode.first { $0.path.hasSuffix(".jsonc") } ?? opencode.first
-                let path = file?.path ?? "\(home.path)/.config/opencode/opencode.json"
-                let change = configChange(
-                    tool: .openCode, file: file, path: path, seed: "{}\n", seen: &seen,
-                    description: "Add the SwarmBar plugin to \(path)",
-                    instruction: "Add \"\(spec)\" to its \"plugin\" list.",
-                    refusal: openCodeRefusal
-                ) { try OpenCodeConfigTransform.install($0, pluginSpec: spec, family: .remote) }
-                if let change { configs.append(Pending(change: change, needs: [pluginPath])) }
-                if let change = bridgeChange(.openCode, pluginPath, bundled.openCodePlugin, pluginMode,
-                                             "OpenCode plugin", reported) {
-                    bridges.append(Pending(change: change))
+                let usual = "\(home.path)/.config/opencode/opencode.json"
+                let leadsOut = file.map {
+                    outside($0, spellings, usual: $0.path.hasSuffix(".jsonc") ? usual + "c" : usual,
+                            tool: .openCode, seen: &seen, into: &configs)
+                } ?? false
+                if !leadsOut {
+                    let path = file?.path ?? usual
+                    let change = configChange(
+                        tool: .openCode, file: file, path: path, relative: relative(path, under: spellings),
+                        seed: "{}\n", seen: &seen,
+                        description: "Add the SwarmBar plugin to \(path)",
+                        instruction: "Add \"\(spec)\" to its \"plugin\" list.",
+                        refusal: openCodeRefusal
+                    ) { try OpenCodeConfigTransform.install($0, pluginSpec: spec, family: .remote) }
+                    if let change { configs.append(Pending(change: change, needs: [pluginPath])) }
+                    if let change = bridgeChange(.openCode, pluginPath, bundled.openCodePlugin, pluginMode,
+                                                 "OpenCode plugin", reported) {
+                        bridges.append(Pending(change: change))
+                    }
                 }
             }
         }
@@ -295,9 +324,13 @@ enum SetupPlanner {
                 (kimiScript(home: home.path), [.kimiCode, .bearCode]),
                 (plugin(home: home.path), [.openCode]),
             ]
+            let spellings = homeSpellings(home, probe)
             for file in probe.configs[home.path] ?? [] {
                 if let key = Seen.key(file), owners[key] != home.path { continue }
-                guard let tool = ProbeResult.tool(named: file.tool),
+                // A config outside this home is another home's, or nobody's
+                // that SwarmBar set up from here.
+                guard let relative = relative(file.path, under: spellings),
+                      let tool = ProbeResult.tool(named: file.tool),
                       let bridge = bridges.first(where: { $0.users.contains(tool) })?.path
                 else { continue }
                 if let text = file.text, file.sha256 != nil {
@@ -323,7 +356,8 @@ enum SetupPlanner {
                      "Remove the [[hooks]] entries that run \(bridge).", "can't be edited")
                 }
                 let change = configChange(
-                    tool: tool, file: file, path: file.path, seed: nil, seen: &seen, description: description,
+                    tool: tool, file: file, path: file.path, relative: relative, seed: nil, seen: &seen,
+                    description: description,
                     instruction: instruction + " Then delete \(bridge).", refusal: refusal
                 ) { text in
                     let undone = switch tool {
@@ -433,6 +467,85 @@ enum SetupPlanner {
         return "\"" + path.unicodeScalars.map { $0.escaped(asASCII: true) }.joined() + "\""
     }
 
+    // MARK: Which home a path is in
+
+    /// The spellings a home's files can be reported under. The probe names
+    /// every file by its realpath, so beside the path it names the home by
+    /// there is the realpath it reports for it, and on Darwin the /private
+    /// form of a home under /var, which is what a helper from before that
+    /// report resolves root's /var/root to.
+    static func homeSpellings(_ home: RemoteHome, _ probe: ProbeResult) -> [String] {
+        var spellings = [home.path]
+        if let real = probe.realHomes?[home.path] { spellings.append(real) }
+        if probe.system == "Darwin", home.path.hasPrefix("/var/") {
+            spellings.append("/private" + home.path)
+        }
+        return spellings
+    }
+
+    /// `path` relative to the first spelling it lies strictly beneath,
+    /// compared a whole component at a time so /home/ab is never inside
+    /// /home/a, or nil when it lies beneath none. A path that is not
+    /// absolute, or holds a "." or ".." component, is in no home.
+    static func relative(_ path: String, under spellings: [String]) -> String? {
+        guard let parts = components(path) else { return nil }
+        for spelling in spellings {
+            guard let base = components(spelling), parts.count > base.count,
+                  Array(parts.prefix(base.count)) == base
+            else { continue }
+            return parts.dropFirst(base.count).joined(separator: "/")
+        }
+        return nil
+    }
+
+    private static func components(_ path: String) -> [Substring]? {
+        guard path.hasPrefix("/") else { return nil }
+        let parts = path.split(separator: "/")
+        guard !parts.contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        return parts
+    }
+
+    /// Whether a config's place in its home is one the helper's write
+    /// allowlist (ALLOWED in swarmbar-helper.py) accepts for this tool.
+    static func isConfigShape(_ relative: String, tool: AgentTool) -> Bool {
+        switch tool {
+        case .claudeCode:
+            let parts = relative.split(separator: "/", omittingEmptySubsequences: false)
+            return parts.count == 2 && parts[1] == "settings.json"
+                && parts[0].hasPrefix(".claude") && !isBackupName(String(parts[0]))
+        case .kimiCode: return relative == ".kimi-code/config.toml"
+        case .bearCode: return relative == ".bearcode/config.toml"
+        case .openCode:
+            return relative == ".config/opencode/opencode.json" || relative == ".config/opencode/opencode.jsonc"
+        case .codex, .grokBuild, .antigravity: return false
+        }
+    }
+
+    /// The helper's own test for a backup-looking .claude* name
+    /// (is_backup_name), which neither discovery nor a write accepts.
+    static func isBackupName(_ name: String) -> Bool {
+        let lowered = name.lowercased()
+        return ["backup", ".bak", "-bak", ".pre-", ".old", "-old", ".copy", "~"].contains { lowered.contains($0) }
+    }
+
+    /// For a config the probe listed under a home at a path outside it:
+    /// the home's own link leads out of the home, so the file there is not
+    /// this home's to write. Lists it as skipped, by the usual path the
+    /// link sits at rather than the path it leads to, and returns true.
+    /// Returns false for a file inside the home, which is planned as usual.
+    private static func outside(
+        _ file: ProbeResult.ConfigFile, _ spellings: [String], usual: String, tool: AgentTool,
+        seen: inout Seen, into configs: inout [Pending]
+    ) -> Bool {
+        guard relative(file.path, under: spellings) == nil else { return false }
+        if seen.first(usual, nil) {
+            configs.append(Pending(change: PlannedChange(
+                tool: tool, path: usual, expectSHA256: "", action: .skipped,
+                description: "Skipped \(proseQuoted(usual)): it leads outside its home, so SwarmBar won't change it")))
+        }
+        return true
+    }
+
     // MARK: Pieces
 
     /// Every home for every user, or the login user's own. Either way an
@@ -524,11 +637,23 @@ enum SetupPlanner {
     /// nothing changes, or the file was already planned under another
     /// name. `seed` is the text of a file that does not exist yet; nil
     /// means a missing file needs nothing.
+    ///
+    /// `relative` is the path within its home. One that is not where the
+    /// helper's write allowlist puts this tool's config (a link to a
+    /// nested folder, say) is a hand edit: no setup path may write it, so
+    /// none is planned to.
     private static func configChange(
-        tool: AgentTool, file: ProbeResult.ConfigFile?, path: String, seed: String?, seen: inout Seen,
-        description: String, instruction: String, refusal: String, transform: (String) throws -> String
+        tool: AgentTool, file: ProbeResult.ConfigFile?, path: String, relative: String?, seed: String?,
+        seen: inout Seen, description: String, instruction: String, refusal: String,
+        transform: (String) throws -> String
     ) -> PlannedChange? {
         guard seen.first(path, file) else { return nil }
+        guard let relative, isConfigShape(relative, tool: tool) else {
+            return PlannedChange(
+                tool: tool, path: path, expectSHA256: "", action: .byHand,
+                description: "Edit by hand: SwarmBar writes \(tool.label) settings only where \(tool.label) "
+                    + "keeps them in a home, and this one is at \(proseQuoted(path)). \(instruction)")
+        }
         guard let file else {
             guard let seed, let text = try? transform(seed) else { return nil }
             return PlannedChange(tool: tool, path: path, expectSHA256: absent,

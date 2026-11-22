@@ -755,6 +755,41 @@ class CrossUserReadTests(unittest.TestCase):
         self.assertIn(transcript, paths)
         self.assertFalse([p for p in paths if p.startswith(self.a + "/")], paths)
 
+    def test_probe_never_reports_another_homes_claude_dir(self):
+        # a links a .claude* name to b's profile, which has no settings.json
+        # yet. Reported under a, setup would create b's settings running
+        # a's script as b.
+        os.makedirs(os.path.join(self.b, ".claude-work", "projects"))
+        os.symlink(os.path.join(self.b, ".claude-work"), os.path.join(self.a, ".claude-work"))
+        warnings = []
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, warnings), [])
+            self.assertNotIn("claude", helper.home_tools(self.a))
+            self.assertEqual(helper.home_claude_dirs(self.b, []),
+                             [{"path": os.path.join(self.b, ".claude-work"), "settings": "missing"}])
+        self.assertTrue(warnings)
+
+    def test_probe_never_reports_a_tool_whose_state_leads_out(self):
+        os.makedirs(os.path.join(self.b, ".kimi-code"))
+        os.symlink(os.path.join(self.b, ".kimi-code"), os.path.join(self.a, ".kimi-code"))
+        with self.foreign():
+            self.assertNotIn("kimi", helper.home_tools(self.a))
+            self.assertIn("kimi", helper.home_tools(self.b))
+
+    def test_probe_claude_dir_its_user_does_not_own_is_not_reported(self):
+        os.makedirs(os.path.join(self.a, ".claude", "projects"))
+        with self.foreign(self.owner + 1):
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [])
+            self.assertEqual(helper.home_tools(self.a), [])
+
+    def test_probe_claude_dir_linked_within_its_home_counts(self):
+        real = os.path.join(self.a, "dotfiles", "claude")
+        os.makedirs(os.path.join(real, "projects"))
+        os.symlink(real, os.path.join(self.a, ".claude"))
+        with self.foreign():
+            self.assertEqual(helper.home_claude_dirs(self.a, []), [{"path": real, "settings": "missing"}])
+            self.assertIn("claude", helper.home_tools(self.a))
+
     def test_claude_root_in_its_own_home_by_link_counts(self):
         real = os.path.join(self.a, "dotfiles", "claude", "projects")
         os.makedirs(real)
@@ -3216,6 +3251,11 @@ class ProbeTests(unittest.TestCase):
             {"path": os.path.join(real, ".claude"), "settings": "present"},
             {"path": os.path.join(real, ".claude-work"), "settings": "missing"},
         ])
+
+    def test_probe_reports_each_homes_realpath(self):
+        # Every file path it reports is a realpath, so the Mac needs the
+        # home's own to tell which home a path is in.
+        self.assertEqual(self.probe()["real_homes"], {self.home: os.path.realpath(self.home)})
 
     def test_probe_reports_unreadable_claude_settings(self):
         self.put(".claude/projects/p/s.jsonl", "{}\n")

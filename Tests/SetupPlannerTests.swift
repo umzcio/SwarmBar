@@ -26,14 +26,15 @@ import Testing
         installed: [String: [String]] = [:], unknown: [String: [String]] = [:],
         configs: [String: [ProbeResult.ConfigFile]] = [:],
         bridges: [String: [ProbeResult.BridgeFile]]? = nil,
-        claudeDirs: [String: [ProbeResult.ClaudeDir]]? = nil
+        claudeDirs: [String: [ProbeResult.ClaudeDir]]? = nil,
+        realHomes: [String: String]? = nil
     ) -> ProbeResult {
         ProbeResult(
             alias: "devbox", protocolVersion: 3, system: system, python: "3.12.3", hostname: "devbox",
             user: user, euid: euid ?? (user == "root" ? 0 : 1000), sudoOK: sudo,
             homes: homes.keys.sorted().map { RemoteHome(path: $0, user: homes[$0]!) },
             processes: [], tools: tools, installed: installed, installedUnknown: unknown,
-            configs: configs, bridges: bridges, claudeDirs: claudeDirs)
+            configs: configs, bridges: bridges, claudeDirs: claudeDirs, realHomes: realHomes)
     }
 
     static func missing(_ dirs: String...) -> [ProbeResult.ClaudeDir] {
@@ -758,6 +759,101 @@ import Testing
     @Test func everyUserWarningSaysItIsRootEquivalent() {
         #expect(SetupCommand.everyUserWarning(user: "u")
             == "This lets u act as root through SwarmBar's helper. Only set this up for an account you'd trust with root.")
+    }
+
+    // MARK: Which home a path is in
+
+    /// find_01RSevL9x5uWGKxAdvoZnNBy: a watched user links a .claude* name
+    /// in their own home to another account's profile, and the probe
+    /// reports it under the linking home. Planned from there, the victim's
+    /// new settings.json would run the linking user's script as the
+    /// victim, and the dedupe by path would drop the victim's own change.
+    @Test func aClaudeDirUnderAnotherHomeIsNeverWiredToTheReportingHome() throws {
+        let probe = Self.probe(
+            homes: ["/home/a": "a", "/home/b": "b"],
+            tools: ["/home/a": ["claude"], "/home/b": ["claude"]],
+            claudeDirs: ["/home/a": Self.missing("/home/b/.claude-work"),
+                         "/home/b": Self.missing("/home/b/.claude-work")])
+        let plan = try Self.plan(probe)
+        let attacker = SetupPlanner.claudeScript(home: "/home/a")
+        for change in plan.changes where change.path.hasPrefix("/home/b/") {
+            #expect(Self.newText(change)?.contains(attacker) != true, "\(change.path)")
+            #expect(!change.description.contains(attacker), "\(change.path)")
+        }
+        // The owning home's own change is still there, naming its own script.
+        let own = try #require(Self.change(plan, at: "/home/b/.claude-work/settings.json"))
+        #expect(own.home?.path == "/home/b")
+        #expect(Self.newText(own)?.contains(SetupPlanner.claudeScript(home: "/home/b")) == true)
+
+        // Reported by the linking home alone, nobody plans it.
+        let alone = try Self.plan(Self.probe(
+            homes: ["/home/a": "a", "/home/b": "b"],
+            tools: ["/home/a": ["claude"], "/home/b": ["claude"]],
+            claudeDirs: ["/home/a": Self.missing("/home/b/.claude-work")]))
+        #expect(Self.change(alone, at: "/home/b/.claude-work/settings.json") == nil)
+    }
+
+    /// Whole components, never a string prefix: /home/ab is not in /home/a,
+    /// and a dot-dot component is in no home at all.
+    @Test func containmentComparesWholeComponents() throws {
+        let plan = try Self.plan(Self.probe(
+            homes: ["/home/a": "a", "/home/ab": "ab"], tools: ["/home/a": ["claude"]],
+            configs: ["/home/a": [Self.config("claude", "/home/ab/.claude/settings.json", "{}\n")]],
+            claudeDirs: ["/home/a": Self.missing("/home/ab/.claude-x", "/home/a/../ab/.claude-y")]))
+        #expect(!plan.changes.contains { $0.path.hasPrefix("/home/ab") || $0.path.contains("..") })
+    }
+
+    /// A config the home's own link leads out of the home is not this
+    /// home's to write, and its realpath names no file of this home.
+    @Test func aConfigLinkedOutOfItsHomeIsSkipped() throws {
+        let probe = Self.probe(
+            homes: ["/home/a": "a", "/home/b": "b"],
+            tools: ["/home/a": ["kimi", "opencode"]],
+            configs: ["/home/a": [
+                ProbeResult.ConfigFile(tool: "kimi", path: "/home/b/.kimi-code/config.toml", sha256: nil, text: nil),
+                ProbeResult.ConfigFile(tool: "opencode", path: "/home/b/.config/opencode/opencode.json",
+                                       sha256: nil, text: nil),
+            ]])
+        let plan = try Self.plan(probe)
+        #expect(!plan.changes.contains { $0.path.hasPrefix("/home/b/") })
+        for path in ["/home/a/.kimi-code/config.toml", "/home/a/.config/opencode/opencode.json"] {
+            let change = try #require(Self.change(plan, at: path))
+            #expect(change.action == .skipped, "\(path)")
+            #expect(!change.description.contains("/home/b"), "\(path)")
+        }
+        #expect(plan.changes.allSatisfy { $0.action != .byHand })
+    }
+
+    /// The probe reports realpaths, and a home can be spelled through a
+    /// link: Darwin's /var/root is /private/var/root, and the probe names
+    /// each home's realpath beside it.
+    @Test func aHomeSpelledThroughALinkStillHoldsItsFiles() throws {
+        let darwin = try Self.plan(Self.probe(
+            system: "Darwin", homes: ["/var/root": "root"], tools: ["/var/root": ["claude"]],
+            configs: ["/var/root": [Self.config("claude", "/private/var/root/.claude/settings.json", "{}\n")]]))
+        #expect(Self.text(darwin, at: "/private/var/root/.claude/settings.json") != nil)
+
+        let linked = try Self.plan(Self.probe(
+            homes: ["/home/u": "u"], tools: ["/home/u": ["claude"]],
+            claudeDirs: ["/home/u": Self.missing("/data/home/u/.claude")],
+            realHomes: ["/home/u": "/data/home/u"]))
+        #expect(Self.text(linked, at: "/data/home/u/.claude/settings.json") != nil)
+        // Without that report the same path is outside the home.
+        let unreported = try Self.plan(Self.probe(
+            homes: ["/home/u": "u"], tools: ["/home/u": ["claude"]],
+            claudeDirs: ["/home/u": Self.missing("/data/home/u/.claude")]))
+        #expect(Self.change(unreported, at: "/data/home/u/.claude/settings.json") == nil)
+    }
+
+    @Test func undoNeverEditsAConfigOutsideItsHome() throws {
+        let installed = try ClaudeHookTransform.install(
+            "{}\n", scriptPath: "/home/a/.swarmbar/swarmbar-remote-hook.sh", family: .remote)
+        let probe = Self.probe(
+            homes: ["/home/a": "a", "/home/b": "b"],
+            tools: ["/home/a": ["claude"]], installed: ["/home/a": ["claude"]],
+            configs: ["/home/a": [Self.config("claude", "/home/b/.claude/settings.json", installed)]])
+        let plan = try SetupPlanner.undoPlan(probe: probe, watchAs: .everyUser)
+        #expect(!plan.changes.contains { $0.path.hasPrefix("/home/b/") })
     }
 
     // MARK: The prompt

@@ -1950,10 +1950,19 @@ def home_claude_dirs(home, warnings):
     "unreadable"}. A profile with no settings.json still needs hooks, and
     only this says where it is."""
     uid = home_owner(home)[1]
+    foreign = cross_user(home)
     found = []
     seen = set()
     for directory in claude_config_dirs(home):
         if not os.path.isdir(os.path.join(directory, "projects")):
+            continue
+        if not own_state_dir(home, directory, foreign):
+            # A link to another account's profile, reported here, would
+            # have setup create that account's settings.json running this
+            # home's script as them. Only after this holds is a missing
+            # settings.json this home's to create.
+            warnings.append("skipped Claude config dir that leads outside its user's own files: %s"
+                            % directory)
             continue
         real = os.path.realpath(directory)
         if real in seen:
@@ -1983,13 +1992,34 @@ def mentions_bridge(home, path, uid):
     return BRIDGE_MARK in data
 
 
+def own_state_dir(home, directory, foreign):
+    """Whether a tool's state directory belongs to the home it was found
+    in. In another user's home (`foreign`, from cross_user) it must resolve
+    inside that home to a directory that user owns, the rule claude_roots
+    applies, so a link cannot pass off someone else's profile as theirs and
+    have setup write there in their name. This process's own home is taken
+    as it is."""
+    if foreign is None:
+        return os.path.isdir(directory)
+    resolved = os.path.realpath(directory)
+    try:
+        info = os.stat(resolved)
+    except OSError:
+        return False
+    return stat_module.S_ISDIR(info.st_mode) and info.st_uid == foreign \
+        and inside(resolved, os.path.realpath(home))
+
+
 def home_tools(home):
-    """Which tools have their state directory in a home, in TOOL_ORDER."""
+    """Which tools have their state directory in a home, in TOOL_ORDER.
+    Each directory counts only where own_state_dir says it is the home's."""
+    foreign = cross_user(home)
     present = set()
-    if any(os.path.isdir(os.path.join(d, "projects")) for d in claude_config_dirs(home)):
+    if any(os.path.isdir(os.path.join(d, "projects")) and own_state_dir(home, d, foreign)
+           for d in claude_config_dirs(home)):
         present.add("claude")
     for tool, relative in TOOL_STATE_DIRS:
-        if os.path.isdir(os.path.join(home, relative)):
+        if own_state_dir(home, os.path.join(home, relative), foreign):
             present.add(tool)
     return [tool for tool in TOOL_ORDER if tool in present]
 
@@ -2135,6 +2165,10 @@ def probe():
         "configs": configs,
         "bridges": bridges,
         "claude_dirs": claude_dirs,
+        # Every path above is a realpath. The Mac relates each to its home
+        # by these, since a home can be spelled through a link (Darwin's
+        # /var/root is /private/var/root).
+        "real_homes": dict((path, os.path.realpath(path)) for path in paths),
         "helper": installed_helpers(paths),
         "self_sha256": own_digest(),
         "warnings": warnings,
