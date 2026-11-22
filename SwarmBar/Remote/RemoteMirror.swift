@@ -300,7 +300,7 @@ struct RemoteMirror: Sendable {
         } catch {
             // Logged, not thrown: what cannot be listed cannot be swept, and
             // the writes that follow are still right.
-            NSLog("SwarmBar: cannot list mirror directory \(directory): \(error)")
+            SwarmLog.log("SwarmBar: cannot list mirror directory \(directory): \(error)")
             return
         }
         for name in names {
@@ -501,7 +501,7 @@ struct RemoteMirror: Sendable {
         if fcntl(handle.fileDescriptor, F_PUNCHHOLE, &hole) != 0 {
             let reason = String(cString: strerror(errno))
             if punchFailureLogged.claim() {
-                NSLog("SwarmBar: mirror at \(root.path) cannot punch holes (\(reason)); files stay dense")
+                SwarmLog.log("SwarmBar: mirror at \(root.path) cannot punch holes (\(reason)); files stay dense")
             }
         }
     }

@@ -40,7 +40,7 @@ enum AgentNotifier {
                 // discarding it is why that went unnoticed. Do Not Disturb
                 // being on is one way to get here: the prompt cannot be
                 // shown, so the request fails rather than pending.
-                NSLog("SwarmBar: notifications not authorized: \(String(describing: error))")
+                SwarmLog.log("SwarmBar: notifications not authorized: \(String(describing: error))")
             }
     }
 
@@ -67,7 +67,7 @@ enum AgentNotifier {
             guard settings.authorizationStatus == .authorized
                     || settings.authorizationStatus == .provisional
             else {
-                NSLog("SwarmBar: dropping notification, status \(settings.authorizationStatus.rawValue)")
+                SwarmLog.log("SwarmBar: dropping notification, status \(settings.authorizationStatus.rawValue)")
                 return
             }
             let content = UNMutableNotificationContent()

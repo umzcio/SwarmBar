@@ -71,7 +71,7 @@ enum RemoteHostStore {
         // log names the count only, since the alias is the hostile part.
         let safe = hosts.filter { SSHConfigParser.isSafeAlias($0.alias) }
         if safe.count != hosts.count {
-            NSLog("SwarmBar: dropped \(hosts.count - safe.count) remote host(s) with an unusable alias")
+            SwarmLog.log("SwarmBar: dropped \(hosts.count - safe.count) remote host(s) with an unusable alias")
         }
         return safe
     }

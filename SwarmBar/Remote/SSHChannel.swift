@@ -460,7 +460,7 @@ actor SSHChannel {
                     case .unrouted:
                         // The helper answers a request it could not parse
                         // with no id, so nothing is waiting on it.
-                        NSLog("SwarmBar: unrouted helper line: \(String(decoding: line.prefix(200), as: UTF8.self))")
+                        SwarmLog.log("SwarmBar: unrouted helper line: \(String(decoding: line.prefix(200), as: UTF8.self))")
                     }
                 }
             }
@@ -587,10 +587,10 @@ actor SSHChannel {
     private func failureMessage(_ reason: String) -> String {
         let hint = stderrTail?.hint ?? ""
         guard !hint.isEmpty else {
-            NSLog("SwarmBar: \(label) failed with no stderr: \(reason)")
+            SwarmLog.log("SwarmBar: \(label) failed with no stderr: \(reason)")
             return reason
         }
-        NSLog("SwarmBar: \(label) ssh said: \(hint)")
+        SwarmLog.log("SwarmBar: \(label) ssh said: \(hint)")
         return "\(reason): \(hint)"
     }
 }

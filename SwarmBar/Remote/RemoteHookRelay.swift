@@ -141,7 +141,7 @@ final class RemoteHookRelay {
                 } catch {
                     // A decision that never landed leaves the agent at its
                     // own prompt, which the row then says.
-                    NSLog("SwarmBar: hook_reply for \(rid) failed: \(error)")
+                    SwarmLog.log("SwarmBar: hook_reply for \(rid) failed: \(error)")
                     completion?(false)
                 }
             }

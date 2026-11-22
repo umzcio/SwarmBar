@@ -221,10 +221,10 @@ final class IntegrationManager {
             else { continue }
             switch refreshScript(at: destination, bundled: bundled) {
             case .leftLinked:
-                NSLog("SwarmBar: \(destination.path) is a symbolic link, so it was not refreshed. "
+                SwarmLog.log("SwarmBar: \(destination.path) is a symbolic link, so it was not refreshed. "
                     + "Update what it points to, or switch the bridge off and on in Settings.")
             case .failed(let error):
-                NSLog("SwarmBar: could not refresh \(name): \(error)")
+                SwarmLog.log("SwarmBar: could not refresh \(name): \(error)")
             case .absent, .current, .refreshed:
                 break
             }

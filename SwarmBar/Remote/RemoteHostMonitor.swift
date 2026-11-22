@@ -146,7 +146,7 @@ struct RemoteHostMonitor: SessionMonitor {
                 case .needsSetup(let message):
                     state.setupNeeded = message
                 case .failed(let message):
-                    NSLog("SwarmBar: \(name) keeps its old helper: \(message)")
+                    SwarmLog.log("SwarmBar: \(name) keeps its old helper: \(message)")
                 }
             }
             // Either way the helper answers, and an old helper that still
@@ -207,7 +207,7 @@ struct RemoteHostMonitor: SessionMonitor {
             // fresh helper and an empty mirror recover from that, and this
             // is counted as a failure so a disk that keeps refusing backs off
             // rather than taking a full reship every poll.
-            NSLog("SwarmBar: \(name) mirror write failed: \(error)")
+            SwarmLog.log("SwarmBar: \(name) mirror write failed: \(error)")
             state.stream = nil
             await channel.noteFailure("mirror: \(error)")
             if Task.isCancelled { return pollInterval }
@@ -241,7 +241,7 @@ struct RemoteHostMonitor: SessionMonitor {
         // condition persists.
         let warnings = snapshot.warnings + mirrorWarnings + result.warnings
         if !warnings.isEmpty && warnings != state.lastWarnings {
-            NSLog("SwarmBar: \(name) reported warnings: \(warnings)")
+            SwarmLog.log("SwarmBar: \(name) reported warnings: \(warnings)")
         }
         state.lastWarnings = warnings
         return pollInterval
