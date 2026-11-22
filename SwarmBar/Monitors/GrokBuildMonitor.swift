@@ -138,6 +138,44 @@ struct GrokBuildMonitor: SessionMonitor {
         return nil
     }
 
+    /// The request the session's pending permission prompt is about, read
+    /// now, or nil when the session is not at one.
+    nonisolated static func pendingPrompt(dir: URL) -> ApprovalPrompt? {
+        guard let pending = pendingPermission(dir: dir) else { return nil }
+        guard let updates = promptUpdates(at: dir.appendingPathComponent("updates.jsonl")) else {
+            return .unreadable(
+                "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal.")
+        }
+        return GrokUpdatesParser.pendingToolPrompt(
+            tail: updates.text, tool: pending.tool, callID: pending.callID,
+            fromStart: updates.fromStart)
+    }
+
+    /// updates.jsonl for finding a gated call: the whole file up to the
+    /// tail ceiling, else its last ceiling's worth, and whether the text
+    /// runs from the file's real start. The status tail's 64 KB is not
+    /// enough here: one large call record pushes everything before it out
+    /// of the window, and the call that is waiting can be among them.
+    ///
+    /// A remote mirror holds a file at its true size with zeros wherever
+    /// the helper shipped nothing, so reading from offset 0 there is not
+    /// reading from the start. JSON never holds a raw NUL, which is how a
+    /// hole is told from the file.
+    nonisolated static func promptUpdates(at file: URL) -> (text: String, fromStart: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        if size <= UInt64(ClaudeCodeMonitor.maxTailBytes) {
+            guard (try? handle.seek(toOffset: 0)) != nil,
+                  let data = try? handle.read(upToCount: Int(size)) ?? Data()
+            else { return nil }
+            return (String(decoding: data, as: UTF8.self), !data.contains(0))
+        }
+        guard let text = ClaudeCodeMonitor.tail(of: file, startingAt: ClaudeCodeMonitor.maxTailBytes)
+        else { return nil }
+        return (text, false)
+    }
+
     private nonisolated static func isDirectory(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
@@ -275,15 +313,11 @@ struct GrokBuildMonitor: SessionMonitor {
             // events.jsonl records permission prompts explicitly
             // (phase_changed to permission_prompt + permission_requested);
             // otherwise the update stream carries the working state.
-            let tail = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
-            if let pending = pendingPermission(dir: dir) {
-                status = .waitingApproval(command: tail.map {
-                    GrokUpdatesParser.pendingToolPrompt(
-                        tail: $0, tool: pending.tool, callID: pending.callID)
-                } ?? .unreadable(
-                    "Grok has not recorded what this \(pending.tool) call would do. Review it in the terminal."))
+            if let prompt = pendingPrompt(dir: dir) {
+                status = .waitingApproval(command: prompt)
             } else {
-                status = tail.flatMap { GrokUpdatesParser.parse(tail: $0) }
+                status = ClaudeCodeMonitor.tail(of: dir.appendingPathComponent("updates.jsonl"))
+                    .flatMap { GrokUpdatesParser.parse(tail: $0) }
                     ?? .working(activity: "Working…")
             }
         } else {

@@ -62,11 +62,23 @@ enum GrokUpdatesParser {
     /// the one events.jsonl names: by id where it gives one, otherwise the
     /// only unfinished call of the named tool. With no unique match the
     /// row says so and offers the terminal instead of Approve.
+    ///
+    /// "The only unfinished call" is a claim about every call the turn has
+    /// made, and `tail` may be a suffix of the file. A gated call whose own
+    /// record ends before the suffix starts is simply not in it, and a
+    /// later call of the same tool would then pass for the only one. So
+    /// without an id the text must be shown to hold every call that could
+    /// be waiting: either it was read from the file's start (`fromStart`),
+    /// or it holds a turn boundary (the stop hook), and then only the calls
+    /// after the last boundary are candidates, since a call from a turn
+    /// that has ended is not the one a prompt in this turn is about.
     nonisolated static func pendingToolPrompt(
-        tail: String, tool: String, callID: String?
+        tail: String, tool: String, callID: String?, fromStart: Bool
     ) -> ApprovalPrompt {
         var calls: [(id: String?, title: String, rawInput: [String: Any]?)] = []
         var finished = Set<String>()
+        // How many calls came before the last turn boundary, once one is seen.
+        var turnStart: Int?
         for raw in tail.split(separator: "\n") {
             guard let data = raw.data(using: .utf8),
                   let line = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -83,6 +95,8 @@ enum GrokUpdatesParser {
                    ["completed", "failed", "cancelled"].contains(status) {
                     finished.insert(id)
                 }
+            case "hook_execution":
+                if (update["event_name"] as? String) == "stop" { turnStart = calls.count }
             default:
                 continue
             }
@@ -91,7 +105,16 @@ enum GrokUpdatesParser {
         if let callID {
             candidates = calls.filter { $0.id == callID }.suffix(1)
         } else {
-            candidates = calls.filter { call in
+            let examined: ArraySlice<(id: String?, title: String, rawInput: [String: Any]?)>
+            if fromStart {
+                examined = calls[...]
+            } else if let turnStart {
+                examined = calls[turnStart...]
+            } else {
+                return .unreadable(
+                    "SwarmBar could not read far enough back to tell which \(tool) call Grok is asking about. Review it in the terminal.")
+            }
+            candidates = examined.filter { call in
                 call.title == tool && !(call.id.map(finished.contains) ?? false)
             }
         }
