@@ -2015,6 +2015,8 @@ class TmuxOwnerTests(unittest.TestCase):
             panes = helper.tmux_panes()
         self.assertEqual(panes, {(42, 1500): {"socket": "/tmp/tmux-1500/default", "id": "%1"}})
         by_socket = dict((argv[2], options) for argv, options in calls)
+        self.assertIn("env", by_socket["/tmp/tmux-1500/default"])
+        del by_socket["/tmp/tmux-1500/default"]["env"]
         self.assertEqual(by_socket["/tmp/tmux-1500/default"],
                          {"user": 1500, "group": 1500, "extra_groups": [1500], "cwd": "/"})
         # Root's own server is root's: run as root, as before.
@@ -4248,6 +4250,66 @@ class KimiEventsTests(unittest.TestCase):
                 mock.patch.object(helper, "run_command", runner):
             self.assertIsNone(self.events(first)["events"])
         runner.assert_not_called()
+
+
+class ChildStdinTests(unittest.TestCase):
+    """The helper's stdin is the Mac's request stream, write_file contents
+    and replies included. A tmux client hands its descriptors to its
+    server, which may belong to any user, so no child may hold it."""
+
+    def request_pipe(self):
+        """Puts a pipe holding one request line on descriptor 0, as ssh
+        does for a serving helper, and restores the real stdin after."""
+        read_end, write_end = os.pipe()
+        os.write(write_end, b'{"cmd":"write_file","content_b64":"c2VjcmV0"}\n')
+        os.close(write_end)
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        os.close(read_end)
+
+        def restore():
+            os.dup2(saved, 0)
+            os.close(saved)
+        self.addCleanup(restore)
+
+    def test_children_read_end_of_file_not_the_requests(self):
+        for options in ({}, {"start_new_session": True},
+                        {"start_new_session": True, "env": {"PATH": "/usr/bin:/bin"}}):
+            self.request_pipe()
+            done = helper.run_command(["/bin/sh", "-c", "cat"], timeout=5, **options)
+            self.assertEqual(done.stdout, b"", options)
+            # The request is still there for the helper to read.
+            self.assertIn(b"write_file", os.read(0, 4096), options)
+
+    def test_explicit_input_still_reaches_the_child(self):
+        self.request_pipe()
+        for options in ({}, {"start_new_session": True}):
+            done = helper.run_command(["/bin/sh", "-c", "cat"], timeout=5, input=b"paste", **options)
+            self.assertEqual(done.stdout, b"paste", options)
+
+    def test_tmux_client_as_another_user_gets_only_what_it_needs(self):
+        entry = mock.Mock(pw_name="alice", pw_gid=1500)
+        seen = []
+
+        def run(argv, timeout=5, input=None, **options):
+            seen.append(options)
+            return completed(argv, 0, "")
+        environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                       "SUDO_USER": "root-caller", "SBK_SECRET": "must not reach tmux"}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(helper.os, "geteuid", return_value=0), \
+                mock.patch("pwd.getpwuid", return_value=entry), \
+                mock.patch.object(helper, "supplementary_groups", return_value=[1500]), \
+                mock.patch.object(helper, "tmux_program", lambda uid: "tmux"), \
+                mock.patch.object(helper, "run_command", run):
+            helper.tmux_command("/tmp/tmux-1500/default", 1500, ["list-panes"])
+            helper.tmux_command("/tmp/tmux-0/default", 0, ["list-panes"])
+        # The locale stays, so capture-pane keeps the selector's symbols.
+        self.assertEqual(seen[0]["env"], {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                                          "LC_ALL": "C.UTF-8"})
+        # Root's own server is root's own: its environment as it is.
+        self.assertNotIn("env", seen[1])
+
 
 class ApplyTests(unittest.TestCase):
     """`swarmbar-helper.py apply <blob>`: the pasted-command path."""

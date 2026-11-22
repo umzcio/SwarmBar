@@ -1079,7 +1079,11 @@ def run_command(argv, timeout=5, input=None, **options):
     Tests replace this so no unit test ever inspects a real process. It
     raises OSError or SubprocessError like subprocess.run, and callers decide
     whether a failure matters. `input` is bytes for the child's stdin (tmux
-    load-buffer reads the paste text there); None leaves stdin alone.
+    load-buffer reads the paste text there); None gives it an empty one.
+    Never this process's own: that is the Mac's request stream, config
+    contents and replies included, and a tmux client hands its descriptors
+    to its server, which may be any user's. A child holding it could read
+    requests meant for the helper, and every byte it read would be lost.
     `options` go to subprocess as they are: env, cwd, and user, group and
     extra_groups to run as someone other than root. With
     start_new_session, a timeout kills the child's whole process group,
@@ -1095,6 +1099,8 @@ def run_command(argv, timeout=5, input=None, **options):
     returns either way, never waiting on a process it did not start.
     """
     if not options.get("start_new_session"):
+        if input is None:
+            options = dict(options, stdin=subprocess.DEVNULL)
         return subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
             input=input, **options
@@ -1104,7 +1110,7 @@ def run_command(argv, timeout=5, input=None, **options):
         marker = os.urandom(8).hex()
         options = dict(options, env=dict(options["env"], **{RUN_MARKER: marker}))
     try:
-        with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
+        with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as proc:
             try:
                 out, err = proc.communicate(input, timeout=timeout)
@@ -1163,8 +1169,8 @@ def kill_marked(marker):
     else:
         try:
             listing = subprocess.run(["ps", "-E", "-ww", "-axo", "pid=,command="],
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     timeout=5).stdout
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             listing = b""
         for line in listing.splitlines():
@@ -1402,6 +1408,10 @@ def tmux_program(uid, directories=TMUX_DIRECTORIES):
     return None
 
 
+# What a tmux client run as another user keeps of this process's environment.
+TMUX_CLIENT_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE")
+
+
 def tmux_command(socket_path, uid, args, input=None, timeout=5):
     """One tmux client call against the server at `socket_path`, owned by
     `uid`, run as that owner. None when it must not run or could not."""
@@ -1413,6 +1423,13 @@ def tmux_command(socket_path, uid, args, input=None, timeout=5):
         return None
     argv = [program, "-S", socket_path] + args
     options = dict(ids)
+    if ids:
+        # A client run as another user needs nothing of root's environment
+        # but where programs live and the locale. Without the locale tmux
+        # takes the client for a non-UTF-8 terminal and capture-pane turns
+        # the selector's symbols into underscores.
+        options["env"] = dict((name, os.environ[name]) for name in TMUX_CLIENT_ENV
+                              if name in os.environ)
     if input is not None:
         options["input"] = input
     try:
